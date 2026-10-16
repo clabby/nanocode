@@ -9,11 +9,14 @@ use nanocode_durability_core::OwnerToken;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{JsonlStore, Location, State, identity};
+use super::{JsonlStore, Location, Record, State, identity};
 
-const MAGIC: &[u8] = b"nanocode-jsonl-index-v2\n";
+const MAGIC: &[u8] = b"nanocode-jsonl-index-v3\n";
+const ENTRY_MAGIC: &[u8] = b"nanocode-jsonl-index-v2\n";
 const LEGACY_MAGIC: &[u8] = b"nanocode-jsonl-index-v1\n";
 const INDEX_COPY_BUFFER_BYTES: usize = 128 * 1024;
+const ENTRY_RECORD: u8 = 0;
+const VALUE_RECORD: u8 = 1;
 
 pub(super) struct Index {
     pub(super) source: String,
@@ -22,6 +25,7 @@ pub(super) struct Index {
     pub(super) states: HashMap<String, State>,
     pub(super) created: Vec<String>,
     pub(super) last: Option<Location>,
+    pub(super) migrated: bool,
     anchor: [u8; 32],
     deferred: HashMap<String, RecordBlock>,
     file: Option<File>,
@@ -31,6 +35,14 @@ pub(super) struct Index {
 struct RecordBlock {
     location: Location,
     digest: [u8; 32],
+    format: Option<BlockFormat>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BlockFormat {
+    Entries,
+    Records,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,11 +64,18 @@ struct SavedIndex {
 }
 
 #[derive(Deserialize)]
+struct LegacyState {
+    revision: u64,
+    location: Location,
+    records: HashMap<String, Location>,
+}
+
+#[derive(Deserialize)]
 struct LegacyIndex {
     source: String,
     offset: u64,
     owners: HashMap<String, OwnerToken>,
-    states: HashMap<String, State>,
+    states: HashMap<String, LegacyState>,
     created: Vec<String>,
     last: Option<Location>,
     anchor: [u8; 32],
@@ -71,6 +90,7 @@ impl Index {
             states: HashMap::new(),
             created: Vec::new(),
             last: None,
+            migrated: false,
             anchor: Sha256::digest([]).into(),
             deferred: HashMap::new(),
             file: None,
@@ -84,11 +104,20 @@ impl Index {
         let _span = tracing::info_span!("durability.jsonl.index.records").entered();
         let file = self.file.as_mut().ok_or_else(invalid)?;
         let bytes = read_block(file, block)?;
-        let records: HashMap<String, Location> =
-            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        let records = match block.format {
+            Some(BlockFormat::Entries) => {
+                serde_json::from_slice::<HashMap<String, Location>>(&bytes)
+                    .map_err(io::Error::other)?
+                    .into_iter()
+                    .map(|(key, location)| (key, Record::Entry(location)))
+                    .collect()
+            }
+            Some(BlockFormat::Records) => decode_records(&bytes)?,
+            None => return Err(invalid()),
+        };
         if !records
             .values()
-            .all(|location| valid_location(*location, self.offset))
+            .all(|record| valid_location(record.location(), self.offset))
         {
             return Err(invalid());
         }
@@ -115,7 +144,7 @@ impl Index {
                     && state
                         .records
                         .values()
-                        .all(|location| location_valid(*location))
+                        .all(|record| location_valid(record.location()))
             })
             && self.owners.values().all(|owner| owner.fence() > 0)
     }
@@ -166,13 +195,36 @@ impl JsonlStore {
             let mut index = Index::new(saved.source);
             index.offset = saved.offset;
             index.owners = saved.owners;
-            index.states = saved.states;
+            index.states = saved
+                .states
+                .into_iter()
+                .map(|(id, state)| {
+                    let records = state
+                        .records
+                        .into_iter()
+                        .map(|(key, location)| (key, Record::Entry(location)))
+                        .collect();
+                    (
+                        id,
+                        State {
+                            revision: state.revision,
+                            location: state.location,
+                            records,
+                        },
+                    )
+                })
+                .collect();
             index.created = saved.created;
             index.last = saved.last;
             index.anchor = saved.anchor;
             return self.checked_index(index);
         }
-        if magic != MAGIC || length < (MAGIC.len() + trailer) as u64 {
+        let format = match &*magic {
+            MAGIC => None,
+            ENTRY_MAGIC => Some(BlockFormat::Entries),
+            _ => return Err(invalid()),
+        };
+        if length < (MAGIC.len() + trailer) as u64 {
             return Err(invalid());
         }
         file.seek(SeekFrom::End(-(trailer as i64)))?;
@@ -199,12 +251,16 @@ impl JsonlStore {
         index.created = saved.created;
         index.last = saved.last;
         index.anchor = saved.anchor;
-        for (id, state) in saved.states {
+        for (id, mut state) in saved.states {
             if state.records.location.position < MAGIC.len() as u64
                 || !valid_location(state.records.location, header_start)
             {
                 return Err(invalid());
             }
+            state.records.format = match (format, state.records.format) {
+                (None, Some(format)) | (Some(format), None) => Some(format),
+                _ => return Err(invalid()),
+            };
             index.deferred.insert(id.clone(), state.records);
             index.states.insert(
                 id,
@@ -229,7 +285,7 @@ impl JsonlStore {
     }
 
     pub(super) fn persist_index(&mut self) {
-        if self.persisted_offset == Some(self.index.offset) {
+        if self.persisted_offset == Some(self.index.offset) && !self.index.migrated {
             return;
         }
         let _span = tracing::info_span!(
@@ -246,7 +302,10 @@ impl JsonlStore {
             return;
         }
         match self.write_index() {
-            Ok(()) => self.persisted_offset = Some(self.index.offset),
+            Ok(()) => {
+                self.persisted_offset = Some(self.index.offset);
+                self.index.migrated = false;
+            }
             Err(error) => tracing::warn!(%error, "could not save rebuildable JSONL index"),
         }
     }
@@ -278,7 +337,7 @@ impl JsonlStore {
                 digest: Sha256::new(),
                 length: 0,
             };
-            if let Some(block) = self.index.deferred.get(id) {
+            let format = if let Some(block) = self.index.deferred.get(id) {
                 let file = self.index.file.as_mut().ok_or_else(invalid)?;
                 file.seek(SeekFrom::Start(block.location.position))?;
                 let mut source = BufReader::with_capacity(
@@ -291,18 +350,21 @@ impl JsonlStore {
                 {
                     return Err(invalid());
                 }
+                block.format
             } else {
                 let mut buffered =
                     io::BufWriter::with_capacity(INDEX_COPY_BUFFER_BYTES, &mut output);
-                serde_json::to_writer(&mut buffered, &state.records).map_err(io::Error::other)?;
+                encode_records(&state.records, &mut buffered)?;
                 buffered.flush()?;
-            }
+                Some(BlockFormat::Records)
+            };
             let records = RecordBlock {
                 location: Location {
                     position,
                     length: output.length,
                 },
                 digest: output.digest.finalize().into(),
+                format,
             };
             states.insert(
                 id.clone(),
@@ -365,6 +427,65 @@ fn valid_location(location: Location, end: u64) -> bool {
             .is_some_and(|position| position <= end)
 }
 
+fn encode_records(records: &HashMap<String, Record>, output: &mut impl Write) -> io::Result<()> {
+    for (key, record) in records {
+        output.write_all(&(key.len() as u64).to_le_bytes())?;
+        output.write_all(key.as_bytes())?;
+        let (tag, location, digest) = match record {
+            Record::Entry(location) => (ENTRY_RECORD, location, None),
+            Record::Value { location, digest } => (VALUE_RECORD, location, Some(digest)),
+        };
+        output.write_all(&[tag])?;
+        output.write_all(&location.position.to_le_bytes())?;
+        output.write_all(&(location.length as u64).to_le_bytes())?;
+        if let Some(digest) = digest {
+            output.write_all(digest)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_records(mut bytes: &[u8]) -> io::Result<HashMap<String, Record>> {
+    let mut records = HashMap::new();
+    while !bytes.is_empty() {
+        let length = usize::try_from(take_u64(&mut bytes)?).map_err(io::Error::other)?;
+        let key = std::str::from_utf8(take(&mut bytes, length)?).map_err(io::Error::other)?;
+        let tag = take(&mut bytes, 1)?[0];
+        let location = Location {
+            position: take_u64(&mut bytes)?,
+            length: usize::try_from(take_u64(&mut bytes)?).map_err(io::Error::other)?,
+        };
+        let record = match tag {
+            ENTRY_RECORD => Record::Entry(location),
+            VALUE_RECORD => Record::Value {
+                location,
+                digest: take(&mut bytes, Sha256::output_size())?
+                    .try_into()
+                    .map_err(io::Error::other)?,
+            },
+            _ => return Err(invalid()),
+        };
+        if records.insert(key.to_owned(), record).is_some() {
+            return Err(invalid());
+        }
+    }
+    Ok(records)
+}
+
+fn take<'a>(bytes: &mut &'a [u8], length: usize) -> io::Result<&'a [u8]> {
+    let (taken, rest) = bytes.split_at_checked(length).ok_or_else(invalid)?;
+    *bytes = rest;
+    Ok(taken)
+}
+
+fn take_u64(bytes: &mut &[u8]) -> io::Result<u64> {
+    Ok(u64::from_le_bytes(
+        take(bytes, size_of::<u64>())?
+            .try_into()
+            .map_err(io::Error::other)?,
+    ))
+}
+
 fn read_block(file: &mut File, block: RecordBlock) -> io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(block.location.position))?;
     let mut bytes = vec![0; block.location.length];
@@ -376,23 +497,11 @@ fn read_block(file: &mut File, block: RecordBlock) -> io::Result<Vec<u8>> {
 }
 
 impl JsonlStore {
-    fn discard_index(&mut self, error: impl std::fmt::Display) {
+    pub(super) fn discard_index(&mut self, error: impl std::fmt::Display) {
         tracing::warn!(%error, "rebuilding invalid JSONL index from journal");
         self.index = Index::new(self.index.source.clone());
         self.persisted_offset = None;
         self.cached = None;
-    }
-
-    pub(super) fn ensure_records(
-        &mut self,
-        id: &str,
-    ) -> Result<(), nanocode_durability_core::StoreError> {
-        if let Err(error) = self.index.load_records(id) {
-            self.discard_index(error);
-            self.refresh()?;
-            self.persist_index();
-        }
-        Ok(())
     }
 
     pub(super) fn refresh_index(&mut self) -> Result<(), nanocode_durability_core::StoreError> {
@@ -408,7 +517,7 @@ impl JsonlStore {
 
 impl Drop for JsonlStore {
     fn drop(&mut self) {
-        if self.ready && self.persisted_offset != Some(self.index.offset) {
+        if self.ready && (self.persisted_offset != Some(self.index.offset) || self.index.migrated) {
             match self.file.try_lock() {
                 Ok(()) => {
                     self.persist_index();
