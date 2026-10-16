@@ -10,6 +10,7 @@ use opentelemetry_proto::{
     tonic::collector::{
         metrics::v1::ExportMetricsServiceRequest, trace::v1::ExportTraceServiceRequest,
     },
+    tonic::trace::v1::ResourceSpans,
     transform::{
         common::tonic::ResourceAttributesWithSchema,
         trace::tonic::group_spans_by_resource_and_scope,
@@ -111,9 +112,12 @@ pub struct TraceExporter {
 
 impl SpanExporter for TraceExporter {
     async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-        self.output.write(&ExportTraceServiceRequest {
-            resource_spans: group_spans_by_resource_and_scope(batch, &self.resource),
-        })
+        let resource_spans = match <[SpanData; 1]>::try_from(batch) {
+            Ok([span]) => vec![ResourceSpans::new(span, &self.resource)],
+            Err(batch) => group_spans_by_resource_and_scope(batch, &self.resource),
+        };
+        self.output
+            .write(&ExportTraceServiceRequest { resource_spans })
     }
 
     fn set_resource(&mut self, resource: &Resource) {
