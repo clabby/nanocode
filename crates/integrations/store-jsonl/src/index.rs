@@ -253,7 +253,12 @@ impl JsonlStore {
         index.anchor = saved.anchor;
         for (id, mut state) in saved.states {
             if state.records.location.position < MAGIC.len() as u64
-                || !valid_location(state.records.location, header_start)
+                || state
+                    .records
+                    .location
+                    .position
+                    .checked_add(state.records.location.length as u64)
+                    .is_none_or(|end| end > header_start)
             {
                 return Err(invalid());
             }
