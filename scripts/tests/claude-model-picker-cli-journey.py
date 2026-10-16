@@ -163,7 +163,7 @@ def main():
                 h.require(len(requests) == start, 'failed selection dispatched inference')
             send('/model')
             wait(lambda: 'Select model' in screen.text(), 'model picker absent')
-            models = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5']
+            models = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1', 'claude-mythos-5-1', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5']
             # The slash-command popup can briefly cover the picker's last rows.
             if not claude_auth:
                 # Claude models are offered only once Claude is signed in.

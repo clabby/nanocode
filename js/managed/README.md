@@ -28,7 +28,7 @@ This works across harnesses and uses the child's captured permissions. Completio
 while the parent is active (including in `wait_agent`) does not add another turn;
 failed or cancelled parent work is not automatically restarted.
 
-With thinking enabled, Claude Opus 5.5, Sonnet 5.5, and Fable 5.1 request
+With thinking enabled, Claude Opus 5.5, Sonnet 5.5, Fable 5.1, and Mythos 5.1 request
 `display: "updates"` and its required beta header. Nonempty provider progress
 updates stream as `reasoning.summary.delta` into the existing Thinking rows;
 empty thinking blocks, signatures, and redacted blocks never become display

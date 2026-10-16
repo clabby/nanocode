@@ -23,8 +23,8 @@ Review the requested changes and return specific findings.
 Profiles require a name and description. Supported fields are `model`, `tools`,
 `disallowedTools`, `permissionMode`, and `isolation`. Tool lists accept YAML lists
 or comma-separated exact tool names. Patterns and argument specifiers are not
-supported. Models accept Claude model IDs, `opus`, `sonnet`, `haiku`, `fable`, or
-`inherit`. Restrictive permission modes are `default`, `manual`, `dontAsk`, and
+supported. Models accept Claude model IDs, `opus`, `sonnet`, `haiku`, `fable`,
+`mythos`, or `inherit`. Restrictive permission modes are `default`, `manual`, `dontAsk`, and
 `plan`; project files cannot enable permission bypass. Unsupported fields,
 symlinks, duplicate names and invalid profiles produce catalog diagnostics.
 Discovery scans at most 256 entries, returns at most 64 profiles and reads at

@@ -163,7 +163,7 @@ impl ClaudeAgentProfiles {
         }
         let model = string(&meta, "model")?.filter(|v| v != "inherit");
         if model.as_ref().is_some_and(|m| {
-            !matches!(m.as_str(), "opus" | "sonnet" | "haiku" | "fable")
+            !matches!(m.as_str(), "opus" | "sonnet" | "haiku" | "fable" | "mythos")
                 && !m.starts_with("claude-")
         }) {
             return Err("agent model must be a Claude model ID, alias or inherit".into());

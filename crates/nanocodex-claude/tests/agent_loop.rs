@@ -3261,6 +3261,7 @@ async fn progress_updates_stream_before_tools_and_preserve_private_continuation(
         ("claude-opus-5-5", true, false),
         ("claude-opus-5-5", true, true),
         ("claude-fable-5-1", true, false),
+        ("claude-mythos-5-1", true, false),
         ("claude-sonnet-5-5", true, false),
         ("claude-haiku-5-5", false, false),
         ("claude-sonnet-4-6", false, false),

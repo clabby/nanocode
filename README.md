@@ -409,7 +409,7 @@ ncl run "inspect the repository" --harness codex --model sol
 
 In the interactive local CLI, `/model` lists both Codex and Claude models before
 the first prompt. Select one from the picker, or enter `/model sonnet`, `/model opus`,
-`/model fable`, or `/model haiku` directly. Selecting another family creates its
+`/model fable`, `/model mythos`, or `/model haiku` directly. Selecting another family creates its
 native harness with that family's credentials and default reasoning settings.
 The model is fixed once the thread starts; start a new thread to use another model.
 
@@ -426,7 +426,7 @@ family. Null values inherit the parent family and its current settings; switchin
 families uses the selected family's defaults. Mixed children share the same task
 tree, result contracts and lifecycle tools. Each family uses its own credentials,
 native tools and transcript format. A model from the wrong family fails before
-provider dispatch. Claude aliases are `opus`, `sonnet`, `fable` and `haiku`;
+provider dispatch. Claude aliases are `opus`, `sonnet`, `fable`, `mythos` and `haiku`;
 `haiku` selects Claude Haiku 5.5, and `claude-haiku-4-5` still selects Haiku 4.5.
 
 Libraries compose the same routing through [`Harness`](crates/nanocodex/README.md)

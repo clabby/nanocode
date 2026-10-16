@@ -420,10 +420,9 @@ impl BuilderBackend for Claude {
 // https://platform.claude.com/docs/en/models/haiku-4-5/overview
 fn model_max_tokens(model: &str) -> Option<u32> {
     match model {
-        "claude-opus-5-5" | "claude-fable-5-1" | "claude-sonnet-5-5" | "claude-haiku-5-5"
-        | "claude-opus-5" | "claude-sonnet-5" | "claude-opus-4-6" | "claude-sonnet-4-6" => {
-            Some(128_000)
-        }
+        "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1" | "claude-sonnet-5-5"
+        | "claude-haiku-5-5" | "claude-opus-5" | "claude-sonnet-5" | "claude-opus-4-6"
+        | "claude-sonnet-4-6" => Some(128_000),
         "claude-haiku-4-5"
         | "claude-haiku-4-5-20251001"
         | "claude-sonnet-4-5"
@@ -482,8 +481,8 @@ pub struct ClaudeBuilder {
 impl ClaudeBuilder {
     fn new(claude: Claude) -> Self {
         let context_window_tokens = match claude.model.as_str() {
-            "claude-opus-5-5" | "claude-fable-5-1" | "claude-sonnet-5-5" | "claude-haiku-5-5"
-            | "claude-sonnet-5" => 1_000_000,
+            "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1" | "claude-sonnet-5-5"
+            | "claude-haiku-5-5" | "claude-sonnet-5" => 1_000_000,
             _ => 200_000, // Conservative fallback; override for other models.
         };
         Self {
@@ -2002,11 +2001,11 @@ async fn web_fetch_with_source<P: nanocodex_claude_tools::web::ApprovedWebFetchS
 
 /// Thinking setting for the bounded context-recovery summary request. Per the
 /// model table at https://platform.claude.com/docs/en/about-claude/models/extended-thinking-models,
-/// `disabled` is a 400 on Opus 5.5, Fable 5.1 and Sonnet 5.5. Sonnet 5.5's lowest
-/// setting is `between_tools` (effort high or below); Opus 5.5 and Fable 5.1 accept
-/// adaptive thinking at low effort. Haiku 5.5 accepts `disabled` at high effort or
-/// below, so the disabled request omits the session effort and runs at the model
-/// default.
+/// `disabled` is a 400 on Opus 5.5, Fable 5.1, Mythos 5.1 and Sonnet 5.5. Sonnet
+/// 5.5's lowest setting is `between_tools` (effort high or below); Opus 5.5,
+/// Fable 5.1 and Mythos 5.1 accept adaptive thinking at low effort. Haiku 5.5
+/// accepts `disabled` at high effort or below, so the disabled request omits the
+/// session effort and runs at the model default.
 enum RecoveryThinking {
     Disabled,
     AdaptiveLow,
@@ -2019,7 +2018,9 @@ fn recovery_thinking(model: &str) -> RecoveryThinking {
             RecoveryThinking::BetweenTools
         }
         Ok(HarnessModel::Claude(
-            nanocodex_agent::ClaudeModel::Opus55 | nanocodex_agent::ClaudeModel::Fable51,
+            nanocodex_agent::ClaudeModel::Opus55
+            | nanocodex_agent::ClaudeModel::Fable51
+            | nanocodex_agent::ClaudeModel::Mythos51,
         )) => RecoveryThinking::AdaptiveLow,
         _ => RecoveryThinking::Disabled,
     }
@@ -3008,7 +3009,7 @@ impl State {
     fn emit_run_started(&self, request: &BackendPrompt) -> (&'static str, String) {
         let reasoning_mode = if matches!(
             self.model().as_str(),
-            "claude-opus-5-5" | "claude-fable-5-1"
+            "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1"
         ) {
             "adaptive"
         } else {
@@ -3072,7 +3073,10 @@ impl State {
                 // https://platform.claude.com/docs/en/build-with-claude/thinking#progress-updates-between-tool-calls
                 if matches!(
                     self.model().as_str(),
-                    "claude-opus-5-5" | "claude-fable-5-1" | "claude-sonnet-5-5"
+                    "claude-opus-5-5"
+                        | "claude-fable-5-1"
+                        | "claude-mythos-5-1"
+                        | "claude-sonnet-5-5"
                 ) {
                     json!({"type":"adaptive","display":"updates"})
                 } else {

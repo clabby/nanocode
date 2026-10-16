@@ -28,6 +28,8 @@ pub enum ManagedModel {
     ClaudeHaiku55,
     /// Claude Fable 5.1.
     ClaudeFable51,
+    /// Claude Mythos 5.1.
+    ClaudeMythos51,
     /// Claude Haiku 4.5, with ordinary inference and no adaptive effort.
     ClaudeHaiku45,
 }
@@ -44,6 +46,7 @@ impl ManagedModel {
             Self::ClaudeOpus55 => "claude-opus-5-5",
             Self::ClaudeHaiku55 => "claude-haiku-5-5",
             Self::ClaudeFable51 => "claude-fable-5-1",
+            Self::ClaudeMythos51 => "claude-mythos-5-1",
             Self::ClaudeHaiku45 => "claude-haiku-4-5",
         }
     }
@@ -58,7 +61,8 @@ impl ManagedModel {
             | Self::ClaudeSonnet55
             | Self::ClaudeOpus55
             | Self::ClaudeHaiku55
-            | Self::ClaudeFable51 => Thinking::Medium,
+            | Self::ClaudeFable51
+            | Self::ClaudeMythos51 => Thinking::Medium,
             Self::ClaudeHaiku45 => Thinking::None,
         }
     }
@@ -73,7 +77,8 @@ impl ManagedModel {
             | Self::ClaudeSonnet55
             | Self::ClaudeOpus55
             | Self::ClaudeHaiku55
-            | Self::ClaudeFable51 => {
+            | Self::ClaudeFable51
+            | Self::ClaudeMythos51 => {
                 matches!(thinking, Thinking::Low | Thinking::Medium | Thinking::High)
             }
             Self::ClaudeHaiku45 => matches!(thinking, Thinking::None),
@@ -91,6 +96,7 @@ impl ManagedModel {
             | Self::ClaudeOpus55
             | Self::ClaudeHaiku55
             | Self::ClaudeFable51
+            | Self::ClaudeMythos51
             | Self::ClaudeHaiku45 => matches!(mode, ReasoningMode::Standard),
         }
     }
@@ -130,6 +136,7 @@ impl ManagedModel {
             Self::ClaudeOpus55 => HarnessModel::Claude(ClaudeModel::Opus55),
             Self::ClaudeHaiku55 => HarnessModel::Claude(ClaudeModel::Haiku55),
             Self::ClaudeFable51 => HarnessModel::Claude(ClaudeModel::Fable51),
+            Self::ClaudeMythos51 => HarnessModel::Claude(ClaudeModel::Mythos51),
             Self::ClaudeHaiku45 => HarnessModel::Claude(ClaudeModel::Haiku45),
         }
     }
@@ -154,6 +161,7 @@ impl From<ClaudeModel> for ManagedModel {
             ClaudeModel::Sonnet55 => Self::ClaudeSonnet55,
             ClaudeModel::Haiku55 => Self::ClaudeHaiku55,
             ClaudeModel::Fable51 => Self::ClaudeFable51,
+            ClaudeModel::Mythos51 => Self::ClaudeMythos51,
             ClaudeModel::Opus46 => Self::ClaudeOpus46,
             ClaudeModel::Sonnet46 => Self::ClaudeSonnet46,
             ClaudeModel::Haiku45 => Self::ClaudeHaiku45,
@@ -205,6 +213,7 @@ impl FromStr for ManagedModel {
             "claude-opus-5-5" => Ok(Self::ClaudeOpus55),
             "claude-haiku-5-5" => Ok(Self::ClaudeHaiku55),
             "claude-fable-5-1" => Ok(Self::ClaudeFable51),
+            "claude-mythos-5-1" => Ok(Self::ClaudeMythos51),
             "claude-haiku-4-5" => Ok(Self::ClaudeHaiku45),
             "gpt-6.1-sol" => Ok(Model::Sol.into()),
             "gpt-6-luna" => Ok(Model::Luna.into()),

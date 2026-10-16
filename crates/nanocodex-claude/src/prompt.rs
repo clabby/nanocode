@@ -43,8 +43,8 @@ impl ImageResolution {
     /// models, including unknown ones, use the standard tier.
     pub(crate) fn of(model: &str) -> Self {
         match model {
-            "claude-opus-5-5" | "claude-fable-5-1" | "claude-sonnet-5-5" | "claude-haiku-5-5"
-            | "claude-opus-5" | "claude-sonnet-5" => Self {
+            "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1" | "claude-sonnet-5-5"
+            | "claude-haiku-5-5" | "claude-opus-5" | "claude-sonnet-5" => Self {
                 max_edge: 2576,
                 max_tokens: 4784,
             },

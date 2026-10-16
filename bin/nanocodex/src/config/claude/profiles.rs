@@ -173,6 +173,7 @@ pub(super) fn model(value: &str) -> &str {
         "sonnet" => "claude-sonnet-5-5",
         "opus" => "claude-opus-5-5",
         "fable" => "claude-fable-5-1",
+        "mythos" => "claude-mythos-5-1",
         "haiku" => "claude-haiku-5-5",
         other => other,
     }

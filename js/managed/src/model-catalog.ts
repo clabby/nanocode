@@ -42,7 +42,7 @@ export function defaultSettingsForModel(model: ManagedAgentSettings["model"]): M
 
 /** Catalog admission comes from the account broker, never a client label. */
 /** Native Claude models children may use: every model the Rust Claude harness supports, gated by the account's live grant. */
-const NATIVE_CLAUDE_CHILD_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] as const;
+const NATIVE_CLAUDE_CHILD_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] as const;
 export async function availableClaudeChildModels(broker: Fetcher, userId: string): Promise<string[]> {
   if (!connected((await credentialStatus(broker, userId)).claude)) return [];
   const allowed = await fetchResponseWithDeadline(broker,

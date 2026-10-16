@@ -328,7 +328,7 @@ impl ClaudeSkills {
         let agent = string_field(&meta, "agent")?;
         let model = string_field(&meta, "model")?.filter(|m| m != "inherit");
         if model.as_ref().is_some_and(|m| {
-            !matches!(m.as_str(), "opus" | "sonnet" | "haiku" | "fable")
+            !matches!(m.as_str(), "opus" | "sonnet" | "haiku" | "fable" | "mythos")
                 && !m.starts_with("claude-")
         }) {
             return Err("forked skill model must be a Claude model ID, alias or inherit".into());
