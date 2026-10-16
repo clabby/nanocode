@@ -133,6 +133,10 @@ pub fn code_style() -> Style {
 }
 
 pub fn wrap(spans: Vec<Span<'static>>, width: u16) -> Vec<Vec<Span<'static>>> {
+    wrap_spans(&spans, width)
+}
+
+pub(crate) fn wrap_spans(spans: &[Span<'_>], width: u16) -> Vec<Vec<Span<'static>>> {
     let mut lines = vec![Vec::<Span<'static>>::new()];
     let mut used = 0_u16;
     for span in spans {

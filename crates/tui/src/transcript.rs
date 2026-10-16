@@ -1,14 +1,15 @@
 use std::{borrow::Cow, rc::Rc, time::Duration};
 
 use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
+    buffer::{Buffer, CellWidth},
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
 
 use syntect::easy::HighlightLines;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     beautify::beautify,
@@ -571,37 +572,55 @@ impl Transcript {
         span.record("scroll.after", self.scroll);
         let end = total - self.scroll;
         let start = end.saturating_sub(height);
-        let mut visible = Vec::with_capacity(end - start);
+        let mut rows = area
+            .intersection(buffer.area)
+            .rows()
+            .filter(|row| !row.is_empty());
         let mut offset = 0;
-        for layout in layouts.iter().rev() {
+        'layouts: for layout in layouts.iter().rev() {
             let count = layout.lines.len();
             let next = offset + count;
             if next > start && offset < end {
                 let from = start.saturating_sub(offset);
                 let to = (end - offset).min(count);
-                visible.extend((from..to).map(|row| layout.line(row, spinner)));
+                for row in from..to {
+                    let Some(row_area) = rows.next() else {
+                        break 'layouts;
+                    };
+                    if layout.spinners.iter().any(|(slot, _)| *slot == row) {
+                        render_line(&layout.line(row, spinner), row_area, buffer);
+                    } else {
+                        render_line(&layout.lines[row], row_area, buffer);
+                    }
+                }
             }
             offset = next;
             if offset >= end {
                 break;
             }
         }
-        Paragraph::new(visible).render(area, buffer);
         if self.scroll > 0 {
             let label = format!(" ↓ {} more lines · end to follow ", self.scroll);
             let label_width = u16::try_from(label.chars().count())
                 .unwrap_or(u16::MAX)
                 .min(area.width);
             let x = area.x + area.width - label_width;
-            buffer.set_stringn(
-                x,
-                area.y + area.height - 1,
-                &label,
-                usize::from(label_width),
-                Style::default()
-                    .fg(theme.code_background())
-                    .bg(theme.accent()),
-            );
+            let visible =
+                Rect::new(x, area.y + area.height - 1, label_width, 1).intersection(buffer.area);
+            if !visible.is_empty() {
+                buffer.set_stringn(
+                    visible.x,
+                    visible.y,
+                    label
+                        .chars()
+                        .skip(usize::from(visible.x - x))
+                        .collect::<String>(),
+                    usize::from(visible.width),
+                    Style::default()
+                        .fg(theme.code_background())
+                        .bg(theme.accent()),
+                );
+            }
         }
     }
 }
@@ -948,6 +967,49 @@ fn code_lines(text: &str, language: &str, width: u16) -> Vec<Line<'static>> {
             .map(Line::from)
         })
         .collect()
+}
+
+fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer) {
+    if line
+        .alignment
+        .is_some_and(|alignment| alignment != Alignment::Left)
+    {
+        Paragraph::new(line.clone()).render(area, buffer);
+        return;
+    }
+    let start = buffer.index_of(area.x, area.y);
+    let cells = &mut buffer.content[start..start + usize::from(area.width)];
+    let mut used = 0;
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        let content = span.content.as_ref();
+        if content.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
+            for index in 0..content.len() {
+                let Some(cell) = cells.get_mut(used) else {
+                    return;
+                };
+                cell.set_symbol(&content[index..=index]).set_style(style);
+                used += 1;
+            }
+            continue;
+        }
+        for grapheme in content
+            .graphemes(true)
+            .filter(|grapheme| !grapheme.contains(char::is_control))
+        {
+            let width = usize::from(grapheme.cell_width());
+            if width > cells.len() {
+                continue;
+            }
+            if used + width > cells.len() {
+                return;
+            }
+            if width > 0 {
+                cells[used].set_symbol(grapheme).set_style(style);
+            }
+            used += width;
+        }
+    }
 }
 
 fn prefixed(

@@ -440,9 +440,9 @@ impl<'a> Renderer<'a> {
             self.blank();
             return;
         }
-        let highlighted = self.highlight(code, language.as_deref());
+        let block = self.highlight(code, language.as_deref());
         if self.width < 6 {
-            self.narrow_code_block(highlighted);
+            self.narrow_code_block(block);
             self.blank();
             return;
         }
@@ -454,9 +454,9 @@ impl<'a> Renderer<'a> {
             self.theme,
         ));
         let content_width = self.width.saturating_sub(4).max(1);
-        for highlighted in highlighted {
+        for highlighted in &self.highlights.blocks[block].lines {
             for (index, mut spans) in
-                super::highlight::wrap(highlighted, content_width.saturating_sub(2).max(1))
+                super::highlight::wrap_spans(highlighted, content_width.saturating_sub(2).max(1))
                     .into_iter()
                     .enumerate()
             {
@@ -486,7 +486,7 @@ impl<'a> Renderer<'a> {
         self.blank();
     }
 
-    fn highlight(&mut self, code: String, language: Option<&str>) -> Vec<Vec<Span<'static>>> {
+    fn highlight(&mut self, code: String, language: Option<&str>) -> usize {
         let block = self.block;
         self.block += 1;
         let cached = self
@@ -497,7 +497,7 @@ impl<'a> Renderer<'a> {
         if let Some(cached) = &cached
             && cached.code == code
         {
-            return cached.lines.clone();
+            return block;
         }
         self.highlighted += 1;
         let assets = super::highlight::assets();
@@ -548,7 +548,7 @@ impl<'a> Renderer<'a> {
         let highlighted = HighlightedBlock {
             language: language.map(str::to_owned),
             code,
-            lines: lines.clone(),
+            lines,
             resume: Some(resume),
         };
         if let Some(slot) = self.highlights.blocks.get_mut(block) {
@@ -556,14 +556,14 @@ impl<'a> Renderer<'a> {
         } else {
             self.highlights.blocks.push(highlighted);
         }
-        lines
+        block
     }
 
-    fn narrow_code_block(&mut self, highlighted: Vec<Vec<Span<'static>>>) {
+    fn narrow_code_block(&mut self, block: usize) {
         let gutter = Style::default().fg(self.theme.border());
         let content_width = self.width.saturating_sub(2).max(1);
-        for highlighted in highlighted {
-            for spans in super::highlight::wrap(highlighted, content_width) {
+        for highlighted in &self.highlights.blocks[block].lines {
+            for spans in super::highlight::wrap_spans(highlighted, content_width) {
                 let mut line = vec![Span::styled("┃ ", gutter)];
                 line.extend(spans);
                 self.lines.push(Line::from(line));
@@ -766,8 +766,7 @@ fn wrap_spans_with_whitespace(
     let graphemes = spans
         .iter()
         .flat_map(|span| {
-            span.content
-                .graphemes(true)
+            graphemes(&span.content)
                 .map(|text| StyledGrapheme {
                     text: text.to_owned(),
                     style: span.style,
@@ -795,10 +794,7 @@ fn wrap_tagged_spans(
     let graphemes = spans
         .iter()
         .flat_map(|tagged| {
-            tagged
-                .span
-                .content
-                .graphemes(true)
+            graphemes(&tagged.span.content)
                 .map(|text| StyledGrapheme {
                     text: text.to_owned(),
                     style: tagged.span.style,
@@ -810,6 +806,21 @@ fn wrap_tagged_spans(
         })
         .collect::<Vec<_>>();
     wrap_graphemes(&graphemes, width, prefer_words, false)
+}
+
+fn graphemes(text: &str) -> impl Iterator<Item = &str> {
+    let ascii = text.bytes().all(|byte| matches!(byte, b' '..=b'~' | b'\n'));
+    let mut segmented = text.graphemes(true);
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        if ascii {
+            let grapheme = text.get(offset..offset + 1)?;
+            offset += 1;
+            Some(grapheme)
+        } else {
+            segmented.next()
+        }
+    })
 }
 
 fn wrap_graphemes(
