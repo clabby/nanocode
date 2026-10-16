@@ -16,7 +16,8 @@ pub(super) fn build_agent(
     crate::client::transport::install_default_rustls_crypto_provider();
     let session_id = session_id.unwrap_or_default();
     let session_id_text = session_id.to_string();
-    let context_source = codex.context.build();
+    let context_source =
+        tracing::info_span!("codex.session.context").in_scope(|| codex.context.build());
     let PromptCacheConfig { key, shared } = prompt_cache;
 
     let is_resume = resume.is_some()
@@ -83,7 +84,8 @@ pub(super) fn build_agent(
             context_source.resolve_workspace(configured_workspace.as_deref())?,
         ))
     };
-    let service = service_factory(Arc::clone(&config));
+    let service = tracing::info_span!("codex.session.service")
+        .in_scope(|| service_factory(Arc::clone(&config)));
     let provider_session_id = Arc::clone(&lineage_id);
     spawn_agent_driver(
         BranchSpawner {
@@ -146,10 +148,12 @@ pub(super) fn spawn_agent_driver(
         child_handle = child_handle.with_spawn_factory(factory.clone());
     }
     child_handle = child_handle.with_child_journal(spawner.child_journal.clone());
-    let tools = spawner
-        .tools
-        .materialize(child_handle.clone())?
-        .for_session(&child_handle.session_environment());
+    let tools = tracing::info_span!("codex.session.tools").in_scope(|| {
+        spawner
+            .tools
+            .materialize(child_handle.clone())
+            .map(|tools| tools.for_session(&child_handle.session_environment()))
+    })?;
 
     if tools.exposure() == nanocode_tool_host::ToolExposure::Hidden {
         return Err(NanocodexError::InvalidRequest(

@@ -1660,6 +1660,7 @@ dependencies = [
  "nanocode-tool-runtime",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1868,6 +1869,7 @@ dependencies = [
  "nanocode-types",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

@@ -190,9 +190,13 @@ impl RuntimeBackend for CodexHarness {
                         "invalid durable Codex session identity: {error}"
                     ))
                 })?;
-                builder = builder.session_id(session_id).durability(state).await?;
+                builder = tracing::Instrument::instrument(
+                    builder.session_id(session_id).durability(state),
+                    tracing::info_span!("codex.session.durability"),
+                )
+                .await?;
             }
-            builder.build()
+            tracing::info_span!("codex.session.build").in_scope(|| builder.build())
         })
     }
 }

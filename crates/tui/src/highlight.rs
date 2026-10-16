@@ -31,20 +31,8 @@ pub fn prewarm() {
         let _ = std::thread::Builder::new()
             .name("tui-highlighting".to_owned())
             .spawn(|| {
-                let assets = assets();
-                for (language, example) in [
-                    (
-                        "javascript",
-                        "const result = await tools.exec_command({cmd: 'ls'});",
-                    ),
-                    ("rust", "pub fn main() { println!(\"ready\"); }"),
-                    ("json", "{\"result\": [true, 42]}"),
-                    ("bash", "echo \"$PATH\" | head -n 1"),
-                ] {
-                    let syntax = syntax_for_token(&assets.syntaxes, language);
-                    let mut highlighter = HighlightLines::new(syntax, theme());
-                    let _ = line(&mut highlighter, example, &assets.syntaxes);
-                }
+                let _ = assets();
+                let _ = theme();
             });
     });
 }

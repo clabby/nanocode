@@ -9,6 +9,7 @@ use nanocode_tool_contracts::{
 use nanocode_types::ImageDetail;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap, ffi::OsString, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
 };
@@ -60,6 +61,14 @@ struct CachedCatalog {
 }
 
 impl CatalogCache {
+    fn entry_path(&self, fingerprint: &Value) -> PathBuf {
+        self.path.with_extension("").join(format!(
+            "{}.json",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(Sha256::digest(fingerprint.to_string().as_bytes()))
+        ))
+    }
+
     fn fingerprint(&self, config: &ComputerConfig) -> Value {
         let lossy = |value: &std::ffi::OsStr| value.to_string_lossy().into_owned();
         let inputs = self
@@ -96,24 +105,46 @@ impl CatalogCache {
     }
 
     fn load(&self, fingerprint: &Value) -> Option<Vec<ProviderTool>> {
-        let cached: CachedCatalog =
-            serde_json::from_slice(&std::fs::read(&self.path).ok()?).ok()?;
-        (cached.fingerprint == *fingerprint && validate_catalog(&cached.catalog).is_ok())
-            .then_some(cached.catalog)
+        let entry = self.entry_path(fingerprint);
+        for path in [&entry, &self.path] {
+            let Some(cached) = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<CachedCatalog>(&bytes).ok())
+            else {
+                continue;
+            };
+            if cached.fingerprint == *fingerprint && validate_catalog(&cached.catalog).is_ok() {
+                if path == &self.path {
+                    drop(self.store(fingerprint.clone(), &cached.catalog));
+                }
+                return Some(cached.catalog);
+            }
+        }
+        None
     }
 
     fn store(&self, fingerprint: Value, catalog: &[ProviderTool]) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
+        let path = self.entry_path(&fingerprint);
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let staged = self
-            .path
-            .with_extension(format!("json.{}.tmp", std::process::id()));
+        let staged = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(
             &staged,
             serde_json::to_vec(&json!({"fingerprint": fingerprint, "catalog": catalog}))?,
         )?;
-        std::fs::rename(&staged, &self.path)
+        std::fs::rename(&staged, &path)
+    }
+
+    fn invalidate(&self, fingerprint: &Value) {
+        drop(std::fs::remove_file(self.entry_path(fingerprint)));
+        if std::fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CachedCatalog>(&bytes).ok())
+            .is_some_and(|cached| cached.fingerprint == *fingerprint)
+        {
+            drop(std::fs::remove_file(&self.path));
+        }
     }
 }
 
@@ -632,7 +663,7 @@ impl Process {
             .is_some_and(|expected| expected != &catalog)
         {
             if let Some(cache) = &config.catalog_cache {
-                drop(std::fs::remove_file(&cache.path));
+                cache.invalidate(&cache.fingerprint(config));
             }
             return Err(
                 "CUA provider catalog changed; reconnect the attachment before invoking it".into(),

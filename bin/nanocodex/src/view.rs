@@ -661,27 +661,3 @@ fn footer(app: &App) -> Line<'static> {
     ));
     Line::from(spans)
 }
-
-pub fn splash(frame: &mut Canvas<'_>, theme: &nanocode_tui::theme::Theme, message: &str) {
-    let area = frame.area();
-    let y = area.y + area.height / 2;
-    let line = Line::from(vec![
-        Span::styled(
-            "nanocodex ",
-            Style::default()
-                .fg(theme.accent())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(message.to_owned(), Style::default().fg(theme.muted())),
-    ]);
-    Paragraph::new(line)
-        .alignment(nanocode_tui::ratatui::layout::Alignment::Center)
-        .render(
-            Rect {
-                y,
-                height: 1,
-                ..area
-            },
-            frame.buffer_mut(),
-        );
-}

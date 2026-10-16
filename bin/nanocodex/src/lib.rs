@@ -66,7 +66,10 @@ fn install_telemetry(cli: &Cli) -> Result<Option<nanocode_observability::Observa
 }
 
 pub fn main() -> ExitCode {
+    let entered = std::time::Instant::now();
     let cli = Cli::parse();
+    let parsed = entered.elapsed();
+    let telemetry_started = std::time::Instant::now();
     let telemetry = match install_telemetry(&cli) {
         Ok(telemetry) => telemetry,
         Err(error) => {
@@ -74,14 +77,32 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = match tracing::info_span!(target: "nanocodex", "nc.startup", process.pid = std::process::id())
-        .in_scope(|| tokio::runtime::Builder::new_multi_thread().enable_all().build()) {
+    let startup = tracing::info_span!(
+        target: "nanocodex",
+        "nc.startup",
+        process.pid = std::process::id(),
+        cli.duration_ms = parsed.as_secs_f64() * 1_000.0,
+        telemetry.duration_ms = telemetry_started.elapsed().as_secs_f64() * 1_000.0,
+        main_to_span.duration_ms = entered.elapsed().as_secs_f64() * 1_000.0,
+        runtime.duration_ms = tracing::field::Empty
+    );
+    let runtime_started = std::time::Instant::now();
+    let runtime = match startup.in_scope(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    }) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("nanocodex: failed to start the async runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
+    startup.record(
+        "runtime.duration_ms",
+        runtime_started.elapsed().as_secs_f64() * 1_000.0,
+    );
+    drop(startup);
     let outcome = runtime.block_on(async move {
         match cli.command {
             Some(Command::Runner(args)) => runner(args).await,
@@ -189,8 +210,13 @@ async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Pre
         runner_servers,
         gateway,
     };
-    let host = Host::build(config, &model, thinking)?;
-    host.runtime.initialize_runners().await?;
+    let host = tracing::info_span!(target: "nanocodex", "nc.host.build")
+        .in_scope(|| Host::build(config, &model, thinking))?;
+    tracing::Instrument::instrument(
+        host.runtime.initialize_runners(),
+        tracing::info_span!(target: "nanocodex", "nc.runners.initialize"),
+    )
+    .await?;
     for server in host.runtime.runner_servers() {
         notify(&format!(
             "listening {} · token {}",
@@ -221,19 +247,13 @@ async fn interactive(args: SessionArgs) -> Result<()> {
                 .into(),
         );
     }
-    let mut terminal =
+    let terminal =
         nanocode_tui::terminal::TerminalSession::enter(nanocode_tui::terminal::TerminalOptions {
             mouse_capture: !args.no_mouse,
             keyboard_enhancement: true,
         })?;
-    let theme = nanocode_tui::theme::Theme::default();
-    terminal.draw(|frame| view::splash(frame, &theme, "starting…"))?;
     nanocode_tui::highlight::prewarm();
-    let prepared = {
-        let mut notify =
-            |message: &str| drop(terminal.draw(|frame| view::splash(frame, &theme, message)));
-        prepare(&args, &mut notify).await
-    };
+    let prepared = prepare(&args, &mut |_| {}).await;
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {

@@ -28,13 +28,19 @@ pub(super) fn cell(explicit: Option<Computer>) -> Arc<Cua> {
 
 #[cfg(not(target_family = "wasm"))]
 pub(super) async fn connect(cell: Cell) -> Result<Option<Computer>> {
+    use tracing::Instrument as _;
+
     let Some(cua) = cell else {
         return Ok(None);
     };
     let mut closed = cua.closed.subscribe();
     let connected = cua.tools.get_or_init(|| async {
         let connected = match crate::ComputerConfig::installed() {
-            Ok(config) => crate::ComputerTools::connect(config).await,
+            Ok(config) => {
+                crate::ComputerTools::connect(config)
+                    .instrument(tracing::info_span!("agent.host.computer.connect"))
+                    .await
+            }
             Err(error) => Err(error),
         };
         connected

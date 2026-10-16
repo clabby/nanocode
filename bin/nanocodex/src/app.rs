@@ -342,7 +342,14 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         app.starting = false;
         app.open_session_picker();
     } else {
-        app.connect(launch.resume.clone());
+        let connection = app.connection(launch.resume.clone());
+        match connection.await {
+            Ok(ready) => app.ready(ready),
+            Err(error) => {
+                app.starting = false;
+                app.notice(NoticeLevel::Error, error.to_string());
+            }
+        }
     }
     let outcome = app.event_loop(&mut terminal, rx).await;
     drop(terminal);
@@ -649,6 +656,21 @@ impl App {
     }
 
     pub fn connect(&mut self, resume: Option<String>) {
+        let ready = self.connection(resume);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let event = match ready.await {
+                Ok(ready) => AppEvent::AgentReady(Box::new(ready)),
+                Err(error) => AppEvent::AgentFailed(error.to_string()),
+            };
+            drop(tx.send(event));
+        });
+    }
+
+    fn connection(
+        &mut self,
+        resume: Option<String>,
+    ) -> impl Future<Output = Result<Ready>> + Send + 'static {
         self.starting = true;
         let thinking_override = self.thinking_override.take();
         let tier_override = self.tier_override.take();
@@ -656,9 +678,8 @@ impl App {
         let model = self.model.clone();
         let thinking = self.thinking;
         let tier = self.tier;
-        let tx = self.tx.clone();
         let span = tracing::info_span!(target: "nanocodex", "nc.session.connect", model = %model, resume = resume.is_some(), otel.status_code = tracing::field::Empty);
-        tokio::spawn(tracing::Instrument::instrument(
+        tracing::Instrument::instrument(
             async move {
                 let ready = async {
                     match resume {
@@ -683,17 +704,12 @@ impl App {
                         }
                     }
                 };
-                let event = match ready.await {
-                    Ok(ready) => AppEvent::AgentReady(Box::new(ready)),
-                    Err(error) => {
-                        tracing::Span::current().record("otel.status_code", "ERROR");
-                        AppEvent::AgentFailed(error.to_string())
-                    }
-                };
-                drop(tx.send(event));
+                ready.await.inspect_err(|_| {
+                    tracing::Span::current().record("otel.status_code", "ERROR");
+                })
             },
             span,
-        ));
+        )
     }
 
     fn handle_app(&mut self, event: AppEvent) -> bool {
