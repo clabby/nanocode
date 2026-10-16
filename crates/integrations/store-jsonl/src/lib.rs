@@ -814,14 +814,39 @@ impl JsonlStore {
     }
 }
 
-impl StateStore for JsonlStore {
-    fn acquire_with<'a>(
-        &'a mut self,
-        id: &'a str,
+impl JsonlStore {
+    fn acquire_batch(
+        &mut self,
+        id: &str,
         owner_id: OwnerId,
         update: StoreUpdate,
-    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
-        let result = self.locked(|store| {
+        companion: Option<(&str, OwnerId)>,
+    ) -> Result<(OwnedState, Option<OwnedState>), StoreError> {
+        if companion
+            .as_ref()
+            .is_some_and(|(companion_id, _)| *companion_id == id)
+        {
+            return Err(StoreError::NotCommitted(
+                "a companion state must differ from its state".into(),
+            ));
+        }
+        self.locked(|store| {
+            let mut entries = Vec::new();
+            let companion = match companion {
+                Some((companion_id, companion_owner)) => {
+                    let fence = store.next_fence(companion_id).ok_or_else(|| {
+                        StoreError::NotCommitted("JSONL owner fence overflow".into())
+                    })?;
+                    let owner = OwnerToken::new(companion_owner, fence);
+                    let state = store.state(companion_id)?;
+                    entries.push(Entry::Acquire {
+                        state_id: companion_id.into(),
+                        owner: owner.clone(),
+                    });
+                    Some((companion_id, OwnedState { owner, state }))
+                }
+                None => None,
+            };
             let fence = store
                 .next_fence(id)
                 .ok_or_else(|| StoreError::NotCommitted("JSONL owner fence overflow".into()))?;
@@ -829,10 +854,10 @@ impl StateStore for JsonlStore {
             let mut state = store.state(id)?;
             let current = state.revision;
             let replacement = update(&state)?;
-            let mut entries = vec![Entry::Acquire {
+            entries.push(Entry::Acquire {
                 state_id: id.into(),
                 owner: owner.clone(),
-            }];
+            });
             if let Some(replacement) = replacement {
                 let revision = state
                     .revision
@@ -851,14 +876,58 @@ impl StateStore for JsonlStore {
                     payload: Some(replacement.payload),
                 };
             }
-            if store.next_fence(id) != Some(fence) || store.revision(id) != current {
+            if store.next_fence(id) != Some(fence)
+                || store.revision(id) != current
+                || companion.as_ref().is_some_and(|(companion_id, companion)| {
+                    store.next_fence(companion_id) != Some(companion.owner.fence())
+                        || store.revision(companion_id) != companion.state.revision
+                })
+            {
                 return Err(StoreError::NotCommitted(
                     "JSONL index changed while validating records".into(),
                 ));
             }
             store.append_entries(entries)?;
-            Ok(OwnedState { owner, state })
-        });
+            Ok((
+                OwnedState { owner, state },
+                companion.map(|(_, companion)| companion),
+            ))
+        })
+    }
+}
+
+impl StateStore for JsonlStore {
+    fn acquire_with<'a>(
+        &'a mut self,
+        id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
+        let result = self
+            .acquire_batch(id, owner_id, update, None)
+            .map(|(owned, _)| owned);
+        Box::pin(async move { result })
+    }
+
+    fn batches_companion_acquisition(&self) -> bool {
+        true
+    }
+
+    fn acquire_with_companion<'a>(
+        &'a mut self,
+        id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+        companion_id: &'a str,
+        companion_owner: OwnerId,
+    ) -> StoreFuture<'a, Result<(OwnedState, OwnedState), StoreError>> {
+        let result = self
+            .acquire_batch(id, owner_id, update, Some((companion_id, companion_owner)))
+            .and_then(|(owned, companion)| {
+                companion
+                    .map(|companion| (owned, companion))
+                    .ok_or_else(|| backend("JSONL companion acquisition was not staged"))
+            });
         Box::pin(async move { result })
     }
 

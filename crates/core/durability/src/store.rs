@@ -133,6 +133,31 @@ async fn acquire_updated<S: StateStore + ?Sized>(
     Ok(owned)
 }
 
+async fn acquire_companion<S: StateStore + ?Sized>(
+    store: &mut S,
+    state_id: &str,
+    owner_id: OwnerId,
+    update: StoreUpdate,
+    companion_id: &str,
+    companion_owner: OwnerId,
+) -> Result<(OwnedState, OwnedState), StoreError> {
+    if companion_id == state_id {
+        return Err(StoreError::NotCommitted(
+            "a companion state must differ from its state".to_owned(),
+        ));
+    }
+    let companion = store.acquire(companion_id, companion_owner).await?;
+    let owned = store
+        .acquire_with(state_id, owner_id, update)
+        .await
+        .map_err(|error| {
+            StoreError::Backend(format!(
+                "state acquisition failed after acquiring its companion: {error}"
+            ))
+        })?;
+    Ok((owned, companion))
+}
+
 fn read_only_unsupported() -> StoreError {
     StoreError::Backend("this store does not support non-fencing reads".to_owned())
 }
@@ -186,6 +211,28 @@ pub trait StateStore: Send {
         update: StoreUpdate,
     ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
         Box::pin(acquire_updated(self, state_id, owner_id, update))
+    }
+
+    fn batches_companion_acquisition(&self) -> bool {
+        false
+    }
+
+    fn acquire_with_companion<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+        companion_id: &'a str,
+        companion_owner: OwnerId,
+    ) -> StoreFuture<'a, Result<(OwnedState, OwnedState), StoreError>> {
+        Box::pin(acquire_companion(
+            self,
+            state_id,
+            owner_id,
+            update,
+            companion_id,
+            companion_owner,
+        ))
     }
 
     fn replace<'a>(
@@ -247,6 +294,28 @@ pub trait StateStore {
         update: StoreUpdate,
     ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
         Box::pin(acquire_updated(self, state_id, owner_id, update))
+    }
+
+    fn batches_companion_acquisition(&self) -> bool {
+        false
+    }
+
+    fn acquire_with_companion<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+        companion_id: &'a str,
+        companion_owner: OwnerId,
+    ) -> StoreFuture<'a, Result<(OwnedState, OwnedState), StoreError>> {
+        Box::pin(acquire_companion(
+            self,
+            state_id,
+            owner_id,
+            update,
+            companion_id,
+            companion_owner,
+        ))
     }
 
     fn replace<'a>(

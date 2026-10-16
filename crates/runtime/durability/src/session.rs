@@ -175,6 +175,7 @@ enum Command {
     AcquireAgent {
         initial: Option<crate::InitialSettings>,
         checkpoint: Option<EncodedPayload>,
+        journal: Option<crate::child_journal::Seed>,
         result: oneshot::Sender<Result<AgentAcquisition>>,
     },
     Admit {
@@ -435,7 +436,7 @@ impl Driver {
     async fn handle_command(&mut self, command: Command) {
         if self.owner.is_none()
             && !matches!(command, Command::AcquireAgent { .. })
-            && let Err(error) = self.acquire(None, None).await
+            && let Err(error) = self.acquire(None, None, None).await
         {
             command.reject(error);
             return;
@@ -545,9 +546,10 @@ impl Driver {
             Command::AcquireAgent {
                 initial,
                 checkpoint,
+                journal,
                 result,
             } => {
-                let outcome = self.acquire_agent(initial, checkpoint).await;
+                let outcome = self.acquire_agent(initial, checkpoint, journal).await;
                 let generation = outcome.as_ref().ok().map(|owner| owner.generation);
                 if result.send(outcome).is_err()
                     && let Some(generation) = generation
@@ -962,21 +964,35 @@ impl Driver {
         &mut self,
         initial: Option<crate::InitialSettings>,
         checkpoint: Option<EncodedPayload>,
+        journal: Option<crate::child_journal::Seed>,
     ) -> Result<bool> {
         let record = self.pending_record.clone();
         let committed = Arc::new(AtomicBool::new(false));
         let staged = Arc::clone(&committed);
-        let acquired = match self
-            .store
-            .acquire_with(
-                &self.state_id,
-                OwnerId::new(),
-                Box::new(move |stored| {
-                    update_session(stored, record, initial, checkpoint, &staged)
+        let update: crate::StoreUpdate =
+            Box::new(move |stored| update_session(stored, record, initial, checkpoint, &staged));
+        let acquired = match journal.filter(crate::child_journal::Seed::awaited) {
+            Some(journal) => self
+                .store
+                .acquire_with_companion(
+                    &self.state_id,
+                    OwnerId::new(),
+                    update,
+                    &journal.state_id,
+                    OwnerId::new(),
+                )
+                .await
+                .map(|(acquired, companion)| {
+                    journal.resolve(companion);
+                    acquired
                 }),
-            )
-            .await
-        {
+            None => {
+                self.store
+                    .acquire_with(&self.state_id, OwnerId::new(), update)
+                    .await
+            }
+        };
+        let acquired = match acquired {
             Ok(acquired) => acquired,
             Err(error @ StoreError::NotCommitted(_)) => return Err(error.into()),
             Err(error) => {
@@ -1002,8 +1018,9 @@ impl Driver {
         &mut self,
         initial: Option<crate::InitialSettings>,
         checkpoint: Option<EncodedPayload>,
+        journal: Option<crate::child_journal::Seed>,
     ) -> Result<AgentAcquisition> {
-        let initial_committed = self.acquire(initial, checkpoint).await?;
+        let initial_committed = self.acquire(initial, checkpoint, journal).await?;
         let generation = match self.next_agent_generation.checked_add(1) {
             Some(generation) => generation,
             None => {
@@ -1842,6 +1859,15 @@ impl DurableSession {
         crate::child_journal::child_journal(self.store.clone(), &self.state_id)
     }
 
+    pub fn seeded_child_journal(
+        &self,
+    ) -> (
+        nanocode_agent_core::backend::ChildJournal,
+        crate::JournalSeed,
+    ) {
+        crate::child_journal::seeded_child_journal(self.store.clone(), &self.state_id)
+    }
+
     #[must_use]
     pub fn state_id(&self) -> &str {
         &self.state_id
@@ -1882,7 +1908,7 @@ impl DurableSession {
     }
 
     pub async fn acquire_agent(&self) -> Result<(DurableOwner, Option<EncodedPayload>)> {
-        self.acquire_agent_inner(None, None)
+        self.acquire_agent_inner(None, None, None)
             .await
             .map(|(owner, checkpoint, _)| (owner, checkpoint))
     }
@@ -1891,7 +1917,7 @@ impl DurableSession {
         &self,
         initial: crate::InitialSettings,
     ) -> Result<(DurableOwner, Option<EncodedPayload>)> {
-        self.acquire_agent_inner(Some(initial), None)
+        self.acquire_agent_inner(Some(initial), None, None)
             .await
             .map(|(owner, checkpoint, _)| (owner, checkpoint))
     }
@@ -1901,8 +1927,35 @@ impl DurableSession {
         initial: Option<crate::InitialSettings>,
         checkpoint: EncodedPayload,
     ) -> Result<(DurableOwner, InitialAcquisition)> {
-        let (owner, existing, committed) =
-            self.acquire_agent_inner(initial, Some(checkpoint)).await?;
+        self.initial_acquisition(initial, checkpoint, None).await
+    }
+
+    pub async fn acquire_agent_with_initial_checkpoint_and_journal(
+        &self,
+        initial: Option<crate::InitialSettings>,
+        checkpoint: EncodedPayload,
+        journal: &crate::JournalClaim,
+    ) -> Result<(DurableOwner, InitialAcquisition)> {
+        let journal = journal.take();
+        if let Some(journal) = &journal
+            && (journal.root_state_id != *self.state_id || !journal.store.same_store(&self.store))
+        {
+            return Err(Error::InvalidState(
+                "the journal seed does not belong to this session".to_owned(),
+            ));
+        }
+        self.initial_acquisition(initial, checkpoint, journal).await
+    }
+
+    async fn initial_acquisition(
+        &self,
+        initial: Option<crate::InitialSettings>,
+        checkpoint: EncodedPayload,
+        journal: Option<crate::child_journal::Seed>,
+    ) -> Result<(DurableOwner, InitialAcquisition)> {
+        let (owner, existing, committed) = self
+            .acquire_agent_inner(initial, Some(checkpoint), journal)
+            .await?;
         Ok((
             owner,
             if committed {
@@ -1922,11 +1975,13 @@ impl DurableSession {
         &self,
         initial: Option<crate::InitialSettings>,
         checkpoint: Option<EncodedPayload>,
+        journal: Option<crate::child_journal::Seed>,
     ) -> Result<(DurableOwner, Option<EncodedPayload>, bool)> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::AcquireAgent {
             initial,
             checkpoint,
+            journal,
             result,
         })
         .await?;

@@ -9,7 +9,7 @@ use nanocode_agent_core::{
 use nanocode_durability::{
     Admission, BeginStep, Branches, CheckpointFormat, DurableAgentExt, DurableBackendRegistration,
     DurableOwner, DurableSession, EncodedPayload, InitialAcquisition, InitialSettings,
-    SessionRecord, SharedStore, agent_error,
+    JournalClaim, JournalSeed, SessionRecord, SharedStore, agent_error,
 };
 use serde_json::{Value, value::RawValue};
 
@@ -134,29 +134,31 @@ impl ClaudeBuilder {
         state: &DurableSession,
         record: SessionRecord,
         notice: String,
-    ) -> AgentResult<(Self, Arc<AtomicBool>)> {
+    ) -> AgentResult<(Self, Arc<AtomicBool>, JournalSeed)> {
         let initial = self.durable_initial_settings()?;
         record
             .model
             .capabilities(nanocode_agent_core::ModelTransport::Native)
             .check_service_tier(initial.service_tier)?;
         let existing = Arc::new(AtomicBool::new(false));
+        let (journal, seed) = state.seeded_child_journal();
         let builder = self
             .lineage(record.lineage.clone())
             .thinking(initial.thinking)?
             .fast_mode(initial.service_tier != nanocode_agent_core::ServiceTier::Standard)
             .initial_developer_notices(vec![(nanocode_platform::uuid_v7().to_string(), notice)])
-            .child_journal(state.child_journal())
+            .child_journal(journal)
             .execution_policy(
                 Arc::new(LazyClaudeExecution::deferred(
                     state.shared_store(),
                     record,
                     initial,
                     Arc::clone(&existing),
+                    seed.claim(),
                 )),
                 None,
             )?;
-        Ok((builder, existing))
+        Ok((builder, existing, seed))
     }
 }
 
@@ -183,6 +185,8 @@ struct LazyClaudeExecution {
     existing: Option<Arc<AtomicBool>>,
 
     attempted: AtomicBool,
+
+    journal: Option<JournalClaim>,
 }
 
 impl LazyClaudeExecution {
@@ -197,6 +201,7 @@ impl LazyClaudeExecution {
             initial: None,
             existing: None,
             attempted: AtomicBool::new(false),
+            journal: None,
         }
     }
 
@@ -205,10 +210,12 @@ impl LazyClaudeExecution {
         record: SessionRecord,
         initial: InitialSettings,
         existing: Arc<AtomicBool>,
+        journal: JournalClaim,
     ) -> Self {
         Self {
             initial: Some(initial),
             existing: Some(existing),
+            journal: Some(journal),
             ..Self::new(store, record)
         }
     }
@@ -239,10 +246,21 @@ impl LazyClaudeExecution {
                 .map_err(agent_error)?;
                 let (owner, checkpoint) = match (initial, self.initial) {
                     (Some(payload), settings) => {
-                        match state
-                            .acquire_agent_with_initial_checkpoint(settings, payload)
-                            .await
-                            .map_err(agent_error)?
+                        match match &self.journal {
+                            Some(journal) => {
+                                state
+                                    .acquire_agent_with_initial_checkpoint_and_journal(
+                                        settings, payload, journal,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                state
+                                    .acquire_agent_with_initial_checkpoint(settings, payload)
+                                    .await
+                            }
+                        }
+                        .map_err(agent_error)?
                         {
                             (owner, InitialAcquisition::Committed) => {
                                 committed.store(true, Ordering::SeqCst);

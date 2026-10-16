@@ -33,6 +33,15 @@ enum Command {
         update: StoreUpdate,
         result: oneshot::Sender<Result<OwnedState, StoreError>>,
     },
+    #[cfg(not(target_family = "wasm"))]
+    AcquireWithCompanion {
+        state_id: String,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+        companion_id: String,
+        companion_owner: OwnerId,
+        result: oneshot::Sender<Result<(OwnedState, OwnedState), StoreError>>,
+    },
     Replace {
         state_id: String,
         owner: OwnerToken,
@@ -60,6 +69,7 @@ struct StoreRequest {
 #[derive(Clone)]
 pub struct SharedStore {
     commands: mpsc::Sender<StoreRequest>,
+    batches_companion_acquisition: bool,
 }
 
 impl SharedStore {
@@ -71,6 +81,10 @@ impl SharedStore {
     where
         S: StateStore + 'static,
     {
+        #[cfg(not(target_family = "wasm"))]
+        let batches_companion_acquisition = store.batches_companion_acquisition();
+        #[cfg(target_family = "wasm")]
+        let batches_companion_acquisition = false;
         let (commands, mut receiver) = mpsc::channel(COMMAND_CAPACITY);
         spawn_driver(async move {
             while let Some(StoreRequest {
@@ -140,6 +154,29 @@ impl SharedStore {
                                 result.send(store.acquire_with(&state_id, owner_id, update).await),
                             );
                         }
+                        #[cfg(not(target_family = "wasm"))]
+                        Command::AcquireWithCompanion {
+                            state_id,
+                            owner_id,
+                            update,
+                            companion_id,
+                            companion_owner,
+                            result,
+                        } => {
+                            drop(
+                                result.send(
+                                    store
+                                        .acquire_with_companion(
+                                            &state_id,
+                                            owner_id,
+                                            update,
+                                            &companion_id,
+                                            companion_owner,
+                                        )
+                                        .await,
+                                ),
+                            );
+                        }
                         Command::Peek { state_id, result } => {
                             drop(result.send(store.peek(&state_id).await));
                         }
@@ -152,11 +189,18 @@ impl SharedStore {
                 .await;
             }
         })?;
-        Ok(Self { commands })
+        Ok(Self {
+            commands,
+            batches_companion_acquisition,
+        })
     }
 }
 
 impl StateStore for SharedStore {
+    fn batches_companion_acquisition(&self) -> bool {
+        self.batches_companion_acquisition
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn acquire_with<'a>(
         &'a mut self,
@@ -178,6 +222,43 @@ impl StateStore for SharedStore {
                         state_id: state_id.to_owned(),
                         owner_id,
                         update,
+                        result,
+                    },
+                    span,
+                    queued: Instant::now(),
+                })
+                .await
+                .map_err(|_| stopped())?;
+            receiver.await.map_err(|_| stopped())?
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn acquire_with_companion<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+        companion_id: &'a str,
+        companion_owner: OwnerId,
+    ) -> StoreFuture<'a, Result<(OwnedState, OwnedState), StoreError>> {
+        let span = tracing::info_span!(
+            "durability.store",
+            operation = "acquire_with_companion",
+            state.id = state_id,
+            companion.id = companion_id,
+            queue.duration_ms = tracing::field::Empty
+        );
+        Box::pin(async move {
+            let (result, receiver) = oneshot::channel();
+            self.commands
+                .send(StoreRequest {
+                    command: Command::AcquireWithCompanion {
+                        state_id: state_id.to_owned(),
+                        owner_id,
+                        update,
+                        companion_id: companion_id.to_owned(),
+                        companion_owner,
                         result,
                     },
                     span,

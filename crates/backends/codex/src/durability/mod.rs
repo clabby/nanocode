@@ -9,7 +9,8 @@ use std::{
 use nanocode_agent_core::{ExecutionPolicyDisposition, NanocodexError, Result as AgentResult};
 use nanocode_durability::{
     Admission, BeginStep, Branches, DurableAgentExt, DurableOwner, DurableSession, EncodedPayload,
-    InitialAcquisition, InitialSettings, OperationStatus, SessionRecord, SharedStore, agent_error,
+    InitialAcquisition, InitialSettings, JournalClaim, JournalSeed, OperationStatus, SessionRecord,
+    SharedStore, agent_error,
 };
 use serde_json::value::RawValue;
 
@@ -136,9 +137,10 @@ impl<F> NanocodexBuilder<F> {
         state: &DurableSession,
         record: SessionRecord,
         notice: String,
-    ) -> (Self, Arc<AtomicBool>) {
+    ) -> (Self, Arc<AtomicBool>, JournalSeed) {
         let state_id = state.state_id().to_owned();
-        let mut builder = self.child_journal(state.child_journal());
+        let (journal, seed) = state.seeded_child_journal();
+        let mut builder = self.child_journal(journal);
         if builder.explicit_session_id().is_none()
             && let Ok(session_id) = state_id.parse::<SessionId>()
         {
@@ -153,8 +155,9 @@ impl<F> NanocodexBuilder<F> {
                 state.shared_store(),
                 record,
                 Arc::clone(&existing),
+                seed.claim(),
             )));
-        (builder, existing)
+        (builder, existing, seed)
     }
 }
 
@@ -616,6 +619,8 @@ struct LazyExecution {
     existing: Option<Arc<AtomicBool>>,
 
     attempted: AtomicBool,
+
+    journal: Option<JournalClaim>,
 }
 
 impl LazyExecution {
@@ -629,12 +634,19 @@ impl LazyExecution {
             created_with: Mutex::new(None),
             existing: None,
             attempted: AtomicBool::new(false),
+            journal: None,
         }
     }
 
-    fn deferred(store: SharedStore, record: SessionRecord, existing: Arc<AtomicBool>) -> Self {
+    fn deferred(
+        store: SharedStore,
+        record: SessionRecord,
+        existing: Arc<AtomicBool>,
+        journal: JournalClaim,
+    ) -> Self {
         Self {
             existing: Some(existing),
+            journal: Some(journal),
             ..Self::new(store, record)
         }
     }
@@ -678,10 +690,21 @@ impl LazyExecution {
                 .map_err(agent_error)?;
                 let (owner, checkpoint) = match initial {
                     Some(payload) => {
-                        match state
-                            .acquire_agent_with_initial_checkpoint(settings, payload)
-                            .await
-                            .map_err(agent_error)?
+                        match match &self.journal {
+                            Some(journal) => {
+                                state
+                                    .acquire_agent_with_initial_checkpoint_and_journal(
+                                        settings, payload, journal,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                state
+                                    .acquire_agent_with_initial_checkpoint(settings, payload)
+                                    .await
+                            }
+                        }
+                        .map_err(agent_error)?
                         {
                             (owner, InitialAcquisition::Committed) => {
                                 committed.store(true, Ordering::SeqCst);

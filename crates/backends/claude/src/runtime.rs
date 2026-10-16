@@ -202,7 +202,7 @@ impl RuntimeBackend for ClaudeHarness {
                         spec.parent.as_ref().map(AgentHandle::session_id),
                     )
                 {
-                    let (deferred, existing) =
+                    let (deferred, existing, _seed) =
                         builder
                             .clone()
                             .deferred_durability(&state, record, text.clone())?;

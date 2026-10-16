@@ -205,7 +205,7 @@ impl RuntimeBackend for CodexHarness {
                         spec.parent.as_ref().map(AgentHandle::session_id),
                     )
                 {
-                    let (deferred, existing) = builder
+                    let (deferred, existing, _seed) = builder
                         .clone()
                         .session_id(session_id)
                         .deferred_durability(&state, record, text.clone());

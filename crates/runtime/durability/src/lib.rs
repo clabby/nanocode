@@ -18,6 +18,7 @@ pub use catalog::{
     BranchPoint, IntoSessionStore, LIST_LIMIT, SessionStore, SessionSummary, StoredSession,
     StoredTurn, TranscriptItem, TurnStatus,
 };
+pub use child_journal::{JournalClaim, JournalSeed};
 pub use format::{AdmittedTurn, CheckpointFormat, FormatFuture};
 pub use memory::MemoryStore;
 pub use nanocode_durability_core::{
