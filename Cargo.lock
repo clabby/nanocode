@@ -2086,6 +2086,8 @@ dependencies = [
  "nanocode-durability-core",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tracing",
 ]
 

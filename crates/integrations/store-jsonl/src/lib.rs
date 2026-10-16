@@ -1,7 +1,10 @@
 #![cfg(not(target_family = "wasm"))]
 
+mod index;
+
 use nanocode_durability_core::{
-    OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoreRecord, StoredState,
+    OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoreRecord, StoreUpdate,
+    StoredState,
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{
@@ -9,11 +12,12 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{File, Metadata, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    ops::Range,
     path::{Path, PathBuf},
     time::Instant,
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Entry {
     Acquire {
@@ -34,6 +38,11 @@ enum Entry {
 enum Kind {
     Acquire,
     Replace,
+}
+
+#[derive(Deserialize)]
+struct Records {
+    records: Vec<StoreRecord>,
 }
 
 #[derive(Deserialize)]
@@ -61,8 +70,25 @@ struct Text;
 
 impl<'de> Deserialize<'de> for Text {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_str(TextVisitor)
+        raw_text(deserializer)?;
+        Ok(Text)
     }
+}
+
+fn raw_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<&'de serde_json::value::RawValue, D::Error> {
+    let raw = <&serde_json::value::RawValue>::deserialize(deserializer)?;
+    if !raw.get().starts_with('"') {
+        return Err(de::Error::custom("expected a string"));
+    }
+    if raw.get().contains("\\u") {
+        let mut decoder = serde_json::Deserializer::from_str(raw.get());
+        decoder
+            .deserialize_str(TextVisitor)
+            .map_err(de::Error::custom)?;
+    }
+    Ok(raw)
 }
 
 struct TextVisitor;
@@ -79,28 +105,101 @@ impl de::Visitor<'_> for TextVisitor {
     }
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 struct Location {
     position: u64,
     length: usize,
 }
 
+#[derive(Serialize, Deserialize)]
 struct State {
     revision: u64,
     location: Location,
     records: HashMap<String, Location>,
 }
 
+#[derive(Deserialize)]
+struct StoredEntry<'a> {
+    #[serde(rename = "type")]
+    kind: Kind,
+    #[serde(borrow)]
+    state_id: Cow<'a, str>,
+    #[serde(rename = "owner")]
+    _owner: OwnerToken,
+    revision: u64,
+    #[serde(borrow, deserialize_with = "raw_text")]
+    payload: &'a serde_json::value::RawValue,
+    #[serde(borrow)]
+    records: Vec<StoredRecord<'a>>,
+}
+
+#[derive(Deserialize)]
+struct StoredRecord<'a> {
+    #[serde(borrow)]
+    key: Cow<'a, str>,
+    #[serde(borrow, deserialize_with = "raw_text")]
+    value: &'a serde_json::value::RawValue,
+}
+
+struct CachedEntry {
+    location: Location,
+    bytes: Vec<u8>,
+    state_id: String,
+    revision: u64,
+    payload: Range<usize>,
+    records: HashMap<String, Range<usize>>,
+}
+
+impl CachedEntry {
+    fn decode(location: Location, bytes: Vec<u8>) -> Result<Self, StoreError> {
+        let entry: StoredEntry = serde_json::from_slice(&bytes).map_err(backend)?;
+        if !matches!(entry.kind, Kind::Replace) {
+            return Err(backend("JSONL index does not reference a replacement"));
+        }
+        let range = |value: &serde_json::value::RawValue| {
+            let start = value.get().as_ptr().addr() - bytes.as_ptr().addr();
+            start..start + value.get().len()
+        };
+        let payload = range(entry.payload);
+        let mut records = HashMap::with_capacity(entry.records.len());
+        for record in entry.records {
+            records
+                .entry(record.key.into_owned())
+                .or_insert_with(|| range(record.value));
+        }
+        Ok(Self {
+            location,
+            state_id: entry.state_id.into_owned(),
+            revision: entry.revision,
+            payload,
+            records,
+            bytes,
+        })
+    }
+
+    fn text(&self, range: Range<usize>) -> Result<String, StoreError> {
+        serde_json::from_slice(&self.bytes[range]).map_err(backend)
+    }
+
+    fn record(&self, key: &str) -> Result<String, StoreError> {
+        self.text(
+            self.records
+                .get(key)
+                .ok_or_else(|| backend("JSONL record index does not reference its record"))?
+                .clone(),
+        )
+    }
+}
+
 pub struct JsonlStore {
     file: File,
     reads: File,
     path: PathBuf,
-    source: String,
-    offset: u64,
-    owners: HashMap<String, OwnerToken>,
-    states: HashMap<String, State>,
-    created: Vec<String>,
-    cached: Option<(Location, Entry)>,
+    index: index::Index,
+    persisted_offset: Option<u64>,
+    ready: bool,
+    invalid_index: Option<String>,
+    cached: Option<CachedEntry>,
 }
 
 impl JsonlStore {
@@ -123,14 +222,20 @@ impl JsonlStore {
             file,
             reads,
             path,
-            source,
-            offset: 0,
-            owners: HashMap::new(),
-            states: HashMap::new(),
-            created: Vec::new(),
+            index: index::Index::new(source),
+            persisted_offset: None,
+            ready: false,
+            invalid_index: None,
             cached: None,
         };
-        store.locked(|_| Ok(()))?;
+        store.restore_index();
+        store.locked(|store| {
+            if store.persisted_offset.is_none() {
+                store.persist_index();
+            }
+            Ok(())
+        })?;
+        store.ready = true;
         Ok(store)
     }
 
@@ -145,7 +250,7 @@ impl JsonlStore {
     ) -> Result<T, StoreError> {
         let _span = tracing::info_span!("durability.jsonl.transaction").entered();
         self.file.lock().map_err(backend)?;
-        let result = self.refresh().and_then(|()| action(self));
+        let result = self.refresh_index().and_then(|()| action(self));
         let unlocked = self.file.unlock().map_err(backend);
         match result {
             Ok(value) => unlocked.map(|()| value),
@@ -154,36 +259,43 @@ impl JsonlStore {
     }
 
     fn refresh(&mut self) -> Result<(), StoreError> {
-        if identity(&std::fs::metadata(&self.path).map_err(backend)?)? != self.source {
+        if identity(&std::fs::metadata(&self.path).map_err(backend)?)? != self.index.source {
             return Err(identity_changed());
         }
         let length = self.file.metadata().map_err(backend)?.len();
-        if length < self.offset {
+        if length < self.index.offset {
             return Err(backend(
                 "JSONL durability log was truncated before its committed offset",
             ));
         }
-        if length == self.offset {
+        if length == self.index.offset {
             return Ok(());
         }
         let _span = tracing::info_span!(
             "durability.jsonl.recover",
-            log.unindexed_bytes = length - self.offset
+            log.unindexed_bytes = length - self.index.offset
         )
         .entered();
         let mut reader = BufReader::new(self.file.try_clone().map_err(backend)?);
-        reader.seek(SeekFrom::Start(self.offset)).map_err(backend)?;
+        reader
+            .seek(SeekFrom::Start(self.index.offset))
+            .map_err(backend)?;
         let mut line = Vec::new();
-        while self.offset < length {
+        while self.index.offset < length {
             line.clear();
             reader.read_until(b'\n', &mut line).map_err(backend)?;
             if line.last() != Some(&b'\n') {
-                self.file.set_len(self.offset).map_err(backend)?;
+                self.file.set_len(self.index.offset).map_err(backend)?;
                 self.file.sync_all().map_err(backend)?;
                 break;
             }
             self.replay(&line)?;
-            self.offset = self
+            self.index.last = Some(Location {
+                position: self.index.offset,
+                length: line.len(),
+            });
+            self.index.offset = self
+                .index
                 .offset
                 .checked_add(line.len() as u64)
                 .ok_or_else(|| backend("JSONL offset overflow"))?;
@@ -194,7 +306,7 @@ impl JsonlStore {
     fn replay(&mut self, line: &[u8]) -> Result<(), StoreError> {
         let indexed: Indexed = serde_json::from_slice(line).map_err(backend)?;
         let location = Location {
-            position: self.offset,
+            position: self.index.offset,
             length: line.len(),
         };
         match indexed.kind {
@@ -207,18 +319,20 @@ impl JsonlStore {
                 };
                 let id = &*indexed.state_id;
                 self.check_replacement(id, &indexed.owner, revision)?;
-                let known = self.states.get(id).map(|state| &state.records);
+                if !records.is_empty()
+                    && let Err(error) = self.index.load_records(id)
+                {
+                    self.invalid_index = Some(error.to_string());
+                    return Err(backend(error));
+                }
+                let known = self.index.states.get(id).map(|state| &state.records);
                 let mut keys = HashSet::with_capacity(records.len());
                 let repeated = records.iter().any(|record| {
                     !keys.insert(&*record.key)
                         || known.is_some_and(|known| known.contains_key(&*record.key))
                 });
                 if repeated {
-                    let Entry::Replace { records, .. } =
-                        serde_json::from_slice(line).map_err(backend)?
-                    else {
-                        return Err(backend("invalid JSONL replacement entry"));
-                    };
+                    let Records { records } = serde_json::from_slice(line).map_err(backend)?;
                     self.validate_records(id, &records)?;
                 }
                 self.replaced(
@@ -233,23 +347,24 @@ impl JsonlStore {
     }
 
     fn next_fence(&self, id: &str) -> Option<u64> {
-        self.owners
+        self.index
+            .owners
             .get(id)
             .map_or(Some(1), |owner| owner.fence().checked_add(1))
     }
 
     fn revision(&self, id: &str) -> u64 {
-        self.states.get(id).map_or(0, |state| state.revision)
+        self.index.states.get(id).map_or(0, |state| state.revision)
     }
 
     fn acquired(&mut self, id: &str, owner: OwnerToken) -> Result<(), StoreError> {
         if self.next_fence(id) != Some(owner.fence()) {
             return Err(backend("invalid JSONL owner fence sequence"));
         }
-        match self.owners.get_mut(id) {
+        match self.index.owners.get_mut(id) {
             Some(current) => *current = owner,
             None => {
-                self.owners.insert(id.into(), owner);
+                self.index.owners.insert(id.into(), owner);
             }
         }
         Ok(())
@@ -261,7 +376,8 @@ impl JsonlStore {
         owner: &OwnerToken,
         revision: u64,
     ) -> Result<(), StoreError> {
-        if self.owners.get(id) != Some(owner) || self.revision(id).checked_add(1) != Some(revision)
+        if self.index.owners.get(id) != Some(owner)
+            || self.revision(id).checked_add(1) != Some(revision)
         {
             return Err(backend("invalid JSONL state revision or owner"));
         }
@@ -275,9 +391,9 @@ impl JsonlStore {
         location: Location,
         keys: impl Iterator<Item = &'k str>,
     ) {
-        if !self.states.contains_key(id) {
-            self.created.push(id.into());
-            self.states.insert(
+        if !self.index.states.contains_key(id) {
+            self.index.created.push(id.into());
+            self.index.states.insert(
                 id.into(),
                 State {
                     revision,
@@ -287,6 +403,7 @@ impl JsonlStore {
             );
         }
         let state = self
+            .index
             .states
             .get_mut(id)
             .expect("a replaced state is indexed");
@@ -299,59 +416,55 @@ impl JsonlStore {
         }
     }
 
-    fn entry(&mut self, location: Location) -> Result<&Entry, StoreError> {
+    fn entry(&mut self, location: Location) -> Result<&CachedEntry, StoreError> {
         if self
             .cached
             .as_ref()
-            .is_none_or(|(cached, _)| *cached != location)
+            .is_none_or(|cached| cached.location != location)
         {
             self.reads
                 .seek(SeekFrom::Start(location.position))
                 .map_err(backend)?;
             let mut bytes = vec![0; location.length];
             self.reads.read_exact(&mut bytes).map_err(backend)?;
-            let entry = serde_json::from_slice(&bytes).map_err(backend)?;
-            self.cached = Some((location, entry));
+            self.cached = Some(CachedEntry::decode(location, bytes)?);
         }
-        Ok(&self.cached.as_ref().expect("the entry was loaded").1)
+        Ok(self.cached.as_ref().expect("the entry was loaded"))
     }
 
     fn state(&mut self, id: &str) -> Result<StoredState, StoreError> {
-        let Some(location) = self.states.get(id).map(|state| state.location) else {
+        let Some(location) = self.index.states.get(id).map(|state| state.location) else {
             return Ok(StoredState::default());
         };
-        match self.entry(location)? {
-            Entry::Replace {
-                state_id,
-                revision,
-                payload,
-                ..
-            } if state_id == id => Ok(StoredState {
-                revision: *revision,
-                payload: Some(payload.clone()),
-            }),
-            _ => Err(backend("JSONL state index does not reference its state")),
+        let entry = self.entry(location)?;
+        if entry.state_id != id {
+            return Err(backend("JSONL state index does not reference its state"));
         }
+        Ok(StoredState {
+            revision: entry.revision,
+            payload: Some(entry.text(entry.payload.clone())?),
+        })
     }
 
-    fn location(&self, id: &str, key: &str) -> Option<Location> {
-        self.states.get(id)?.records.get(key).copied()
+    fn location(&mut self, id: &str, key: &str) -> Result<Option<Location>, StoreError> {
+        self.ensure_records(id)?;
+        Ok(self
+            .index
+            .states
+            .get(id)
+            .and_then(|state| state.records.get(key))
+            .copied())
     }
 
     fn record(&mut self, id: &str, key: &str) -> Result<Option<String>, StoreError> {
-        let Some(location) = self.location(id, key) else {
+        let Some(location) = self.location(id, key)? else {
             return Ok(None);
         };
-        match self.entry(location)? {
-            Entry::Replace {
-                state_id, records, ..
-            } if state_id == id => records
-                .iter()
-                .find(|record| record.key == key)
-                .map(|record| Some(record.value.clone()))
-                .ok_or_else(|| backend("JSONL record index does not reference its record")),
-            _ => Err(backend("JSONL record index does not reference its state")),
+        let entry = self.entry(location)?;
+        if entry.state_id != id {
+            return Err(backend("JSONL record index does not reference its state"));
         }
+        entry.record(key).map(Some)
     }
 
     fn validate_records(&mut self, id: &str, records: &[StoreRecord]) -> Result<(), StoreError> {
@@ -373,8 +486,13 @@ impl JsonlStore {
     }
 
     fn append(&mut self, entry: Entry) -> Result<(), StoreError> {
+        self.append_entries(vec![entry])
+    }
+
+    fn append_entries(&mut self, entries: Vec<Entry>) -> Result<(), StoreError> {
         let span = tracing::info_span!(
             "durability.jsonl.append",
+            entry.count = entries.len(),
             log.bytes = tracing::field::Empty,
             encode.duration_ms = tracing::field::Empty,
             fsync.duration_ms = tracing::field::Empty,
@@ -382,15 +500,21 @@ impl JsonlStore {
         );
         let _entered = span.enter();
         let started = Instant::now();
-        let mut bytes = serde_json::to_vec(&entry).map_err(backend)?;
-        bytes.push(b'\n');
+        let mut bytes = Vec::new();
+        let mut lengths = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let start = bytes.len();
+            serde_json::to_writer(&mut bytes, entry).map_err(backend)?;
+            bytes.push(b'\n');
+            lengths.push(bytes.len() - start);
+        }
         span.record("log.bytes", bytes.len());
         span.record(
             "encode.duration_ms",
             started.elapsed().as_secs_f64() * 1_000.0,
         );
         self.file
-            .seek(SeekFrom::Start(self.offset))
+            .seek(SeekFrom::Start(self.index.offset))
             .map_err(backend)?;
         self.file.write_all(&bytes).map_err(backend)?;
         let started = Instant::now();
@@ -400,41 +524,86 @@ impl JsonlStore {
             started.elapsed().as_secs_f64() * 1_000.0,
         );
         let started = Instant::now();
-        let location = Location {
-            position: self.offset,
-            length: bytes.len(),
-        };
-        match entry {
-            Entry::Acquire { state_id, owner } => self.acquired(&state_id, owner)?,
-            Entry::Replace {
-                state_id,
-                owner,
-                revision,
-                records,
-                ..
-            } => {
-                self.check_replacement(&state_id, &owner, revision)?;
-                self.replaced(
-                    &state_id,
+        for (entry, length) in entries.into_iter().zip(lengths) {
+            let location = Location {
+                position: self.index.offset,
+                length,
+            };
+            match entry {
+                Entry::Acquire { state_id, owner } => self.acquired(&state_id, owner)?,
+                Entry::Replace {
+                    state_id,
+                    owner,
                     revision,
-                    location,
-                    records.iter().map(|record| record.key.as_str()),
-                );
+                    records,
+                    ..
+                } => {
+                    self.check_replacement(&state_id, &owner, revision)?;
+                    self.replaced(
+                        &state_id,
+                        revision,
+                        location,
+                        records.iter().map(|record| record.key.as_str()),
+                    );
+                }
             }
+            self.index.last = Some(location);
+            self.index.offset = self
+                .index
+                .offset
+                .checked_add(length as u64)
+                .ok_or_else(|| backend("JSONL offset overflow"))?;
         }
         span.record(
             "index.duration_ms",
             started.elapsed().as_secs_f64() * 1_000.0,
         );
-        self.offset = self
-            .offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| backend("JSONL offset overflow"))?;
         Ok(())
     }
 }
 
 impl StateStore for JsonlStore {
+    fn acquire_with<'a>(
+        &'a mut self,
+        id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
+        let result = self.locked(|store| {
+            let fence = store
+                .next_fence(id)
+                .ok_or_else(|| StoreError::NotCommitted("JSONL owner fence overflow".into()))?;
+            let owner = OwnerToken::new(owner_id, fence);
+            let mut state = store.state(id)?;
+            let replacement = update(&state)?;
+            let mut entries = vec![Entry::Acquire {
+                state_id: id.into(),
+                owner: owner.clone(),
+            }];
+            if let Some(replacement) = replacement {
+                let revision = state
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::NotCommitted("JSONL revision overflow".into()))?;
+                store.validate_records(id, &replacement.records)?;
+                entries.push(Entry::Replace {
+                    state_id: id.into(),
+                    owner: owner.clone(),
+                    revision,
+                    payload: replacement.payload.clone(),
+                    records: replacement.records,
+                });
+                state = StoredState {
+                    revision,
+                    payload: Some(replacement.payload),
+                };
+            }
+            store.append_entries(entries)?;
+            Ok(OwnedState { owner, state })
+        });
+        Box::pin(async move { result })
+    }
+
     fn read_record<'a>(
         &'a mut self,
         id: &'a str,
@@ -452,33 +621,17 @@ impl StateStore for JsonlStore {
             let mut grouped = HashMap::<Location, Vec<(usize, &String)>>::new();
             let mut values = vec![None; keys.len()];
             for (index, key) in keys.iter().enumerate() {
-                if let Some(location) = store.location(id, key) {
+                if let Some(location) = store.location(id, key)? {
                     grouped.entry(location).or_default().push((index, key));
                 }
             }
             for (location, requested) in grouped {
-                let Entry::Replace {
-                    state_id, records, ..
-                } = store.entry(location)?
-                else {
-                    return Err(backend(
-                        "JSONL record index does not reference a replacement",
-                    ));
-                };
-                if state_id != id {
+                let entry = store.entry(location)?;
+                if entry.state_id != id {
                     return Err(backend("JSONL record index does not reference its state"));
                 }
-                let records: HashMap<_, _> = records
-                    .iter()
-                    .map(|record| (&record.key, &record.value))
-                    .collect();
                 for (index, key) in requested {
-                    values[index] = Some(
-                        (*records.get(key).ok_or_else(|| {
-                            backend("JSONL record index does not reference its record")
-                        })?)
-                        .clone(),
-                    );
+                    values[index] = Some(entry.record(key)?);
                 }
             }
             Ok(values)
@@ -493,8 +646,16 @@ impl StateStore for JsonlStore {
         &'a mut self,
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
-        let result =
-            self.locked(|store| Ok(store.created.iter().rev().take(limit).cloned().collect()));
+        let result = self.locked(|store| {
+            Ok(store
+                .index
+                .created
+                .iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect())
+        });
         Box::pin(async move { result })
     }
     fn acquire<'a>(
@@ -527,7 +688,7 @@ impl StateStore for JsonlStore {
         records: &'a [StoreRecord],
     ) -> StoreFuture<'a, Result<u64, StoreError>> {
         let result = self.locked(|store| {
-            if store.owners.get(id) != Some(owner) {
+            if store.index.owners.get(id) != Some(owner) {
                 return Err(StoreError::Fenced);
             }
             let actual = store.revision(id);
