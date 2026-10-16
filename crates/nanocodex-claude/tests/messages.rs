@@ -233,6 +233,70 @@ async fn reports_in_band_error_and_rejects_malformed_tool_json() {
     assert!(collect_stream(first, events).await.is_err());
 }
 
+async fn models_server(
+    handler: impl Fn(Option<String>) -> (StatusCode, Value) + Clone + Send + Sync + 'static,
+) -> String {
+    use axum::{extract::Query, http::HeaderMap, routing::get};
+    use std::collections::HashMap;
+    let app = Router::new().route(
+        "/v1/models",
+        get(
+            move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| {
+                let handler = handler.clone();
+                async move {
+                    assert_eq!(headers.get("x-api-key").unwrap(), "synthetic-key");
+                    assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+                    assert_eq!(query.get("limit").map(String::as_str), Some("1000"));
+                    let (status, body) = handler(query.get("after_id").cloned());
+                    (status, Json(body)).into_response()
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{address}/v1/messages")
+}
+
+#[tokio::test]
+async fn lists_every_model_page_beside_the_messages_endpoint() {
+    let endpoint = models_server(|after_id| match after_id.as_deref() {
+        None => (
+            StatusCode::OK,
+            json!({"data":[{"id":"claude-opus-5-5"},{"id":"claude-fable-5-1"}],"has_more":true,"last_id":"claude-fable-5-1"}),
+        ),
+        Some("claude-fable-5-1") => (
+            StatusCode::OK,
+            json!({"data":[{"id":"claude-mythos-5-1"}],"has_more":false,"last_id":"claude-mythos-5-1"}),
+        ),
+        Some(other) => panic!("unexpected cursor {other}"),
+    })
+    .await;
+    let client = ClaudeClient::new(http_client(), endpoint, "synthetic-key");
+    assert_eq!(
+        client.models().await.unwrap(),
+        ["claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"]
+    );
+}
+
+#[tokio::test]
+async fn model_listing_errors_redact_reflected_credentials() {
+    let endpoint = models_server(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            json!({"type":"error","error":{"type":"permission_error","message":"key synthetic-key denied"}}),
+        )
+    })
+    .await;
+    let client = ClaudeClient::new(http_client(), endpoint, "synthetic-key");
+    let Err(ClaudeError::Http { status, body, .. }) = client.models().await else {
+        panic!("model listing should fail");
+    };
+    assert_eq!(status, 403);
+    assert!(body.contains("[redacted]") && !body.contains("synthetic-key"));
+}
+
 #[tokio::test]
 async fn sets_console_api_headers_without_exposing_key_in_request_body() {
     use axum::http::HeaderMap;

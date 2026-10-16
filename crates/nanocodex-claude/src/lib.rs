@@ -74,6 +74,39 @@ impl ClaudeError {
     }
 }
 
+/// Records credential values carried by request headers so provider error
+/// bodies that reflect them can be redacted before they reach callers.
+fn collect_credentials(headers: &reqwest::header::HeaderMap, credentials: &mut Vec<String>) {
+    for (name, value) in headers {
+        if name == reqwest::header::AUTHORIZATION || name == "x-api-key" || value.is_sensitive() {
+            let value = String::from_utf8_lossy(value.as_bytes());
+            if !value.is_empty() && !credentials.iter().any(|item| item == &value) {
+                credentials.push(value.to_string());
+            }
+            if name == reqwest::header::AUTHORIZATION
+                && let Some((_, token)) = value.split_once(' ')
+                && !token.trim().is_empty()
+                && !credentials.iter().any(|item| item == token.trim())
+            {
+                credentials.push(token.trim().to_owned());
+            }
+        }
+    }
+}
+
+/// One page of `GET /v1/models`.
+#[derive(Deserialize)]
+struct ModelPage {
+    data: Vec<ModelEntry>,
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
 /// Parses delta-seconds or an HTTP-date; a past date means no extra delay.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers
@@ -1107,6 +1140,97 @@ impl ClaudeClient {
         }
     }
 
+    /// This client's authentication headers. Provider headers are also returned
+    /// so an explicit 401 can ask the provider to recover that generation.
+    async fn auth_headers(
+        &self,
+    ) -> Result<
+        (
+            reqwest::header::HeaderMap,
+            Option<reqwest::header::HeaderMap>,
+        ),
+        ClaudeError,
+    > {
+        Ok(match &self.auth {
+            ClientAuth::ApiKey(key) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                let mut value = reqwest::header::HeaderValue::from_str(key)
+                    .map_err(|_| ClaudeError::AuthUnavailable)?;
+                value.set_sensitive(true);
+                headers.insert("x-api-key", value);
+                (headers, None)
+            }
+            ClientAuth::Headers(headers) => (headers.clone(), None),
+            ClientAuth::Provider(provider) => {
+                let headers = provider
+                    .headers()
+                    .await
+                    .map_err(|_| ClaudeError::AuthUnavailable)?;
+                (headers.clone(), Some(headers))
+            }
+        })
+    }
+
+    /// Lists the model IDs these credentials can use, from the Models API
+    /// beside the configured Messages endpoint. Listing reads account metadata
+    /// only and consumes no tokens, so hosts can admit access-gated models
+    /// before offering them. Subscription wire compatibility is not applied.
+    /// See https://platform.claude.com/docs/en/api/models/list
+    pub async fn models(&self) -> Result<Vec<String>, ClaudeError> {
+        // Bounds a misbehaving catalog at 10 pages of the 1,000-entry maximum.
+        const MAX_PAGES: usize = 10;
+        let base = self
+            .endpoint
+            .strip_suffix("/messages")
+            .ok_or_else(|| ClaudeError::Protocol("Claude endpoint is not a Messages URL".into()))?;
+        let url = reqwest::Url::parse(&format!("{base}/models"))
+            .map_err(|_| ClaudeError::Protocol("invalid Claude Models URL".into()))?;
+        let (headers, _) = self.auth_headers().await?;
+        let mut credentials = Vec::new();
+        collect_credentials(&headers, &mut credentials);
+        credentials.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+        let mut models = Vec::new();
+        let mut after_id: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut page_url = url.clone();
+            page_url.query_pairs_mut().append_pair("limit", "1000");
+            if let Some(id) = after_id.take() {
+                page_url.query_pairs_mut().append_pair("after_id", &id);
+            }
+            let response = self
+                .http
+                .get(page_url)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .headers(headers.clone())
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let retry_after = retry_after(response.headers());
+                let mut body = response.text().await?;
+                for credential in &credentials {
+                    body = body.replace(credential, "[redacted]");
+                }
+                return Err(ClaudeError::Http {
+                    status,
+                    body,
+                    retry_after,
+                });
+            }
+            let page: ModelPage = response.json().await?;
+            models.extend(page.data.into_iter().map(|model| model.id));
+            if !page.has_more {
+                return Ok(models);
+            }
+            after_id = Some(page.last_id.ok_or_else(|| {
+                ClaudeError::Protocol("Models page reported more results without last_id".into())
+            })?);
+        }
+        Err(ClaudeError::Protocol(
+            "Models API exceeded the page limit".into(),
+        ))
+    }
+
     async fn post(
         &self,
         request: &MessagesRequest,
@@ -1124,26 +1248,7 @@ impl ClaudeClient {
         // failure receipt. Sensitive request headers alone do not scrub bodies.
         let mut credentials = Vec::<String>::new();
         loop {
-            let mut provider_headers = None;
-            let mut headers = match &self.auth {
-                ClientAuth::ApiKey(key) => {
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    let mut value = reqwest::header::HeaderValue::from_str(key)
-                        .map_err(|_| ClaudeError::AuthUnavailable)?;
-                    value.set_sensitive(true);
-                    headers.insert("x-api-key", value);
-                    headers
-                }
-                ClientAuth::Headers(headers) => headers.clone(),
-                ClientAuth::Provider(provider) => {
-                    let headers = provider
-                        .headers()
-                        .await
-                        .map_err(|_| ClaudeError::AuthUnavailable)?;
-                    provider_headers = Some(headers.clone());
-                    headers
-                }
-            };
+            let (mut headers, provider_headers) = self.auth_headers().await?;
             // Authentication and request features share this comma-separated
             // header. RequestBuilder::headers replaces a pre-existing value,
             // which would silently drop context management for OAuth clients.
@@ -1260,24 +1365,7 @@ impl ClaudeClient {
                 }
                 headers.remove("x-claude-code-request-class");
             }
-            for (name, value) in &headers {
-                if name == reqwest::header::AUTHORIZATION
-                    || name == "x-api-key"
-                    || value.is_sensitive()
-                {
-                    let value = String::from_utf8_lossy(value.as_bytes());
-                    if !value.is_empty() && !credentials.iter().any(|item| item == &value) {
-                        credentials.push(value.to_string());
-                    }
-                    if name == reqwest::header::AUTHORIZATION
-                        && let Some((_, token)) = value.split_once(' ')
-                        && !token.trim().is_empty()
-                        && !credentials.iter().any(|item| item == token.trim())
-                    {
-                        credentials.push(token.trim().to_owned());
-                    }
-                }
-            }
+            collect_credentials(&headers, &mut credentials);
             let builder = self
                 .http
                 .post(&self.endpoint)
