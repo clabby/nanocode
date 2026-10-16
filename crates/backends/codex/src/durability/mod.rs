@@ -30,16 +30,14 @@ pub use session::DurableSessionExt;
 impl<F> DurableAgentExt for NanocodexBuilder<F> {
     async fn durability(self, state: DurableSession) -> AgentResult<Self> {
         let state_id = state.state_id().to_owned();
-        let mut record = state.record().await.map_err(agent_error)?;
-        if let Some(stored) = &mut record
-            && stored.initial.is_none()
-        {
-            stored.initial = Some(InitialSettings {
+        let (owner, checkpoint) = state
+            .acquire_agent_with_initial(InitialSettings {
                 thinking: self.config.thinking,
                 service_tier: self.config.service_tier,
-            });
-            *stored = state.describe(stored.clone()).await.map_err(agent_error)?;
-        }
+            })
+            .await
+            .map_err(agent_error)?;
+        let record = state.record().await.map_err(agent_error)?;
         let mut builder = self.child_journal(state.child_journal());
 
         if builder.explicit_session_id().is_none()
@@ -61,7 +59,6 @@ impl<F> DurableAgentExt for NanocodexBuilder<F> {
             store: state.shared_store(),
             record,
         };
-        let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
         let mut known_records = HashSet::new();
         if let Some(checkpoint) = checkpoint {
             let (restored, keys) = context::load_snapshot_with_keys(
@@ -601,13 +598,6 @@ impl LazyExecution {
     async fn get(&self) -> AgentResult<&DurableExecution> {
         self.ready
             .get_or_try_init(|| async {
-                let state = DurableSession::open_shared(
-                    self.store.clone(),
-                    self.record.session_id.clone(),
-                    None,
-                )
-                .await
-                .map_err(agent_error)?;
                 let mut record = self.record.clone();
                 if let Some(settings) = self.created_with.lock().ok().and_then(|settings| *settings)
                 {
@@ -620,8 +610,20 @@ impl LazyExecution {
                         service_tier: settings.service_tier,
                     });
                 }
-                let record = state.describe(record).await.map_err(agent_error)?;
+                let state = DurableSession::prepare_shared_described(
+                    self.store.clone(),
+                    record.session_id.clone(),
+                    None,
+                    Some(record),
+                )
+                .await
+                .map_err(agent_error)?;
                 let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
+                let record = state.record().await.map_err(agent_error)?.ok_or_else(|| {
+                    agent_error(nanocode_durability::Error::InvalidState(
+                        "described durable session has no record".to_owned(),
+                    ))
+                })?;
                 self.reopened.store(
                     checkpoint.is_some()
                         || !state

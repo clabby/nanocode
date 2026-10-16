@@ -53,13 +53,22 @@ impl DurableAgentExt for ClaudeBuilder {
     async fn durability(self, state: DurableSession) -> AgentResult<Self> {
         let state_id = state.state_id().to_owned();
         let journal = state.child_journal();
-        let mut record = state.record().await.map_err(agent_error)?;
-        if let Some(stored) = &mut record
-            && stored.initial.is_none()
-        {
-            stored.initial = Some(self.durable_initial_settings()?);
-            *stored = state.describe(stored.clone()).await.map_err(agent_error)?;
+        let (owner, checkpoint) = match self.durable_initial_settings() {
+            Ok(initial) => state.acquire_agent_with_initial(initial).await,
+            Err(error) => {
+                if state
+                    .record()
+                    .await
+                    .map_err(agent_error)?
+                    .is_some_and(|record| record.initial.is_none())
+                {
+                    return Err(error);
+                }
+                state.acquire_agent().await
+            }
         }
+        .map_err(agent_error)?;
+        let record = state.record().await.map_err(agent_error)?;
         let branches = Branches {
             store: state.shared_store(),
             record,
@@ -69,7 +78,6 @@ impl DurableAgentExt for ClaudeBuilder {
             Some(record) => self.lineage(record.lineage.clone()),
             None => self,
         };
-        let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
         let builder = if checkpoint.is_none()
             && let Some(record) = &branches.record
             && let Some(initial) = record.initial
@@ -150,19 +158,24 @@ impl LazyClaudeExecution {
     async fn get(&self) -> AgentResult<&ClaudeExecution> {
         self.ready
             .get_or_try_init(|| async {
-                let state = DurableSession::open_shared(
-                    self.store.clone(),
-                    self.record.session_id.clone(),
-                    None,
-                )
-                .await
-                .map_err(agent_error)?;
                 let mut record = self.record.clone();
                 if let Some(model) = self.model.lock().ok().and_then(|model| model.clone()) {
                     record.model = model;
                 }
-                let record = state.describe(record).await.map_err(agent_error)?;
+                let state = DurableSession::prepare_shared_described(
+                    self.store.clone(),
+                    record.session_id.clone(),
+                    None,
+                    Some(record),
+                )
+                .await
+                .map_err(agent_error)?;
                 let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
+                let record = state.record().await.map_err(agent_error)?.ok_or_else(|| {
+                    agent_error(nanocode_durability::Error::InvalidState(
+                        "described durable session has no record".to_owned(),
+                    ))
+                })?;
                 self.reopened.store(
                     checkpoint.is_some()
                         || !state

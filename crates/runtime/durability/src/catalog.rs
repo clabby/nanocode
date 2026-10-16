@@ -412,11 +412,23 @@ mod store {
         }
 
         pub async fn session(&self, record: SessionRecord) -> Result<DurableSession> {
-            let session =
-                DurableSession::open_shared(self.store.clone(), record.session_id.clone(), None)
-                    .await?;
-            session.describe(record).await?;
-            Ok(session)
+            DurableSession::open_shared_described(
+                self.store.clone(),
+                record.session_id.clone(),
+                None,
+                Some(record),
+            )
+            .await
+        }
+
+        pub async fn prepare_session(&self, record: SessionRecord) -> Result<DurableSession> {
+            DurableSession::prepare_shared_described(
+                self.store.clone(),
+                record.session_id.clone(),
+                None,
+                Some(record),
+            )
+            .await
         }
 
         pub async fn recovery_checkpoint(
@@ -441,17 +453,31 @@ mod store {
         }
 
         pub async fn resume(&self, id: &str) -> Result<DurableSession> {
+            let record = self.resume_record(id).await?;
+            DurableSession::open_shared_described(self.store.clone(), id.to_owned(), None, record)
+                .await
+        }
+
+        pub async fn prepare_resume(&self, id: &str) -> Result<DurableSession> {
+            let record = self.resume_record(id).await?;
+            DurableSession::prepare_shared_described(
+                self.store.clone(),
+                id.to_owned(),
+                None,
+                record,
+            )
+            .await
+        }
+
+        async fn resume_record(&self, id: &str) -> Result<Option<SessionRecord>> {
             let state = self.require(id).await?;
-            let session =
-                DurableSession::open_shared(self.store.clone(), id.to_owned(), None).await?;
-            if state.session().is_none()
-                && let Some(checkpoint) = self.native_checkpoint(id, &state).await?
-            {
-                session
-                    .describe(self.infer_record(id, &checkpoint)?)
-                    .await?;
+            if state.session().is_some() {
+                return Ok(None);
             }
-            Ok(session)
+            self.native_checkpoint(id, &state)
+                .await?
+                .map(|checkpoint| self.infer_record(id, &checkpoint))
+                .transpose()
         }
 
         pub async fn branch(

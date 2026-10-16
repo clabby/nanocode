@@ -12,8 +12,8 @@ use tracing::Instrument;
 
 use crate::{
     DurableState, EncodedPayload, Error, OperationStatus, OwnerId, OwnerToken, Result, StateStore,
-    SteerState, StepStatus, StoreError, StoredState, Transition, shared_store::SharedStore,
-    state::RetainedCheckpoint,
+    SteerState, StepStatus, StoreError, StoreReplacement, StoredState, Transition,
+    shared_store::SharedStore, state::RetainedCheckpoint,
 };
 
 const COMMAND_CAPACITY: usize = 64;
@@ -156,13 +156,17 @@ enum Command {
         operation_id: String,
         result: oneshot::Sender<Result<Option<OperationStatus>>>,
     },
+    Acquire {
+        result: oneshot::Sender<Result<()>>,
+    },
     State {
-        result: oneshot::Sender<DurableState>,
+        result: oneshot::Sender<Result<DurableState>>,
     },
     LatestCheckpoint {
         result: oneshot::Sender<Result<Option<EncodedPayload>>>,
     },
     AcquireAgent {
+        initial: Option<crate::InitialSettings>,
         result: oneshot::Sender<Result<AgentAcquisition>>,
     },
     Admit {
@@ -283,6 +287,41 @@ enum Command {
     },
 }
 
+impl Command {
+    fn reject(self, error: Error) {
+        match self {
+            Self::LoadPayloads { result, .. } => drop(result.send(Err(error))),
+            Self::LoadPayload { result, .. } => drop(result.send(Err(error))),
+            Self::Continuation { result, .. } => drop(result.send(Err(error))),
+            Self::Advance { result, .. }
+            | Self::Release { result, .. }
+            | Self::BeginAttempt { result, .. }
+            | Self::WithdrawSteer { result, .. }
+            | Self::BindSteer { result, .. }
+            | Self::CompleteStep { result, .. }
+            | Self::Complete { result, .. }
+            | Self::Fail { result, .. }
+            | Self::FailAttempt { result, .. }
+            | Self::Cancel { result, .. }
+            | Self::PruneReceipts { result, .. }
+            | Self::CommitCheckpoint { result, .. }
+            | Self::DiscardUnused { result, .. }
+            | Self::Acquire { result } => drop(result.send(Err(error))),
+            Self::RecoverFailure { result, .. } => drop(result.send(Err(error))),
+            Self::State { result } => drop(result.send(Err(error))),
+            Self::LatestCheckpoint { result } => drop(result.send(Err(error))),
+            Self::AcquireAgent { result, .. } => drop(result.send(Err(error))),
+            Self::Admit { result, .. } => drop(result.send(Err(error))),
+            Self::AdmitAutomatic { result, .. } => drop(result.send(Err(error))),
+            Self::AcceptSteer { result, .. } => drop(result.send(Err(error))),
+            Self::IdentifiedSteerAccepted { result, .. } => drop(result.send(Err(error))),
+            Self::RetainedSteers { result, .. } => drop(result.send(Err(error))),
+            Self::BeginStep { result, .. } => drop(result.send(Err(error))),
+            Self::Describe { result, .. } => drop(result.send(Err(error))),
+        }
+    }
+}
+
 struct CommandRequest {
     command: Command,
     span: tracing::Span,
@@ -302,7 +341,8 @@ struct Driver {
     state_id: Arc<str>,
     state: DurableState,
     terminal_receipt_limit: Option<usize>,
-    owner: OwnerToken,
+    owner: Option<OwnerToken>,
+    pending_record: Option<crate::catalog::SessionRecord>,
     next_agent_generation: u64,
     active_agent_generation: Option<u64>,
     claimed: HashMap<String, Caller>,
@@ -385,6 +425,13 @@ impl Driver {
     }
 
     async fn handle_command(&mut self, command: Command) {
+        if self.owner.is_none()
+            && !matches!(command, Command::AcquireAgent { .. })
+            && let Err(error) = self.acquire(None).await
+        {
+            command.reject(error);
+            return;
+        }
         match command {
             Command::LoadPayloads {
                 caller,
@@ -478,7 +525,8 @@ impl Driver {
                 });
                 drop(result.send(outcome));
             }
-            Command::State { result } => drop(result.send(self.state.clone())),
+            Command::Acquire { result } => drop(result.send(Ok(()))),
+            Command::State { result } => drop(result.send(Ok(self.state.clone()))),
             Command::LatestCheckpoint { result } => {
                 let outcome = match self.state.latest_checkpoint() {
                     Some(value) => value.load(&mut *self.store, &self.state_id).await.map(Some),
@@ -486,8 +534,8 @@ impl Driver {
                 };
                 drop(result.send(outcome));
             }
-            Command::AcquireAgent { result } => {
-                let outcome = self.acquire_agent().await;
+            Command::AcquireAgent { initial, result } => {
+                let outcome = self.acquire_agent(initial).await;
                 let generation = outcome.as_ref().ok().map(|owner| owner.generation);
                 if result.send(outcome).is_err()
                     && let Some(generation) = generation
@@ -898,8 +946,17 @@ impl Driver {
         }
     }
 
-    async fn acquire_agent(&mut self) -> Result<AgentAcquisition> {
-        let acquired = match self.store.acquire(&self.state_id, OwnerId::new()).await {
+    async fn acquire(&mut self, initial: Option<crate::InitialSettings>) -> Result<()> {
+        let record = self.pending_record.clone();
+        let acquired = match self
+            .store
+            .acquire_with(
+                &self.state_id,
+                OwnerId::new(),
+                Box::new(move |stored| update_session(stored, record, initial)),
+            )
+            .await
+        {
             Ok(acquired) => acquired,
             Err(error @ StoreError::NotCommitted(_)) => return Err(error.into()),
             Err(error) => {
@@ -914,6 +971,18 @@ impl Driver {
                 return Err(error);
             }
         };
+        self.owner = Some(acquired.owner);
+        self.pending_record = None;
+        self.state = state;
+        self.committed_records.clear();
+        Ok(())
+    }
+
+    async fn acquire_agent(
+        &mut self,
+        initial: Option<crate::InitialSettings>,
+    ) -> Result<AgentAcquisition> {
+        self.acquire(initial).await?;
         let generation = match self.next_agent_generation.checked_add(1) {
             Some(generation) => generation,
             None => {
@@ -923,9 +992,6 @@ impl Driver {
                 ));
             }
         };
-        self.owner = acquired.owner;
-        self.state = state;
-        self.committed_records.clear();
         self.claimed.clear();
         self.running.clear();
         self.next_agent_generation = generation;
@@ -1358,11 +1424,17 @@ impl Driver {
             session.touch();
         }
         let payload = next.checkpoint_payload()?;
+        let Some(owner) = &self.owner else {
+            return Err(Error::InvalidState(format!(
+                "state {} was persisted before its owner was acquired",
+                self.state_id
+            )));
+        };
         let revision = match self
             .store
             .replace(
                 &self.state_id,
-                &self.owner,
+                owner,
                 self.state.revision(),
                 &payload,
                 &records,
@@ -1459,6 +1531,51 @@ const fn finishing_attempt_releases_claim(outcome: &Result<()>) -> bool {
         outcome,
         Ok(()) | Err(Error::Store(StoreError::NotCommitted(_)))
     )
+}
+
+fn store_update_error(error: Error) -> StoreError {
+    StoreError::Backend(error.to_string())
+}
+
+fn update_session(
+    stored: &StoredState,
+    record: Option<crate::catalog::SessionRecord>,
+    initial: Option<crate::InitialSettings>,
+) -> std::result::Result<Option<StoreReplacement>, StoreError> {
+    if record.is_none() && initial.is_none() {
+        return Ok(None);
+    }
+    let mut state = reduce(stored.clone()).map_err(store_update_error)?;
+    let mut merged = match (state.session(), record) {
+        (Some(existing), Some(record)) => Some(existing.merged(record)),
+        (existing, record) => record.or_else(|| existing.cloned()),
+    };
+    if let (Some(merged), Some(initial)) = (&mut merged, initial)
+        && merged.initial.is_none()
+    {
+        merged.initial = Some(initial);
+    }
+    if state.session() == merged.as_ref() {
+        return Ok(None);
+    }
+    state.set_session(merged);
+    prepare_update(state).map(Some).map_err(store_update_error)
+}
+
+fn prepare_update(mut state: DurableState) -> Result<StoreReplacement> {
+    let revision = state
+        .revision()
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidState("state revision exceeded the u64 range".to_owned()))?;
+    state.advance_revision(revision)?;
+    let records = state.stage_records();
+    if let Some(record) = state.session_mut() {
+        record.touch();
+    }
+    Ok(StoreReplacement {
+        payload: state.checkpoint_payload()?,
+        records,
+    })
 }
 
 fn reduce(stored: StoredState) -> Result<DurableState> {
@@ -1569,26 +1686,55 @@ impl DurableSession {
     }
 
     pub async fn open_shared(
-        mut store: SharedStore,
+        store: SharedStore,
         state_id: String,
         terminal_receipt_limit: Option<usize>,
+    ) -> Result<Self> {
+        Self::open_shared_described(store, state_id, terminal_receipt_limit, None).await
+    }
+
+    pub async fn open_shared_described(
+        store: SharedStore,
+        state_id: String,
+        terminal_receipt_limit: Option<usize>,
+        record: Option<crate::SessionRecord>,
+    ) -> Result<Self> {
+        let session =
+            Self::prepare_shared_described(store, state_id, terminal_receipt_limit, record).await?;
+        let (result, receiver) = oneshot::channel();
+        session.send(Command::Acquire { result }).await?;
+        receive(receiver).await?;
+        Ok(session)
+    }
+
+    pub async fn prepare_shared_described(
+        store: SharedStore,
+        state_id: String,
+        terminal_receipt_limit: Option<usize>,
+        record: Option<crate::SessionRecord>,
     ) -> Result<Self> {
         if state_id.trim().is_empty() {
             return Err(Error::InvalidState(
                 "state identity must not be empty".to_owned(),
             ));
         }
-        let acquired = store.acquire(&state_id, OwnerId::new()).await?;
-        let state = reduce(acquired.state)?;
+        if let Some(record) = &record
+            && record.session_id != state_id
+        {
+            return Err(Error::InvalidState(
+                "session record does not describe its state".into(),
+            ));
+        }
         let state_id = Arc::<str>::from(state_id);
         let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (releases, release_receiver) = mpsc::unbounded_channel();
         spawn_driver(Driver {
             store: Box::new(store.clone()),
             state_id: Arc::clone(&state_id),
-            state,
+            state: DurableState::default(),
             terminal_receipt_limit,
-            owner: acquired.owner,
+            owner: None,
+            pending_record: record,
             next_agent_generation: 0,
             active_agent_generation: None,
             claimed: HashMap::new(),
@@ -1653,7 +1799,7 @@ impl DurableSession {
     pub async fn state(&self) -> Result<DurableState> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::State { result }).await?;
-        receiver.await.map_err(|_| Error::DriverStopped)
+        receive(receiver).await
     }
 
     pub async fn resolve_many(&self, payloads: Vec<EncodedPayload>) -> Result<Vec<EncodedPayload>> {
@@ -1685,8 +1831,22 @@ impl DurableSession {
     }
 
     pub async fn acquire_agent(&self) -> Result<(DurableOwner, Option<EncodedPayload>)> {
+        self.acquire_agent_inner(None).await
+    }
+
+    pub async fn acquire_agent_with_initial(
+        &self,
+        initial: crate::InitialSettings,
+    ) -> Result<(DurableOwner, Option<EncodedPayload>)> {
+        self.acquire_agent_inner(Some(initial)).await
+    }
+
+    async fn acquire_agent_inner(
+        &self,
+        initial: Option<crate::InitialSettings>,
+    ) -> Result<(DurableOwner, Option<EncodedPayload>)> {
         let (result, receiver) = oneshot::channel();
-        self.send(Command::AcquireAgent { result }).await?;
+        self.send(Command::AcquireAgent { initial, result }).await?;
         let acquired = receive(receiver).await?;
         let owner = DurableOwner {
             generation: acquired.generation,

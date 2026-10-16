@@ -1611,6 +1611,7 @@ dependencies = [
  "nanocode-tool-contracts",
  "nanocode-tool-host",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

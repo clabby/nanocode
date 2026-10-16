@@ -22,7 +22,7 @@ pub use format::{AdmittedTurn, CheckpointFormat, FormatFuture};
 pub use memory::MemoryStore;
 pub use nanocode_durability_core::{
     EncodedPayload, Error, OwnedState, OwnerId, OwnerToken, Result, StateStore, StoreError,
-    StoreFuture, StoreRecord, StoredState,
+    StoreFuture, StoreRecord, StoreReplacement, StoreUpdate, StoredState,
 };
 pub use paged::{PagedWriter, PayloadReader, Prepared, Sequence, load_sequence};
 pub use session::{

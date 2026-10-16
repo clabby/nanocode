@@ -183,7 +183,10 @@ impl<D: CheckpointFormats> Harness<D> {
             .harness_model(model)
             .thinking(thinking);
         options.validate_harness()?;
-        let durable_state = store.resume(session_id).await.map_err(catalog_error)?;
+        let durable_state = store
+            .prepare_resume(session_id)
+            .await
+            .map_err(catalog_error)?;
         self.inner
             .clone()
             .construct(

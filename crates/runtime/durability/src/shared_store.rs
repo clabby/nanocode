@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 
 #[cfg(not(target_family = "wasm"))]
-use crate::Error;
+use crate::{Error, StoreUpdate};
 use crate::{OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture};
 
 const COMMAND_CAPACITY: usize = 64;
@@ -24,6 +24,13 @@ enum Command {
     Acquire {
         state_id: String,
         owner_id: OwnerId,
+        result: oneshot::Sender<Result<OwnedState, StoreError>>,
+    },
+    #[cfg(not(target_family = "wasm"))]
+    AcquireWith {
+        state_id: String,
+        owner_id: OwnerId,
+        update: StoreUpdate,
         result: oneshot::Sender<Result<OwnedState, StoreError>>,
     },
     Replace {
@@ -122,6 +129,17 @@ impl SharedStore {
                                 ),
                             );
                         }
+                        #[cfg(not(target_family = "wasm"))]
+                        Command::AcquireWith {
+                            state_id,
+                            owner_id,
+                            update,
+                            result,
+                        } => {
+                            drop(
+                                result.send(store.acquire_with(&state_id, owner_id, update).await),
+                            );
+                        }
                         Command::Peek { state_id, result } => {
                             drop(result.send(store.peek(&state_id).await));
                         }
@@ -139,6 +157,38 @@ impl SharedStore {
 }
 
 impl StateStore for SharedStore {
+    #[cfg(not(target_family = "wasm"))]
+    fn acquire_with<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
+        let span = tracing::info_span!(
+            "durability.store",
+            operation = "acquire_with",
+            state.id = state_id,
+            queue.duration_ms = tracing::field::Empty
+        );
+        Box::pin(async move {
+            let (result, receiver) = oneshot::channel();
+            self.commands
+                .send(StoreRequest {
+                    command: Command::AcquireWith {
+                        state_id: state_id.to_owned(),
+                        owner_id,
+                        update,
+                        result,
+                    },
+                    span,
+                    queued: Instant::now(),
+                })
+                .await
+                .map_err(|_| stopped())?;
+            receiver.await.map_err(|_| stopped())?
+        })
+    }
+
     fn read_records<'a>(
         &'a mut self,
         state_id: &'a str,

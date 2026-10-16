@@ -607,7 +607,7 @@ fn persistent_recipe(
                         }
                         spec.durable_state = Some(
                             store
-                                .resume(checkpoint.session_id())
+                                .prepare_resume(checkpoint.session_id())
                                 .await
                                 .map_err(catalog_error)?,
                         );
@@ -651,7 +651,8 @@ fn persistent_recipe(
                     Some(workspace.to_path_buf()),
                 )
                 .with_lineage(lineage);
-                spec.durable_state = Some(store.session(record).await.map_err(catalog_error)?);
+                spec.durable_state =
+                    Some(store.prepare_session(record).await.map_err(catalog_error)?);
             }
             recipe(spec).await
         })
@@ -793,7 +794,10 @@ impl AgentRuntime {
             .all(|turn| turn.status != crate::durability::TurnStatus::Pending)
             .then(|| stored.summary.record.inherited_transcript.clone())
             .filter(|transcript| !transcript.is_empty());
-        let durable_state = configured.resume(session_id).await.map_err(catalog_error)?;
+        let durable_state = configured
+            .prepare_resume(session_id)
+            .await
+            .map_err(catalog_error)?;
         let (agent, events) = self
             .construct(AgentSpec {
                 parent: None,
@@ -876,7 +880,7 @@ impl AgentRuntime {
                     crate::Origin::Fork,
                 ))
                 .with_inherited_transcript(transcript.clone());
-                Some(store.session(record).await.map_err(catalog_error)?)
+                Some(store.prepare_session(record).await.map_err(catalog_error)?)
             }
             None => None,
         };
@@ -909,7 +913,12 @@ impl AgentRuntime {
     async fn construct(&self, spec: AgentSpec) -> AgentResult {
         let recipe = self.inner.recipe(spec.model.family())?;
         let ownership = Arc::clone(&self.inner.ownership);
-        ownership.own(move || recipe(spec)).await
+        let span = tracing::info_span!(
+            "agent.session.create",
+            model = %spec.model,
+            resume = spec.checkpoint.is_some() || spec.durable_state.is_some()
+        );
+        tracing::Instrument::instrument(ownership.own(move || recipe(spec)), span).await
     }
 }
 
