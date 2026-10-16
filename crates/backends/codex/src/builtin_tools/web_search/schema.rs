@@ -1,9 +1,17 @@
+use std::sync::LazyLock;
+
 use schemars::r#gen::SchemaSettings;
 use serde_json::{Map, Value};
 
 use super::wire::SearchCommands;
 
+static COMMANDS_SCHEMA: LazyLock<Value> = LazyLock::new(generate_commands_schema);
+
 pub(super) fn commands_schema() -> Value {
+    COMMANDS_SCHEMA.clone()
+}
+
+fn generate_commands_schema() -> Value {
     let schema = SchemaSettings::draft2019_09()
         .with(|settings| {
             settings.inline_subschemas = true;

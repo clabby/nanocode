@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Weak},
+    sync::{Arc, LazyLock, Weak},
     time::Duration,
 };
 use tokio::sync::oneshot;
@@ -768,7 +768,7 @@ impl Tool for SpawnAgent {
             ),
         )
         .with_strict_parameters()
-        .with_output_schema(spawn_agent_output_schema())
+        .with_output_schema(SPAWN_AGENT_OUTPUT_SCHEMA.clone())
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -816,7 +816,8 @@ impl Tool for SpawnAgent {
 }
 
 fn spawn_agent_parameters_for(policy: &SpawnPolicy) -> Value {
-    let mut parameters = spawn_agent_parameters();
+    static PARAMETERS: LazyLock<Value> = LazyLock::new(spawn_agent_parameters);
+    let mut parameters = PARAMETERS.clone();
     let properties = &mut parameters["properties"];
     if let Some(models) = policy.offered_models() {
         let mut names = models
@@ -1210,7 +1211,7 @@ impl Tool for WaitAgent {
                 "additionalProperties": false
             }),
         )
-        .with_output_schema(wait_agent_output_schema())
+        .with_output_schema(WAIT_AGENT_OUTPUT_SCHEMA.clone())
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -1365,6 +1366,10 @@ impl Tool for TurnAuthority {
             .await
     }
 }
+
+static SPAWN_AGENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(spawn_agent_output_schema);
+
+static WAIT_AGENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(wait_agent_output_schema);
 
 fn spawn_agent_output_schema() -> Value {
     json!({
