@@ -8,7 +8,8 @@ pub use state::{
     RetainedCheckpoint, SteerState, StepState, StepStatus, Transition,
 };
 pub use store::{
-    OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoreRecord, StoredState,
+    OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoreRecord,
+    StoreReplacement, StoreUpdate, StoredState,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -86,6 +86,53 @@ pub struct StoreRecord {
     pub value: String,
 }
 
+pub struct StoreReplacement {
+    pub payload: String,
+    pub records: Vec<StoreRecord>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub type StoreUpdate =
+    Box<dyn FnOnce(&StoredState) -> Result<Option<StoreReplacement>, StoreError> + Send>;
+
+#[cfg(target_family = "wasm")]
+pub type StoreUpdate =
+    Box<dyn FnOnce(&StoredState) -> Result<Option<StoreReplacement>, StoreError>>;
+
+async fn acquire_updated<S: StateStore + ?Sized>(
+    store: &mut S,
+    state_id: &str,
+    owner_id: OwnerId,
+    update: StoreUpdate,
+) -> Result<OwnedState, StoreError> {
+    let mut owned = store.acquire(state_id, owner_id).await?;
+    if let Some(replacement) = update(&owned.state).map_err(|error| {
+        StoreError::Backend(format!(
+            "state update failed after acquiring its owner: {error}"
+        ))
+    })? {
+        let revision = store
+            .replace(
+                state_id,
+                &owned.owner,
+                owned.state.revision,
+                &replacement.payload,
+                &replacement.records,
+            )
+            .await
+            .map_err(|error| {
+                StoreError::Backend(format!(
+                    "state update failed after acquiring its owner: {error}"
+                ))
+            })?;
+        owned.state = StoredState {
+            revision,
+            payload: Some(replacement.payload),
+        };
+    }
+    Ok(owned)
+}
+
 fn read_only_unsupported() -> StoreError {
     StoreError::Backend("this store does not support non-fencing reads".to_owned())
 }
@@ -131,6 +178,15 @@ pub trait StateStore: Send {
         state_id: &'a str,
         owner_id: OwnerId,
     ) -> StoreFuture<'a, Result<OwnedState, StoreError>>;
+
+    fn acquire_with<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
+        Box::pin(acquire_updated(self, state_id, owner_id, update))
+    }
 
     fn replace<'a>(
         &'a mut self,
@@ -183,6 +239,15 @@ pub trait StateStore {
         state_id: &'a str,
         owner_id: OwnerId,
     ) -> StoreFuture<'a, Result<OwnedState, StoreError>>;
+
+    fn acquire_with<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner_id: OwnerId,
+        update: StoreUpdate,
+    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
+        Box::pin(acquire_updated(self, state_id, owner_id, update))
+    }
 
     fn replace<'a>(
         &'a mut self,
