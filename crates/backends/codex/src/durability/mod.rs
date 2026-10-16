@@ -1,12 +1,15 @@
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use nanocode_agent_core::{ExecutionPolicyDisposition, NanocodexError, Result as AgentResult};
 use nanocode_durability::{
-    Admission, BeginStep, Branches, DurableAgentExt, DurableOwner, DurableSession, InitialSettings,
-    OperationStatus, SessionRecord, SharedStore, agent_error,
+    Admission, BeginStep, Branches, DurableAgentExt, DurableOwner, DurableSession, EncodedPayload,
+    InitialAcquisition, InitialSettings, OperationStatus, SessionRecord, SharedStore, agent_error,
 };
 use serde_json::value::RawValue;
 
@@ -124,6 +127,34 @@ impl<F> DurableAgentExt for NanocodexBuilder<F> {
                 let policy: Arc<dyn ExecutionPolicy> = Arc::new(policy);
                 Ok(policy)
             }) )
+    }
+}
+
+impl<F> NanocodexBuilder<F> {
+    pub(crate) fn deferred_durability(
+        self,
+        state: &DurableSession,
+        record: SessionRecord,
+        notice: String,
+    ) -> (Self, Arc<AtomicBool>) {
+        let state_id = state.state_id().to_owned();
+        let mut builder = self.child_journal(state.child_journal());
+        if builder.explicit_session_id().is_none()
+            && let Ok(session_id) = state_id.parse::<SessionId>()
+        {
+            builder = builder.session_id(session_id);
+        }
+        let existing = Arc::new(AtomicBool::new(false));
+        let builder = builder
+            .lineage(record.lineage.clone())
+            .default_prompt_cache_key(state_id)
+            .initial_developer_messages(vec![notice])
+            .execution_policy(Arc::new(LazyExecution::deferred(
+                state.shared_store(),
+                record,
+                Arc::clone(&existing),
+            )));
+        (builder, existing)
     }
 }
 
@@ -581,6 +612,10 @@ struct LazyExecution {
     initialized: std::sync::atomic::AtomicBool,
 
     created_with: Mutex<Option<crate::execution::InitialSettings>>,
+
+    existing: Option<Arc<AtomicBool>>,
+
+    attempted: AtomicBool,
 }
 
 impl LazyExecution {
@@ -592,24 +627,47 @@ impl LazyExecution {
             reopened: std::sync::atomic::AtomicBool::new(false),
             initialized: std::sync::atomic::AtomicBool::new(false),
             created_with: Mutex::new(None),
+            existing: None,
+            attempted: AtomicBool::new(false),
+        }
+    }
+
+    fn deferred(store: SharedStore, record: SessionRecord, existing: Arc<AtomicBool>) -> Self {
+        Self {
+            existing: Some(existing),
+            ..Self::new(store, record)
         }
     }
 
     async fn get(&self) -> AgentResult<&DurableExecution> {
-        self.ready
+        self.acquire(None).await.map(|(policy, _)| policy)
+    }
+
+    async fn acquire(
+        &self,
+        initial: Option<EncodedPayload>,
+    ) -> AgentResult<(&DurableExecution, bool)> {
+        let committed = AtomicBool::new(false);
+        let policy = self
+            .ready
             .get_or_try_init(|| async {
                 let mut record = self.record.clone();
+                let mut initial_settings = None;
                 if let Some(settings) = self.created_with.lock().ok().and_then(|settings| *settings)
                 {
                     record.model = nanocode_agent_core::ModelSelection::new(
                         nanocode_agent_core::BackendId::Codex,
                         settings.model.as_str(),
                     );
-                    record.initial = Some(InitialSettings {
+                    initial_settings = Some(InitialSettings {
                         thinking: settings.thinking,
                         service_tier: settings.service_tier,
                     });
+                    if self.existing.is_none() {
+                        record.initial = initial_settings;
+                    }
                 }
+                let settings = initial_settings;
                 let state = DurableSession::prepare_shared_described(
                     self.store.clone(),
                     record.session_id.clone(),
@@ -618,7 +676,24 @@ impl LazyExecution {
                 )
                 .await
                 .map_err(agent_error)?;
-                let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
+                let (owner, checkpoint) = match initial {
+                    Some(payload) => {
+                        match state
+                            .acquire_agent_with_initial_checkpoint(settings, payload)
+                            .await
+                            .map_err(agent_error)?
+                        {
+                            (owner, InitialAcquisition::Committed) => {
+                                committed.store(true, Ordering::SeqCst);
+                                (owner, None)
+                            }
+                            (owner, InitialAcquisition::Existing(checkpoint)) => {
+                                (owner, checkpoint)
+                            }
+                        }
+                    }
+                    None => state.acquire_agent().await.map_err(agent_error)?,
+                };
                 let record = state.record().await.map_err(agent_error)?.ok_or_else(|| {
                     agent_error(nanocode_durability::Error::InvalidState(
                         "described durable session has no record".to_owned(),
@@ -634,7 +709,7 @@ impl LazyExecution {
                             .is_empty(),
                     std::sync::atomic::Ordering::SeqCst,
                 );
-                Ok(DurableExecution::ready(
+                Ok::<_, NanocodexError>(DurableExecution::ready(
                     owner,
                     record.session_id.clone(),
                     Some(Branches {
@@ -643,13 +718,18 @@ impl LazyExecution {
                     }),
                 ))
             })
-            .await
+            .await?;
+        Ok((policy, committed.load(Ordering::SeqCst)))
     }
 }
 
 impl ExecutionPolicy for LazyExecution {
     fn durable_state_id(&self) -> Option<String> {
         Some(self.record.session_id.clone())
+    }
+
+    fn commits_initial(&self) -> bool {
+        self.existing.is_some()
     }
 
     fn branch(
@@ -704,16 +784,49 @@ impl ExecutionPolicy for LazyExecution {
             if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(());
             }
+            if self.existing.is_some() && self.attempted.swap(true, Ordering::SeqCst) {
+                return Err(NanocodexError::InvalidExecutionPolicy(
+                    "the deferred durable acquisition already failed".to_owned(),
+                ));
+            }
             if let Ok(mut created_with) = self.created_with.lock() {
                 *created_with = Some(settings);
             }
 
-            let policy = self.get().await?;
+            let (snapshot, prepared) = match snapshot {
+                Some(snapshot) if self.ready.get().is_none() => (
+                    None,
+                    Some(
+                        context::prepare_snapshot(snapshot, &HashSet::new())
+                            .map_err(agent_error)?,
+                    ),
+                ),
+                snapshot => (snapshot, None),
+            };
+            let (policy, committed) = self
+                .acquire(prepared.as_ref().map(|prepared| prepared.payload.clone()))
+                .await?;
+            if let Some(existing) = self.existing.as_ref().filter(|_| !committed) {
+                existing.store(true, Ordering::SeqCst);
+                return Err(NanocodexError::InvalidExecutionPolicy(
+                    "the prepared durable session already holds state".to_owned(),
+                ));
+            }
             if self.reopened.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(());
             }
             self.initialized
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(prepared) = prepared {
+                if !committed {
+                    policy
+                        .owner
+                        .commit_checkpoint(prepared.payload)
+                        .await
+                        .map_err(agent_error)?;
+                }
+                return policy.remember(prepared.keys);
+            }
             match snapshot {
                 Some(snapshot) => policy.commit_checkpoint(snapshot).await,
                 None => Ok(()),

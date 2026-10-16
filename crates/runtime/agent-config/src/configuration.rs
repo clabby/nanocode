@@ -108,6 +108,14 @@ pub trait HostServices: Send + Sync + 'static {
         initial: bool,
     ) -> nanocode_tool_host::embedded::HostFuture<'a, Result<()>>;
     fn unregister(&self, session_id: &str);
+    fn initial_notice(
+        &self,
+        _session_id: &str,
+        _parent_session_id: Option<&str>,
+    ) -> Option<String> {
+        None
+    }
+    fn initial_notice_committed(&self, _agent: &crate::Agent, _text: String) {}
     fn unavailable(&self) -> Option<String>;
     fn close(&self);
     fn shutdown(&self) -> BackendFuture<Result<()>>;

@@ -1,11 +1,15 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use nanocode_agent_core::{
     AgentEvents, BackendRequest, Nanocodex, Result as AgentResult, backend::BackendFuture,
 };
 use nanocode_durability::{
     Admission, BeginStep, Branches, CheckpointFormat, DurableAgentExt, DurableBackendRegistration,
-    DurableOwner, DurableSession, EncodedPayload, SessionRecord, SharedStore, agent_error,
+    DurableOwner, DurableSession, EncodedPayload, InitialAcquisition, InitialSettings,
+    SessionRecord, SharedStore, agent_error,
 };
 use serde_json::{Value, value::RawValue};
 
@@ -124,6 +128,38 @@ impl DurableAgentExt for ClaudeBuilder {
     }
 }
 
+impl ClaudeBuilder {
+    pub(crate) fn deferred_durability(
+        self,
+        state: &DurableSession,
+        record: SessionRecord,
+        notice: String,
+    ) -> AgentResult<(Self, Arc<AtomicBool>)> {
+        let initial = self.durable_initial_settings()?;
+        record
+            .model
+            .capabilities(nanocode_agent_core::ModelTransport::Native)
+            .check_service_tier(initial.service_tier)?;
+        let existing = Arc::new(AtomicBool::new(false));
+        let builder = self
+            .lineage(record.lineage.clone())
+            .thinking(initial.thinking)?
+            .fast_mode(initial.service_tier != nanocode_agent_core::ServiceTier::Standard)
+            .initial_developer_notices(vec![(nanocode_platform::uuid_v7().to_string(), notice)])
+            .child_journal(state.child_journal())
+            .execution_policy(
+                Arc::new(LazyClaudeExecution::deferred(
+                    state.shared_store(),
+                    record,
+                    initial,
+                    Arc::clone(&existing),
+                )),
+                None,
+            )?;
+        Ok((builder, existing))
+    }
+}
+
 struct ClaudeExecution {
     state_id: String,
     owner: DurableOwner,
@@ -141,6 +177,12 @@ struct LazyClaudeExecution {
     initialized: std::sync::atomic::AtomicBool,
 
     model: std::sync::Mutex<Option<nanocode_agent_core::ModelSelection>>,
+
+    initial: Option<InitialSettings>,
+
+    existing: Option<Arc<AtomicBool>>,
+
+    attempted: AtomicBool,
 }
 
 impl LazyClaudeExecution {
@@ -152,11 +194,36 @@ impl LazyClaudeExecution {
             reopened: std::sync::atomic::AtomicBool::new(false),
             initialized: std::sync::atomic::AtomicBool::new(false),
             model: std::sync::Mutex::new(None),
+            initial: None,
+            existing: None,
+            attempted: AtomicBool::new(false),
+        }
+    }
+
+    fn deferred(
+        store: SharedStore,
+        record: SessionRecord,
+        initial: InitialSettings,
+        existing: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            initial: Some(initial),
+            existing: Some(existing),
+            ..Self::new(store, record)
         }
     }
 
     async fn get(&self) -> AgentResult<&ClaudeExecution> {
-        self.ready
+        self.acquire(None).await.map(|(policy, _)| policy)
+    }
+
+    async fn acquire(
+        &self,
+        initial: Option<EncodedPayload>,
+    ) -> AgentResult<(&ClaudeExecution, bool)> {
+        let committed = AtomicBool::new(false);
+        let policy = self
+            .ready
             .get_or_try_init(|| async {
                 let mut record = self.record.clone();
                 if let Some(model) = self.model.lock().ok().and_then(|model| model.clone()) {
@@ -170,7 +237,28 @@ impl LazyClaudeExecution {
                 )
                 .await
                 .map_err(agent_error)?;
-                let (owner, checkpoint) = state.acquire_agent().await.map_err(agent_error)?;
+                let (owner, checkpoint) = match (initial, self.initial) {
+                    (Some(payload), settings) => {
+                        match state
+                            .acquire_agent_with_initial_checkpoint(settings, payload)
+                            .await
+                            .map_err(agent_error)?
+                        {
+                            (owner, InitialAcquisition::Committed) => {
+                                committed.store(true, Ordering::SeqCst);
+                                (owner, None)
+                            }
+                            (owner, InitialAcquisition::Existing(checkpoint)) => {
+                                (owner, checkpoint)
+                            }
+                        }
+                    }
+                    (None, Some(settings)) => state
+                        .acquire_agent_with_initial(settings)
+                        .await
+                        .map_err(agent_error)?,
+                    (None, None) => state.acquire_agent().await.map_err(agent_error)?,
+                };
                 let record = state.record().await.map_err(agent_error)?.ok_or_else(|| {
                     agent_error(nanocode_durability::Error::InvalidState(
                         "described durable session has no record".to_owned(),
@@ -186,7 +274,7 @@ impl LazyClaudeExecution {
                             .is_empty(),
                     std::sync::atomic::Ordering::SeqCst,
                 );
-                Ok(ClaudeExecution {
+                Ok::<_, nanocode_agent_core::NanocodexError>(ClaudeExecution {
                     state_id: record.session_id.clone(),
                     owner,
                     session: state,
@@ -196,7 +284,8 @@ impl LazyClaudeExecution {
                     },
                 })
             })
-            .await
+            .await?;
+        Ok((policy, committed.load(Ordering::SeqCst)))
     }
 }
 
@@ -348,15 +437,34 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
             if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(());
             }
+            if self.existing.is_some() && self.attempted.swap(true, Ordering::SeqCst) {
+                return Err(nanocode_agent_core::NanocodexError::InvalidExecutionPolicy(
+                    "the deferred durable acquisition already failed".to_owned(),
+                ));
+            }
             if let Ok(mut recorded) = self.model.lock() {
                 *recorded = Some(model);
             }
 
-            let policy = self.get().await?;
+            let prepared = self
+                .ready
+                .get()
+                .is_none()
+                .then(|| payload(&state))
+                .transpose()?;
+            let (policy, committed) = self.acquire(prepared).await?;
+            if let Some(existing) = self.existing.as_ref().filter(|_| !committed) {
+                existing.store(true, Ordering::SeqCst);
+                return Err(nanocode_agent_core::NanocodexError::InvalidExecutionPolicy(
+                    "the prepared durable session already holds state".to_owned(),
+                ));
+            }
             if self.reopened.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(());
             }
-            policy.checkpoint(state).await?;
+            if !committed {
+                policy.checkpoint(state).await?;
+            }
             self.initialized
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())

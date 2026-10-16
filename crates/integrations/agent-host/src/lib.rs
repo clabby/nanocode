@@ -250,6 +250,16 @@ impl HostServices for Services {
         let _ = session_id;
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn initial_notice(&self, session_id: &str, parent_session_id: Option<&str>) -> Option<String> {
+        self.agents.initial_notice(session_id, parent_session_id)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn initial_notice_committed(&self, agent: &Agent, text: String) {
+        self.agents.initial_notice_committed(agent, text);
+    }
+
     fn unavailable(&self) -> Option<String> {
         computer::unavailable(&self.computer)
     }

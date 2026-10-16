@@ -108,6 +108,11 @@ impl RuntimeBackend for ClaudeHarness {
                 .tools
                 .as_ref()
                 .is_some_and(AgentTools::has_code_mode_host);
+            let fold_notice = !remote
+                && configure.is_none()
+                && spec.checkpoint.is_none()
+                && !matches!(settings.tools, Some(AgentTools::PerAgent(_)));
+            let host = services.clone();
             let shared = services.shared_tools(remote).await?;
             if spec.model.family() != HarnessFamily::Claude {
                 return Err(NanocodexError::InvalidRequest(
@@ -187,6 +192,29 @@ impl RuntimeBackend for ClaudeHarness {
 
             if let Some(state) = spec.durable_state {
                 use nanocode_durability::DurableAgentExt as _;
+                if fold_notice
+                    && let Some(record) = state
+                        .described_record()
+                        .filter(|record| record.initial.is_none())
+                        .cloned()
+                    && let Some(text) = host.initial_notice(
+                        state.state_id(),
+                        spec.parent.as_ref().map(AgentHandle::session_id),
+                    )
+                {
+                    let (deferred, existing) =
+                        builder
+                            .clone()
+                            .deferred_durability(&state, record, text.clone())?;
+                    match nanocode_agent_core::Nanocodex::persist_created(deferred.build()).await {
+                        Ok((agent, events)) => {
+                            host.initial_notice_committed(&agent, text);
+                            return Ok((agent, events));
+                        }
+                        Err(_) if existing.load(std::sync::atomic::Ordering::SeqCst) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 builder = builder.durability(state).await?;
             }
             builder.build()

@@ -18,6 +18,7 @@ struct RunnerAgentState {
     code_mode_hosts: HashMap<String, bool>,
     events: Option<mpsc::UnboundedReceiver<RunnerEvent>>,
     agents: Vec<(String, crate::WeakAgent, mpsc::UnboundedSender<Notice>)>,
+    folded: Vec<(String, crate::WeakAgent, String)>,
     runners: Vec<Runner>,
     servers: Vec<RunnerServerConfig>,
     startup: Vec<tokio::sync::watch::Receiver<Option<Result<(), AttachmentError>>>>,
@@ -42,6 +43,7 @@ impl RunnerAgents {
                 code_mode_hosts: HashMap::new(),
                 events: Some(events),
                 agents: Vec::new(),
+                folded: Vec::new(),
                 runners,
                 servers,
                 startup: Vec::new(),
@@ -177,7 +179,34 @@ impl RunnerAgents {
     pub(crate) fn unregister(&self, session_id: &str) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.agents.retain(|(id, _, _)| id != session_id);
+        state.folded.retain(|(id, _, _)| id != session_id);
         state.code_mode_hosts.remove(session_id);
+    }
+
+    pub(crate) fn initial_notice(
+        self: &Arc<Self>,
+        session_id: &str,
+        parent_session_id: Option<&str>,
+    ) -> Option<String> {
+        self.activate();
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let configured = state
+            .code_mode_hosts
+            .get(session_id)
+            .copied()
+            .or_else(|| {
+                parent_session_id.and_then(|parent| state.code_mode_hosts.get(parent).copied())
+            })
+            .unwrap_or(false);
+        (!configured).then(|| self.summary())
+    }
+
+    pub(crate) fn initial_notice_committed(&self, agent: &crate::Agent, text: String) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.folded.retain(|(_, agent, _)| agent.is_live());
+        state
+            .folded
+            .push((agent.session_id().to_owned(), agent.downgrade(), text));
     }
 
     pub(crate) fn code_mode_host(&self, session_id: &str, configured: bool) {
@@ -223,11 +252,13 @@ impl RunnerAgents {
         let worker = weak.clone();
         let (notices, mut receiver) = mpsc::unbounded_channel::<Notice>();
         let (completed, result) = oneshot::channel();
+        let awaited;
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state
                 .agents
                 .retain(|(_, agent, notices)| agent.is_live() && !notices.is_closed());
+            state.folded.retain(|(_, agent, _)| agent.is_live());
             if state
                 .agents
                 .iter()
@@ -235,12 +266,21 @@ impl RunnerAgents {
             {
                 return Ok(());
             }
-            notices
-                .send(Notice {
-                    text: self.summary(),
-                    completed: await_initial.then_some(completed),
-                })
-                .map_err(|_| crate::NanocodexError::AgentStopped)?;
+            let folded = state
+                .folded
+                .iter()
+                .position(|(id, _, _)| id == agent.session_id())
+                .map(|index| state.folded.swap_remove(index).2);
+            awaited = await_initial && folded.is_none();
+            let summary = self.summary();
+            if folded.as_ref() != Some(&summary) {
+                notices
+                    .send(Notice {
+                        text: summary,
+                        completed: awaited.then_some(completed),
+                    })
+                    .map_err(|_| crate::NanocodexError::AgentStopped)?;
+            }
             state
                 .agents
                 .push((agent.session_id().to_owned(), weak, notices));
@@ -261,7 +301,7 @@ impl RunnerAgents {
                 }
             }
         });
-        if await_initial {
+        if awaited {
             result
                 .await
                 .map_err(|_| crate::NanocodexError::AgentStopped)?

@@ -108,6 +108,11 @@ impl RuntimeBackend for CodexHarness {
                 .tools
                 .as_ref()
                 .is_some_and(AgentTools::has_code_mode_host);
+            let fold_notice = !remote
+                && configure.is_none()
+                && spec.checkpoint.is_none()
+                && !matches!(settings.tools, Some(AgentTools::PerAgent(_)));
+            let host = services.clone();
             let shared = services.shared_tools(remote).await?;
             let Some(model) = spec.model.as_codex() else {
                 return Err(NanocodexError::InvalidRequest(
@@ -190,6 +195,31 @@ impl RuntimeBackend for CodexHarness {
                         "invalid durable Codex session identity: {error}"
                     ))
                 })?;
+                if fold_notice
+                    && let Some(record) = state
+                        .described_record()
+                        .filter(|record| record.initial.is_none())
+                        .cloned()
+                    && let Some(text) = host.initial_notice(
+                        state.state_id(),
+                        spec.parent.as_ref().map(AgentHandle::session_id),
+                    )
+                {
+                    let (deferred, existing) = builder
+                        .clone()
+                        .session_id(session_id)
+                        .deferred_durability(&state, record, text.clone());
+                    let built =
+                        tracing::info_span!("codex.session.build").in_scope(|| deferred.build());
+                    match nanocode_agent_core::Nanocodex::persist_created(built).await {
+                        Ok((agent, events)) => {
+                            host.initial_notice_committed(&agent, text);
+                            return Ok((agent, events));
+                        }
+                        Err(_) if existing.load(std::sync::atomic::Ordering::SeqCst) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 builder = tracing::Instrument::instrument(
                     builder.session_id(session_id).durability(state),
                     tracing::info_span!("codex.session.durability"),

@@ -93,6 +93,10 @@ pub trait ExecutionPolicy: Send + Sync {
         None
     }
 
+    fn commits_initial(&self) -> bool {
+        false
+    }
+
     fn branch(&self, _child: &crate::SessionInfo) -> Result<Option<Arc<dyn ExecutionPolicy>>> {
         Ok(None)
     }
@@ -293,6 +297,10 @@ pub trait ExecutionPolicy: Send + Sync {
 pub trait ExecutionPolicy: Send + Sync {
     fn durable_state_id(&self) -> Option<String> {
         None
+    }
+
+    fn commits_initial(&self) -> bool {
+        false
     }
 
     fn branch(&self, _child: &crate::SessionInfo) -> Result<Option<Arc<dyn ExecutionPolicy>>> {
@@ -871,6 +879,12 @@ impl Execution {
 
     pub(crate) fn has_policy(&self) -> bool {
         self.policy.is_some()
+    }
+
+    pub(crate) fn commits_initial(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_some_and(|policy| policy.commits_initial())
     }
 
     pub(crate) async fn commit_initial_checkpoint(

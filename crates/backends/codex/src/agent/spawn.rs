@@ -106,6 +106,7 @@ pub(super) fn build_agent(
             restored_snapshot: None,
             host_context: codex.host_context,
             service_factory,
+            initial_developer_messages: codex.initial_developer_messages,
         },
         session_id,
         workspace,

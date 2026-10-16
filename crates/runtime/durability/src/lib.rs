@@ -26,7 +26,8 @@ pub use nanocode_durability_core::{
 };
 pub use paged::{PagedWriter, PayloadReader, Prepared, Sequence, load_sequence};
 pub use session::{
-    Admission, AutomaticAdmission, BeginStep, DurableOwner, DurableSession, StoredSteer,
+    Admission, AutomaticAdmission, BeginStep, DurableOwner, DurableSession, InitialAcquisition,
+    StoredSteer,
 };
 pub use shared_store::SharedStore;
 pub use state::{

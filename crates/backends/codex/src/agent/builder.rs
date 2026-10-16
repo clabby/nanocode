@@ -57,6 +57,7 @@ pub(super) struct CodexCompatibility {
     pub(super) spawn_factory: Option<Arc<dyn backend::AgentFactory>>,
     pub(super) host_context: Option<Arc<str>>,
     pub(super) child_journal: Option<backend::ChildJournal>,
+    pub(super) initial_developer_messages: Vec<String>,
 }
 
 impl Default for CodexCompatibility {
@@ -69,6 +70,7 @@ impl Default for CodexCompatibility {
             spawn_factory: None,
             host_context: None,
             child_journal: None,
+            initial_developer_messages: Vec::new(),
         }
     }
 }
@@ -336,6 +338,11 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub const fn resume_snapshot(&self) -> Option<&SessionSnapshot> {
         self.resume.as_ref()
+    }
+
+    pub(crate) fn initial_developer_messages(mut self, messages: Vec<String>) -> Self {
+        self.codex.initial_developer_messages = messages;
+        self
     }
 
     #[must_use]

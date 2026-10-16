@@ -19,6 +19,7 @@ pub(in crate::agent) struct BranchSpawner {
     pub(in crate::agent) restored_snapshot: Option<SessionSnapshot>,
     pub(in crate::agent) host_context: Option<Arc<str>>,
     pub(in crate::agent) service_factory: ServiceFactory,
+    pub(in crate::agent) initial_developer_messages: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -82,6 +83,7 @@ impl BranchSpawner {
             restored_snapshot: None,
             host_context: self.host_context.as_ref().map(Arc::clone),
             service_factory: Arc::clone(&self.service_factory),
+            initial_developer_messages: Vec::new(),
         }
     }
 }
@@ -212,6 +214,7 @@ impl BranchSpawner {
             restored_snapshot: None,
             host_context,
             service_factory: Arc::clone(&self.service_factory),
+            initial_developer_messages: Vec::new(),
         };
         let service = (spawner.service_factory)(Arc::clone(&spawner.config));
         spawn_agent_driver(

@@ -538,8 +538,14 @@ pub struct ClaudeBuilder {
     conversation_id: Option<String>,
     #[cfg(not(target_family = "wasm"))]
     task_board: Option<Arc<crate::tools::tasks::ClaudeTasks>>,
+    initial_developer_notices: Vec<(String, String)>,
 }
 impl ClaudeBuilder {
+    pub(crate) fn initial_developer_notices(mut self, notices: Vec<(String, String)>) -> Self {
+        self.initial_developer_notices = notices;
+        self
+    }
+
     pub(crate) fn durable_initial_settings(&self) -> Result<nanocode_durability::InitialSettings> {
         Ok(nanocode_durability::InitialSettings {
             thinking: if self.thinking_explicit || self.effort.is_some() {
@@ -598,6 +604,7 @@ impl ClaudeBuilder {
             conversation_id: None,
             #[cfg(not(target_family = "wasm"))]
             task_board: None,
+            initial_developer_notices: Vec::new(),
         }
     }
 
@@ -1152,6 +1159,7 @@ impl ClaudeBuilder {
         let mut recipe = self.clone();
         recipe.session_id = None;
         recipe.restored = None;
+        recipe.initial_developer_notices = Vec::new();
         recipe.lineage = None;
         recipe.conversation_id = None;
 
@@ -1430,7 +1438,10 @@ impl ClaudeBuilder {
                 "durable Claude session ID must equal the policy state ID",
             ));
         }
-        let restored = self.restored.unwrap_or_default();
+        let mut restored = self.restored.unwrap_or_default();
+        restored
+            .developer_notices
+            .extend(std::mem::take(&mut self.initial_developer_notices));
 
         let accepted_turns = u64::from(
             !restored.conversation.messages.is_empty()

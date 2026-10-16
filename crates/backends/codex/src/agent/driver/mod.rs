@@ -96,13 +96,33 @@ impl AgentDriver {
         let mut developer_checkpoint_ready = true;
         let mut commands_open = true;
         let mut shutdown_failures = Vec::new();
+        let mut initial_notices = Ok(());
+        for text in std::mem::take(&mut self.spawner.initial_developer_messages) {
+            match model.append_developer_message(text, self.workspace.as_deref()) {
+                Ok(snapshot) => {
+                    latest_fork_checkpoint = Some(Arc::new(CommittedSession::new(
+                        Arc::clone(&self.spawner.lineage_id),
+                        thread_model,
+                        default_thinking,
+                        default_service_tier,
+                        snapshot,
+                    )));
+                }
+                Err(error) => {
+                    initial_notices = Err(error);
+                    break;
+                }
+            }
+        }
         if let Some(persisted) = self.initial_persisted.take() {
             let child = match self.origin.start {
                 crate::session::SessionStart::New(origin) => !matches!(origin, crate::Origin::Root),
                 crate::session::SessionStart::Restore => true,
                 crate::session::SessionStart::Resume => false,
             };
-            let outcome = if child && self.execution.has_policy() {
+            let outcome = if let Err(error) = initial_notices {
+                Err(error)
+            } else if (child || self.execution.commits_initial()) && self.execution.has_policy() {
                 self.execution
                     .commit_initial_checkpoint(
                         latest_fork_checkpoint.as_deref(),
