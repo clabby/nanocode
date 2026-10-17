@@ -322,14 +322,20 @@ fn schema<T: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T)).expect("JSON schema serialization")
 }
 fn definition(tool: HostTool) -> Value {
-    if tool != HostTool::TaskOutput {
-        return crate::upstream::tool_value(tool.name());
+    match tool {
+        HostTool::TaskOutput => json!({
+            "name": tool.name(),
+            "description": "SDK extension: read a host-owned background task's status and output, optionally waiting up to timeout milliseconds.",
+            "input_schema": schema::<TaskOutputRequest>()
+        }),
+        HostTool::Agent => {
+            let mut definition = crate::upstream::tool_value(tool.name());
+            definition["input_schema"]["properties"]["model"]["enum"] =
+                schema::<AgentModel>()["enum"].clone();
+            definition
+        }
+        _ => crate::upstream::tool_value(tool.name()),
     }
-    json!({
-        "name": tool.name(),
-        "description": "SDK extension: read a host-owned background task's status and output, optionally waiting up to timeout milliseconds.",
-        "input_schema": schema::<TaskOutputRequest>()
-    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -368,6 +374,8 @@ pub enum AgentModel {
     Haiku,
 
     Fable,
+
+    Mythos,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
