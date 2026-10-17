@@ -344,6 +344,15 @@ pub trait LifecycleBackend: Send + Sync + 'static {
 
     fn append_developer_message(&self, text: String) -> BackendFuture<Result<AgentSessionContext>>;
 
+    fn append_developer_notice(
+        &self,
+        text: String,
+        _prefix: Option<String>,
+    ) -> BackendFuture<Result<bool>> {
+        let appended = self.append_developer_message(text);
+        Box::pin(async move { appended.await.map(|_| true) })
+    }
+
     fn context(&self) -> BackendFuture<Result<AgentSessionContext>>;
 
     fn checkpoint(&self) -> BackendFuture<Result<SessionCheckpoint>>;

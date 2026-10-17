@@ -79,6 +79,21 @@ impl WeakAgent {
         Some(backend.append_developer_message(text).await)
     }
 
+    pub async fn append_developer_notice(
+        &self,
+        text: impl Into<String>,
+        prefix: Option<String>,
+    ) -> Option<Result<bool>> {
+        let backend = self.backend.upgrade()?;
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Some(Err(NanocodexError::InvalidRequest(
+                "developer message must not be empty".to_owned(),
+            )));
+        }
+        Some(backend.append_developer_notice(text, prefix).await)
+    }
+
     pub async fn shutdown(&self) -> Option<Result<()>> {
         let backend = self.backend.upgrade()?;
         Some(backend.shutdown().await)

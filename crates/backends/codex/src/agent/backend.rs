@@ -340,7 +340,28 @@ impl LifecycleBackend for LocalLifecycle {
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
             request_command(&commands, &shutdown, |result| {
-                Command::AppendDeveloperMessage { text, result }
+                Command::AppendDeveloperMessage {
+                    text,
+                    result: super::turn::DeveloperMessageResult::Context(result),
+                }
+            })
+            .await
+        })
+    }
+
+    fn append_developer_notice(
+        &self,
+        text: String,
+        prefix: Option<String>,
+    ) -> BackendFuture<Result<bool>> {
+        let commands = self.commands.clone();
+        let shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            request_command(&commands, &shutdown, |result| {
+                Command::AppendDeveloperMessage {
+                    text,
+                    result: super::turn::DeveloperMessageResult::Notice { prefix, result },
+                }
             })
             .await
         })

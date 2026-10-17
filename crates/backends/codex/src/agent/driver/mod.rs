@@ -89,10 +89,8 @@ impl AgentDriver {
         let mut latest_fork_checkpoint = inherited_checkpoint;
         let mut queued_turns = VecDeque::new();
         let mut pending_compact = None;
-        let mut pending_developer_messages: Vec<(
-            String,
-            oneshot::Sender<Result<AgentSessionContext>>,
-        )> = Vec::new();
+        let mut pending_developer_messages: Vec<(String, super::turn::DeveloperMessageResult)> =
+            Vec::new();
         let mut developer_checkpoint_ready = true;
         let mut commands_open = true;
         let mut shutdown_failures = Vec::new();
@@ -299,6 +297,13 @@ impl AgentDriver {
                 if developer_checkpoint_ready && !pending_developer_messages.is_empty() {
                     let mut developer_messages = pending_developer_messages.drain(..);
                     while let Some((text, message_result)) = developer_messages.next() {
+                        if message_result
+                            .prefix()
+                            .is_some_and(|prefix| model.developer_notice_current(prefix, &text))
+                        {
+                            message_result.skip();
+                            continue;
+                        }
                         let committed = commit_developer_message(
                             &mut model,
                             &self.execution,
@@ -308,16 +313,12 @@ impl AgentDriver {
                             self.workspace.as_deref(),
                         )
                         .await;
-                        let message_outcome = match committed {
+                        let committed = match committed {
                             Ok(checkpoint) => {
                                 if let Some(checkpoint) = checkpoint {
                                     latest_fork_checkpoint = Some(checkpoint);
                                 }
-                                agent_session_context(
-                                    latest_fork_checkpoint.as_deref(),
-                                    self.workspace.as_deref(),
-                                    &self.spawner.context_source,
-                                )
+                                Ok(())
                             }
                             Err(error) => {
                                 model = model_from_checkpoint(
@@ -331,8 +332,14 @@ impl AgentDriver {
                                 Err(error)
                             }
                         };
-                        let message_reopens = outcome_requires_reopen(&message_outcome);
-                        drop(message_result.send(message_outcome));
+                        let message_reopens =
+                            complete_developer_message(message_result, committed, || {
+                                agent_session_context(
+                                    latest_fork_checkpoint.as_deref(),
+                                    self.workspace.as_deref(),
+                                    &self.spawner.context_source,
+                                )
+                            });
                         if message_reopens {
                             begin_shutdown(
                                 &mut self.commands,
@@ -343,7 +350,7 @@ impl AgentDriver {
                             .await;
                             commands_open = false;
                             for (_, pending_result) in developer_messages {
-                                drop(pending_result.send(Err(NanocodexError::AgentStopped)));
+                                pending_result.fail(NanocodexError::AgentStopped);
                             }
                             break;
                         }
@@ -475,7 +482,14 @@ impl AgentDriver {
                         pending_developer_messages.push((text, result));
                         continue;
                     }
-                    let outcome =
+                    if result
+                        .prefix()
+                        .is_some_and(|prefix| model.developer_notice_current(prefix, &text))
+                    {
+                        result.skip();
+                        continue;
+                    }
+                    let committed =
                         match model.append_developer_message(text, self.workspace.as_deref()) {
                             Ok(snapshot) => {
                                 let checkpoint = Arc::new(CommittedSession::new(
@@ -488,11 +502,7 @@ impl AgentDriver {
                                 match self.execution.commit_checkpoint(&checkpoint).await {
                                     Ok(()) => {
                                         latest_fork_checkpoint = Some(checkpoint);
-                                        agent_session_context(
-                                            latest_fork_checkpoint.as_deref(),
-                                            self.workspace.as_deref(),
-                                            &self.spawner.context_source,
-                                        )
+                                        Ok(())
                                     }
                                     Err(error) => {
                                         model = model_from_checkpoint(
@@ -509,8 +519,13 @@ impl AgentDriver {
                             }
                             Err(error) => Err(error),
                         };
-                    let reopen = outcome_requires_reopen(&outcome);
-                    drop(result.send(outcome));
+                    let reopen = complete_developer_message(result, committed, || {
+                        agent_session_context(
+                            latest_fork_checkpoint.as_deref(),
+                            self.workspace.as_deref(),
+                            &self.spawner.context_source,
+                        )
+                    });
                     if reopen {
                         begin_shutdown(
                             &mut self.commands,
@@ -1072,10 +1087,8 @@ impl AgentDriver {
                     if !developer_checkpoint_ready && let Err(error) = &outcome {
                         let detail = error.to_string();
                         for (_, message_result) in pending_developer_messages.drain(..) {
-                            drop(message_result.send(Err(
-                                NanocodexError::InvalidExecutionPolicy(format!(
-                                    "developer message was not committed because the preceding compaction failed: {detail}"
-                                )),
+                            message_result.fail(NanocodexError::InvalidExecutionPolicy(format!(
+                                "developer message was not committed because the preceding compaction failed: {detail}"
                             )));
                         }
                     }
@@ -1964,7 +1977,7 @@ impl AgentDriver {
             drop(result.send(outcome));
             if reopen_after_turn {
                 for (_, message_result) in pending_developer_messages.drain(..) {
-                    drop(message_result.send(Err(NanocodexError::AgentStopped)));
+                    message_result.fail(NanocodexError::AgentStopped);
                 }
             }
             developer_checkpoint_ready =
@@ -2005,6 +2018,27 @@ fn duplicate_policy_error(error: &NanocodexError) -> NanocodexError {
             source: Arc::clone(source),
         },
         error => NanocodexError::InvalidExecutionPolicy(error.to_string()),
+    }
+}
+
+fn complete_developer_message(
+    result: super::turn::DeveloperMessageResult,
+    committed: Result<()>,
+    context: impl FnOnce() -> Result<AgentSessionContext>,
+) -> bool {
+    match result {
+        super::turn::DeveloperMessageResult::Context(result) => {
+            let outcome = committed.and_then(|()| context());
+            let reopen = outcome_requires_reopen(&outcome);
+            drop(result.send(outcome));
+            reopen
+        }
+        super::turn::DeveloperMessageResult::Notice { result, .. } => {
+            let outcome = committed.map(|()| true);
+            let reopen = outcome_requires_reopen(&outcome);
+            drop(result.send(outcome));
+            reopen
+        }
     }
 }
 

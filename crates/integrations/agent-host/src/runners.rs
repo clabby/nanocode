@@ -14,6 +14,8 @@ pub(crate) struct RunnerAgents {
     initialized: tokio::sync::OnceCell<Result<(), AttachmentError>>,
 }
 
+const NOTICE_PREFIX: &str = "Runner ";
+
 struct RunnerAgentState {
     code_mode_hosts: HashMap<String, bool>,
     events: Option<mpsc::UnboundedReceiver<RunnerEvent>>,
@@ -26,6 +28,7 @@ struct RunnerAgentState {
 
 struct Notice {
     text: String,
+    prefix: Option<String>,
     completed: Option<oneshot::Sender<nanocode_agent_core::Result<()>>>,
 }
 
@@ -170,6 +173,7 @@ impl RunnerAgents {
                 && notices
                     .send(Notice {
                         text: notice.clone(),
+                        prefix: None,
                         completed: None,
                     })
                     .is_ok()
@@ -277,6 +281,7 @@ impl RunnerAgents {
                 notices
                     .send(Notice {
                         text: summary,
+                        prefix: Some(NOTICE_PREFIX.to_owned()),
                         completed: awaited.then_some(completed),
                     })
                     .map_err(|_| crate::NanocodexError::AgentStopped)?;
@@ -288,7 +293,7 @@ impl RunnerAgents {
         tokio::spawn(async move {
             while let Some(notice) = receiver.recv().await {
                 let outcome = worker
-                    .append_developer_message(notice.text)
+                    .append_developer_notice(notice.text, notice.prefix)
                     .await
                     .unwrap_or(Err(crate::NanocodexError::AgentStopped))
                     .map(|_| ());

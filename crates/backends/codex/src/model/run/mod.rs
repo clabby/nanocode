@@ -414,6 +414,32 @@ impl ModelRun {
         }
     }
 
+    pub(crate) fn developer_notice_current(&self, prefix: &str, text: &str) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .conversation
+                    .managed
+                    .history()
+                    .filter_map(|item| match item {
+                        ResponseItem::Message {
+                            role: MessageRole::Developer,
+                            content,
+                            ..
+                        } => match content.as_slice() {
+                            [ContentItem::InputText { text }] if text.starts_with(prefix) => {
+                                Some(text)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .last()
+            })
+            .is_some_and(|latest| latest.ends_with(text))
+    }
+
     pub(crate) fn append_developer_message(
         &mut self,
         text: String,

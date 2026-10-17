@@ -128,6 +128,13 @@ impl LifecycleBackend for Owned {
     ) -> BackendFuture<Result<crate::AgentSessionContext>> {
         self.inner.append_developer_message(text)
     }
+    fn append_developer_notice(
+        &self,
+        text: String,
+        prefix: Option<String>,
+    ) -> BackendFuture<Result<bool>> {
+        self.inner.append_developer_notice(text, prefix)
+    }
     fn context(&self) -> BackendFuture<Result<crate::AgentSessionContext>> {
         self.inner.context()
     }

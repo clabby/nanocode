@@ -90,7 +90,7 @@ pub(super) enum Command {
     },
     AppendDeveloperMessage {
         text: String,
-        result: oneshot::Sender<Result<AgentSessionContext>>,
+        result: DeveloperMessageResult,
     },
     Context {
         result: oneshot::Sender<Result<AgentSessionContext>>,
@@ -100,6 +100,36 @@ pub(super) enum Command {
         result: oneshot::Sender<Result<nanocode_agent_core::SideAnswer>>,
     },
     Shutdown,
+}
+
+pub(super) enum DeveloperMessageResult {
+    Context(oneshot::Sender<Result<AgentSessionContext>>),
+    Notice {
+        prefix: Option<String>,
+        result: oneshot::Sender<Result<bool>>,
+    },
+}
+
+impl DeveloperMessageResult {
+    pub(super) fn prefix(&self) -> Option<&str> {
+        match self {
+            Self::Context(_) => None,
+            Self::Notice { prefix, .. } => prefix.as_deref(),
+        }
+    }
+
+    pub(super) fn fail(self, error: NanocodexError) {
+        match self {
+            Self::Context(result) => drop(result.send(Err(error))),
+            Self::Notice { result, .. } => drop(result.send(Err(error))),
+        }
+    }
+
+    pub(super) fn skip(self) {
+        if let Self::Notice { result, .. } = self {
+            drop(result.send(Ok(false)));
+        }
+    }
 }
 
 pub(super) enum ForkFrom {
