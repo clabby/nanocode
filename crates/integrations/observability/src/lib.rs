@@ -280,12 +280,12 @@ impl ObservabilityBuilder {
 
 fn tracer_provider(
     endpoint: Option<&str>,
-    file: Option<file::TraceExporter>,
+    file: Option<file::TraceProcessor>,
     resource: Resource,
 ) -> Result<SdkTracerProvider, ObservabilityError> {
     let mut builder = SdkTracerProvider::builder().with_resource(resource);
     if let Some(file) = file {
-        builder = builder.with_simple_exporter(file);
+        builder = builder.with_span_processor(file);
     }
     if let Some(endpoint) = endpoint {
         let exporter = SpanExporter::builder()
