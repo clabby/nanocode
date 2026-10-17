@@ -20,9 +20,35 @@ pub struct RemoteContext {
     pub turn_id: Option<String>,
     #[serde(skip)]
     pub history: Arc<Vec<nanocode_types_core::responses::ResponseItem>>,
+    #[serde(
+        serialize_with = "serialize_output_budget",
+        deserialize_with = "deserialize_output_budget"
+    )]
     pub output_token_budget: usize,
     pub instruction_revision: Option<u64>,
     pub host_context: Option<String>,
+}
+
+fn serialize_output_budget<S: serde::Serializer>(
+    value: &usize,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(if *value == usize::MAX {
+        u64::MAX
+    } else {
+        *value as u64
+    })
+}
+
+fn deserialize_output_budget<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<usize, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if value == u64::MAX {
+        Ok(usize::MAX)
+    } else {
+        usize::try_from(value).map_err(serde::de::Error::custom)
+    }
 }
 
 impl RemoteContext {
