@@ -15,6 +15,7 @@ description = "SQLite state store for Nanocodex durability"
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 nanocode-durability-core.workspace = true
 rusqlite.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true

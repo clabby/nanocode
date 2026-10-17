@@ -19,7 +19,7 @@ async fn run() -> support::Result<()> {
     } else {
         args.join(" ")
     };
-    let runtime = agents::runtime(support::tools()?)?.build()?;
+    let runtime = agents::runtime(support::tools()?)?.build_async().await?;
     let outcome: support::Result<()> = async {
         for backend in ["claude", "codex"] {
             let (agent, mut events) = agents::spawn(&runtime, backend).await?;

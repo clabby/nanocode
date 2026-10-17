@@ -243,6 +243,10 @@ pub trait StateStore: Send {
         payload: &'a str,
         records: &'a [crate::StoreRecord],
     ) -> StoreFuture<'a, Result<u64, StoreError>>;
+
+    fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -326,4 +330,8 @@ pub trait StateStore {
         payload: &'a str,
         records: &'a [crate::StoreRecord],
     ) -> StoreFuture<'a, Result<u64, StoreError>>;
+
+    fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
 }

@@ -28,6 +28,7 @@
 - Do not add tests or test-only dependencies. Validate changes with focused native and WASM builds and reproducible runtime measurements.
 - Benchmark performance changes with reproducible commands, inputs, and before/after results. Separate cold builds, incremental builds, and runtime performance.
 - [Principles for fast Tokio applications](https://dial9-rs.github.io/blog/principles-for-fast-tokio-applications/)
+- Keep blocking native storage work behind an owning worker and asynchronous message/response channels. Batch complete transactions there, including file-lock waits, index refresh, serialization and disk sync. Async SDK construction and shutdown must await their completion without running filesystem work or joining worker threads on Tokio workers. Preserve synchronous compatibility entry points and durable acknowledgements.
 - [Fast Rust Builds](https://matklad.github.io/2021/09/04/fast-rust-builds.html)
 - Keep logs, traces, and benchmark artifacts in ignored output/. Never commit credentials or personal test data.
 - Prefer simple code and small changes. Preserve unrelated work. Use subagents only when explicitly requested.

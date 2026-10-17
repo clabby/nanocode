@@ -208,6 +208,26 @@ impl<B, D: RuntimeDefaults> RuntimeBuilder<B, D> {
         let inner = assemble(self.data, preferred, services)?;
         Ok(Runtime { inner, host })
     }
+
+    pub async fn build_async(self) -> Result<Runtime<D>>
+    where
+        B: 'static,
+    {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let runtime = tokio::runtime::Handle::try_current()
+                .map_err(|_| NanocodexError::TokioRuntimeUnavailable)?;
+            let span = tracing::Span::current();
+            runtime
+                .spawn_blocking(move || span.in_scope(|| self.build()))
+                .await
+                .map_err(|error| NanocodexError::backend("runtime construction", error))?
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            self.build()
+        }
+    }
 }
 
 fn assemble(
@@ -929,8 +949,13 @@ impl AgentRuntime {
         self.inner.services.close();
         let host_result = self.inner.services.shutdown().await;
         let ownership_result = self.inner.ownership.shutdown().await;
+        let store_result = match &self.inner.durability {
+            Some(store) => store.flush().await.map_err(catalog_error),
+            None => Ok(()),
+        };
         host_result?;
-        ownership_result
+        ownership_result?;
+        store_result
     }
 
     async fn construct(&self, spec: AgentSpec) -> AgentResult {

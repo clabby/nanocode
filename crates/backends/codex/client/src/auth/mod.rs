@@ -258,26 +258,28 @@ impl From<&str> for OpenAiAuth {
 #[cfg(not(target_family = "wasm"))]
 #[derive(Default)]
 struct CodexHomeAuth {
-    loaded: std::sync::Mutex<Option<OpenAiAuth>>,
+    loaded: tokio::sync::OnceCell<OpenAiAuth>,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl CodexHomeAuth {
-    fn load(&self) -> Result<OpenAiAuth, OpenAiAuthError> {
-        let mut loaded = self
-            .loaded
-            .lock()
-            .map_err(|_| OpenAiAuthError::Unavailable(Arc::from("Codex login cache poisoned")))?;
-        if let Some(auth) = &*loaded {
-            return Ok(auth.clone());
-        }
-        let home = nanocode_home::AgentHome::from_env()
-            .map_err(|error| OpenAiAuthError::Unavailable(Arc::from(error.to_string())))?;
-        let auth = load_chatgpt_auth(home.codex_home().join("auth.json")).map_err(|error| {
-            OpenAiAuthError::LoginRequired(Arc::from(format!("{error}; run `codex login`")))
-        })?;
-        *loaded = Some(auth.clone());
-        Ok(auth)
+    async fn load(&self) -> Result<&OpenAiAuth, OpenAiAuthError> {
+        self.loaded
+            .get_or_try_init(|| async {
+                tokio::task::spawn_blocking(|| {
+                    let home = nanocode_home::AgentHome::from_env().map_err(|error| {
+                        OpenAiAuthError::Unavailable(Arc::from(error.to_string()))
+                    })?;
+                    load_chatgpt_auth(home.codex_home().join("auth.json")).map_err(|error| {
+                        OpenAiAuthError::LoginRequired(Arc::from(format!(
+                            "{error}; run `codex login`"
+                        )))
+                    })
+                })
+                .await
+                .map_err(|error| OpenAiAuthError::Unavailable(Arc::from(error.to_string())))?
+            })
+            .await
     }
 }
 
@@ -288,7 +290,7 @@ impl OpenAiAuthSource for CodexHomeAuth {
     }
 
     fn snapshot(&self) -> OpenAiAuthFuture<'_, Result<OpenAiAuthSnapshot, OpenAiAuthError>> {
-        Box::pin(async move { self.load()?.snapshot().await })
+        Box::pin(async move { self.load().await?.snapshot().await })
     }
 
     fn recover_unauthorized(
@@ -296,7 +298,7 @@ impl OpenAiAuthSource for CodexHomeAuth {
         rejected: &OpenAiAuthSnapshot,
     ) -> OpenAiAuthFuture<'_, Result<(), OpenAiAuthError>> {
         let rejected = rejected.clone();
-        Box::pin(async move { self.load()?.recover_unauthorized(&rejected).await })
+        Box::pin(async move { self.load().await?.recover_unauthorized(&rejected).await })
     }
 }
 

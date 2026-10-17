@@ -196,10 +196,7 @@ async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Pre
     let store = if args.ephemeral {
         None
     } else {
-        Some({
-            let home = home.clone();
-            tokio::task::spawn_blocking(move || host::open_store(&home)).await??
-        })
+        Some(host::open_store(&home).await?)
     };
     let (runners, runner_servers) = host::runner_configs(&args.remote)?;
     let config = HostConfig {
@@ -210,8 +207,11 @@ async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Pre
         runner_servers,
         gateway,
     };
-    let host = tracing::info_span!(target: "nanocodex", "nc.host.build")
-        .in_scope(|| Host::build(config, &model, thinking))?;
+    let host = tracing::Instrument::instrument(
+        Host::build(config, &model, thinking),
+        tracing::info_span!(target: "nanocodex", "nc.host.build"),
+    )
+    .await?;
     tracing::Instrument::instrument(
         host.runtime.initialize_runners(),
         tracing::info_span!(target: "nanocodex", "nc.runners.initialize"),
@@ -396,7 +396,7 @@ async fn exec(args: SessionArgs) -> Result<()> {
 
 async fn list_sessions(args: SessionsArgs) -> Result<()> {
     let home = host::home_dir(args.home.as_deref())?;
-    let store = host::open_store(&home)?;
+    let store = host::open_store(&home).await?;
     let workspace = std::env::current_dir()?;
     for session in store.list().await? {
         let record = &session.record;
@@ -414,6 +414,7 @@ async fn list_sessions(args: SessionsArgs) -> Result<()> {
             sessions::title(&session)
         );
     }
+    store.flush().await?;
     Ok(())
 }
 

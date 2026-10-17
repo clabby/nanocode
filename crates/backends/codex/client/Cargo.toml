@@ -36,6 +36,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+arc-swap.workspace = true
 getrandom.workspace = true
 nanocode-tls.workspace = true
 reqwest.workspace = true

@@ -18,10 +18,11 @@ async fn run() -> support::Result<()> {
     if args.len() < 5 {
         return Err("expected BACKEND STORE SESSION|- REQUEST_ID PROMPT...; use --help".into());
     }
-    let store = nanocode::session_store(JsonlStore::open(&args[1])?)?;
+    let store = nanocode::session_store(JsonlStore::open_async(&args[1]).await?)?;
     let runtime = agents::runtime(support::tools()?)?
         .durability(store.clone())
-        .build()?;
+        .build_async()
+        .await?;
     let outcome: support::Result<()> = async {
         let (agent, mut events) = if args[2] == "-" {
             agents::spawn(&runtime, &args[0]).await?

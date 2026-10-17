@@ -186,16 +186,20 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn build(config: HostConfig, model: &ModelSelection, thinking: Thinking) -> Result<Self> {
+    pub async fn build(
+        config: HostConfig,
+        model: &ModelSelection,
+        thinking: Thinking,
+    ) -> Result<Self> {
         let openai = match &config.gateway {
             Some(gateway) => {
                 gateway.check(model)?;
-                OpenAi::builder(gateway.auth.clone())
-                    .responses_gateway(gateway.route.clone())
-                    .build()?
+                OpenAi::builder(gateway.auth.clone()).responses_gateway(gateway.route.clone())
             }
-            None => OpenAi::default(),
-        };
+            None => OpenAi::builder(nanocode::codex::OpenAiAuth::codex_home()),
+        }
+        .raw_api_events(false)
+        .build()?;
         let codex = CodexHarness::new(openai);
         let claude = ClaudeHarness::new(ClaudeClient::default());
         let mut builder = Nanocodex::builder()
@@ -216,16 +220,22 @@ impl Host {
             builder = builder.without_subagents();
         }
         let builder = match (model.as_codex(), model.as_claude()) {
-            (Some(model), _) => builder
-                .for_backend::<Codex>()
-                .model(model)
-                .thinking(thinking)
-                .build(),
-            (_, Some(model)) => builder
-                .for_backend::<Claude>()
-                .model(model)
-                .thinking(thinking)
-                .build(),
+            (Some(model), _) => {
+                builder
+                    .for_backend::<Codex>()
+                    .model(model)
+                    .thinking(thinking)
+                    .build_async()
+                    .await
+            }
+            (_, Some(model)) => {
+                builder
+                    .for_backend::<Claude>()
+                    .model(model)
+                    .thinking(thinking)
+                    .build_async()
+                    .await
+            }
             _ => return Err(format!("unsupported model {model}").into()),
         };
         Ok(Self {
@@ -315,8 +325,8 @@ pub fn home_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(home.codex_home().join("nanocode"))
 }
 
-pub fn open_store(home: &Path) -> Result<SessionStore> {
-    let store = nanocode_store_jsonl::JsonlStore::open_home(home)?;
+pub async fn open_store(home: &Path) -> Result<SessionStore> {
+    let store = nanocode_store_jsonl::JsonlStore::open_home_async(home).await?;
     Ok(nanocode::session_store(store)?)
 }
 

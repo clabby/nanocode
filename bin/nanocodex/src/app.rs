@@ -1190,7 +1190,7 @@ impl App {
                             generation,
                             control: turn.control(),
                         }));
-                        let result = turn.await.map_err(|error| error.to_string());
+                        let result = turn.result().await.map_err(|error| error.to_string());
                         drop(tx.send(AppEvent::TurnFinished { generation, result }));
                     }
                     Err(error) => {
@@ -1285,7 +1285,7 @@ impl App {
                             id,
                             control: turn.control(),
                         }));
-                        let result = turn.await.map_err(|error| error.to_string());
+                        let result = turn.result().await.map_err(|error| error.to_string());
                         drop(tx.send(AppEvent::TurnFinished { generation, result }));
                     }
                     Err(error) => drop(tx.send(AppEvent::SteerSent {

@@ -166,20 +166,20 @@ Examples:
         }
     }
 
-    fn store(args: &Args) -> Result<SessionStore> {
+    async fn store(args: &Args) -> Result<SessionStore> {
         let store = match &args.store {
             Some(path) => {
                 if let Some(parent) = path
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
                 {
-                    std::fs::create_dir_all(parent)?;
+                    tokio::fs::create_dir_all(parent).await?;
                 }
-                JsonlStore::open(path)?
+                JsonlStore::open_async(path).await?
             }
             None => {
                 let home = nanocode_home::AgentHome::from_env()?;
-                JsonlStore::open_home(&home.codex_home().join("nanocode"))?
+                JsonlStore::open_home_async(&home.codex_home().join("nanocode")).await?
             }
         };
         Ok(nanocode::session_store(store)?)
@@ -256,7 +256,7 @@ Examples:
             .unwrap_or("low")
             .parse::<Thinking>()?;
         let host = remote(&args).await?;
-        let store = store(&args)?;
+        let store = store(&args).await?;
         let tools = Tools::builder().without_defaults().build()?;
         if tools.workspace_enabled()
             || tools.web_search_enabled()
@@ -276,9 +276,17 @@ Examples:
             builder = builder.code_mode_host(host)?;
         }
         let runtime = if let Some(model) = model.as_codex() {
-            builder.for_backend::<Codex>().model(model).build()?
+            builder
+                .for_backend::<Codex>()
+                .model(model)
+                .build_async()
+                .await?
         } else if let Some(model) = model.as_claude() {
-            builder.for_backend::<Claude>().model(model).build()?
+            builder
+                .for_backend::<Claude>()
+                .model(model)
+                .build_async()
+                .await?
         } else {
             return Err("select a built-in Codex or Claude model".into());
         };

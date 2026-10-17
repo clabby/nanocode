@@ -351,7 +351,11 @@ impl App {
             match agent.prompt(sent.as_str()).await {
                 Ok(turn) => {
                     send(SideUpdate::Started(turn.control()));
-                    let result = turn.await.map(drop).map_err(|error| error.to_string());
+                    let result = turn
+                        .result()
+                        .await
+                        .map(drop)
+                        .map_err(|error| error.to_string());
                     send(SideUpdate::Finished(result));
                 }
                 Err(error) => send(SideUpdate::PromptFailed(error.to_string())),

@@ -4,7 +4,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::UNIX_EPOCH,
 };
 
@@ -12,6 +12,7 @@ use super::{
     OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
     OpenAiAuthSource,
 };
+use arc_swap::ArcSwap;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -21,6 +22,7 @@ use tokio::{
     sync::Mutex,
     time::{Duration, timeout},
 };
+use tracing::Instrument;
 use url::Url;
 
 const AUTH_ISSUER: &str = "https://auth.openai.com";
@@ -189,9 +191,13 @@ impl ChatGptLogin {
             &self.code_verifier,
         )
         .await?;
-        let _lock = lock_auth_file(&self.auth_file).await?;
-        write_store(&self.auth_file, &credentials)?;
-        Ok(credentials.status())
+        let status = credentials.status();
+        run_blocking(self.auth_file.clone(), move |path| {
+            let _lock = lock_auth_file(path)?;
+            write_store(path, &credentials)
+        })
+        .await?;
+        Ok(status)
     }
 }
 
@@ -234,21 +240,17 @@ pub fn load_chatgpt_auth(auth_file: impl Into<PathBuf>) -> Result<OpenAiAuth, Ch
     if let Some(access_token) = personal_access_token_from_document(&document, &auth_file)? {
         return chatgpt_access_token(access_token);
     }
-    let (credentials, auth_record) = read_stored_auth(&auth_file)?;
-    credentials.validate(&auth_file)?;
-    let manager = ManagedChatGptAuth {
+    let credentials = StoredCredentials::from_document(&document, &auth_file)?;
+    let manager = ManagedAuthInner {
         auth_file,
         issuer: Arc::from(AUTH_ISSUER),
         client: auth_client()?,
-        state: RwLock::new(ManagedState {
-            credentials,
-            auth_record,
-            revision: 0,
-            permanent_failure: None,
-        }),
+        state: ArcSwap::from_pointee(ManagedState::new(credentials, document, 0)),
         refresh: Mutex::new(()),
     };
-    Ok(OpenAiAuth::managed_chatgpt(Arc::new(manager)))
+    Ok(OpenAiAuth::managed_chatgpt(Arc::new(ManagedChatGptAuth {
+        inner: Arc::new(manager),
+    })))
 }
 
 pub fn chatgpt_access_token(
@@ -261,7 +263,7 @@ pub async fn resolve_chatgpt_auth_status(
     auth_file: impl AsRef<Path>,
 ) -> Result<ChatGptAuthStatus, ChatGptAuthError> {
     let auth_file = auth_file.as_ref();
-    let document = read_document(auth_file)?;
+    let document = run_blocking(auth_file.to_path_buf(), read_document).await?;
     if let Some(access_token) = personal_access_token_from_document(&document, auth_file)? {
         return hydrate_personal_access_token(
             &auth_client()?,
@@ -436,23 +438,70 @@ struct CodexTokenData {
 }
 
 struct ManagedChatGptAuth {
+    inner: Arc<ManagedAuthInner>,
+}
+
+struct ManagedAuthInner {
     auth_file: PathBuf,
     issuer: Arc<str>,
     client: reqwest::Client,
-    state: RwLock<ManagedState>,
+    state: ArcSwap<ManagedState>,
     refresh: Mutex<()>,
 }
 
+enum CurrentSnapshot {
+    Fresh(OpenAiAuthSnapshot),
+    Stale(u64),
+}
+
+#[derive(Clone)]
 struct ManagedState {
     credentials: StoredCredentials,
     auth_record: CodexAuthDocument,
-    revision: u64,
-    permanent_failure: Option<AuthScopedRefreshFailure>,
+    snapshot: OpenAiAuthSnapshot,
+    expires_at: Option<i64>,
+    permanent_failure: Option<Arc<str>>,
 }
 
-struct AuthScopedRefreshFailure {
-    auth_record: CodexAuthDocument,
-    detail: Arc<str>,
+impl ManagedState {
+    fn new(credentials: StoredCredentials, auth_record: CodexAuthDocument, revision: u64) -> Self {
+        let snapshot = OpenAiAuthSnapshot::new(
+            OpenAiAuthMode::ChatGpt,
+            Arc::<str>::from(credentials.access_token.as_str()),
+            Some(Arc::<str>::from(credentials.account_id.as_str())),
+            credentials.fedramp,
+            revision,
+        );
+        Self {
+            expires_at: jwt_expiration(&credentials.access_token),
+            credentials,
+            auth_record,
+            snapshot,
+            permanent_failure: None,
+        }
+    }
+
+    fn next(&self, credentials: StoredCredentials, auth_record: CodexAuthDocument) -> Self {
+        Self::new(
+            credentials,
+            auth_record,
+            self.snapshot.revision().wrapping_add(1),
+        )
+    }
+
+    fn needs_refresh(&self) -> bool {
+        self.permanent_failure.is_some()
+            || self
+                .expires_at
+                .is_some_and(|expiry| expiry <= unix_now() + REFRESH_EARLY_SECONDS)
+    }
+
+    fn checked_snapshot(&self) -> Result<OpenAiAuthSnapshot, OpenAiAuthError> {
+        match &self.permanent_failure {
+            Some(detail) => Err(OpenAiAuthError::LoginRequired(Arc::clone(detail))),
+            None => Ok(self.snapshot.clone()),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -625,61 +674,56 @@ fn auth_api_base_url() -> String {
 }
 
 impl ManagedChatGptAuth {
-    fn state(&self) -> Result<std::sync::RwLockReadGuard<'_, ManagedState>, OpenAiAuthError> {
-        self.state
-            .read()
-            .map_err(|_| OpenAiAuthError::Unavailable(Arc::from("authorization state poisoned")))
-    }
-
-    fn snapshot_from_state(state: &ManagedState) -> OpenAiAuthSnapshot {
-        OpenAiAuthSnapshot::new(
-            OpenAiAuthMode::ChatGpt,
-            Arc::<str>::from(state.credentials.access_token.as_str()),
-            Some(Arc::<str>::from(state.credentials.account_id.as_str())),
-            state.credentials.fedramp,
-            state.revision,
-        )
-    }
-
-    fn snapshot_unchecked(&self) -> Result<OpenAiAuthSnapshot, OpenAiAuthError> {
-        let state = self.state()?;
-        Ok(Self::snapshot_from_state(&state))
-    }
-
-    fn snapshot_now(&self) -> Result<OpenAiAuthSnapshot, OpenAiAuthError> {
-        let state = self.state()?;
-        if let Some(failure) = &state.permanent_failure
-            && failure.auth_record == state.auth_record
-        {
-            return Err(OpenAiAuthError::LoginRequired(Arc::clone(&failure.detail)));
-        }
-        Ok(Self::snapshot_from_state(&state))
-    }
-
     async fn refresh_if_current(&self, rejected_revision: u64) -> Result<(), OpenAiAuthError> {
-        let _refresh = self.refresh.lock().await;
-        if self.state()?.revision != rejected_revision {
+        if self.inner.state().snapshot.revision() != rejected_revision {
             return Ok(());
         }
-        let _lock = lock_auth_file(&self.auth_file)
+        let refresh = Arc::clone(&self.inner).refresh_if_current(rejected_revision);
+        tokio::spawn(refresh.in_current_span())
             .await
-            .map_err(|error| auth_store_error(&error))?;
-        if self.reload_if_changed()? {
+            .map_err(|error| OpenAiAuthError::Unavailable(Arc::from(error.to_string())))?
+    }
+}
+
+impl ManagedAuthInner {
+    fn state(&self) -> Arc<ManagedState> {
+        self.state.load_full()
+    }
+
+    fn current(&self) -> CurrentSnapshot {
+        let state = self.state.load();
+        if state.needs_refresh() {
+            CurrentSnapshot::Stale(state.snapshot.revision())
+        } else {
+            CurrentSnapshot::Fresh(state.snapshot.clone())
+        }
+    }
+
+    fn replace_state(&self, next: ManagedState) {
+        self.state.store(Arc::new(next));
+    }
+
+    async fn refresh_if_current(
+        self: Arc<Self>,
+        rejected_revision: u64,
+    ) -> Result<(), OpenAiAuthError> {
+        let _refresh = self.refresh.lock().await;
+        if self.state().snapshot.revision() != rejected_revision {
+            return Ok(());
+        }
+        let (lock, stored) = run_blocking(self.auth_file.clone(), |path| {
+            let lock = lock_auth_file(path)?;
+            Ok((lock, read_stored_auth(path)?))
+        })
+        .await
+        .map_err(|error| auth_store_error(&error))?;
+        if self.reload_if_changed(stored)? {
             return Ok(());
         }
 
-        let (refresh_token, attempted_auth_record) = {
-            let state = self.state()?;
-            if let Some(failure) = &state.permanent_failure
-                && failure.auth_record == state.auth_record
-            {
-                return Err(OpenAiAuthError::LoginRequired(Arc::clone(&failure.detail)));
-            }
-            (
-                state.credentials.refresh_token.clone(),
-                state.auth_record.clone(),
-            )
-        };
+        let attempted = self.state();
+        attempted.checked_snapshot()?;
+        let refresh_token = attempted.credentials.refresh_token.clone();
         let response = self
             .client
             .post(format!("{}/oauth/token", self.issuer.trim_end_matches('/')))
@@ -710,13 +754,13 @@ impl ManagedChatGptAuth {
             let detail: Arc<str> =
                 Arc::from(code.unwrap_or_else(|| format!("token endpoint returned HTTP {status}")));
             if permanent {
-                if self.reload_if_changed()? {
+                let (_lock, stored) = read_stored_auth_locked(lock, self.auth_file.clone())
+                    .await
+                    .map_err(|error| auth_store_error(&error))?;
+                if self.reload_if_changed(stored)? {
                     return Ok(());
                 }
-                if self.record_permanent_failure_if_unchanged(
-                    &attempted_auth_record,
-                    Arc::clone(&detail),
-                )? {
+                if self.record_permanent_failure_if_unchanged(&attempted, Arc::clone(&detail))? {
                     return Err(OpenAiAuthError::LoginRequired(detail));
                 }
                 return Ok(());
@@ -725,115 +769,102 @@ impl ManagedChatGptAuth {
         }
         let refreshed: RefreshResponse = serde_json::from_slice(&body)
             .map_err(|error| OpenAiAuthError::Refresh(Arc::from(error.to_string())))?;
-        if self.reload_if_changed()? {
+        let (lock, stored) = read_stored_auth_locked(lock, self.auth_file.clone())
+            .await
+            .map_err(|error| auth_store_error(&error))?;
+        if self.reload_if_changed(stored)? {
             return Ok(());
         }
-        self.apply_refresh(refreshed)
+        let current = self.state();
+        let next = refreshed_credentials(&current.credentials, refreshed)?;
+        let saved = next.clone();
+        let auth_record = run_blocking(self.auth_file.clone(), move |path| {
+            let auth_record = write_store(path, &saved);
+            drop(lock);
+            auth_record
+        })
+        .await
+        .map_err(|error| auth_store_error(&error))?;
+        self.replace_state(current.next(next, auth_record));
+        Ok(())
     }
 
-    fn reload_if_changed(&self) -> Result<bool, OpenAiAuthError> {
-        let (stored, auth_record) =
-            read_stored_auth(&self.auth_file).map_err(|error| auth_store_error(&error))?;
-        stored
-            .validate(&self.auth_file)
-            .map_err(|error| auth_store_error(&error))?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| OpenAiAuthError::Unavailable(Arc::from("authorization state poisoned")))?;
+    fn reload_if_changed(
+        &self,
+        (stored, auth_record): (StoredCredentials, CodexAuthDocument),
+    ) -> Result<bool, OpenAiAuthError> {
+        let state = self.state();
         if stored.account_id != state.credentials.account_id {
             return Err(OpenAiAuthError::AccountChanged);
         }
         if auth_record == state.auth_record {
             return Ok(false);
         }
-        state.credentials = stored;
-        state.auth_record = auth_record;
-        state.revision = state.revision.wrapping_add(1);
-        state.permanent_failure = None;
+        self.replace_state(state.next(stored, auth_record));
         Ok(true)
     }
 
     fn record_permanent_failure_if_unchanged(
         &self,
-        attempted_auth_record: &CodexAuthDocument,
+        attempted: &ManagedState,
         detail: Arc<str>,
     ) -> Result<bool, OpenAiAuthError> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| OpenAiAuthError::Unavailable(Arc::from("authorization state poisoned")))?;
-        if state.auth_record != *attempted_auth_record {
+        let state = self.state();
+        if state.auth_record != attempted.auth_record {
             return Ok(false);
         }
-        state.permanent_failure = Some(AuthScopedRefreshFailure {
-            auth_record: attempted_auth_record.clone(),
-            detail,
-        });
+        let mut failed = ManagedState::clone(&state);
+        failed.permanent_failure = Some(detail);
+        self.replace_state(failed);
         Ok(true)
     }
+}
 
-    fn apply_refresh(&self, refreshed: RefreshResponse) -> Result<(), OpenAiAuthError> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| OpenAiAuthError::Unavailable(Arc::from("authorization state poisoned")))?;
-        let mut next = state.credentials.clone();
-        if let Some(access_token) = refreshed.access {
-            next.access_token = access_token;
-        }
-        if let Some(refresh_token) = refreshed.refresh {
-            next.refresh_token = refresh_token;
-        }
-        if let Some(id_token) = refreshed.id {
-            let claims: IdClaims = decode_jwt(&id_token)
-                .map_err(|error| OpenAiAuthError::Refresh(Arc::from(error.to_string())))?;
-            let auth = claims.auth.unwrap_or_default();
-            if let Some(account_id) = auth.account_id
-                && account_id != next.account_id
-            {
-                return Err(OpenAiAuthError::AccountChanged);
-            }
-            next.id_token = id_token;
-            next.email = claims
-                .email
-                .or_else(|| claims.profile.and_then(|profile| profile.email));
-            next.plan = auth.plan;
-            next.fedramp = auth.fedramp;
-        }
-        let auth_record =
-            write_store(&self.auth_file, &next).map_err(|error| auth_store_error(&error))?;
-        state.credentials = next;
-        state.auth_record = auth_record;
-        state.revision = state.revision.wrapping_add(1);
-        state.permanent_failure = None;
-        Ok(())
+fn refreshed_credentials(
+    current: &StoredCredentials,
+    refreshed: RefreshResponse,
+) -> Result<StoredCredentials, OpenAiAuthError> {
+    let mut next = current.clone();
+    if let Some(access_token) = refreshed.access {
+        next.access_token = access_token;
     }
+    if let Some(refresh_token) = refreshed.refresh {
+        next.refresh_token = refresh_token;
+    }
+    if let Some(id_token) = refreshed.id {
+        let claims: IdClaims = decode_jwt(&id_token)
+            .map_err(|error| OpenAiAuthError::Refresh(Arc::from(error.to_string())))?;
+        let auth = claims.auth.unwrap_or_default();
+        if let Some(account_id) = auth.account_id
+            && account_id != next.account_id
+        {
+            return Err(OpenAiAuthError::AccountChanged);
+        }
+        next.id_token = id_token;
+        next.email = claims
+            .email
+            .or_else(|| claims.profile.and_then(|profile| profile.email));
+        next.plan = auth.plan;
+        next.fedramp = auth.fedramp;
+    }
+    Ok(next)
 }
 
 impl OpenAiAuthSource for ManagedChatGptAuth {
     fn validate(&self) -> Result<(), OpenAiAuthError> {
-        self.snapshot_now().map(|_| ())
+        self.inner.state().checked_snapshot().map(|_| ())
     }
 
     fn snapshot(&self) -> OpenAiAuthFuture<'_, Result<OpenAiAuthSnapshot, OpenAiAuthError>> {
         Box::pin(async move {
-            let snapshot = self.snapshot_unchecked()?;
-            let should_refresh = {
-                let state = self.state()?;
-                let expires_soon = jwt_expiration(&state.credentials.access_token)
-                    .is_some_and(|expiry| expiry <= unix_now() + REFRESH_EARLY_SECONDS);
-                let permanently_rejected = state
-                    .permanent_failure
-                    .as_ref()
-                    .is_some_and(|failure| failure.auth_record == state.auth_record);
-                expires_soon || permanently_rejected
+            let revision = match self.inner.current() {
+                CurrentSnapshot::Fresh(snapshot) => return Ok(snapshot),
+                CurrentSnapshot::Stale(revision) => revision,
             };
-            if should_refresh && let Err(error) = self.refresh_if_current(snapshot.revision()).await
-            {
+            if let Err(error) = self.refresh_if_current(revision).await {
                 tracing::warn!(error = %error, "proactive ChatGPT token refresh failed");
             }
-            self.snapshot_now()
+            self.inner.state().checked_snapshot()
         })
     }
 
@@ -993,21 +1024,33 @@ fn read_document(path: &Path) -> Result<CodexAuthDocument, ChatGptAuthError> {
     })
 }
 
-async fn lock_auth_file(path: &Path) -> Result<File, ChatGptAuthError> {
-    let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let file = open_auth_lock_file(&owned)?;
-        file.lock().map_err(|source| ChatGptAuthError::Storage {
-            path: owned,
-            source,
-        })?;
-        Ok(file)
-    })
-    .await
-    .map_err(|source| ChatGptAuthError::Storage {
+async fn run_blocking<T: Send + 'static>(
+    path: PathBuf,
+    task: impl FnOnce(&Path) -> Result<T, ChatGptAuthError> + Send + 'static,
+) -> Result<T, ChatGptAuthError> {
+    let task_path = path.clone();
+    tokio::task::spawn_blocking(move || task(&task_path))
+        .await
+        .map_err(|source| ChatGptAuthError::Storage {
+            path,
+            source: io::Error::other(source),
+        })?
+}
+
+async fn read_stored_auth_locked(
+    lock: File,
+    path: PathBuf,
+) -> Result<(File, (StoredCredentials, CodexAuthDocument)), ChatGptAuthError> {
+    run_blocking(path, move |path| Ok((lock, read_stored_auth(path)?))).await
+}
+
+fn lock_auth_file(path: &Path) -> Result<File, ChatGptAuthError> {
+    let file = open_auth_lock_file(path)?;
+    file.lock().map_err(|source| ChatGptAuthError::Storage {
         path: path.to_path_buf(),
-        source: io::Error::other(source),
-    })?
+        source,
+    })?;
+    Ok(file)
 }
 
 fn open_auth_lock_file(path: &Path) -> Result<File, ChatGptAuthError> {

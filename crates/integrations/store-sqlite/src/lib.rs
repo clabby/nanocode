@@ -1,17 +1,29 @@
 #![cfg(not(target_family = "wasm"))]
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    thread,
+};
 
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use tokio::sync::{mpsc, oneshot};
 
 use nanocode_durability_core::{
     OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoredState,
 };
 
 const MAX_SQL_REVISION: u64 = i64::MAX as u64;
+const JOB_CAPACITY: usize = 1;
+
+type Job = Box<dyn FnOnce(&mut Database) + Send>;
+
+struct Database {
+    connection: Connection,
+}
 
 pub struct SqliteStore {
-    connection: Connection,
+    jobs: mpsc::Sender<Job>,
+    closed: oneshot::Receiver<Result<(), StoreError>>,
 }
 
 impl SqliteStore {
@@ -21,10 +33,7 @@ impl SqliteStore {
     }
 
     pub fn open_home(home: &Path) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(home).map_err(|error| {
-            StoreError::NotCommitted(format!("failed to create {}: {error}", home.display()))
-        })?;
-        Self::open(Self::home_path(home))
+        Self::open(Database::home(home)?)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -33,6 +42,110 @@ impl SqliteStore {
     }
 
     pub fn from_connection(connection: Connection) -> Result<Self, StoreError> {
+        let database = Database::initialize(connection)?;
+        Self::start(move || Ok(database)).map(|(store, _)| store)
+    }
+
+    pub async fn open_home_async(home: &Path) -> Result<Self, StoreError> {
+        let home = home.to_owned();
+        Self::opened(Self::start(move || Database::open(Database::home(&home)?))?).await
+    }
+
+    pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref().to_owned();
+        Self::opened(Self::start(move || Database::open(path))?).await
+    }
+
+    pub async fn from_connection_async(connection: Connection) -> Result<Self, StoreError> {
+        Self::opened(Self::start(move || Database::initialize(connection))?).await
+    }
+
+    pub async fn close(self) -> Result<(), StoreError> {
+        let Self { jobs, closed } = self;
+        drop(jobs);
+        closed.await.map_err(|_| stopped())?
+    }
+
+    fn start(
+        open: impl FnOnce() -> Result<Database, StoreError> + Send + 'static,
+    ) -> Result<(Self, oneshot::Receiver<Result<(), StoreError>>), StoreError> {
+        let (jobs, mut receiver) = mpsc::channel::<Job>(JOB_CAPACITY);
+        let (finished, closed) = oneshot::channel();
+        let (ready, opened) = oneshot::channel();
+        thread::Builder::new()
+            .name("nanocode-sqlite".into())
+            .spawn(move || {
+                let mut database = match open() {
+                    Ok(database) => database,
+                    Err(error) => return drop(ready.send(Err(error))),
+                };
+                drop(ready.send(Ok(())));
+                while let Some(job) = receiver.blocking_recv() {
+                    job(&mut database);
+                }
+                let closed = database
+                    .connection
+                    .close()
+                    .map_err(|(_, error)| backend(error));
+                drop(finished.send(closed));
+            })
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok((Self { jobs, closed }, opened))
+    }
+
+    async fn opened(
+        (store, opened): (Self, oneshot::Receiver<Result<(), StoreError>>),
+    ) -> Result<Self, StoreError> {
+        opened.await.map_err(|_| stopped())??;
+        Ok(store)
+    }
+
+    fn write<T: Send + 'static>(
+        &mut self,
+        action: impl FnOnce(&mut Database) -> Result<T, StoreError> + Send + 'static,
+    ) -> StoreFuture<'_, Result<T, StoreError>> {
+        self.dispatch(false, action)
+    }
+
+    fn read<T: Send + 'static>(
+        &mut self,
+        action: impl FnOnce(&mut Database) -> Result<T, StoreError> + Send + 'static,
+    ) -> StoreFuture<'_, Result<T, StoreError>> {
+        self.dispatch(true, action)
+    }
+
+    fn dispatch<T: Send + 'static>(
+        &mut self,
+        abandonable: bool,
+        action: impl FnOnce(&mut Database) -> Result<T, StoreError> + Send + 'static,
+    ) -> StoreFuture<'_, Result<T, StoreError>> {
+        let (reply, result) = oneshot::channel();
+        let job: Job = Box::new(move |database| {
+            if abandonable && reply.is_closed() {
+                return;
+            }
+            drop(reply.send(action(database)));
+        });
+        Box::pin(async move {
+            self.jobs.send(job).await.map_err(|_| stopped())?;
+            result.await.map_err(|_| stopped())?
+        })
+    }
+}
+
+impl Database {
+    fn home(home: &Path) -> Result<PathBuf, StoreError> {
+        std::fs::create_dir_all(home).map_err(|error| {
+            StoreError::NotCommitted(format!("failed to create {}: {error}", home.display()))
+        })?;
+        Ok(SqliteStore::home_path(home))
+    }
+
+    fn open(path: PathBuf) -> Result<Self, StoreError> {
+        Self::initialize(Connection::open(path).map_err(backend)?)
+    }
+
+    fn initialize(connection: Connection) -> Result<Self, StoreError> {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = ON;
@@ -183,54 +296,20 @@ impl SqliteStore {
         transaction.commit().map_err(backend)?;
         Ok(revision)
     }
-}
 
-impl StateStore for SqliteStore {
-    fn read_record<'a>(
-        &'a mut self,
-        state_id: &'a str,
-        key: &'a str,
-    ) -> StoreFuture<'a, Result<Option<String>, StoreError>> {
-        let result = self
-            .connection
+    fn read_record(&self, state_id: &str, key: &str) -> Result<Option<String>, StoreError> {
+        self.connection
             .query_row(
                 "SELECT value FROM nanocodex_durable_records WHERE state_id = ?1 AND key = ?2",
                 params![state_id, key],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(backend);
-        Box::pin(async move { result })
+            .map_err(backend)
     }
 
-    fn acquire<'a>(
-        &'a mut self,
-        state_id: &'a str,
-        owner_id: OwnerId,
-    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
-        let result = self.acquire_transactional(state_id, owner_id, || {});
-        Box::pin(async move { result })
-    }
-
-    fn replace<'a>(
-        &'a mut self,
-        state_id: &'a str,
-        owner: &'a OwnerToken,
-        expected_revision: u64,
-        payload: &'a str,
-        records: &'a [nanocode_durability_core::StoreRecord],
-    ) -> StoreFuture<'a, Result<u64, StoreError>> {
-        let result =
-            self.replace_transactional(state_id, owner, expected_revision, payload, records, || {});
-        Box::pin(async move { result })
-    }
-
-    fn peek<'a>(
-        &'a mut self,
-        state_id: &'a str,
-    ) -> StoreFuture<'a, Result<StoredState, StoreError>> {
-        let result = self
-            .connection
+    fn peek(&self, state_id: &str) -> Result<StoredState, StoreError> {
+        self.connection
             .query_row(
                 "SELECT revision, payload FROM nanocodex_durable_states WHERE state_id = ?1",
                 [state_id],
@@ -246,29 +325,98 @@ impl StateStore for SqliteStore {
                     })?,
                     payload: Some(payload),
                 }),
-            });
-        Box::pin(async move { result })
+            })
+    }
+
+    fn list_states(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT state_id FROM nanocodex_durable_states ORDER BY rowid DESC LIMIT ?1")
+            .map_err(backend)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        statement
+            .query_map([limit], |row| row.get::<_, String>(0))
+            .map_err(backend)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(backend)
+    }
+}
+
+impl StateStore for SqliteStore {
+    fn read_record<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        key: &'a str,
+    ) -> StoreFuture<'a, Result<Option<String>, StoreError>> {
+        let (state_id, key) = (state_id.to_owned(), key.to_owned());
+        self.read(move |database| database.read_record(&state_id, &key))
+    }
+
+    fn read_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        keys: &'a [String],
+    ) -> StoreFuture<'a, Result<Vec<Option<String>>, StoreError>> {
+        let (state_id, keys) = (state_id.to_owned(), keys.to_vec());
+        self.read(move |database| {
+            keys.iter()
+                .map(|key| database.read_record(&state_id, key))
+                .collect()
+        })
+    }
+
+    fn acquire<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner_id: OwnerId,
+    ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
+        let state_id = state_id.to_owned();
+        self.write(move |database| database.acquire_transactional(&state_id, owner_id, || {}))
+    }
+
+    fn replace<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner: &'a OwnerToken,
+        expected_revision: u64,
+        payload: &'a str,
+        records: &'a [nanocode_durability_core::StoreRecord],
+    ) -> StoreFuture<'a, Result<u64, StoreError>> {
+        let (state_id, owner, payload, records) = (
+            state_id.to_owned(),
+            owner.clone(),
+            payload.to_owned(),
+            records.to_vec(),
+        );
+        self.write(move |database| {
+            database.replace_transactional(
+                &state_id,
+                &owner,
+                expected_revision,
+                &payload,
+                &records,
+                || {},
+            )
+        })
+    }
+
+    fn peek<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<StoredState, StoreError>> {
+        let state_id = state_id.to_owned();
+        self.read(move |database| database.peek(&state_id))
     }
 
     fn list_states<'a>(
         &'a mut self,
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
-        let result = (|| {
-            let mut statement = self
-                .connection
-                .prepare(
-                    "SELECT state_id FROM nanocodex_durable_states ORDER BY rowid DESC LIMIT ?1",
-                )
-                .map_err(backend)?;
-            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-            statement
-                .query_map([limit], |row| row.get::<_, String>(0))
-                .map_err(backend)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(backend)
-        })();
-        Box::pin(async move { result })
+        self.read(move |database| database.list_states(limit))
+    }
+
+    fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
+        self.write(|_| Ok(()))
     }
 }
 
@@ -415,6 +563,10 @@ fn load_state(connection: &Connection, state_id: &str) -> Result<StoredState, St
 
 fn backend(error: rusqlite::Error) -> StoreError {
     StoreError::Backend(error.to_string())
+}
+
+fn stopped() -> StoreError {
+    StoreError::Backend("SQLite durability worker stopped".to_owned())
 }
 
 fn to_u64(value: i64) -> Result<u64, StoreError> {

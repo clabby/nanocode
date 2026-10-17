@@ -16,8 +16,14 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::{Path, PathBuf},
+    thread,
     time::Instant,
 };
+use tokio::sync::{mpsc, oneshot};
+
+const JOB_CAPACITY: usize = 1;
+
+type Job = Box<dyn FnOnce(&mut Journal) + Send>;
 
 enum Entry {
     Acquire {
@@ -309,7 +315,7 @@ impl CachedEntry {
     }
 }
 
-pub struct JsonlStore {
+struct Journal {
     file: File,
     reads: File,
     path: PathBuf,
@@ -320,17 +326,17 @@ pub struct JsonlStore {
     cached: Option<CachedEntry>,
 }
 
-impl JsonlStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+impl Journal {
+    fn open(path: &Path) -> Result<Self, StoreError> {
         let _span = tracing::info_span!("durability.jsonl.open").entered();
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(path.as_ref())
+            .open(path)
             .map_err(backend)?;
-        let path = std::fs::canonicalize(path.as_ref()).map_err(backend)?;
+        let path = std::fs::canonicalize(path).map_err(backend)?;
         let reads = File::open(&path).map_err(backend)?;
         let source = identity(&file.metadata().map_err(backend)?)?;
         if identity(&reads.metadata().map_err(backend)?)? != source {
@@ -357,17 +363,23 @@ impl JsonlStore {
         Ok(store)
     }
 
-    pub fn open_home(home: &Path) -> Result<Self, StoreError> {
+    fn home(home: &Path) -> Result<PathBuf, StoreError> {
         std::fs::create_dir_all(home).map_err(backend)?;
-        Self::open(home.join("sessions.jsonl"))
+        Ok(home.join("sessions.jsonl"))
     }
 
     fn locked<T>(
         &mut self,
         action: impl FnOnce(&mut Self) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let _span = tracing::info_span!("durability.jsonl.transaction").entered();
+        let span = tracing::info_span!(
+            "durability.jsonl.transaction",
+            lock.wait_ms = tracing::field::Empty
+        );
+        let _entered = span.enter();
+        let started = Instant::now();
         self.file.lock().map_err(backend)?;
+        span.record("lock.wait_ms", started.elapsed().as_secs_f64() * 1_000.0);
         let result = self.refresh_index().and_then(|()| action(self));
         let unlocked = self.file.unlock().map_err(backend);
         match result {
@@ -814,7 +826,7 @@ impl JsonlStore {
     }
 }
 
-impl JsonlStore {
+impl Journal {
     fn acquire_batch(
         &mut self,
         id: &str,
@@ -894,6 +906,192 @@ impl JsonlStore {
             ))
         })
     }
+
+    fn read_record(&mut self, id: &str, key: &str) -> Result<Option<String>, StoreError> {
+        self.locked(|store| store.rebuilt(|store| store.record(id, key)))
+    }
+
+    fn read_records(
+        &mut self,
+        id: &str,
+        keys: &[String],
+    ) -> Result<Vec<Option<String>>, StoreError> {
+        self.locked(|store| {
+            store.rebuilt(|store| keys.iter().map(|key| store.record(id, key)).collect())
+        })
+    }
+
+    fn peek(&mut self, id: &str) -> Result<StoredState, StoreError> {
+        self.locked(|store| store.state(id))
+    }
+
+    fn list_states(&mut self, limit: usize) -> Result<Vec<String>, StoreError> {
+        self.locked(|store| {
+            Ok(store
+                .index
+                .created
+                .iter()
+                .rev()
+                .take(limit)
+                .cloned()
+                .collect())
+        })
+    }
+
+    fn acquire(&mut self, id: &str, owner_id: OwnerId) -> Result<OwnedState, StoreError> {
+        self.locked(|store| {
+            let fence = store
+                .next_fence(id)
+                .ok_or_else(|| StoreError::NotCommitted("JSONL owner fence overflow".into()))?;
+            let owner = OwnerToken::new(owner_id, fence);
+            store.append(Entry::Acquire {
+                state_id: id.into(),
+                owner: owner.clone(),
+            })?;
+            Ok(OwnedState {
+                owner,
+                state: store.state(id)?,
+            })
+        })
+    }
+
+    fn replace(
+        &mut self,
+        id: &str,
+        owner: &OwnerToken,
+        expected: u64,
+        payload: String,
+        records: Vec<StoreRecord>,
+    ) -> Result<u64, StoreError> {
+        self.locked(|store| {
+            let revision = store.rebuilt(|store| {
+                if store.index.owners.get(id) != Some(owner) {
+                    return Err(StoreError::Fenced);
+                }
+                let actual = store.revision(id);
+                if actual != expected {
+                    return Err(StoreError::Conflict { expected, actual });
+                }
+                let revision = actual
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::NotCommitted("JSONL revision overflow".into()))?;
+                store.validate_records(id, &records)?;
+                Ok(revision)
+            })?;
+            store.append(Entry::Replace {
+                state_id: id.into(),
+                owner: owner.clone(),
+                revision,
+                payload,
+                records,
+            })?;
+            Ok(revision)
+        })
+    }
+}
+
+pub struct JsonlStore {
+    jobs: mpsc::Sender<Job>,
+    closed: oneshot::Receiver<()>,
+}
+
+impl JsonlStore {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let journal = Journal::open(path.as_ref())?;
+        Self::start(move || Ok(journal)).map(|(store, _)| store)
+    }
+
+    pub fn open_home(home: &Path) -> Result<Self, StoreError> {
+        Self::open(Journal::home(home)?)
+    }
+
+    pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref().to_owned();
+        Self::opened(Self::start(move || Journal::open(&path))?).await
+    }
+
+    pub async fn open_home_async(home: &Path) -> Result<Self, StoreError> {
+        let home = home.to_owned();
+        Self::opened(Self::start(move || Journal::open(&Journal::home(&home)?))?).await
+    }
+
+    pub async fn close(self) -> Result<(), StoreError> {
+        let Self { jobs, closed } = self;
+        drop(jobs);
+        closed.await.map_err(|_| stopped())
+    }
+
+    fn start(
+        open: impl FnOnce() -> Result<Journal, StoreError> + Send + 'static,
+    ) -> Result<(Self, oneshot::Receiver<Result<(), StoreError>>), StoreError> {
+        let (jobs, mut receiver) = mpsc::channel::<Job>(JOB_CAPACITY);
+        let (finished, closed) = oneshot::channel();
+        let (ready, opened) = oneshot::channel();
+        let span = tracing::Span::current();
+        thread::Builder::new()
+            .name("nanocode-jsonl".into())
+            .spawn(move || {
+                let mut journal = match span.in_scope(open) {
+                    Ok(journal) => journal,
+                    Err(error) => return drop(ready.send(Err(error))),
+                };
+                drop(ready.send(Ok(())));
+                while let Some(job) = receiver.blocking_recv() {
+                    job(&mut journal);
+                }
+                drop(journal);
+                let _ = finished.send(());
+            })
+            .map_err(backend)?;
+        Ok((Self { jobs, closed }, opened))
+    }
+
+    async fn opened(
+        (store, opened): (Self, oneshot::Receiver<Result<(), StoreError>>),
+    ) -> Result<Self, StoreError> {
+        opened.await.map_err(|_| stopped())??;
+        Ok(store)
+    }
+
+    fn write<T: Send + 'static>(
+        &mut self,
+        action: impl FnOnce(&mut Journal) -> Result<T, StoreError> + Send + 'static,
+    ) -> StoreFuture<'_, Result<T, StoreError>> {
+        self.dispatch(false, action)
+    }
+
+    fn read<T: Send + 'static>(
+        &mut self,
+        action: impl FnOnce(&mut Journal) -> Result<T, StoreError> + Send + 'static,
+    ) -> StoreFuture<'_, Result<T, StoreError>> {
+        self.dispatch(true, action)
+    }
+
+    fn dispatch<T: Send + 'static>(
+        &mut self,
+        abandonable: bool,
+        action: impl FnOnce(&mut Journal) -> Result<T, StoreError> + Send + 'static,
+    ) -> StoreFuture<'_, Result<T, StoreError>> {
+        let parent = tracing::Span::current();
+        let queued = Instant::now();
+        let (reply, result) = oneshot::channel();
+        let job: Job = Box::new(move |journal| {
+            if abandonable && reply.is_closed() {
+                return;
+            }
+            let span = tracing::info_span!(
+                parent: &parent,
+                "durability.jsonl.worker",
+                queue.duration_ms = queued.elapsed().as_secs_f64() * 1_000.0
+            );
+            let _entered = span.enter();
+            drop(reply.send(action(journal)));
+        });
+        Box::pin(async move {
+            self.jobs.send(job).await.map_err(|_| stopped())?;
+            result.await.map_err(|_| stopped())?
+        })
+    }
 }
 
 impl StateStore for JsonlStore {
@@ -903,10 +1101,12 @@ impl StateStore for JsonlStore {
         owner_id: OwnerId,
         update: StoreUpdate,
     ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
-        let result = self
-            .acquire_batch(id, owner_id, update, None)
-            .map(|(owned, _)| owned);
-        Box::pin(async move { result })
+        let id = id.to_owned();
+        self.write(move |journal| {
+            journal
+                .acquire_batch(&id, owner_id, update, None)
+                .map(|(owned, _)| owned)
+        })
     }
 
     fn batches_companion_acquisition(&self) -> bool {
@@ -921,14 +1121,21 @@ impl StateStore for JsonlStore {
         companion_id: &'a str,
         companion_owner: OwnerId,
     ) -> StoreFuture<'a, Result<(OwnedState, OwnedState), StoreError>> {
-        let result = self
-            .acquire_batch(id, owner_id, update, Some((companion_id, companion_owner)))
-            .and_then(|(owned, companion)| {
-                companion
-                    .map(|companion| (owned, companion))
-                    .ok_or_else(|| backend("JSONL companion acquisition was not staged"))
-            });
-        Box::pin(async move { result })
+        let (id, companion_id) = (id.to_owned(), companion_id.to_owned());
+        self.write(move |journal| {
+            journal
+                .acquire_batch(
+                    &id,
+                    owner_id,
+                    update,
+                    Some((&companion_id, companion_owner)),
+                )
+                .and_then(|(owned, companion)| {
+                    companion
+                        .map(|companion| (owned, companion))
+                        .ok_or_else(|| backend("JSONL companion acquisition was not staged"))
+                })
+        })
     }
 
     fn read_record<'a>(
@@ -936,59 +1143,34 @@ impl StateStore for JsonlStore {
         id: &'a str,
         key: &'a str,
     ) -> StoreFuture<'a, Result<Option<String>, StoreError>> {
-        let result = self.locked(|store| store.rebuilt(|store| store.record(id, key)));
-        Box::pin(async move { result })
+        let (id, key) = (id.to_owned(), key.to_owned());
+        self.read(move |journal| journal.read_record(&id, &key))
     }
     fn read_records<'a>(
         &'a mut self,
         id: &'a str,
         keys: &'a [String],
     ) -> StoreFuture<'a, Result<Vec<Option<String>>, StoreError>> {
-        let result = self.locked(|store| {
-            store.rebuilt(|store| keys.iter().map(|key| store.record(id, key)).collect())
-        });
-        Box::pin(async move { result })
+        let (id, keys) = (id.to_owned(), keys.to_vec());
+        self.read(move |journal| journal.read_records(&id, &keys))
     }
     fn peek<'a>(&'a mut self, id: &'a str) -> StoreFuture<'a, Result<StoredState, StoreError>> {
-        let result = self.locked(|store| store.state(id));
-        Box::pin(async move { result })
+        let id = id.to_owned();
+        self.read(move |journal| journal.peek(&id))
     }
     fn list_states<'a>(
         &'a mut self,
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
-        let result = self.locked(|store| {
-            Ok(store
-                .index
-                .created
-                .iter()
-                .rev()
-                .take(limit)
-                .cloned()
-                .collect())
-        });
-        Box::pin(async move { result })
+        self.read(move |journal| journal.list_states(limit))
     }
     fn acquire<'a>(
         &'a mut self,
         id: &'a str,
         owner_id: OwnerId,
     ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
-        let result = self.locked(|store| {
-            let fence = store
-                .next_fence(id)
-                .ok_or_else(|| StoreError::NotCommitted("JSONL owner fence overflow".into()))?;
-            let owner = OwnerToken::new(owner_id, fence);
-            store.append(Entry::Acquire {
-                state_id: id.into(),
-                owner: owner.clone(),
-            })?;
-            Ok(OwnedState {
-                owner,
-                state: store.state(id)?,
-            })
-        });
-        Box::pin(async move { result })
+        let id = id.to_owned();
+        self.write(move |journal| journal.acquire(&id, owner_id))
     }
     fn replace<'a>(
         &'a mut self,
@@ -998,31 +1180,20 @@ impl StateStore for JsonlStore {
         payload: &'a str,
         records: &'a [StoreRecord],
     ) -> StoreFuture<'a, Result<u64, StoreError>> {
-        let result = self.locked(|store| {
-            let revision = store.rebuilt(|store| {
-                if store.index.owners.get(id) != Some(owner) {
-                    return Err(StoreError::Fenced);
-                }
-                let actual = store.revision(id);
-                if actual != expected {
-                    return Err(StoreError::Conflict { expected, actual });
-                }
-                let revision = actual
-                    .checked_add(1)
-                    .ok_or_else(|| StoreError::NotCommitted("JSONL revision overflow".into()))?;
-                store.validate_records(id, records)?;
-                Ok(revision)
-            })?;
-            store.append(Entry::Replace {
-                state_id: id.into(),
-                owner: owner.clone(),
-                revision,
-                payload: payload.into(),
-                records: records.into(),
-            })?;
-            Ok(revision)
-        });
-        Box::pin(async move { result })
+        let (id, owner, payload, records) = (
+            id.to_owned(),
+            owner.clone(),
+            payload.to_owned(),
+            records.to_vec(),
+        );
+        self.write(move |journal| journal.replace(&id, &owner, expected, payload, records))
+    }
+
+    fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
+        self.write(|journal| {
+            journal.flush_index();
+            Ok(())
+        })
     }
 }
 
@@ -1039,6 +1210,10 @@ fn identity(metadata: &Metadata) -> Result<String, StoreError> {
 
 fn identity_changed() -> StoreError {
     backend("JSONL log identity changed while its store was open")
+}
+
+fn stopped() -> StoreError {
+    backend("JSONL durability worker stopped")
 }
 
 fn backend(error: impl std::fmt::Display) -> StoreError {

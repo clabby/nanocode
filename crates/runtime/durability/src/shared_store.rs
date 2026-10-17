@@ -58,6 +58,9 @@ enum Command {
         limit: usize,
         result: oneshot::Sender<Result<Vec<String>, StoreError>>,
     },
+    Flush {
+        result: oneshot::Sender<Result<(), StoreError>>,
+    },
 }
 
 struct StoreRequest {
@@ -198,6 +201,9 @@ impl SharedStore {
                         Command::ListStates { limit, result } => {
                             drop(result.send(store.list_states(limit).await));
                         }
+                        Command::Flush { result } => {
+                            drop(result.send(store.flush().await));
+                        }
                     }
                 }
                 .instrument(span)
@@ -212,6 +218,26 @@ impl SharedStore {
 }
 
 impl StateStore for SharedStore {
+    fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
+        let span = tracing::info_span!(
+            "durability.store",
+            operation = "flush",
+            queue.duration_ms = tracing::field::Empty
+        );
+        Box::pin(async move {
+            let (result, receiver) = oneshot::channel();
+            self.commands
+                .send(StoreRequest {
+                    command: Command::Flush { result },
+                    span,
+                    queued: Instant::now(),
+                })
+                .await
+                .map_err(|_| stopped())?;
+            receiver.await.map_err(|_| stopped())?
+        })
+    }
+
     fn batches_companion_acquisition(&self) -> bool {
         self.batches_companion_acquisition
     }

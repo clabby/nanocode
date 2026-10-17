@@ -136,7 +136,8 @@ async fn run() -> support::Result<()> {
         .without_cua()
         .runner_management(false)
         .thinking(Thinking::Low)
-        .build()?;
+        .build_async()
+        .await?;
     let outcome: support::Result<()> = async {
         let (agent, mut events) = runtime
             .spawn()

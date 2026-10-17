@@ -336,6 +336,11 @@ mod store {
             self.formats.register(format)
         }
 
+        pub async fn flush(&self) -> Result<()> {
+            self.store.clone().flush().await?;
+            Ok(())
+        }
+
         pub async fn list(&self) -> Result<Vec<SessionSummary>> {
             let ids = self.store.clone().list_states(usize::MAX).await?;
             let mut sessions = Vec::new();

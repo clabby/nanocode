@@ -55,7 +55,9 @@ impl Turn {
     }
 
     pub async fn result(self) -> Result<TurnResult> {
-        self.await
+        let Self { events, result, .. } = self;
+        drop(events);
+        result.await
     }
 }
 

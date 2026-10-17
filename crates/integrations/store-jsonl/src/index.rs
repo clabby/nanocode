@@ -9,7 +9,7 @@ use nanocode_durability_core::OwnerToken;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{JsonlStore, Location, Record, State, identity};
+use super::{Journal, Location, Record, State, identity};
 
 const MAGIC: &[u8] = b"nanocode-jsonl-index-v3\n";
 const ENTRY_MAGIC: &[u8] = b"nanocode-jsonl-index-v2\n";
@@ -150,7 +150,7 @@ impl Index {
     }
 }
 
-impl JsonlStore {
+impl Journal {
     fn index_path(&self) -> PathBuf {
         self.path.with_added_extension("index")
     }
@@ -501,7 +501,7 @@ fn read_block(file: &mut File, block: RecordBlock) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-impl JsonlStore {
+impl Journal {
     pub(super) fn discard_index(&mut self, error: impl std::fmt::Display) {
         tracing::warn!(%error, "rebuilding invalid JSONL index from journal");
         self.index = Index::new(self.index.source.clone());
@@ -520,8 +520,8 @@ impl JsonlStore {
     }
 }
 
-impl Drop for JsonlStore {
-    fn drop(&mut self) {
+impl Journal {
+    pub(super) fn flush_index(&mut self) {
         if self.ready && (self.persisted_offset != Some(self.index.offset) || self.index.migrated) {
             match self.file.try_lock() {
                 Ok(()) => {
@@ -535,6 +535,12 @@ impl Drop for JsonlStore {
                 }
             }
         }
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        self.flush_index();
     }
 }
 
