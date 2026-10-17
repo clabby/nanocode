@@ -436,6 +436,13 @@ impl RunnerPool {
         name: &str,
         identity: Option<&Arc<()>>,
     ) -> Result<(), AttachmentError> {
+        Self::wait_disconnected(self.begin_disconnect(name, identity)?).await
+    }
+    fn begin_disconnect(
+        &self,
+        name: &str,
+        identity: Option<&Arc<()>>,
+    ) -> Result<RemoteRunner, AttachmentError> {
         let remote = {
             let mut state = self.inner.state();
             let entry = state
@@ -465,6 +472,10 @@ impl RunnerPool {
             emit(&mut state, RunnerEvent::StatusChanged { info });
             remote
         };
+        remote.revoke();
+        Ok(remote)
+    }
+    async fn wait_disconnected(remote: RemoteRunner) -> Result<(), AttachmentError> {
         let mut connected = remote.connection_status();
         connected
             .wait_for(|connected| !connected)
@@ -484,8 +495,15 @@ impl RunnerPool {
                     std::mem::take(&mut state.servers),
                 )
             };
-            for name in names {
-                self.disconnect(&name).await?;
+            for inner in &servers {
+                inner.cancel.cancel();
+            }
+            let remotes = names
+                .into_iter()
+                .map(|name| self.begin_disconnect(&name, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            for remote in remotes {
+                Self::wait_disconnected(remote).await?;
             }
             for inner in servers {
                 RunnerServer { inner }.stop().await?;

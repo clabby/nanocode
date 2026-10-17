@@ -81,13 +81,20 @@ impl ProcessRoutes {
             let state = sessions
                 .get_mut(session_id)
                 .ok_or("process route session missing")?;
-            let previous = state.mounts.clone();
-            state.mounts.extend(mounts.iter().cloned());
-            if previous != state.mounts {
+            let added = mounts
+                .iter()
+                .filter(|mount| !state.mounts.contains(*mount))
+                .collect::<Vec<_>>();
+            if !added.is_empty() {
+                state
+                    .mounts
+                    .extend(added.iter().map(|mount| (*mount).clone()));
                 if let Some(store) = &self.store {
                     if let Err(error) = store.save(session_id, serde_json::to_value(&*state)?).await
                     {
-                        state.mounts = previous;
+                        for mount in added {
+                            state.mounts.remove(mount);
+                        }
                         return Err(error);
                     }
                 }

@@ -49,6 +49,7 @@ struct Inner {
 
 #[derive(Default)]
 struct State {
+    revoked: bool,
     generation: u64,
     connection: Option<Connection>,
     runtime_id: Option<Box<str>>,
@@ -200,6 +201,30 @@ impl RemoteRunner {
 
     pub(crate) fn failure_status(&self) -> watch::Receiver<Option<AttachmentError>> {
         self.inner.failure.subscribe()
+    }
+
+    pub(crate) fn revoke(&self) {
+        let pending = {
+            let mut state = self.inner.state();
+            state.revoked = true;
+            std::mem::take(&mut state.pending)
+        };
+        for (_, pending) in pending {
+            let (status, message) = if pending.sent {
+                (
+                    "ambiguous",
+                    "runner was disconnected before returning a receipt",
+                )
+            } else {
+                (
+                    "unavailable",
+                    "runner was disconnected before the call was dispatched",
+                )
+            };
+            let _ = pending
+                .result
+                .send((json!({"status": status, "message": message}), None));
+        }
     }
 
     pub(crate) fn tools_snapshot(&self) -> Option<RemoteTools> {
@@ -408,6 +433,9 @@ impl Inner {
     ) -> Result<(u64, mpsc::UnboundedReceiver<Outbound>, Vec<String>), AttachmentError> {
         let specs = parse_catalog(&self.namespace, &tools)?;
         let mut state = self.state();
+        if state.revoked {
+            return Err(AttachmentError::Closed);
+        }
         if state.connection.is_some() {
             return Err(AttachmentError::Catalog(
                 "runner already has a live connection".into(),
@@ -624,6 +652,9 @@ impl Inner {
         let (result, receipt) = oneshot::channel();
         {
             let mut state = self.state();
+            if state.revoked {
+                return Err(AttachmentError::Closed);
+            }
             state.pending.insert(
                 call_id.clone(),
                 Pending {

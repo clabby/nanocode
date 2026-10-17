@@ -562,7 +562,17 @@ impl Tool for RoutedTool {
         Ok(())
     }
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
-        let routes = self.snapshot();
+        self.execute_routes(input, context, self.snapshot()).await
+    }
+}
+
+impl RoutedTool {
+    async fn execute_routes(
+        &self,
+        input: ToolInput,
+        context: ToolContext<'_>,
+        routes: Vec<Route>,
+    ) -> ToolResult {
         if let Some(pool) = &self.pool {
             self.sessions
                 .remember_mounts(context.session_id(), &pool.reserved_mounts())
@@ -864,6 +874,22 @@ impl RunnerProvider {
             .collect()
     }
 
+    fn definition(&self, snapshot: &Snapshot, name: &str) -> Option<ToolDefinition> {
+        self.providers
+            .iter()
+            .filter(|provider| provider.contains(name))
+            .flat_map(|provider| provider.available_definitions())
+            .find(|definition| definition.name() == name)
+            .or_else(|| {
+                snapshot
+                    .pool
+                    .iter()
+                    .flat_map(|route| route.tools.iter())
+                    .find(|tool| tool.remote_name() == name)
+                    .map(RemoteTool::native_definition)
+            })
+    }
+
     fn routed(&self, definition: ToolDefinition, snapshot: &Snapshot) -> RoutedTool {
         RoutedTool {
             local_desktop: self
@@ -893,6 +919,16 @@ impl crate::DynamicToolProvider for RunnerProvider {
     fn model_catalog_visible(&self) -> bool {
         false
     }
+    fn contains(&self, name: &str) -> bool {
+        self.providers
+            .iter()
+            .any(|provider| provider.contains(name))
+            || self
+                .pool
+                .routes()
+                .iter()
+                .any(|route| route.tools.iter().any(|tool| tool.remote_name() == name))
+    }
     fn available_definitions(&self) -> Vec<ToolDefinition> {
         let snapshot = self.snapshot();
         self.definitions(&snapshot)
@@ -907,13 +943,13 @@ impl crate::DynamicToolProvider for RunnerProvider {
         context: ToolContext<'_>,
     ) -> Option<crate::ToolOutput> {
         let snapshot = self.snapshot();
-        let definition = self
-            .definitions(&snapshot)
-            .into_iter()
-            .find(|definition| definition.name() == name)?;
+        let definition = self.definition(&snapshot, name)?;
         let routed = self.routed(definition, &snapshot);
         Some(match serde_json::value::to_raw_value(&input) {
-            Ok(raw) => match routed.execute(ToolInput::Function(raw), context).await {
+            Ok(raw) => match routed
+                .execute_routes(ToolInput::Function(raw), context, snapshot.effective)
+                .await
+            {
                 Ok(output) => output,
                 Err(error) => crate::ToolOutput::error(error.to_string()),
             },
