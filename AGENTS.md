@@ -29,6 +29,7 @@
 - Benchmark performance changes with reproducible commands, inputs, and before/after results. Separate cold builds, incremental builds, and runtime performance.
 - [Principles for fast Tokio applications](https://dial9-rs.github.io/blog/principles-for-fast-tokio-applications/)
 - Keep blocking native storage work behind an owning worker and asynchronous message/response channels. Batch complete transactions there, including file-lock waits, index refresh, serialization and disk sync. Async SDK construction and shutdown must await their completion without running filesystem work or joining worker threads on Tokio workers. Preserve synchronous compatibility entry points and durable acknowledgements.
+- Route subagent journal writes through the per-root journal writer and acknowledge each request only after its store save completes. Keep subagent message, residency and journal serialization per root so a slow or fenced store for one root cannot stall another.
 - [Fast Rust Builds](https://matklad.github.io/2021/09/04/fast-rust-builds.html)
 - Keep logs, traces, and benchmark artifacts in ignored output/. Never commit credentials or personal test data.
 - Prefer simple code and small changes. Preserve unrelated work. Use subagents only when explicitly requested.

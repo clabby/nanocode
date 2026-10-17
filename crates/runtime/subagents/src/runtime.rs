@@ -129,8 +129,7 @@ pub struct Registry {
     max_resident: AtomicUsize,
 
     max_resident_explicit: std::sync::atomic::AtomicBool,
-    residency_lock: tokio::sync::Mutex<()>,
-    message_lock: tokio::sync::Mutex<()>,
+    scope_locks: std::sync::Mutex<HashMap<String, Arc<ScopeLocks>>>,
     store: std::sync::RwLock<Option<Arc<dyn SubagentStore>>>,
 
     journals: std::sync::RwLock<HashMap<String, Arc<dyn SubagentStore>>>,
@@ -142,7 +141,7 @@ pub struct Registry {
     spawn_admission: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     journal_writer: std::sync::atomic::AtomicBool,
 
-    journal_write_lock: tokio::sync::Mutex<()>,
+    journal_writers: std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<JournalRequest>>>,
     checkpoints: std::sync::Mutex<HashMap<(String, AgentId), durable::JournalCheckpoint>>,
 
     pending_checkpoints: std::sync::Mutex<HashMap<String, usize>>,
@@ -245,6 +244,79 @@ const fn settled_update(id: AgentId, status: AgentStatus, completion: Option<u64
 struct JournalWrite {
     payload: String,
     records: Vec<(Arc<str>, Arc<str>)>,
+}
+
+enum JournalRequest {
+    Persist {
+        scope: bool,
+        done: oneshot::Sender<std::io::Result<()>>,
+    },
+    Final {
+        write: JournalWrite,
+        done: oneshot::Sender<std::io::Result<()>>,
+    },
+}
+
+#[derive(Default)]
+pub(super) struct ScopeLocks {
+    pub(super) residency: tokio::sync::Mutex<()>,
+    pub(super) message: tokio::sync::Mutex<()>,
+}
+
+fn copy_error(error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), error.to_string())
+}
+
+async fn journal_writer(
+    registry: Weak<Registry>,
+    root_session_id: String,
+    mut requests: mpsc::UnboundedReceiver<JournalRequest>,
+    mut revision: watch::Receiver<u64>,
+) {
+    let mut saved = None;
+    let mut recorded = HashMap::new();
+    let mut pending = Vec::new();
+    loop {
+        for _ in 0..requests.len() {
+            if let Ok(request) = requests.try_recv() {
+                pending.push(request);
+            }
+        }
+        let Some(live) = registry.upgrade() else {
+            return;
+        };
+        let finished = live
+            .write_journal(
+                &root_session_id,
+                std::mem::take(&mut pending),
+                &mut saved,
+                &mut recorded,
+            )
+            .await;
+        if finished {
+            let mut writers = lock_unpoisoned(&live.journal_writers);
+            while let Ok(request) = requests.try_recv() {
+                pending.push(request);
+            }
+            if pending.is_empty() {
+                writers.remove(&root_session_id);
+                return;
+            }
+            continue;
+        }
+        drop(live);
+        tokio::select! {
+            changed = revision.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            request = requests.recv() => match request {
+                Some(request) => pending.push(request),
+                None => return,
+            },
+        }
+    }
 }
 
 impl AgentScope {
@@ -454,24 +526,6 @@ impl RegistryState {
         session.last_used = last_used;
         self.scope_mut(root_session_id).sessions.insert(id, session);
         Ok(())
-    }
-
-    fn journal(
-        &self,
-        checkpoints: &HashMap<(String, AgentId), durable::JournalCheckpoint>,
-    ) -> Vec<(String, JournalWrite)> {
-        let mut payloads = Vec::with_capacity(self.scopes.len());
-        for (root_session_id, scope) in self
-            .scopes
-            .iter()
-            .filter(|(_, scope)| !scope.journal_frozen)
-        {
-            match scope.journal_payload(root_session_id, checkpoints) {
-                Ok(payload) => payloads.push((root_session_id.clone(), payload)),
-                Err(error) => tracing::warn!(%error, "could not encode subagent journal"),
-            }
-        }
-        payloads
     }
 
     fn submit_result(
@@ -1223,15 +1277,14 @@ impl Registry {
             session_handles: std::sync::RwLock::new(HashMap::new()),
             max_resident: AtomicUsize::new(crate::DEFAULT_MAX_RESIDENT_SUBAGENTS),
             max_resident_explicit: std::sync::atomic::AtomicBool::new(false),
-            residency_lock: tokio::sync::Mutex::new(()),
-            message_lock: tokio::sync::Mutex::new(()),
+            scope_locks: std::sync::Mutex::new(HashMap::new()),
             store: std::sync::RwLock::new(None),
             journals: std::sync::RwLock::new(HashMap::new()),
             restored: std::sync::Mutex::new(HashMap::new()),
             reserved: std::sync::Mutex::new(HashMap::new()),
             spawn_admission: std::sync::Mutex::new(HashMap::new()),
             journal_writer: std::sync::atomic::AtomicBool::new(false),
-            journal_write_lock: tokio::sync::Mutex::new(()),
+            journal_writers: std::sync::Mutex::new(HashMap::new()),
             checkpoints: std::sync::Mutex::new(HashMap::new()),
             pending_checkpoints: std::sync::Mutex::new(HashMap::new()),
             progress_captures: std::sync::Mutex::new(HashMap::new()),
@@ -1471,72 +1524,260 @@ impl Registry {
         let registry = Arc::downgrade(self);
         let mut revision = self.revision.subscribe();
         drop(platform::spawn(async move {
-            let mut saved = HashMap::<String, String>::new();
-
-            let mut recorded = HashMap::<String, Arc<str>>::new();
             loop {
                 let Some(live) = registry.upgrade() else {
                     return;
                 };
-
-                let write_guard = live.journal_write_lock.lock().await;
-                let payloads = live.journal_payloads().await;
-                let stores = payloads
+                let roots = live
+                    .state
+                    .lock()
+                    .await
+                    .scopes
                     .iter()
-                    .map(|(root, _)| live.store_for(root))
+                    .filter(|(_, scope)| !scope.journal_frozen)
+                    .map(|(root, _)| root.clone())
                     .collect::<Vec<_>>();
-                for ((root_session_id, write), store) in payloads.into_iter().zip(stores) {
-                    let Some(store) = store else { continue };
-                    let JournalWrite { payload, records } = write;
-                    if saved.get(&root_session_id) == Some(&payload) {
-                        live.acknowledge(&root_session_id, &records);
-                        continue;
-                    }
-                    let contents = records.iter().map(|(_, json)| Arc::clone(json)).collect();
-                    match store
-                        .save(&root_session_id, payload.clone(), contents)
-                        .instrument(tracing::info_span!(
-                            "subagent.journal.save",
-                            session.root_id = root_session_id,
-                            payload.bytes = payload.len(),
-                            record.count = records.len()
-                        ))
-                        .await
-                    {
-                        Ok(()) => {
-                            live.acknowledge(&root_session_id, &records);
-
-                            for (key, checkpoint) in live.child_checkpoints(&root_session_id).await
-                            {
-                                let session_id = checkpoint.session_id().to_owned();
-                                if recorded.get(&session_id) == Some(&key) {
-                                    continue;
-                                }
-                                match store.record_session(&root_session_id, checkpoint).await {
-                                    Ok(()) => {
-                                        live.release_recorded(&root_session_id, &key);
-                                        recorded.insert(session_id, key);
-                                    }
-                                    Err(error) => tracing::warn!(
-                                        %error, %root_session_id, %session_id,
-                                        "could not record subagent session"
-                                    ),
-                                }
-                            }
-                            saved.insert(root_session_id, payload);
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, %root_session_id, "could not save subagent journal");
-                        }
+                for root in roots {
+                    if live.store_for(&root).is_some() {
+                        live.send_journal(&root, None);
                     }
                 }
-                drop(write_guard);
                 drop(live);
                 if revision.changed().await.is_err() {
                     return;
                 }
             }
         }));
+    }
+
+    fn send_journal(&self, root_session_id: &str, request: Option<JournalRequest>) {
+        let mut writers = lock_unpoisoned(&self.journal_writers);
+        let request = match writers.get(root_session_id) {
+            Some(sender) => match request.map(|request| sender.send(request)) {
+                None | Some(Ok(())) => return,
+                Some(Err(mpsc::error::SendError(request))) => Some(request),
+            },
+            None => request,
+        };
+        let Some(registry) = self.this.get().cloned() else {
+            return;
+        };
+        let (sender, requests) = mpsc::unbounded_channel();
+        if let Some(request) = request {
+            let _ = sender.send(request);
+        }
+        writers.insert(root_session_id.to_owned(), sender);
+        drop(writers);
+        let revision = self.revision.subscribe();
+        drop(platform::spawn(journal_writer(
+            registry,
+            root_session_id.to_owned(),
+            requests,
+            revision,
+        )));
+    }
+
+    async fn request_journal(&self, root_session_id: &str, scope: bool) -> std::io::Result<()> {
+        if self.store_for(root_session_id).is_none() {
+            return Err(std::io::Error::other("no subagent store is installed"));
+        }
+        let (done, saved) = oneshot::channel();
+        self.send_journal(
+            root_session_id,
+            Some(JournalRequest::Persist { scope, done }),
+        );
+        saved
+            .await
+            .map_err(|_| std::io::Error::other("subagent journal write was interrupted"))?
+    }
+
+    async fn final_journal(
+        &self,
+        root_session_id: &str,
+        write: JournalWrite,
+    ) -> std::io::Result<()> {
+        let (done, saved) = oneshot::channel();
+        self.send_journal(root_session_id, Some(JournalRequest::Final { write, done }));
+        saved
+            .await
+            .map_err(|_| std::io::Error::other("subagent journal write was interrupted"))?
+    }
+
+    pub(super) fn scope_locks(&self, root_session_id: &str) -> Arc<ScopeLocks> {
+        Arc::clone(
+            lock_unpoisoned(&self.scope_locks)
+                .entry(root_session_id.to_owned())
+                .or_default(),
+        )
+    }
+
+    async fn session_locks(&self, session_id: &str) -> Arc<ScopeLocks> {
+        let root = self
+            .state
+            .lock()
+            .await
+            .root_session_id(session_id)
+            .to_owned();
+        self.scope_locks(&root)
+    }
+
+    async fn write_journal(
+        &self,
+        root_session_id: &str,
+        requests: Vec<JournalRequest>,
+        saved: &mut Option<String>,
+        recorded: &mut HashMap<String, Arc<str>>,
+    ) -> bool {
+        let (restoring, background) = {
+            let restored = self
+                .restored
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let gate = restored
+                .get(root_session_id)
+                .map(|gate| gate.borrow().clone());
+            (
+                matches!(
+                    gate,
+                    Some(RestorationState::Loading | RestorationState::Failed(_))
+                ),
+                matches!(gate, None | Some(RestorationState::Ready)),
+            )
+        };
+        let mut waiters = Vec::new();
+        let mut finals = Vec::new();
+        for request in requests {
+            match request {
+                JournalRequest::Persist { scope: false, done } if restoring => {
+                    let _ = done.send(Err(std::io::Error::other(
+                        "subagent task tree is still restoring",
+                    )));
+                }
+                JournalRequest::Persist { scope, done } => waiters.push((scope, done)),
+                JournalRequest::Final { write, done } => finals.push((write, done)),
+            }
+        }
+        let Some(store) = self.store_for(root_session_id) else {
+            for done in waiters
+                .into_iter()
+                .map(|(_, done)| done)
+                .chain(finals.into_iter().map(|(_, done)| done))
+            {
+                let _ = done.send(Err(std::io::Error::other("no subagent store is installed")));
+            }
+            return true;
+        };
+        let frozen = || {
+            Err(std::io::Error::other(
+                "subagent journal is frozen for shutdown",
+            ))
+        };
+        let (payload, finished) = {
+            let state = self.state.lock().await;
+            let checkpoints = self
+                .checkpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.scopes.get(root_session_id) {
+                None => {
+                    for (scope, done) in waiters.drain(..) {
+                        let _ = done.send(if scope { Ok(()) } else { frozen() });
+                    }
+                    (None, true)
+                }
+                Some(scope) => {
+                    if scope.journal_frozen {
+                        let (scoped, unscoped): (Vec<_>, Vec<_>) =
+                            waiters.drain(..).partition(|(scope, _)| *scope);
+                        waiters = scoped;
+                        for (_, done) in unscoped {
+                            let _ = done.send(frozen());
+                        }
+                    }
+                    let write = !waiters.is_empty() || (background && !scope.journal_frozen);
+                    (
+                        write.then(|| scope.journal_payload(root_session_id, &checkpoints)),
+                        scope.journal_frozen,
+                    )
+                }
+            }
+        };
+        let result = match payload {
+            None => Ok(()),
+            Some(Err(error)) => Err(error),
+            Some(Ok(JournalWrite { payload, records })) => {
+                if waiters.is_empty() && saved.as_ref() == Some(&payload) {
+                    self.acknowledge(root_session_id, &records);
+                    Ok(())
+                } else {
+                    let contents = records.iter().map(|(_, json)| Arc::clone(json)).collect();
+                    let result = store
+                        .save(root_session_id, payload.clone(), contents)
+                        .instrument(tracing::info_span!(
+                            "subagent.journal.save",
+                            session.root_id = root_session_id,
+                            payload.bytes = payload.len(),
+                            record.count = records.len(),
+                            request.count = waiters.len()
+                        ))
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            self.acknowledge(root_session_id, &records);
+                            self.record_children(root_session_id, store.as_ref(), recorded)
+                                .await;
+                            *saved = Some(payload);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            *saved = None;
+                            Err(error)
+                        }
+                    }
+                }
+            }
+        };
+        if waiters.is_empty()
+            && let Err(error) = &result
+        {
+            tracing::warn!(%error, %root_session_id, "could not save subagent journal");
+        }
+        for (_, done) in waiters {
+            let _ = done.send(result.as_ref().copied().map_err(copy_error));
+        }
+        let closed = !finals.is_empty();
+        for (write, done) in finals {
+            *saved = None;
+            let _ = done.send(
+                self.save_write(root_session_id, store.as_ref(), write)
+                    .await,
+            );
+        }
+        finished || closed
+    }
+
+    async fn record_children(
+        &self,
+        root_session_id: &str,
+        store: &dyn SubagentStore,
+        recorded: &mut HashMap<String, Arc<str>>,
+    ) {
+        for (key, checkpoint) in self.child_checkpoints(root_session_id).await {
+            let session_id = checkpoint.session_id().to_owned();
+            if recorded.get(&session_id) == Some(&key) {
+                continue;
+            }
+            match store.record_session(root_session_id, checkpoint).await {
+                Ok(()) => {
+                    self.release_recorded(root_session_id, &key);
+                    recorded.insert(session_id, key);
+                }
+                Err(error) => tracing::warn!(
+                    %error, %root_session_id, %session_id,
+                    "could not record subagent session"
+                ),
+            }
+        }
     }
 
     async fn child_checkpoints(&self, root_session_id: &str) -> Vec<(Arc<str>, SessionCheckpoint)> {
@@ -1560,27 +1801,6 @@ impl Registry {
                     .ok()?,
                 };
                 Some((checkpoint.key, checkpoint.checkpoint?))
-            })
-            .collect()
-    }
-
-    async fn journal_payloads(&self) -> Vec<(String, JournalWrite)> {
-        let state = self.state.lock().await;
-        let checkpoints = self
-            .checkpoints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let restored = self
-            .restored
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .journal(&checkpoints)
-            .into_iter()
-            .filter(|(root, _)| {
-                restored
-                    .get(root)
-                    .is_none_or(|gate| matches!(&*gate.borrow(), RestorationState::Ready))
             })
             .collect()
     }
@@ -2072,14 +2292,12 @@ impl Registry {
         drop(state);
 
         if !report.interrupted.is_empty() || !report.completed.is_empty() {
-            self.save_scope(root_session_id, store.as_ref())
-                .await
-                .map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!("could not record subagent resume attempts: {error}"),
-                    )
-                })?;
+            self.save_scope(root_session_id).await.map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not record subagent resume attempts: {error}"),
+                )
+            })?;
         }
         self.pending_resume
             .lock()
@@ -2089,41 +2307,13 @@ impl Registry {
         Ok(report)
     }
 
-    async fn save_scope(
-        &self,
-        root_session_id: &str,
-        store: &dyn SubagentStore,
-    ) -> std::io::Result<()> {
-        self.save_scope_inner(root_session_id, store)
+    async fn save_scope(&self, root_session_id: &str) -> std::io::Result<()> {
+        self.request_journal(root_session_id, true)
             .instrument(tracing::info_span!(
                 "subagent.journal.snapshot",
                 session.root_id = root_session_id
             ))
             .await
-    }
-
-    async fn save_scope_inner(
-        &self,
-        root_session_id: &str,
-        store: &dyn SubagentStore,
-    ) -> std::io::Result<()> {
-        let _write_guard = self.journal_write_lock.lock().await;
-        let payload = {
-            let state = self.state.lock().await;
-            let checkpoints = self
-                .checkpoints
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state
-                .scopes
-                .get(root_session_id)
-                .map(|scope| scope.journal_payload(root_session_id, &checkpoints))
-                .transpose()?
-        };
-        match payload {
-            Some(write) => self.save_write(root_session_id, store, write).await,
-            None => Ok(()),
-        }
     }
 
     async fn save_write(
@@ -2373,16 +2563,13 @@ impl Registry {
         Ok((outcome, durable))
     }
 
-    async fn persist_durably(self: &Arc<Self>, root_session_id: &str) -> std::io::Result<()> {
-        let (done, saved) = oneshot::channel();
-        let registry = Arc::clone(self);
-        let root_session_id = root_session_id.to_owned();
-        drop(platform::spawn(async move {
-            let _ = done.send(registry.persist_now(&root_session_id).await);
-        }));
-        saved
+    async fn persist_durably(&self, root_session_id: &str) -> std::io::Result<()> {
+        self.request_journal(root_session_id, false)
+            .instrument(tracing::info_span!(
+                "subagent.journal.persist",
+                session.root_id = root_session_id
+            ))
             .await
-            .map_err(|_| std::io::Error::other("subagent journal write was interrupted"))?
     }
 
     fn send_status(&self, root_session_id: &str, update: AgentUpdate) {
@@ -2431,7 +2618,9 @@ impl Registry {
 
     async fn run_ordered(self: &Arc<Self>, root_session_id: &str, id: AgentId, job: OrderedJob) {
         match job {
-            OrderedJob::Update(update) => self.send(root_session_id, update),
+            OrderedJob::Update(update) => {
+                self.send_unless_closed(root_session_id, id, update).await
+            }
             OrderedJob::Settle {
                 status,
                 completion,
@@ -2447,9 +2636,28 @@ impl Registry {
                 if let Err(error) = self.persist_durably(root_session_id).await {
                     tracing::warn!(%error, %root_session_id, "settled subagent turn not journaled yet; the writer retries");
                 }
-                self.send(root_session_id, settled_update(id, status, completion));
+                self.send_unless_closed(
+                    root_session_id,
+                    id,
+                    settled_update(id, status, completion),
+                )
+                .await;
                 self.changed();
             }
+        }
+    }
+
+    async fn send_unless_closed(&self, root_session_id: &str, id: AgentId, update: AgentUpdate) {
+        let state = self.state.lock().await;
+        let closed = state
+            .scopes
+            .get(root_session_id)
+            .and_then(|scope| scope.sessions.get(&id))
+            .is_some_and(|session| matches!(session.status, AgentStatus::Closed));
+        let stale = closed
+            && matches!(&update, AgentUpdate::Status { status, .. } if !matches!(status, AgentStatus::Closed));
+        if !stale {
+            self.send(root_session_id, update);
         }
     }
 
@@ -2520,62 +2728,6 @@ impl Registry {
                 );
             }
         }));
-    }
-
-    async fn persist_now(&self, root_session_id: &str) -> std::io::Result<()> {
-        self.persist_now_inner(root_session_id)
-            .instrument(tracing::info_span!(
-                "subagent.journal.persist",
-                session.root_id = root_session_id
-            ))
-            .await
-    }
-
-    async fn persist_now_inner(&self, root_session_id: &str) -> std::io::Result<()> {
-        let Some(store) = self.store_for(root_session_id) else {
-            return Err(std::io::Error::other("no subagent store is installed"));
-        };
-        let restoring = self
-            .restored
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root_session_id)
-            .is_some_and(|gate| {
-                !matches!(
-                    &*gate.borrow(),
-                    RestorationState::Resuming | RestorationState::Ready
-                )
-            });
-        if restoring {
-            return Err(std::io::Error::other(
-                "subagent task tree is still restoring",
-            ));
-        }
-
-        let _write_guard = self.journal_write_lock.lock().await;
-        let payload = {
-            let state = self.state.lock().await;
-            let checkpoints = self
-                .checkpoints
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match state.scopes.get(root_session_id) {
-                Some(scope) if !scope.journal_frozen => {
-                    Some(scope.journal_payload(root_session_id, &checkpoints))
-                }
-                _ => None,
-            }
-        };
-        match payload {
-            Some(Ok(write)) => {
-                self.save_write(root_session_id, store.as_ref(), write)
-                    .await
-            }
-            Some(Err(error)) => Err(error),
-            None => Err(std::io::Error::other(
-                "subagent journal is frozen for shutdown",
-            )),
-        }
     }
 
     async fn announce_restored_completions(&self, root_session_id: &str, ids: &[AgentId]) {
@@ -2715,26 +2867,26 @@ impl Registry {
         )?;
         drop(state);
         self.changed();
-        if let Some(store) = self.store_for(&root_session_id) {
-            if let Err(error) = self.save_scope(&root_session_id, store.as_ref()).await {
-                if let Some(session) = self
-                    .state
-                    .lock()
-                    .await
-                    .scopes
-                    .get_mut(&root_session_id)
-                    .and_then(|scope| scope.sessions.get_mut(&id))
-                    && let Some(events) = session.event_task.take()
-                {
-                    events.abort();
-                }
-                return match self.close_batch(&root_session_id, vec![id]).await {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => Err(std::io::Error::other(format!(
-                        "{error}; subagent startup cleanup failed: {cleanup}"
-                    ))),
-                };
+        if self.store_for(&root_session_id).is_some()
+            && let Err(error) = self.save_scope(&root_session_id).await
+        {
+            if let Some(session) = self
+                .state
+                .lock()
+                .await
+                .scopes
+                .get_mut(&root_session_id)
+                .and_then(|scope| scope.sessions.get_mut(&id))
+                && let Some(events) = session.event_task.take()
+            {
+                events.abort();
             }
+            return match self.close_batch(&root_session_id, vec![id]).await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(std::io::Error::other(format!(
+                    "{error}; subagent startup cleanup failed: {cleanup}"
+                ))),
+            };
         }
         Ok(())
     }
@@ -2936,9 +3088,10 @@ impl Registry {
     }
 
     async fn enforce_resident_limit(&self, root_session_id: &str) {
-        let _residency_guard = self.residency_lock.lock().await;
+        let locks = self.scope_locks(root_session_id);
+        let _residency_guard = locks.residency.lock().await;
         loop {
-            let _message_guard = self.message_lock.lock().await;
+            let _message_guard = locks.message.lock().await;
             let eviction = self
                 .state
                 .lock()
@@ -3435,8 +3588,9 @@ impl Registry {
         body: String,
         user: bool,
     ) -> std::io::Result<MessageReceipt> {
-        let _residency_guard = self.residency_lock.lock().await;
-        let _message_guard = self.message_lock.lock().await;
+        let locks = self.session_locks(session_id).await;
+        let _residency_guard = locks.residency.lock().await;
+        let _message_guard = locks.message.lock().await;
         self.rehydrate(session_id, to, purpose).await?;
         let prepared = self.state.lock().await.prepare_message(
             session_id,
@@ -3712,7 +3866,8 @@ impl Registry {
         id: AgentId,
     ) -> std::io::Result<Vec<AgentSummary>> {
         self.await_restored(session_id).await?;
-        let _message_guard = self.message_lock.lock().await;
+        let locks = self.session_locks(session_id).await;
+        let _message_guard = locks.message.lock().await;
         let (root_session_id, ids, harnesses) = {
             let mut state = self.state.lock().await;
             state.request_interrupt(session_id, id)?
@@ -3729,7 +3884,8 @@ impl Registry {
 
     pub async fn close(&self, session_id: &str, id: AgentId) -> std::io::Result<Vec<AgentSummary>> {
         self.await_restored(session_id).await?;
-        let _message_guard = self.message_lock.lock().await;
+        let locks = self.session_locks(session_id).await;
+        let _message_guard = locks.message.lock().await;
         let CloseRequest {
             root_session_id,
             ids,
@@ -3755,7 +3911,7 @@ impl Registry {
             }
         }
         if self.store_for(root_session_id).is_some()
-            && let Err(error) = self.persist_now(root_session_id).await
+            && let Err(error) = self.persist_durably(root_session_id).await
         {
             errors.push(format!("persisting startup cleanup: {error}"));
         }
@@ -3768,8 +3924,8 @@ impl Registry {
 
     async fn close_all(&self, session_id: &str) -> std::io::Result<Vec<AgentSummary>> {
         self.await_restored(session_id).await?;
-        let _message_guard = self.message_lock.lock().await;
-        let write_guard = self.journal_write_lock.lock().await;
+        let locks = self.session_locks(session_id).await;
+        let _message_guard = locks.message.lock().await;
         let mut revision = self.revision.subscribe();
         let capture_deadline = Instant::now() + AGENT_STOP_TIMEOUT;
         let (request, final_journal) = loop {
@@ -3804,7 +3960,7 @@ impl Registry {
                 .get(&root)
                 .is_some_and(|scope| scope.journal_frozen);
             let final_journal = match self.store_for(&root) {
-                Some(store) if !frozen => {
+                Some(_) if !frozen => {
                     let checkpoints = self
                         .checkpoints
                         .lock()
@@ -3812,7 +3968,7 @@ impl Registry {
                     let scope = state.scope_mut(&root);
                     let payload = scope.journal_payload(&root, &checkpoints)?;
                     scope.journal_frozen = true;
-                    Some((store, payload))
+                    Some(payload)
                 }
                 _ => None,
             };
@@ -3825,13 +3981,10 @@ impl Registry {
             harnesses,
             status_updates,
         } = request;
-        let journal_result = if let Some((store, write)) = final_journal {
-            self.save_write(&root_session_id, store.as_ref(), write)
-                .await
-        } else {
-            Ok(())
+        let journal_result = match final_journal {
+            Some(write) => self.final_journal(&root_session_id, write).await,
+            None => Ok(()),
         };
-        drop(write_guard);
 
         for (id, status) in status_updates {
             self.send_status(&root_session_id, AgentUpdate::Status { id, status });
@@ -3926,7 +4079,8 @@ impl Registry {
         if self.await_restored(session_id).await.is_err() {
             return;
         }
-        let _message_guard = self.message_lock.lock().await;
+        let locks = self.session_locks(session_id).await;
+        let _message_guard = locks.message.lock().await;
         let (root_session_id, ids, harnesses) = {
             let mut state = self.state.lock().await;
             state.request_interrupt_all(session_id)
