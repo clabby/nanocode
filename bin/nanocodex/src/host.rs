@@ -263,8 +263,12 @@ impl Host {
         Ok(started?)
     }
 
-    pub async fn open(&self, session_id: &str) -> Result<(Agent, AgentEvents)> {
-        Ok(self.runtime.open_session(session_id).await?)
+    pub async fn open(
+        &self,
+        store: &SessionStore,
+        stored: &nanocode::durability::StoredSession,
+    ) -> Result<(Agent, AgentEvents)> {
+        Ok(self.runtime.open_loaded(store, stored).await?)
     }
 }
 

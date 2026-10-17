@@ -191,8 +191,10 @@ mod store {
     use super::{BranchBoundary, SessionRecord};
     use crate::{
         AdmittedTurn, CheckpointFormat, DurableSession, DurableState, EncodedPayload, Error,
-        OperationStatus, OwnerId, PayloadReader, Result, StateStore, Transition, format::Formats,
-        session::reduce_peeked, shared_store::SharedStore,
+        OperationStatus, OwnerId, PayloadReader, Result, StateStore, Transition,
+        format::Formats,
+        session::reduce_peeked,
+        shared_store::{SharedStore, WeakSharedStore},
     };
 
     pub use nanocode_agent_core::session::TranscriptItem;
@@ -240,6 +242,15 @@ mod store {
         pub checkpoint: Option<Value>,
 
         formats: Formats,
+
+        loaded: Loaded,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Loaded {
+        store: WeakSharedStore,
+        state_id: String,
+        checkpoint_key: Option<String>,
     }
 
     impl StoredSession {
@@ -403,6 +414,13 @@ mod store {
                 turns,
                 checkpoint,
                 formats: self.formats.clone(),
+                loaded: Loaded {
+                    store: self.store.downgrade(),
+                    state_id: id.to_owned(),
+                    checkpoint_key: state
+                        .latest_checkpoint()
+                        .map(|payload| payload.key().to_owned()),
+                },
             })
         }
 
@@ -467,6 +485,30 @@ mod store {
                 record,
             )
             .await
+        }
+
+        pub async fn prepare_resume_loaded(
+            &self,
+            stored: &StoredSession,
+        ) -> Result<DurableSession> {
+            if !stored.loaded.store.is(&self.store) {
+                return Err(Error::InvalidState(
+                    "the stored session was loaded from a different session store".to_owned(),
+                ));
+            }
+            let id = &stored.summary.record.session_id;
+            if *id != stored.loaded.state_id {
+                return Err(Error::InvalidState(
+                    "the stored session identity changed after loading".to_owned(),
+                ));
+            }
+            let state = self.prepare_resume(id).await?;
+            if let (Some(key), Some(checkpoint)) =
+                (&stored.loaded.checkpoint_key, &stored.checkpoint)
+            {
+                state.preload_checkpoint(key.clone(), checkpoint.clone());
+            }
+            Ok(state)
         }
 
         async fn resume_record(&self, id: &str) -> Result<Option<SessionRecord>> {

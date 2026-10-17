@@ -34,6 +34,8 @@ pub struct Defaults<C, A> {
     computer_disabled: bool,
     #[cfg(not(target_family = "wasm"))]
     management_disabled: bool,
+    #[cfg(target_os = "macos")]
+    machine_tools_disabled: bool,
     #[cfg(not(target_family = "wasm"))]
     runners: Vec<Runner>,
     #[cfg(not(target_family = "wasm"))]
@@ -50,6 +52,8 @@ impl<C, A> Default for Defaults<C, A> {
             computer_disabled: false,
             #[cfg(not(target_family = "wasm"))]
             management_disabled: false,
+            #[cfg(target_os = "macos")]
+            machine_tools_disabled: false,
             #[cfg(not(target_family = "wasm"))]
             runners: Vec::new(),
             #[cfg(not(target_family = "wasm"))]
@@ -121,6 +125,10 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
                     .validate()
                     .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
             }
+            #[cfg(target_os = "macos")]
+            if !self.machine_tools_disabled {
+                nanocode_home::shell::warm_user_shell();
+            }
             let pool = RunnerPool::new().with_model_management(!self.management_disabled);
             let agents = runners::RunnerAgents::new(pool.clone(), self.runners, self.servers);
             Ok(Arc::new(Services {
@@ -141,6 +149,10 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
             self.computer = None;
             self.computer_disabled = true;
             self.management_disabled = true;
+            #[cfg(target_os = "macos")]
+            {
+                self.machine_tools_disabled = true;
+            }
         }
     }
 }

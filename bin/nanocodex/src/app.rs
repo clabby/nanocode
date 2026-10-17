@@ -2297,7 +2297,7 @@ pub async fn open_session(
         .filter_map(|turn| turn.preview.clone())
         .collect();
     let (agent, events) = tracing::Instrument::instrument(
-        host.open(session_id),
+        host.open(store, &stored),
         tracing::info_span!(target: "nanocodex", "nc.session.restore", session.id = session_id),
     )
     .await?;

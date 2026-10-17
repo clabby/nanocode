@@ -72,9 +72,24 @@ pub struct SharedStore {
     batches_companion_acquisition: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct WeakSharedStore(mpsc::WeakSender<StoreRequest>);
+
+impl WeakSharedStore {
+    pub(crate) fn is(&self, store: &SharedStore) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|commands| commands.same_channel(&store.commands))
+    }
+}
+
 impl SharedStore {
     pub(crate) fn same_store(&self, other: &Self) -> bool {
         self.commands.same_channel(&other.commands)
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakSharedStore {
+        WeakSharedStore(self.commands.downgrade())
     }
 
     pub(crate) fn new<S>(mut store: S) -> crate::Result<Self>

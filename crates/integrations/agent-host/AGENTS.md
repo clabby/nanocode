@@ -1,1 +1,3 @@
 Own native default storage, CUA lifecycle, runner attachment and durable process routing. Receive provider defaults through generic contracts without depending on backends. Explicit remote Code Mode must not initialize local machine tools. Preserve native/WASM adapters and the facade runner APIs.
+
+On macOS, native defaults may overlap the first user database lookup with runtime construction. Keep the ordinary shell lookup authoritative and skip warming when explicit remote Code Mode disables local machine tools. Measure startup and total CPU together; do not extend this warmup to other platforms without measurements.

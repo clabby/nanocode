@@ -381,7 +381,7 @@ fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
 
 #[cfg(not(target_family = "wasm"))]
 fn detected_execution_environment() -> ExecutionEnvironment {
-    match iana_time_zone::get_timezone() {
+    match system_timezone() {
         Ok(timezone) => {
             ExecutionEnvironment::new(Local::now().format("%Y-%m-%d").to_string(), timezone)
         }
@@ -391,6 +391,33 @@ fn detected_execution_environment() -> ExecutionEnvironment {
         ),
     }
 }
+
+#[cfg(target_os = "macos")]
+fn system_timezone() -> Result<String, iana_time_zone::GetTimezoneError> {
+    const TZDIR: &str = "/var/db/timezone/zoneinfo/";
+    if std::env::var_os("TZFILE").is_none()
+        && std::env::var_os("TZ").is_none()
+        && let Ok(link) = std::fs::read_link("/etc/localtime")
+        && let Some(name) = link.to_str().and_then(|link| link.strip_prefix(TZDIR))
+        && !name.starts_with("GMT")
+        && !name.starts_with("UTC")
+        && let Ok(index) = std::fs::read(format!("{TZDIR}tzdata.zi"))
+        && index.split(|byte| *byte == b'\n').any(|line| {
+            let mut fields = line.split(|byte| *byte == b' ');
+            match fields.next() {
+                Some(b"Z") => fields.next() == Some(name.as_bytes()),
+                Some(b"L") => fields.nth(1) == Some(name.as_bytes()),
+                _ => false,
+            }
+        })
+    {
+        return Ok(name.to_owned());
+    }
+    iana_time_zone::get_timezone()
+}
+
+#[cfg(all(not(target_family = "wasm"), not(target_os = "macos")))]
+use iana_time_zone::get_timezone as system_timezone;
 
 #[cfg(target_family = "wasm")]
 fn detected_execution_environment() -> ExecutionEnvironment {

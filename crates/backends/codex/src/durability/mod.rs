@@ -65,12 +65,18 @@ impl<F> DurableAgentExt for NanocodexBuilder<F> {
         };
         let mut known_records = HashSet::new();
         if let Some(checkpoint) = checkpoint {
-            let (restored, keys) = context::load_snapshot_with_keys(
-                (&owner).into(),
-                checkpoint.decode().map_err(agent_error)?,
-            )
-            .await
-            .map_err(agent_error)?;
+            let preloaded = state
+                .take_checkpoint_preload(checkpoint.key())
+                .and_then(|preloaded| context::preloaded_snapshot(&preloaded, checkpoint.key()));
+            let (restored, keys) = match preloaded {
+                Some(preloaded) => preloaded,
+                None => context::load_snapshot_with_keys(
+                    (&owner).into(),
+                    checkpoint.decode().map_err(agent_error)?,
+                )
+                .await
+                .map_err(agent_error)?,
+            };
             if let Some(configured) = builder.resume_snapshot()
                 && serde_json::to_string(configured)
                     .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?

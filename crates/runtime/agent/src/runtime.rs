@@ -764,15 +764,17 @@ impl AgentRuntime {
         store: &crate::durability::SessionStore,
         session_id: &str,
     ) -> AgentResult {
-        let configured = self.inner.durability.as_ref().ok_or_else(|| {
-            NanocodexError::InvalidRequest("runtime durability is not configured".into())
-        })?;
-        if !configured.same_store(store) {
-            return Err(NanocodexError::InvalidRequest(
-                "session store differs from the runtime's configured durability store".into(),
-            ));
-        }
+        let configured = self.configured_store(store)?;
         let stored = configured.load(session_id).await.map_err(catalog_error)?;
+        self.open_loaded(store, &stored).await
+    }
+
+    pub async fn open_loaded(
+        &self,
+        store: &crate::durability::SessionStore,
+        stored: &crate::durability::StoredSession,
+    ) -> AgentResult {
+        let configured = self.configured_store(store)?;
         let model = stored.summary.record.model.clone();
         let thinking = stored
             .session_checkpoint()
@@ -795,9 +797,10 @@ impl AgentRuntime {
             .then(|| stored.summary.record.inherited_transcript.clone())
             .filter(|transcript| !transcript.is_empty());
         let durable_state = configured
-            .prepare_resume(session_id)
+            .prepare_resume_loaded(stored)
             .await
             .map_err(catalog_error)?;
+        let _preload = CheckpointPreload(durable_state.clone());
         let (agent, events) = self
             .construct(AgentSpec {
                 parent: None,
@@ -817,6 +820,21 @@ impl AgentRuntime {
             Some(transcript) => Ok((agent.with_transcript(transcript)?, events)),
             None => Ok((agent, events)),
         }
+    }
+
+    fn configured_store(
+        &self,
+        store: &crate::durability::SessionStore,
+    ) -> Result<&crate::durability::SessionStore> {
+        let configured = self.inner.durability.as_ref().ok_or_else(|| {
+            NanocodexError::InvalidRequest("runtime durability is not configured".into())
+        })?;
+        if !configured.same_store(store) {
+            return Err(NanocodexError::InvalidRequest(
+                "session store differs from the runtime's configured durability store".into(),
+            ));
+        }
+        Ok(configured)
     }
 
     pub async fn switch(
@@ -1004,6 +1022,14 @@ impl<B: crate::BackendKind> SpawnBuilder<'_, B> {
     }
 }
 
+struct CheckpointPreload(crate::durability::DurableSession);
+
+impl Drop for CheckpointPreload {
+    fn drop(&mut self) {
+        drop(self.0.take_checkpoint_preload(""));
+    }
+}
+
 struct AgentSpec {
     model: ModelSelection,
     thinking: Thinking,
@@ -1053,7 +1079,7 @@ impl nanocode_tool_contracts::ToolCollection for SharedTools {
 #[cfg(target_family = "wasm")]
 fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
     workspace
-        .filter(|workspace| workspace.is_absolute())
+        .filter(|workspace| workspace.has_root())
         .ok_or_else(|| {
             NanocodexError::InvalidRequest(
                 "a WASM runtime requires an absolute workspace path".into(),

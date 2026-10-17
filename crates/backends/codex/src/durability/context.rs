@@ -86,6 +86,24 @@ pub(crate) async fn restore_snapshot(
         .map(|(snapshot, _)| snapshot)
 }
 
+pub(crate) fn preloaded_snapshot(
+    checkpoint: &serde_json::Value,
+    key: &str,
+) -> Option<(SessionSnapshot, HashSet<String>)> {
+    let prepared = prepare_snapshot(
+        SessionSnapshot::deserialize(checkpoint).ok()?,
+        &HashSet::new(),
+    )
+    .ok()?;
+    if prepared.payload.key() != key {
+        return None;
+    }
+    Some((
+        SessionSnapshot::deserialize(checkpoint).ok()?,
+        prepared.keys,
+    ))
+}
+
 pub(crate) async fn load_snapshot_with_keys(
     reader: PayloadReader<'_>,
     saved: Snapshot,

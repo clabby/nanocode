@@ -1683,6 +1683,7 @@ pub struct DurableSession {
     caller_id: OwnerId,
     active_claims: AtomicUsize,
     described: Option<crate::SessionRecord>,
+    preload: Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>,
 }
 
 impl Clone for DurableSession {
@@ -1696,6 +1697,7 @@ impl Clone for DurableSession {
             caller_id: OwnerId::new(),
             active_claims: AtomicUsize::new(0),
             described: self.described.clone(),
+            preload: Arc::clone(&self.preload),
         }
     }
 }
@@ -1820,7 +1822,24 @@ impl DurableSession {
             caller_id: OwnerId::new(),
             active_claims: AtomicUsize::new(0),
             described,
+            preload: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    pub(crate) fn preload_checkpoint(&self, key: String, checkpoint: serde_json::Value) {
+        *self
+            .preload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((key, checkpoint));
+    }
+
+    pub fn take_checkpoint_preload(&self, key: &str) -> Option<serde_json::Value> {
+        self.preload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .filter(|(preloaded, _)| preloaded == key)
+            .map(|(_, checkpoint)| checkpoint)
     }
 
     pub async fn describe(

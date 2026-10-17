@@ -72,6 +72,7 @@ impl DurableAgentExt for ClaudeBuilder {
             }
         }
         .map_err(agent_error)?;
+        drop(state.take_checkpoint_preload(""));
         let record = state.record().await.map_err(agent_error)?;
         let branches = Branches {
             store: state.shared_store(),

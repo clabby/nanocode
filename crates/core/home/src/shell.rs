@@ -84,6 +84,13 @@ fn user_shell_path() -> Option<PathBuf> {
         .map(|user| user.shell)
 }
 
+#[cfg(target_os = "macos")]
+pub fn warm_user_shell() {
+    let _ = std::thread::Builder::new()
+        .name("nanocode-user-shell".to_owned())
+        .spawn(|| drop(user_shell_path()));
+}
+
 #[cfg(windows)]
 fn user_shell_path() -> Option<PathBuf> {
     env::var_os("COMSPEC").map(PathBuf::from)
