@@ -128,6 +128,9 @@ pub trait RuntimeDefaults: Clone + Default + Send + Sync + 'static {
     fn preferred_backend(existing: &[BackendId]) -> Option<BackendId>;
     fn default_backends(existing: &[BackendId]) -> Vec<Arc<dyn RuntimeBackend>>;
     fn default_store() -> nanocode_durability::Result<SessionStore>;
+    fn default_store_async() -> Option<BackendFuture<nanocode_durability::Result<SessionStore>>> {
+        None
+    }
     fn build(self) -> Result<Arc<Self::Host>>;
     fn disable_machine_tools(&mut self);
 }

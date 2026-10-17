@@ -11,17 +11,20 @@ use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{File, Metadata, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     ops::Range,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex, PoisonError, Weak},
     thread,
     time::Instant,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 const JOB_CAPACITY: usize = 1;
+
+static OPENING: Mutex<BTreeMap<PathBuf, Weak<Semaphore>>> = Mutex::new(BTreeMap::new());
 
 type Job = Box<dyn FnOnce(&mut Journal) + Send>;
 
@@ -365,7 +368,11 @@ impl Journal {
 
     fn home(home: &Path) -> Result<PathBuf, StoreError> {
         std::fs::create_dir_all(home).map_err(backend)?;
-        Ok(home.join("sessions.jsonl"))
+        Ok(Self::home_path(home))
+    }
+
+    fn home_path(home: &Path) -> PathBuf {
+        home.join("sessions.jsonl")
     }
 
     fn locked<T>(
@@ -1010,12 +1017,29 @@ impl JsonlStore {
 
     pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_owned();
-        Self::opened(Self::start(move || Journal::open(&path))?).await
+        let key = path.clone();
+        Self::admitted(&key, move || Journal::open(&path)).await
     }
 
     pub async fn open_home_async(home: &Path) -> Result<Self, StoreError> {
         let home = home.to_owned();
-        Self::opened(Self::start(move || Journal::open(&Journal::home(&home)?))?).await
+        Self::admitted(&Journal::home_path(&home), move || {
+            Journal::open(&Journal::home(&home)?)
+        })
+        .await
+    }
+
+    async fn admitted(
+        path: &Path,
+        open: impl FnOnce() -> Result<Journal, StoreError> + Send + 'static,
+    ) -> Result<Self, StoreError> {
+        let permit = opening(path).await?;
+        Self::opened(Self::start(move || {
+            let journal = open();
+            drop(permit);
+            journal
+        })?)
+        .await
     }
 
     pub async fn close(self) -> Result<(), StoreError> {
@@ -1209,6 +1233,28 @@ fn identity(metadata: &Metadata) -> Result<String, StoreError> {
 #[cfg(not(unix))]
 fn identity(metadata: &Metadata) -> Result<String, StoreError> {
     Ok(format!("{:?}", metadata.created().map_err(backend)?))
+}
+
+async fn opening(path: &Path) -> Result<OwnedSemaphorePermit, StoreError> {
+    let mut key = PathBuf::new();
+    for component in std::path::absolute(path).map_err(backend)?.components() {
+        match component {
+            Component::ParentDir => {
+                key.pop();
+            }
+            component => key.push(component),
+        }
+    }
+    let gate = {
+        let mut gates = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        gates.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let gate = Arc::new(Semaphore::new(1));
+            gates.insert(key, Arc::downgrade(&gate));
+            gate
+        })
+    };
+    gate.acquire_owned().await.map_err(backend)
 }
 
 fn identity_changed() -> StoreError {

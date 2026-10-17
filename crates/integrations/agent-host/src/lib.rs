@@ -112,6 +112,28 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
         Ok(store)
     }
 
+    fn default_store_async() -> Option<BackendFuture<nanocode_durability::Result<SessionStore>>> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            Some(Box::pin(async {
+                let home = nanocode_home::AgentHome::from_env()
+                    .map_err(|error| nanocode_durability::StoreError::Backend(error.to_string()))?;
+                let store = nanocode_store_jsonl::JsonlStore::open_home_async(
+                    &home.codex_home().join("nanocode"),
+                )
+                .await?;
+                let store = SessionStore::new(store)?;
+                store.register_format(C::builtin_format())?;
+                store.register_format(A::builtin_format())?;
+                Ok(store)
+            }))
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            None
+        }
+    }
+
     fn build(self) -> Result<Arc<Services>> {
         #[cfg(not(target_family = "wasm"))]
         {
