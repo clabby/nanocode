@@ -6,8 +6,8 @@ use std::{path::Path, str::FromStr, sync::OnceLock};
 use syntect::{
     easy::HighlightLines,
     highlighting::{
-        Color as SyntectColor, FontStyle, ScopeSelectors, StyleModifier, Theme as SyntaxTheme,
-        ThemeItem, ThemeSettings,
+        Color as SyntectColor, FontStyle, ScopeSelectors, Style as SyntaxStyle, StyleModifier,
+        Theme as SyntaxTheme, ThemeItem, ThemeSettings,
     },
     parsing::{SyntaxReference, SyntaxSet},
 };
@@ -99,33 +99,46 @@ pub fn line(
     let Ok(regions) = highlighter.highlight_line(&line, syntaxes) else {
         return vec![Span::styled(text.to_owned(), code_style())];
     };
-    let mut spans = Vec::new();
-    for (style, region) in regions {
-        let region = region.trim_end_matches('\n');
-        if region.is_empty() {
-            continue;
-        }
-        let mut modifier = Modifier::empty();
-        if style.font_style.contains(FontStyle::BOLD) {
-            modifier.insert(Modifier::BOLD);
-        }
-        if style.font_style.contains(FontStyle::ITALIC) {
-            modifier.insert(Modifier::ITALIC);
-        }
-        if style.font_style.contains(FontStyle::UNDERLINE) {
-            modifier.insert(Modifier::UNDERLINED);
-        }
-        spans.push(Span::styled(
-            region.to_owned(),
-            Style::default()
-                .fg(terminal_color(style.foreground))
-                .add_modifier(modifier),
-        ));
+    let regions = regions
+        .into_iter()
+        .map(|(style, region)| (span_style(style), region.trim_end_matches('\n')))
+        .filter(|(_, region)| !region.is_empty())
+        .collect::<Vec<_>>();
+    if regions.is_empty() {
+        return vec![Span::styled(String::new(), code_style())];
     }
-    if spans.is_empty() {
-        spans.push(Span::styled(String::new(), code_style()));
+    let joined = |left: &(Style, &str), right: &(Style, &str)| {
+        left.0 == right.0 && printable(left.1) && printable(right.1)
+    };
+    let mut spans = Vec::with_capacity(regions.chunk_by(joined).count());
+    for run in regions.chunk_by(joined) {
+        let mut content = String::with_capacity(run.iter().map(|(_, region)| region.len()).sum());
+        for (_, region) in run {
+            content.push_str(region);
+        }
+        spans.push(Span::styled(content, run[0].0));
     }
     spans
+}
+
+fn span_style(style: SyntaxStyle) -> Style {
+    let mut modifier = Modifier::empty();
+    if style.font_style.contains(FontStyle::BOLD) {
+        modifier.insert(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        modifier.insert(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        modifier.insert(Modifier::UNDERLINED);
+    }
+    Style::default()
+        .fg(terminal_color(style.foreground))
+        .add_modifier(modifier)
+}
+
+fn printable(text: &str) -> bool {
+    crate::text::ascii_prefix(text, false) == text.len()
 }
 
 pub fn code_style() -> Style {

@@ -1,7 +1,10 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex as SyncMutex},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -265,7 +268,7 @@ struct SubscriptionInner {
     key: Arc<str>,
     issuer: Arc<str>,
     refresh: Mutex<()>,
-    known_authenticated: SyncMutex<bool>,
+    known_authenticated: AtomicBool,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -373,7 +376,7 @@ impl ChatGptSubscription {
                 key,
                 issuer,
                 refresh: Mutex::new(()),
-                known_authenticated: SyncMutex::new(false),
+                known_authenticated: AtomicBool::new(false),
             }),
         };
         let loaded = subscription.load().await?;
@@ -806,9 +809,9 @@ impl ChatGptSubscription {
     }
 
     fn set_known_authenticated(&self, value: bool) {
-        if let Ok(mut authenticated) = self.inner.known_authenticated.lock() {
-            *authenticated = value;
-        }
+        self.inner
+            .known_authenticated
+            .store(value, Ordering::Relaxed);
     }
 }
 
@@ -818,14 +821,17 @@ struct SubscriptionAuthSource {
 
 impl OpenAiAuthSource for SubscriptionAuthSource {
     fn validate(&self) -> Result<(), OpenAiAuthError> {
-        match self.subscription.inner.known_authenticated.lock() {
-            Ok(authenticated) if *authenticated => Ok(()),
-            Ok(_) => Err(OpenAiAuthError::LoginRequired(Arc::from(
+        if self
+            .subscription
+            .inner
+            .known_authenticated
+            .load(Ordering::Relaxed)
+        {
+            Ok(())
+        } else {
+            Err(OpenAiAuthError::LoginRequired(Arc::from(
                 "the hosted subscription is signed out",
-            ))),
-            Err(_) => Err(OpenAiAuthError::Unavailable(Arc::from(
-                "subscription state poisoned",
-            ))),
+            )))
         }
     }
 
