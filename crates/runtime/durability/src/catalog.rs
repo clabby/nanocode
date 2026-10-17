@@ -301,6 +301,7 @@ mod store {
     pub struct SessionStore {
         store: SharedStore,
         formats: Formats,
+        terminal_receipt_limit: Option<usize>,
     }
 
     pub trait IntoSessionStore {
@@ -329,7 +330,14 @@ mod store {
             Ok(Self {
                 store: SharedStore::new(store)?,
                 formats: Formats::default(),
+                terminal_receipt_limit: None,
             })
+        }
+
+        #[must_use]
+        pub fn with_terminal_receipt_limit(mut self, limit: usize) -> Self {
+            self.terminal_receipt_limit = Some(limit);
+            self
         }
 
         pub fn register_format(&self, format: Arc<dyn CheckpointFormat>) -> Result<()> {
@@ -438,7 +446,7 @@ mod store {
             DurableSession::open_shared_described(
                 self.store.clone(),
                 record.session_id.clone(),
-                None,
+                self.terminal_receipt_limit,
                 Some(record),
             )
             .await
@@ -448,7 +456,7 @@ mod store {
             DurableSession::prepare_shared_described(
                 self.store.clone(),
                 record.session_id.clone(),
-                None,
+                self.terminal_receipt_limit,
                 Some(record),
             )
             .await
@@ -477,8 +485,13 @@ mod store {
 
         pub async fn resume(&self, id: &str) -> Result<DurableSession> {
             let record = self.resume_record(id).await?;
-            DurableSession::open_shared_described(self.store.clone(), id.to_owned(), None, record)
-                .await
+            DurableSession::open_shared_described(
+                self.store.clone(),
+                id.to_owned(),
+                self.terminal_receipt_limit,
+                record,
+            )
+            .await
         }
 
         pub async fn prepare_resume(&self, id: &str) -> Result<DurableSession> {
@@ -486,7 +499,7 @@ mod store {
             DurableSession::prepare_shared_described(
                 self.store.clone(),
                 id.to_owned(),
-                None,
+                self.terminal_receipt_limit,
                 record,
             )
             .await

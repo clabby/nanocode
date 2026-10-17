@@ -11,3 +11,5 @@ SessionStore::prepare_resume_loaded prepares the same resume as prepare_resume f
 Startup durability is bounded by full disk syncs, about 5 ms each with F_FULLFSYNC on macOS APFS. Measure journal entries, sync count and latency for new-session construction when changing acquisition paths.
 
 StateStore::flush is an ordered adapter barrier, with a no-op default for adapters whose completed writes need no further work. SharedStore serializes it with reads and mutations; SessionStore::flush exposes it to SDK consumers without closing shared clones. Native storage adapters must keep blocking file work outside asynchronous runtime workers and complete accepted writes even when their response receiver is dropped.
+
+SessionStore::with_terminal_receipt_limit makes every session the store opens, prepares or resumes retain only that many terminal operation receipts, pruning older ones and marking the record history_pruned. The default retains all receipts. A pruned turn can no longer be a branch target. The limit bounds the journal payload that append-only stores rewrite on every revision, which otherwise grows with every completed turn.
