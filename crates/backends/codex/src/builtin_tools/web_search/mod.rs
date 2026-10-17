@@ -140,10 +140,13 @@ impl WebSearchHandler {
                 .await
                 .map_err(|error| auth_failure(&error))?;
             return self
-                .read_response(self.send_authorized(request, &refreshed).await?)
+                .read_response(
+                    self.send_authorized(request, &refreshed).await?,
+                    &[&auth, &refreshed],
+                )
                 .await;
         }
-        self.read_response(response).await
+        self.read_response(response, &[&auth]).await
     }
 
     async fn send_authorized(
@@ -175,14 +178,34 @@ impl WebSearchHandler {
     async fn read_response(
         &self,
         response: reqwest::Response,
+        used: &[&OpenAiAuthSnapshot],
     ) -> Result<(reqwest::StatusCode, Vec<u8>), RequestFailure> {
         let status = response.status();
         let body = read_response_body(response).await.map_err(|mut failure| {
             failure.retryable |= status.is_server_error();
             failure
         })?;
-        Ok((status, body))
+        if status.is_success() {
+            return Ok((status, body));
+        }
+        Ok((status, redact_credentials(body, used)))
     }
+}
+
+fn redact_credentials(body: Vec<u8>, used: &[&OpenAiAuthSnapshot]) -> Vec<u8> {
+    let mut text = match String::from_utf8_lossy(&body) {
+        text if used
+            .iter()
+            .any(|auth| auth.sends_bearer() && text.contains(auth.bearer())) =>
+        {
+            text.into_owned()
+        }
+        _ => return body,
+    };
+    for auth in used.iter().filter(|auth| auth.sends_bearer()) {
+        text = text.replace(auth.bearer(), "[redacted]");
+    }
+    text.into_bytes()
 }
 
 fn auth_failure(error: &OpenAiAuthError) -> RequestFailure {

@@ -14,6 +14,7 @@ use crate::client::{
     service_error::ResponsesServiceError,
     socket::{ResponsesSocket, decode_event},
     telemetry::{ApiEvent, ApiEventData, elapsed_ns},
+    transport::error::Credentials,
 };
 
 #[derive(Deserialize, Serialize)]
@@ -227,6 +228,7 @@ pub(crate) async fn receive<S>(
     source: &mut S,
     transport: &'static str,
     observer: &ResponsesObserver,
+    credentials: &Credentials,
     call_index: u32,
     started_at: Instant,
 ) -> Result<GenerationOutput, ResponsesServiceError>
@@ -243,6 +245,7 @@ where
             source,
             transport,
             observer,
+            credentials,
             "generation",
             call_index,
             &mut timing,
@@ -461,6 +464,7 @@ pub(crate) async fn receive_compaction<S>(
     source: &mut S,
     transport: &'static str,
     observer: &ResponsesObserver,
+    credentials: &Credentials,
     call_index: u32,
     started_at: Instant,
 ) -> Result<CompactionOutput, ResponsesServiceError>
@@ -475,6 +479,7 @@ where
             source,
             transport,
             observer,
+            credentials,
             "compaction",
             call_index,
             &mut timing,
@@ -513,6 +518,7 @@ async fn next_event<S>(
     source: &mut S,
     transport: &'static str,
     observer: &ResponsesObserver,
+    credentials: &Credentials,
     phase: &'static str,
     call_index: u32,
     timing: &mut StreamTiming,
@@ -539,7 +545,8 @@ where
     let decode_started_at = Instant::now();
     let parsed = decode_event::<ServerEvent>(received.text.as_str())?;
     let initial_decode_duration_ns = elapsed_ns(decode_started_at);
-    let raw_event = parsed.raw;
+    let raw_event = credentials.redact(parsed.raw);
+    let raw_event = raw_event.as_ref();
     let decoded = parsed.decoded;
     let elapsed = elapsed_ns(timing.started_at);
     timing.first_event_ns.get_or_insert(elapsed);

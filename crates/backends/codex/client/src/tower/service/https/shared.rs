@@ -73,6 +73,7 @@ pub(crate) async fn run(
                 &mut response,
                 transport,
                 &request.observer,
+                &connection.credentials,
                 required_call_index(request)?,
                 started_at,
             )
@@ -83,6 +84,7 @@ pub(crate) async fn run(
                 &mut response,
                 transport,
                 &request.observer,
+                &connection.credentials,
                 required_call_index(request)?,
                 started_at,
             )
@@ -124,6 +126,7 @@ async fn send_with_auth_recovery(
     guard: &mut AttemptGuard<'_>,
 ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
     let auth = service.auth_snapshot().await?;
+    guard.credentials.insert(auth.shared_bearer());
     let turn_state = guard.turn_state.clone();
     match service
         .platform
@@ -150,6 +153,7 @@ async fn send_with_auth_recovery(
                     detail: error.to_string(),
                 })?;
             let refreshed = service.auth_snapshot().await?;
+            guard.credentials.insert(refreshed.shared_bearer());
             service
                 .platform
                 .http()

@@ -32,6 +32,7 @@ use crate::client::{
     },
     transport::{
         SendOutcome,
+        error::Credentials,
         platform::{self, ServiceFuture},
     },
 };
@@ -44,6 +45,8 @@ struct ConnectionState {
     next_purpose: ConnectionPurpose,
     server_reasoning_included: bool,
     logical_turn: Option<u64>,
+    credentials: Credentials,
+    socket_credentials: Credentials,
 }
 
 struct EstablishedConnection {
@@ -51,6 +54,7 @@ struct EstablishedConnection {
     metadata: ConnectionMetadata,
     attempt: u32,
     duration_ns: u64,
+    credentials: Credentials,
 }
 
 impl ConnectionState {
@@ -62,6 +66,8 @@ impl ConnectionState {
             next_purpose: ConnectionPurpose::Initial,
             server_reasoning_included: false,
             logical_turn: None,
+            credentials: Credentials::new(),
+            socket_credentials: Credentials::new(),
         }
     }
 
@@ -275,6 +281,10 @@ impl ResponsesService {
             .response_attempts
             .fetch_add(1, Ordering::Relaxed);
         let started_at = Instant::now();
+        connection.credentials = self.gateway_credentials();
+        connection
+            .credentials
+            .extend(&connection.socket_credentials);
         request.observer.emit(
             AgentEventKind::ModelAttemptStarted,
             AttemptStarted {
@@ -298,6 +308,10 @@ impl ResponsesService {
         .map_err(|error| error.with_request_input(active_request.as_ref()));
         guard.complete();
         drop(guard);
+        let result = result.map_err(|mut error| {
+            error.redact(&connection.credentials);
+            error
+        });
         tracing::Span::current().record(
             "status",
             if result.is_ok() {
@@ -349,6 +363,7 @@ impl ResponsesService {
         let request = request.as_ref();
         let generation = connection.generation;
         let span = tracing::Span::current();
+        let credentials = connection.credentials.clone();
         let socket = connection.socket.as_mut().ok_or_else(|| {
             ResponsesServiceError::invalid_attempt_state(
                 "request sent without an installed WebSocket",
@@ -358,7 +373,7 @@ impl ResponsesService {
         })?;
         let output = match request.kind {
             ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(
-                receive_warmup(socket, request)
+                receive_warmup(socket, request, &credentials)
                     .await
                     .map_err(|error| error.with_connection_generation(generation))?,
             ),
@@ -367,6 +382,7 @@ impl ResponsesService {
                     socket,
                     ResponsesTransport::WebSocket.as_str(),
                     &request.observer,
+                    &credentials,
                     required_call_index(request)?,
                     started_at,
                 )
@@ -378,6 +394,7 @@ impl ResponsesService {
                     socket,
                     ResponsesTransport::WebSocket.as_str(),
                     &request.observer,
+                    &credentials,
                     required_call_index(request)?,
                     started_at,
                 )
@@ -567,7 +584,10 @@ impl ResponsesService {
             metadata,
             attempt,
             duration_ns,
+            credentials,
         } = established;
+        connection.credentials.extend(&credentials);
+        connection.socket_credentials = credentials;
         connection.generation = generation;
         connection.next_purpose = ConnectionPurpose::Reconnect;
         if !matches!(purpose, ConnectionPurpose::Initial) {
@@ -633,11 +653,13 @@ impl ResponsesService {
             status = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );
+        let mut credentials = Credentials::new();
         let result = self
             .connect_with_auth_recovery(
                 request.profile.session_id(),
                 request.profile.thread_id(),
                 turn_state,
+                &mut credentials,
             )
             .instrument(connect_span.clone())
             .await;
@@ -662,7 +684,10 @@ impl ResponsesService {
             .fetch_add(duration_ns(elapsed), Ordering::Relaxed);
         let (socket, metadata) = match result {
             Ok(connection) => connection,
-            Err(error) => {
+            Err(mut error) => {
+                let mut redaction = self.gateway_credentials();
+                redaction.extend(&credentials);
+                error.redact(&redaction);
                 let message = error.to_string();
                 request.observer.emit(
                     AgentEventKind::ModelConnectionFailed,
@@ -687,6 +712,7 @@ impl ResponsesService {
             metadata,
             attempt,
             duration_ns: duration_ns(elapsed),
+            credentials,
         })
     }
 
@@ -695,8 +721,10 @@ impl ResponsesService {
         session_id: &str,
         thread_id: &str,
         turn_state: Option<&str>,
+        credentials: &mut Credentials,
     ) -> Result<(ResponsesSocket, ConnectionMetadata), ResponsesError> {
         let auth = self.auth_snapshot().await?;
+        credentials.insert(auth.shared_bearer());
         match platform::connect_socket(
             &self.platform,
             &self.config,
@@ -718,6 +746,7 @@ impl ResponsesService {
                         detail: error.to_string(),
                     })?;
                 let refreshed = self.auth_snapshot().await?;
+                credentials.insert(refreshed.shared_bearer());
                 platform::connect_socket(
                     &self.platform,
                     &self.config,
@@ -730,6 +759,21 @@ impl ResponsesService {
             }
             result => result,
         }
+    }
+
+    fn gateway_credentials(&self) -> Credentials {
+        let mut credentials = Credentials::new();
+        for header in self
+            .config
+            .responses_gateway
+            .as_deref()
+            .map_or(&[][..], crate::client::transport::ResponsesGateway::headers)
+        {
+            if let Some(secret) = header.secret_value() {
+                credentials.insert(secret);
+            }
+        }
+        credentials
     }
 
     async fn auth_snapshot(&self) -> Result<OpenAiAuthSnapshot, ResponsesError> {
@@ -901,11 +945,13 @@ impl Service<ResponsesAttempt> for ResponsesService {
 async fn receive_warmup(
     socket: &mut ResponsesSocket,
     request: &ResponsesAttempt,
+    credentials: &Credentials,
 ) -> Result<WarmupResponse, ResponsesServiceError> {
     loop {
         let received = socket.next_text().await?;
         let parsed = decode_event::<WarmupServerEvent>(received.text.as_str())?;
-        let raw_event = parsed.raw;
+        let raw_event = credentials.redact(parsed.raw);
+        let raw_event = raw_event.as_ref();
         tracing::trace!(
             target: "nanocode_codex",
             direction = "inbound",

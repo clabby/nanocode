@@ -90,6 +90,10 @@ impl OpenAiAuthSnapshot {
         &self.bearer
     }
 
+    pub(crate) const fn shared_bearer(&self) -> &Arc<str> {
+        &self.bearer
+    }
+
     #[must_use]
     pub fn sends_bearer(&self) -> bool {
         !self.bearer.is_empty()

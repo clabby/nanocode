@@ -112,6 +112,12 @@ impl ResponsesServiceError {
         }
     }
 
+    pub(crate) fn redact(&mut self, credentials: &crate::client::transport::error::Credentials) {
+        if let ResponsesServiceErrorSource::Responses(source) = &mut self.source {
+            source.redact(credentials);
+        }
+    }
+
     #[must_use]
     pub const fn error_class(&self) -> &'static str {
         self.class

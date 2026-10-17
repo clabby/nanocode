@@ -36,6 +36,10 @@ impl GatewayHeader {
     pub fn value(&self) -> &str {
         &self.value
     }
+
+    pub(crate) const fn secret_value(&self) -> Option<&Arc<str>> {
+        if self.secret { Some(&self.value) } else { None }
+    }
 }
 
 impl fmt::Debug for GatewayHeader {

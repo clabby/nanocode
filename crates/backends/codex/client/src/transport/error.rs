@@ -1,3 +1,5 @@
+use std::{borrow::Cow, sync::Arc};
+
 use super::RetryAfter;
 
 use super::api_error::{
@@ -401,6 +403,79 @@ impl ResponsesError {
             let retry_after =
                 retryable_api_error_received(&event, received).and_then(|(_, advice)| advice);
             Self::Api { event, retry_after }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct Credentials(Vec<Arc<str>>);
+
+impl Credentials {
+    pub(crate) const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub(crate) fn insert(&mut self, secret: &Arc<str>) {
+        if secret.is_empty() || self.0.iter().any(|known| known == secret) {
+            return;
+        }
+        self.0.push(Arc::clone(secret));
+        self.0
+            .sort_unstable_by_key(|known| std::cmp::Reverse(known.len()));
+    }
+
+    pub(crate) fn extend(&mut self, other: &Self) {
+        for secret in &other.0 {
+            self.insert(secret);
+        }
+    }
+
+    pub(crate) fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let mut text = Cow::Borrowed(text);
+        for secret in &self.0 {
+            if text.contains(&**secret) {
+                text = Cow::Owned(text.replace(&**secret, "[redacted]"));
+            }
+        }
+        text
+    }
+
+    fn redact_in_place(&self, text: &mut String) {
+        if let Cow::Owned(redacted) = self.redact(text) {
+            *text = redacted;
+        }
+    }
+}
+
+impl ResponsesError {
+    pub(crate) fn redact(&mut self, credentials: &Credentials) {
+        match self {
+            Self::Authorization { detail }
+            | Self::InvalidUrl { detail }
+            | Self::InvalidAuthorization { detail }
+            | Self::InvalidSessionId { detail }
+            | Self::Handshake { detail, .. }
+            | Self::Send { detail, .. }
+            | Self::Receive { detail, .. }
+            | Self::Closed { detail }
+            | Self::HttpRequest { detail, .. }
+            | Self::InvalidSseUtf8 { detail } => credentials.redact_in_place(detail),
+            Self::HandshakeRejected { body, .. } | Self::HttpRejected { body, .. } => {
+                credentials.redact_in_place(body);
+            }
+            Self::InvalidPayload { event, .. }
+            | Self::Api { event, .. }
+            | Self::ContextWindowExceeded { event }
+            | Self::InvalidImageRequest { event } => credentials.redact_in_place(event),
+            Self::InvalidToolSchema { source, .. } => source.redact(credentials),
+            Self::HostUnavailable
+            | Self::HandshakeTimeout { .. }
+            | Self::SendTimeout { .. }
+            | Self::UnexpectedEnd
+            | Self::InvalidJson(_)
+            | Self::UnexpectedBinary
+            | Self::EncodeRequest(_)
+            | Self::GatewayUnsupported { .. } => {}
         }
     }
 }
