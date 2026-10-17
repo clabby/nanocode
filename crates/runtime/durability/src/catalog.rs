@@ -849,9 +849,11 @@ mod store {
         async fn state_turns(&self, id: &str, state: &DurableState) -> Result<Vec<StoredTurn>> {
             let mut operations: Vec<_> = state.operations().iter().collect();
             operations.sort_by_key(|(_, op)| op.accepted_order());
+            let inputs: Vec<_> = operations.iter().map(|(_, op)| op.input.clone()).collect();
+            let inputs = EncodedPayload::load_many(&inputs, &mut self.store.clone(), id).await?;
             let mut turns = Vec::new();
-            for (turn, operation) in operations {
-                let input: Value = self.load_payload(id, &operation.input).await?.decode()?;
+            for ((turn, operation), input) in operations.into_iter().zip(inputs) {
+                let input: Value = input.decode()?;
                 if input
                     .get("kind")
                     .and_then(Value::as_str)
