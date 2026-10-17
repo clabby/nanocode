@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -189,6 +189,7 @@ impl ChatGptLogin {
             &self.code_verifier,
         )
         .await?;
+        let _lock = lock_auth_file(&self.auth_file).await?;
         write_store(&self.auth_file, &credentials)?;
         Ok(credentials.status())
     }
@@ -285,6 +286,21 @@ pub fn chatgpt_auth_status(
 
 pub fn logout_chatgpt(auth_file: impl AsRef<Path>) -> Result<bool, ChatGptAuthError> {
     let auth_file = auth_file.as_ref();
+    if !auth_file
+        .try_exists()
+        .map_err(|source| ChatGptAuthError::Storage {
+            path: auth_file.to_path_buf(),
+            source,
+        })?
+    {
+        return Ok(false);
+    }
+    let lock = open_auth_lock_file(auth_file)?;
+    lock.try_lock()
+        .map_err(|source| ChatGptAuthError::Storage {
+            path: auth_file.to_path_buf(),
+            source: source.into(),
+        })?;
     match std::fs::remove_file(auth_file) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
@@ -645,6 +661,9 @@ impl ManagedChatGptAuth {
         if self.state()?.revision != rejected_revision {
             return Ok(());
         }
+        let _lock = lock_auth_file(&self.auth_file)
+            .await
+            .map_err(|error| auth_store_error(&error))?;
         if self.reload_if_changed()? {
             return Ok(());
         }
@@ -706,6 +725,9 @@ impl ManagedChatGptAuth {
         }
         let refreshed: RefreshResponse = serde_json::from_slice(&body)
             .map_err(|error| OpenAiAuthError::Refresh(Arc::from(error.to_string())))?;
+        if self.reload_if_changed()? {
+            return Ok(());
+        }
         self.apply_refresh(refreshed)
     }
 
@@ -969,6 +991,51 @@ fn read_document(path: &Path) -> Result<CodexAuthDocument, ChatGptAuthError> {
         path: path.to_path_buf(),
         detail: error.to_string(),
     })
+}
+
+async fn lock_auth_file(path: &Path) -> Result<File, ChatGptAuthError> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = open_auth_lock_file(&owned)?;
+        file.lock().map_err(|source| ChatGptAuthError::Storage {
+            path: owned,
+            source,
+        })?;
+        Ok(file)
+    })
+    .await
+    .map_err(|source| ChatGptAuthError::Storage {
+        path: path.to_path_buf(),
+        source: io::Error::other(source),
+    })?
+}
+
+fn open_auth_lock_file(path: &Path) -> Result<File, ChatGptAuthError> {
+    let parent = path.parent().ok_or_else(|| ChatGptAuthError::Storage {
+        path: path.to_path_buf(),
+        source: io::Error::new(ErrorKind::InvalidInput, "auth file has no parent directory"),
+    })?;
+    std::fs::create_dir_all(parent).map_err(|source| ChatGptAuthError::Storage {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|source| ChatGptAuthError::Storage {
+            path: lock_path.clone(),
+            source,
+        })?;
+    Ok(file)
 }
 
 fn write_store(

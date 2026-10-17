@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -14,7 +20,10 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::client::{EncodedRequest, OpenAiAuthSnapshot, ResponsesError, connector::connect_async};
+use crate::client::{
+    EncodedRequest, OpenAiAuthSnapshot, ResponsesError, connector::connect_async,
+    transport::SendOutcome,
+};
 use crate::client::{monotonic_now_ns, transport::wire::turn_state_from_event};
 
 pub(crate) use crate::client::transport::wire::decode_event;
@@ -51,6 +60,7 @@ struct SocketPump {
     commands: mpsc::Sender<SocketCommand>,
     messages: mpsc::Receiver<PumpMessage>,
     task: tokio::task::JoinHandle<()>,
+    stopped: Arc<AtomicBool>,
 }
 
 struct PumpMessage {
@@ -62,7 +72,7 @@ struct PumpMessage {
 enum SocketCommand {
     Send {
         message: Message,
-        result: oneshot::Sender<std::result::Result<(), WebSocketError>>,
+        result: oneshot::Sender<std::result::Result<SendOutcome, WebSocketError>>,
     },
 }
 
@@ -163,15 +173,21 @@ impl ResponsesSocket {
         ))
     }
 
-    pub(crate) async fn send(&self, request: EncodedRequest) -> Result<(), ResponsesError> {
+    pub(crate) async fn send(
+        &self,
+        request: EncodedRequest,
+    ) -> Result<SendOutcome, ResponsesError> {
         let message = Message::Text(request.into_string().into());
         timeout(SEND_TIMEOUT, self.pump.send(message))
             .await
             .map_err(|_| ResponsesError::SendTimeout {
                 seconds: SEND_TIMEOUT.as_secs(),
             })?
-            .map_err(map_send_error)?;
-        Ok(())
+            .map_err(map_send_error)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.pump.commands.is_closed()
     }
 
     pub(crate) async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError> {
@@ -226,6 +242,8 @@ impl SocketPump {
     fn new(mut socket: Socket) -> Self {
         let (commands, mut command_receiver) = mpsc::channel(32);
         let (message_sender, messages) = mpsc::channel(SOCKET_MESSAGE_CAPACITY);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let completion = Arc::clone(&stopped);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -237,6 +255,11 @@ impl SocketPump {
                             SocketCommand::Send { message, result } => {
                                 let send_result = socket.send(message).await;
                                 let should_stop = send_result.is_err();
+                                let send_result = match send_result {
+                                    Ok(()) => Ok(SendOutcome::Sent),
+                                    Err(WebSocketError::AlreadyClosed | WebSocketError::Protocol(ProtocolError::SendAfterClosing)) => Ok(SendOutcome::Disconnected),
+                                    Err(error) => Err(error),
+                                };
                                 drop(result.send(send_result));
                                 if should_stop {
                                     break;
@@ -282,23 +305,31 @@ impl SocketPump {
                     }
                 }
             }
+            completion.store(true, Ordering::Release);
         });
         Self {
             commands,
             messages,
             task,
+            stopped,
         }
     }
 
-    async fn send(&self, message: Message) -> std::result::Result<(), WebSocketError> {
+    async fn send(&self, message: Message) -> std::result::Result<SendOutcome, WebSocketError> {
         let (result, receiver) = oneshot::channel();
-        self.commands
+        if self
+            .commands
             .send(SocketCommand::Send { message, result })
             .await
-            .map_err(|_| WebSocketError::ConnectionClosed)?;
-        receiver
-            .await
-            .unwrap_or(Err(WebSocketError::ConnectionClosed))
+            .is_err()
+        {
+            return Ok(SendOutcome::Disconnected);
+        }
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) if self.stopped.load(Ordering::Acquire) => Ok(SendOutcome::Disconnected),
+            Err(_) => Err(WebSocketError::ConnectionClosed),
+        }
     }
 
     async fn next(&mut self) -> Option<PumpMessage> {

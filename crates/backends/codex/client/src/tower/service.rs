@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     num::NonZeroU32,
     ops::{Deref, DerefMut},
     sync::{Arc, atomic::Ordering},
@@ -29,7 +30,10 @@ use crate::client::{
         ConnectionFailed, ConnectionPurpose, ConnectionStarted, TRANSPORT, display_endpoint,
         duration_ns, elapsed_ns,
     },
-    transport::platform::{self, ServiceFuture},
+    transport::{
+        SendOutcome,
+        platform::{self, ServiceFuture},
+    },
 };
 
 struct ConnectionState {
@@ -283,13 +287,15 @@ impl ResponsesService {
                 connection_generation: connection.generation,
             },
         )?;
+        let mut active_request = Cow::Borrowed(request);
         let mut guard = AttemptGuard::new(connection, request, transport, started_at);
         let result = if matches!(transport, ResponsesTransport::WebSocket) {
-            self.run_websocket(&mut guard, request, started_at).await
+            self.run_websocket(&mut guard, &mut active_request, started_at)
+                .await
         } else {
             https::run(self, &mut guard, request, started_at).await
         }
-        .map_err(|error| error.with_request_input(request));
+        .map_err(|error| error.with_request_input(active_request.as_ref()));
         guard.complete();
         drop(guard);
         tracing::Span::current().record(
@@ -335,59 +341,21 @@ impl ResponsesService {
     async fn run_websocket(
         &self,
         connection: &mut AttemptGuard<'_>,
-        request: &ResponsesAttempt,
+        request: &mut Cow<'_, ResponsesAttempt>,
         started_at: Instant,
     ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
-        if connection.socket.is_none() {
-            self.connect(connection, request).await?;
-        }
+        let (request_bytes, encode_duration_ns, send_duration_ns) =
+            self.send_websocket(connection, request).await?;
+        let request = request.as_ref();
         let generation = connection.generation;
-        let encode_started_at = Instant::now();
-        let encoded = self.encode_request(connection, request, ResponsesTransport::WebSocket)?;
-        let encode_duration_ns = elapsed_ns(encode_started_at);
-        let request_bytes = encoded.raw().get().len();
         let span = tracing::Span::current();
-        span.record("request.bytes", request_bytes);
-        span.record("request.encode.duration_ns", encode_duration_ns);
-        tracing::trace!(
-            target: "nanocode_codex",
-            direction = "outbound",
-            transport = TRANSPORT,
-            phase = request.kind.phase(),
-            model.call_index = request.call_index,
-            api.request = %encoded.raw().get(),
-            "OpenAI Responses API request"
-        );
-        request.observer.emit(
-            AgentEventKind::ApiEvent,
-            ApiEvent {
-                direction: "outbound",
-                transport: TRANSPORT,
-                phase: request.kind.phase(),
-                model_call_index: request.call_index,
-                event: ApiEventData::Encoded(encoded.raw()),
-            },
-        )?;
-        if connection.socket.is_none() {
-            return Err(ResponsesServiceError::invalid_attempt_state(
-                "connection completed without installing a WebSocket",
-                FailurePhase::Connect,
-                generation,
-            ));
-        }
         let socket = connection.socket.as_mut().ok_or_else(|| {
             ResponsesServiceError::invalid_attempt_state(
-                "connection completed without installing a WebSocket",
-                FailurePhase::Connect,
+                "request sent without an installed WebSocket",
+                FailurePhase::Send,
                 generation,
             )
         })?;
-        let send_started_at = Instant::now();
-        socket.send(encoded).await.map_err(|error| {
-            ResponsesServiceError::responses(error, FailurePhase::Send, generation)
-        })?;
-        let send_duration_ns = elapsed_ns(send_started_at);
-        span.record("request.send.duration_ns", send_duration_ns);
         let output = match request.kind {
             ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(
                 receive_warmup(socket, request)
@@ -437,6 +405,97 @@ impl ResponsesService {
             connection_generation: generation,
             server_reasoning_included: connection.server_reasoning_included,
         })
+    }
+
+    async fn send_websocket(
+        &self,
+        connection: &mut ConnectionState,
+        request: &mut Cow<'_, ResponsesAttempt>,
+    ) -> Result<(usize, u64, u64), ResponsesServiceError> {
+        let mut reused = connection.socket.is_some();
+        if connection
+            .socket
+            .as_ref()
+            .is_some_and(ResponsesSocket::is_closed)
+        {
+            connection.invalidate(ConnectionPurpose::Reconnect);
+            request.to_mut().force_full_replay();
+            reused = false;
+        }
+        loop {
+            if connection.socket.is_none() {
+                self.connect(connection, request.as_ref()).await?;
+            }
+            let generation = connection.generation;
+            let encode_started_at = Instant::now();
+            let encoded =
+                self.encode_request(connection, request.as_ref(), ResponsesTransport::WebSocket)?;
+            let encode_duration_ns = elapsed_ns(encode_started_at);
+            let request_bytes = encoded.raw().get().len();
+            let span = tracing::Span::current();
+            span.record("request.bytes", request_bytes);
+            span.record("request.encode.duration_ns", encode_duration_ns);
+            tracing::trace!(
+                target: "nanocode_codex",
+                direction = "outbound",
+                transport = TRANSPORT,
+                phase = request.kind.phase(),
+                model.call_index = request.call_index,
+                api.request = %encoded.raw().get(),
+                "OpenAI Responses API request"
+            );
+            request.observer.emit(
+                AgentEventKind::ApiEvent,
+                ApiEvent {
+                    direction: "outbound",
+                    transport: TRANSPORT,
+                    phase: request.kind.phase(),
+                    model_call_index: request.call_index,
+                    event: ApiEventData::Encoded(encoded.raw()),
+                },
+            )?;
+            if connection.socket.is_none() {
+                return Err(ResponsesServiceError::invalid_attempt_state(
+                    "connection completed without installing a WebSocket",
+                    FailurePhase::Connect,
+                    generation,
+                ));
+            }
+            let socket = connection.socket.as_mut().ok_or_else(|| {
+                ResponsesServiceError::invalid_attempt_state(
+                    "connection completed without installing a WebSocket",
+                    FailurePhase::Connect,
+                    generation,
+                )
+            })?;
+            span.record("replay.mode", request.replay_mode());
+            span.record("model.input.item_count", request.input_item_count());
+            let send_started_at = Instant::now();
+            let outcome = socket.send(encoded).await.map_err(|error| {
+                ResponsesServiceError::responses(error, FailurePhase::Send, generation)
+            })?;
+            let send_duration_ns = elapsed_ns(send_started_at);
+            span.record("request.send.duration_ns", send_duration_ns);
+            match outcome {
+                SendOutcome::Sent => {
+                    return Ok((request_bytes, encode_duration_ns, send_duration_ns));
+                }
+                SendOutcome::Disconnected if reused => {
+                    connection.invalidate(ConnectionPurpose::Reconnect);
+                    request.to_mut().force_full_replay();
+                    reused = false;
+                }
+                SendOutcome::Disconnected => {
+                    return Err(ResponsesServiceError::responses(
+                        ResponsesError::Closed {
+                            detail: "before request dispatch".to_owned(),
+                        },
+                        FailurePhase::Send,
+                        generation,
+                    ));
+                }
+            }
+        }
     }
 
     fn encode_request(
@@ -807,6 +866,14 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 if matches!(transport, ResponsesTransport::Https) && connection.socket.is_some() {
                     connection.capture_turn_state();
                     connection.socket = None;
+                }
+                if matches!(transport, ResponsesTransport::WebSocket)
+                    && connection
+                        .socket
+                        .as_ref()
+                        .is_some_and(ResponsesSocket::is_closed)
+                {
+                    connection.invalidate(ConnectionPurpose::Reconnect);
                 }
                 let replaces_websocket = matches!(transport, ResponsesTransport::WebSocket)
                     && connection.socket.is_none()

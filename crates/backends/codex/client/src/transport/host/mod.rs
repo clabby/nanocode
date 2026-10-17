@@ -31,6 +31,10 @@ pub trait HostConnection: Send + 'static {
 
     fn next(&mut self) -> HostFuture<'_, Result<HostMessage, HostError>>;
 
+    fn is_closed(&self) -> bool {
+        false
+    }
+
     fn close(&mut self);
 }
 

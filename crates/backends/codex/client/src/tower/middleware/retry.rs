@@ -1,4 +1,5 @@
 use std::{
+    hash::{DefaultHasher, Hash, Hasher},
     num::NonZeroU32,
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -173,7 +174,13 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
             advice
                 .and_then(|advice| advice.server_delay)
                 .map(crate::client::RetryAfter::remaining_delay)
-                .unwrap_or_else(|| retry_delay(request.attempt, request.call_index))
+                .unwrap_or_else(|| {
+                    retry_delay(
+                        request.attempt,
+                        request.call_index,
+                        request.profile.thread_id(),
+                    )
+                })
         };
         let error_class = if checkpoint_missing {
             "checkpoint_missing"
@@ -271,11 +278,13 @@ fn wait_for_retry(
 
 pub type DefaultResponsesService = Retry<ResponsesRetryPolicy, ResponsesService>;
 
-fn retry_delay(attempt: u32, call_index: Option<u32>) -> Duration {
+fn retry_delay(attempt: u32, call_index: Option<u32>, thread_id: &str) -> Duration {
     let base_ms = 1_000;
     let exponent = attempt.saturating_sub(1).min(4);
     let raw_ms = base_ms * 2_u64.pow(exponent);
-    let seed = u64::from(call_index.unwrap_or_default()) * 31 + u64::from(attempt) * 17;
+    let mut hasher = DefaultHasher::new();
+    (thread_id, call_index, attempt).hash(&mut hasher);
+    let seed = hasher.finish();
     let jitter_percent = 90 + seed % 21;
     Duration::from_millis(raw_ms * jitter_percent / 100)
 }

@@ -37,6 +37,11 @@ pub(crate) use retry_after::RetryReceipt;
 pub use telemetry::TRANSPORT;
 pub use wire::EncodedRequest;
 
+pub(crate) enum SendOutcome {
+    Sent,
+    Disconnected,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ResponsesTransport {
     #[default]

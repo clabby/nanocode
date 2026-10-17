@@ -1,7 +1,7 @@
 use crate::client::{OpenAiAuthSnapshot, ResponsesError, monotonic_now_ns};
 
 use super::{HostConnectRequest, HostConnection, HostError, HostMessage, HostTransport};
-use crate::client::transport::{EncodedRequest, wire::turn_state_from_event};
+use crate::client::transport::{EncodedRequest, SendOutcome, wire::turn_state_from_event};
 
 pub(crate) use crate::client::transport::wire::decode_event;
 
@@ -77,7 +77,13 @@ impl ResponsesSocket {
         ))
     }
 
-    pub(crate) async fn send(&self, request: EncodedRequest) -> Result<(), ResponsesError> {
+    pub(crate) async fn send(
+        &self,
+        request: EncodedRequest,
+    ) -> Result<SendOutcome, ResponsesError> {
+        if self.connection.is_closed() {
+            return Ok(SendOutcome::Disconnected);
+        }
         self.connection
             .send(request.raw().get())
             .await
@@ -88,6 +94,11 @@ impl ResponsesSocket {
                     detail: error.to_string(),
                 }
             })
+            .map(|()| SendOutcome::Sent)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.connection.is_closed()
     }
 
     pub(crate) async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError> {
