@@ -801,6 +801,11 @@ impl AgentRuntime {
             .await
             .map_err(catalog_error)?;
         let _preload = CheckpointPreload(durable_state.clone());
+        let _journal = match &self.inner.subagents {
+            Some(control) => JournalReservation::new(control.registry(), &durable_state)
+                .map_err(catalog_error)?,
+            None => None,
+        };
         let (agent, events) = self
             .construct(AgentSpec {
                 parent: None,
@@ -1023,6 +1028,44 @@ impl<B: crate::BackendKind> SpawnBuilder<'_, B> {
 }
 
 struct CheckpointPreload(crate::durability::DurableSession);
+
+struct JournalReservation {
+    registry: Arc<nanocode_subagents::Registry>,
+    root: String,
+    journal: nanocode_agent_core::backend::ChildJournal,
+    _seed: crate::durability::JournalSeed,
+}
+
+impl JournalReservation {
+    fn new(
+        registry: &Arc<nanocode_subagents::Registry>,
+        state: &crate::durability::DurableSession,
+    ) -> crate::durability::Result<Option<Self>> {
+        use crate::durability::StateStore as _;
+        if !state.shared_store().batches_companion_acquisition() {
+            return Ok(None);
+        }
+        let root = state.state_id().to_owned();
+        let (journal, seed) = state.seeded_child_journal();
+        if !registry.reserve_journal(&root, journal.clone()) {
+            return Ok(None);
+        }
+        let reservation = Self {
+            registry: Arc::clone(registry),
+            root,
+            journal,
+            _seed: seed,
+        };
+        state.adopt_child_journal(&reservation._seed)?;
+        Ok(Some(reservation))
+    }
+}
+
+impl Drop for JournalReservation {
+    fn drop(&mut self) {
+        self.registry.release_journal(&self.root, &self.journal);
+    }
+}
 
 impl Drop for CheckpointPreload {
     fn drop(&mut self) {

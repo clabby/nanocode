@@ -1684,6 +1684,7 @@ pub struct DurableSession {
     active_claims: AtomicUsize,
     described: Option<crate::SessionRecord>,
     preload: Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>,
+    adopted: Arc<std::sync::Mutex<Option<crate::JournalClaim>>>,
 }
 
 impl Clone for DurableSession {
@@ -1698,6 +1699,7 @@ impl Clone for DurableSession {
             active_claims: AtomicUsize::new(0),
             described: self.described.clone(),
             preload: Arc::clone(&self.preload),
+            adopted: Arc::clone(&self.adopted),
         }
     }
 }
@@ -1823,6 +1825,7 @@ impl DurableSession {
             active_claims: AtomicUsize::new(0),
             described,
             preload: Arc::new(std::sync::Mutex::new(None)),
+            adopted: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -1887,6 +1890,27 @@ impl DurableSession {
         crate::child_journal::seeded_child_journal(self.store.clone(), &self.state_id)
     }
 
+    pub fn adopt_child_journal(&self, seed: &crate::JournalSeed) -> Result<()> {
+        if !seed.adopt(&self.state_id, &self.store) {
+            return Err(Error::InvalidState(
+                "the journal seed does not belong to this session".to_owned(),
+            ));
+        }
+        *self
+            .adopted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seed.claim());
+        Ok(())
+    }
+
+    fn adopted_seed(&self) -> Option<crate::child_journal::Seed> {
+        self.adopted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?
+            .take()
+    }
+
     #[must_use]
     pub fn state_id(&self) -> &str {
         &self.state_id
@@ -1927,7 +1951,7 @@ impl DurableSession {
     }
 
     pub async fn acquire_agent(&self) -> Result<(DurableOwner, Option<EncodedPayload>)> {
-        self.acquire_agent_inner(None, None, None)
+        self.acquire_agent_inner(None, None, self.adopted_seed())
             .await
             .map(|(owner, checkpoint, _)| (owner, checkpoint))
     }
@@ -1936,7 +1960,7 @@ impl DurableSession {
         &self,
         initial: crate::InitialSettings,
     ) -> Result<(DurableOwner, Option<EncodedPayload>)> {
-        self.acquire_agent_inner(Some(initial), None, None)
+        self.acquire_agent_inner(Some(initial), None, self.adopted_seed())
             .await
             .map(|(owner, checkpoint, _)| (owner, checkpoint))
     }

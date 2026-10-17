@@ -39,6 +39,21 @@ impl JournalSeed {
     pub fn claim(&self) -> JournalClaim {
         JournalClaim(self.0.as_ref().map_or_else(Weak::new, Arc::downgrade))
     }
+
+    pub(crate) fn adopt(&self, root_state_id: &str, store: &SharedStore) -> bool {
+        let Some(seed) = &self.0 else {
+            return false;
+        };
+        let seed = seed.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(seed) = seed
+            .as_ref()
+            .filter(|seed| seed.root_state_id == root_state_id && seed.store.same_store(store))
+        else {
+            return false;
+        };
+        seed.awaited.store(true, Ordering::Release);
+        true
+    }
 }
 
 #[derive(Clone)]

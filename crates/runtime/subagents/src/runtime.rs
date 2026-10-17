@@ -137,6 +137,8 @@ pub struct Registry {
 
     restored: std::sync::Mutex<HashMap<String, RestorationOutcome>>,
 
+    reserved: std::sync::Mutex<HashMap<String, nanocode_agent_core::backend::ChildJournal>>,
+
     spawn_admission: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     journal_writer: std::sync::atomic::AtomicBool,
 
@@ -1226,6 +1228,7 @@ impl Registry {
             store: std::sync::RwLock::new(None),
             journals: std::sync::RwLock::new(HashMap::new()),
             restored: std::sync::Mutex::new(HashMap::new()),
+            reserved: std::sync::Mutex::new(HashMap::new()),
             spawn_admission: std::sync::Mutex::new(HashMap::new()),
             journal_writer: std::sync::atomic::AtomicBool::new(false),
             journal_write_lock: tokio::sync::Mutex::new(()),
@@ -1273,13 +1276,52 @@ impl Registry {
             })
     }
 
+    pub fn reserve_journal(
+        &self,
+        root_session_id: &str,
+        journal: nanocode_agent_core::backend::ChildJournal,
+    ) -> bool {
+        let restored = self
+            .restored
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if restored.contains_key(root_session_id) || reserved.contains_key(root_session_id) {
+            return false;
+        }
+        reserved.insert(root_session_id.to_owned(), journal);
+        true
+    }
+
+    pub fn release_journal(
+        &self,
+        root_session_id: &str,
+        journal: &nanocode_agent_core::backend::ChildJournal,
+    ) {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reserved.get(root_session_id).is_some_and(|reserved| {
+            std::ptr::addr_eq(
+                Arc::as_ptr(&reserved.store()),
+                Arc::as_ptr(&journal.store()),
+            )
+        }) {
+            reserved.remove(root_session_id);
+        }
+    }
+
     fn adopt_journal(self: &Arc<Self>, handle: &AgentHandle) {
         let Some(journal) = handle.child_journal() else {
             return;
         };
         let root = handle.session_id().to_owned();
         let (ready, gate) = tokio::sync::watch::channel(RestorationState::Loading);
-        {
+        let journal = {
             let mut restored = self
                 .restored
                 .lock()
@@ -1288,7 +1330,12 @@ impl Registry {
                 return;
             }
             restored.insert(root.clone(), gate);
-        }
+            self.reserved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&root)
+                .unwrap_or_else(|| journal.clone())
+        };
         self.spawn_admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
