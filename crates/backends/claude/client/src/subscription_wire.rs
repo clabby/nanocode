@@ -217,20 +217,20 @@ pub fn prepare(request: &mut MessagesRequest, identity: &SubscriptionIdentity) {
     request.system = Some(Value::Array(blocks));
 }
 
-fn stringify(value: &Value, out: &mut String) -> Result<(), ClaudeError> {
+fn stringify(value: &Value, out: &mut Vec<u8>) -> Result<(), ClaudeError> {
     match value {
         Value::Array(a) => {
-            out.push('[');
+            out.push(b'[');
             for (i, v) in a.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push(b',');
                 }
                 stringify(v, out)?;
             }
-            out.push(']');
+            out.push(b']');
         }
         Value::Object(map) => {
-            out.push('{');
+            out.push(b'{');
             let mut first = true;
             for key in ["type", "text"]
                 .into_iter()
@@ -242,16 +242,16 @@ fn stringify(value: &Value, out: &mut String) -> Result<(), ClaudeError> {
                 )
             {
                 if !first {
-                    out.push(',');
+                    out.push(b',');
                 }
                 first = false;
-                out.push_str(&serde_json::to_string(key)?);
-                out.push(':');
+                serde_json::to_writer(&mut *out, key)?;
+                out.push(b':');
                 stringify(&map[key], out)?;
             }
-            out.push('}');
+            out.push(b'}');
         }
-        _ => out.push_str(&serde_json::to_string(value)?),
+        _ => serde_json::to_writer(&mut *out, value)?,
     }
     Ok(())
 }
@@ -276,9 +276,8 @@ pub fn body(
     if value.get("tools").is_none() {
         value["tools"] = json!([]);
     }
-    let mut wire = String::new();
-    stringify(&value, &mut wire)?;
-    let mut bytes = wire.into_bytes();
+    let mut bytes = Vec::new();
+    stringify(&value, &mut bytes)?;
     if let Some(marker) = bytes.windows(MARKER.len()).position(|v| v == MARKER) {
         let start = marker + MARKER.len();
         if let Some(offset) = bytes[start..]

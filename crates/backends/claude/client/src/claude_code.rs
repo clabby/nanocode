@@ -6,6 +6,7 @@ use std::{
 
 use reqwest::header::HeaderValue;
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 use crate::{
     ClaudeAccessToken, ClaudeAuthFuture, ClaudeAuthUnavailable, ClaudeClient, ClaudeTokenSource,
@@ -21,6 +22,7 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const KEYCHAIN_COMMAND_LIMIT: usize = 4032;
 const LOCK_FILE: &str = ".nanocodex-oauth-refresh.lock";
 
+#[derive(Clone)]
 struct ClaudeCodeLogin {
     http: reqwest::Client,
 }
@@ -327,7 +329,22 @@ impl ClaudeCodeLogin {
         if login.usable(rejected)? {
             return login.token();
         }
-        let guard = lock(&login.directory).await?;
+        let refresh = self.clone();
+        let directory = login.directory;
+        let rejected = rejected.cloned();
+        tokio::spawn(
+            async move { refresh.refresh(&directory, rejected.as_ref()).await }.in_current_span(),
+        )
+        .await
+        .map_err(|error| unavailable(&format!("Claude Code login refresh task failed: {error}")))?
+    }
+
+    async fn refresh(
+        &self,
+        directory: &Path,
+        rejected: Option<&HeaderValue>,
+    ) -> Result<ClaudeAccessToken, ClaudeAuthUnavailable> {
+        let guard = lock(directory).await?;
         let mut login = Login::load().await?;
         if login.usable(rejected)? {
             drop(guard);
