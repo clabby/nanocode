@@ -218,8 +218,18 @@ impl<B, D: RuntimeDefaults> RuntimeBuilder<B, D> {
             let runtime = tokio::runtime::Handle::try_current()
                 .map_err(|_| NanocodexError::TokioRuntimeUnavailable)?;
             let span = tracing::Span::current();
-            runtime
-                .spawn_blocking(move || span.in_scope(|| self.build()))
+            let (completed, result) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("nanocode-runtime-construction".into())
+                .spawn(move || {
+                    if completed.is_closed() {
+                        return;
+                    }
+                    let _runtime = runtime.enter();
+                    let _ = completed.send(span.in_scope(|| self.build()));
+                })
+                .map_err(|error| NanocodexError::backend("runtime construction", error))?;
+            result
                 .await
                 .map_err(|error| NanocodexError::backend("runtime construction", error))?
         }
