@@ -1,0 +1,164 @@
+use super::{Registry, RestorationState, SubagentControl, lock_unpoisoned};
+use crate::model::{AgentId, AgentStatus};
+use nanocode_agent_core::Nanocodex;
+use serde::Serialize;
+use std::sync::Arc;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SubagentActivity {
+    pub revision: u64,
+    pub durable: bool,
+    pub restoring: bool,
+    pub restore_failure: Option<String>,
+    pub active: Vec<AgentId>,
+    pub resuming: Vec<AgentId>,
+    pub pending_completions: Vec<(AgentId, u64)>,
+    pub pending_messages: Vec<AgentId>,
+    pub checkpoint_captures: usize,
+}
+
+impl SubagentActivity {
+    #[must_use]
+    pub const fn is_quiescent(&self) -> bool {
+        !self.restoring
+            && self.restore_failure.is_none()
+            && self.active.is_empty()
+            && self.resuming.is_empty()
+            && self.pending_completions.is_empty()
+            && self.pending_messages.is_empty()
+            && self.checkpoint_captures == 0
+    }
+}
+
+fn not_root(root_session_id: &str) -> String {
+    format!("{root_session_id} is a subagent session, not a root session")
+}
+
+impl Registry {
+    pub async fn activity(&self, root_session_id: &str) -> SubagentActivity {
+        let revision = *self.revision.borrow();
+        let durable = self.store_for(root_session_id).is_some();
+        let gate = lock_unpoisoned(&self.restored)
+            .get(root_session_id)
+            .map(|gate| gate.borrow().clone());
+        let reserved = lock_unpoisoned(&self.reserved).contains_key(root_session_id);
+        let (restoring, restore_failure) = match gate {
+            None => (reserved, None),
+            Some(RestorationState::Ready) => (false, None),
+            Some(RestorationState::Failed(error)) => (false, Some(error)),
+            Some(RestorationState::Loading | RestorationState::Resuming) => (true, None),
+        };
+        let resuming = lock_unpoisoned(&self.pending_resume)
+            .get(root_session_id)
+            .cloned()
+            .unwrap_or_default();
+        let checkpoint_captures = lock_unpoisoned(&self.pending_checkpoints)
+            .get(root_session_id)
+            .copied()
+            .unwrap_or_default();
+        let mut activity = SubagentActivity {
+            revision,
+            durable,
+            restoring,
+            restore_failure,
+            resuming,
+            checkpoint_captures,
+            ..SubagentActivity::default()
+        };
+        let state = self.state.lock().await;
+        if state.root_by_session.contains_key(root_session_id) {
+            activity.restore_failure = Some(not_root(root_session_id));
+            return activity;
+        }
+        let Some(scope) = state.scopes.get(root_session_id) else {
+            return activity;
+        };
+        let mut ids = scope.sessions.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        for id in ids {
+            let session = &scope.sessions[&id];
+            if session.active
+                || matches!(
+                    session.status,
+                    AgentStatus::Pending | AgentStatus::Running | AgentStatus::Closing
+                )
+            {
+                activity.active.push(id);
+            }
+            if session.descriptor.parent.is_none()
+                && session.status.wakes_parent()
+                && let Some(revision) = session.pending_completion
+            {
+                activity.pending_completions.push((id, revision));
+            }
+            let deliverable = (session.harness.is_some()
+                || session.stored_runtime.is_some()
+                || session.journaled_runtime)
+                && !matches!(session.status, AgentStatus::Closing | AgentStatus::Closed);
+            if deliverable && scope.messages.has_pending_for(id) {
+                activity.pending_messages.push(id);
+            }
+        }
+        activity
+    }
+
+    pub async fn deliver_completions(
+        self: &Arc<Self>,
+        parent: &Nanocodex,
+        root_session_id: &str,
+    ) -> Vec<(AgentId, std::io::Result<bool>)> {
+        if self.await_restored(root_session_id).await.is_err() {
+            return Vec::new();
+        }
+        let pending = self.activity(root_session_id).await.pending_completions;
+        let mut results = Vec::with_capacity(pending.len());
+        for (id, revision) in pending {
+            results.push((
+                id,
+                self.continue_parent(parent, root_session_id, id, revision)
+                    .await,
+            ));
+        }
+        results
+    }
+
+    pub async fn persist(&self, root_session_id: &str) -> std::io::Result<()> {
+        if self.store_for(root_session_id).is_none() {
+            return Ok(());
+        }
+        {
+            let state = self.state.lock().await;
+            if state.root_by_session.contains_key(root_session_id) {
+                return Err(std::io::Error::other(not_root(root_session_id)));
+            }
+            if state
+                .scopes
+                .get(root_session_id)
+                .is_none_or(|scope| scope.journal_frozen)
+            {
+                return Ok(());
+            }
+        }
+        self.persist_durably(root_session_id).await
+    }
+}
+
+impl SubagentControl {
+    pub async fn activity(&self, root_session_id: &str) -> SubagentActivity {
+        self.registry.activity(root_session_id).await
+    }
+
+    pub async fn deliver_completions(
+        &self,
+        parent: &Nanocodex,
+        root_session_id: &str,
+    ) -> Vec<(AgentId, std::io::Result<bool>)> {
+        self.registry
+            .deliver_completions(parent, root_session_id)
+            .await
+    }
+
+    pub async fn persist(&self, root_session_id: &str) -> std::io::Result<()> {
+        self.registry.persist(root_session_id).await
+    }
+}

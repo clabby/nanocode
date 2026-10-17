@@ -33,7 +33,10 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument;
 
+mod activity;
 mod focus;
+
+pub use activity::SubagentActivity;
 
 pub(super) struct ChildSession {
     pub(super) descriptor: AgentDescriptor,
@@ -3239,6 +3242,7 @@ impl Registry {
         let root_session_id = root_session_id.to_owned();
         drop(platform::spawn(async move {
             let Some(parent) = resolver(&root_session_id) else {
+                registry.retry_completion(&root_session_id, id, revision);
                 return;
             };
             if let Err(error) = registry

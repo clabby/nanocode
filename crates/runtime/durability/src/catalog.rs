@@ -191,7 +191,7 @@ mod store {
     use super::{BranchBoundary, SessionRecord};
     use crate::{
         AdmittedTurn, CheckpointFormat, DurableSession, DurableState, EncodedPayload, Error,
-        OperationStatus, OwnerId, PayloadReader, Result, StateStore, Transition,
+        OperationState, OperationStatus, OwnerId, PayloadReader, Result, StateStore, Transition,
         format::Formats,
         session::reduce_peeked,
         shared_store::{SharedStore, WeakSharedStore},
@@ -432,6 +432,23 @@ mod store {
         pub async fn turns(&self, id: &str) -> Result<Vec<StoredTurn>> {
             let state = self.require(id).await?;
             self.state_turns(id, &state).await
+        }
+
+        pub async fn pending_turns(&self, id: &str) -> Result<Vec<StoredTurn>> {
+            let state = self.require(id).await?;
+            self.stored_turns(id, state.pending_operations(), false)
+                .await
+        }
+
+        pub async fn turn(&self, id: &str, request_id: &str) -> Result<Option<StoredTurn>> {
+            let state = self.require(id).await?;
+            let Some(operation) = state.operation(request_id) else {
+                return Ok(None);
+            };
+            Ok(self
+                .stored_turns(id, vec![(request_id, operation)], false)
+                .await?
+                .pop())
         }
 
         pub async fn session(&self, record: SessionRecord) -> Result<DurableSession> {
@@ -852,22 +869,36 @@ mod store {
         }
 
         async fn state_turns(&self, id: &str, state: &DurableState) -> Result<Vec<StoredTurn>> {
-            let mut operations: Vec<_> = state.operations().iter().collect();
+            let mut operations: Vec<_> = state
+                .operations()
+                .iter()
+                .map(|(turn, op)| (turn.as_str(), op))
+                .collect();
             operations.sort_by_key(|(_, op)| op.accepted_order());
+            self.stored_turns(id, operations, true).await
+        }
+
+        async fn stored_turns(
+            &self,
+            id: &str,
+            operations: Vec<(&str, &OperationState)>,
+            prompts_only: bool,
+        ) -> Result<Vec<StoredTurn>> {
             let inputs: Vec<_> = operations.iter().map(|(_, op)| op.input.clone()).collect();
             let inputs = EncodedPayload::load_many(&inputs, &mut self.store.clone(), id).await?;
             let mut turns = Vec::new();
             for ((turn, operation), input) in operations.into_iter().zip(inputs) {
                 let input: Value = input.decode()?;
-                if input
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind != "prompt")
+                if prompts_only
+                    && input
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind != "prompt")
                 {
                     continue;
                 }
                 turns.push(StoredTurn {
-                    id: turn.clone(),
+                    id: turn.to_owned(),
                     preview: prompt_text(&input),
                     status: match operation.status {
                         OperationStatus::Pending => TurnStatus::Pending,
