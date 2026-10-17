@@ -380,6 +380,9 @@ impl Journal {
         let started = Instant::now();
         self.file.lock().map_err(backend)?;
         span.record("lock.wait_ms", started.elapsed().as_secs_f64() * 1_000.0);
+        if !self.ready && self.persisted_offset.is_none() && self.index.offset == 0 {
+            self.restore_index();
+        }
         let result = self.refresh_index().and_then(|()| action(self));
         let unlocked = self.file.unlock().map_err(backend);
         match result {
