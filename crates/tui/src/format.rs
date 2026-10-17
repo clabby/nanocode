@@ -30,24 +30,36 @@ pub fn sanitize_terminal_text_inline(text: &str) -> Cow<'_, str> {
 }
 
 fn sanitize_terminal_text_with_break(text: &str, line_break: char) -> Cow<'_, str> {
-    let requires_sanitization = text.chars().any(|character| {
-        character == '\r'
-            || character == '\t'
-            || character.is_control() && character != '\n'
-            || character == '\n' && line_break != '\n'
-    });
-    if !requires_sanitization {
+    let mut offset = 0;
+    while offset < text.len() {
+        offset += crate::text::control_prefix(&text[offset..], line_break == '\n');
+        let Some(character) = text[offset..].chars().next() else {
+            return Cow::Borrowed(text);
+        };
+        if character.is_control() {
+            break;
+        }
+        offset += character.len_utf8();
+    }
+    if offset == text.len() {
         return Cow::Borrowed(text);
     }
-
     let mut sanitized = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
+    sanitized.push_str(&text[..offset]);
+    let mut characters = text[offset..].chars();
+    loop {
+        let remaining = characters.as_str();
+        let length = crate::text::control_prefix(remaining, line_break == '\n');
+        sanitized.push_str(&remaining[..length]);
+        characters = remaining[length..].chars();
+        let Some(character) = characters.next() else {
+            break;
+        };
         match character {
             '\u{1b}' => skip_escape(&mut characters),
             '\u{9b}' => skip_control_sequence(&mut characters),
             '\r' => {
-                if characters.peek() == Some(&'\n') {
+                if characters.as_str().starts_with('\n') {
                     characters.next();
                 }
                 sanitized.push(line_break);
@@ -61,42 +73,56 @@ fn sanitize_terminal_text_with_break(text: &str, line_break: char) -> Cow<'_, st
     Cow::Owned(sanitized)
 }
 
-fn skip_escape(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+fn skip_escape(characters: &mut std::str::Chars<'_>) {
     match characters.next() {
         Some('[') => skip_control_sequence(characters),
         Some(']' | 'P' | 'X' | '^' | '_') => {
-            while let Some(character) = characters.next() {
-                if character == '\u{7}' {
-                    break;
+            let remaining = characters.as_str();
+            if let Some(index) = memchr::memchr2(0x07, 0x1b, remaining.as_bytes()) {
+                let mut end = index + 1;
+                if remaining.as_bytes()[index] == 0x1b
+                    && remaining.as_bytes().get(end) == Some(&b'\\')
+                {
+                    end += 1;
                 }
-                if character == '\u{1b}' {
-                    if characters.peek() == Some(&'\\') {
-                        characters.next();
-                    }
-                    break;
-                }
+                *characters = remaining[end..].chars();
+            } else {
+                *characters = "".chars();
             }
         }
         Some(' '..='/') => {
             while characters
-                .next_if(|character| (' '..='/').contains(character))
-                .is_some()
-            {}
+                .as_str()
+                .starts_with(|character| (' '..='/').contains(&character))
+            {
+                characters.next();
+            }
             characters.next();
         }
         _ => {}
     }
 }
 
-fn skip_control_sequence(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    while characters
-        .next_if(|character| ('0'..='?').contains(character) || (' '..='/').contains(character))
-        .is_some()
-    {}
-    characters.next_if(|character| ('@'..='~').contains(character));
+fn skip_control_sequence(characters: &mut std::str::Chars<'_>) {
+    let remaining = characters.as_str();
+    let end = remaining
+        .as_bytes()
+        .iter()
+        .position(|byte| !(b' '..=b'?').contains(byte))
+        .unwrap_or(remaining.len());
+    *characters = remaining[end..].chars();
+    if characters
+        .as_str()
+        .starts_with(|character| ('@'..='~').contains(&character))
+    {
+        characters.next();
+    }
 }
 
 pub fn terminal_text_width(text: &str) -> usize {
+    if crate::text::ascii_prefix(text, false) == text.len() {
+        return text.len();
+    }
     text.graphemes(true)
         .map(|grapheme| match grapheme {
             "\t" => 4,

@@ -804,6 +804,37 @@ pub enum StreamEvent {
     Other,
 }
 
+fn decode_stream_event(data: &str, event_name: Option<&str>) -> Result<StreamEvent, ClaudeError> {
+    if let Ok(event) = serde_json::from_str::<StreamEvent>(data) {
+        let kind = match &event {
+            StreamEvent::MessageStart { .. } => Some("message_start"),
+            StreamEvent::ContentBlockStart { .. } => Some("content_block_start"),
+            StreamEvent::ContentBlockDelta { .. } => Some("content_block_delta"),
+            StreamEvent::ContentBlockStop { .. } => Some("content_block_stop"),
+            StreamEvent::MessageDelta { .. } => Some("message_delta"),
+            StreamEvent::MessageStop => Some("message_stop"),
+            StreamEvent::Ping => Some("ping"),
+            StreamEvent::Error { .. } => Some("error"),
+            StreamEvent::Other => None,
+        };
+        if let Some(kind) = kind {
+            if event_name.is_some_and(|name| name != kind) {
+                return Err(ClaudeError::Protocol(
+                    "SSE event name disagrees with data type".into(),
+                ));
+            }
+            return Ok(event);
+        }
+    }
+    let value = serde_json::from_str::<Value>(data)?;
+    if event_name.is_some_and(|name| value.get("type").and_then(Value::as_str) != Some(name)) {
+        return Err(ClaudeError::Protocol(
+            "SSE event name disagrees with data type".into(),
+        ));
+    }
+    serde_json::from_value(value).map_err(ClaudeError::from)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct MessageChange {
     #[serde(default)]
@@ -1313,19 +1344,7 @@ impl ClaudeClient {
                             state.frame_bytes = 0;
                             let event_name = state.event_name.take();
                             if let Some(data) = state.take_data() {
-                                let parsed = serde_json::from_str::<Value>(&data)
-                                    .map_err(ClaudeError::from)
-                                    .and_then(|value| {
-                                        if event_name.as_deref().is_some_and(|name| {
-                                            value.get("type").and_then(Value::as_str) != Some(name)
-                                        }) {
-                                            return Err(ClaudeError::Protocol(
-                                                "SSE event name disagrees with data type".into(),
-                                            ));
-                                        }
-                                        serde_json::from_value::<StreamEvent>(value)
-                                            .map_err(ClaudeError::from)
-                                    });
+                                let parsed = decode_stream_event(&data, event_name.as_deref());
                                 let event = match parsed {
                                     Ok(StreamEvent::Error { error }) => {
                                         Err(ClaudeError::StreamError {
@@ -1388,7 +1407,7 @@ impl ClaudeClient {
                     }
                     match state.response.next().await {
                         Some(Ok(chunk)) => {
-                            state.bytes.extend_from_slice(&chunk);
+                            state.push(&chunk);
                         }
                         None => {
                             state.done = true;
@@ -1466,6 +1485,7 @@ struct SseState {
     first_line: bool,
     skip_lf: bool,
     scan_start: usize,
+    cursor: usize,
 }
 
 impl SseState {
@@ -1485,24 +1505,24 @@ impl SseState {
             first_line: true,
             skip_lf: false,
             scan_start: 0,
+            cursor: 0,
         }
     }
 
     fn pop_line(&mut self) -> Result<Option<String>, ClaudeError> {
         if self.skip_lf {
-            if self.bytes.is_empty() {
+            if self.cursor == self.bytes.len() {
                 return Ok(None);
             }
-            if self.bytes[0] == b'\n' {
-                self.bytes.remove(0);
+            if self.bytes[self.cursor] == b'\n' {
+                self.cursor += 1;
+                self.scan_start = self.cursor;
             }
             self.skip_lf = false;
         }
-        let delimiter = self.bytes[self.scan_start..]
-            .iter()
-            .position(|byte| matches!(byte, b'\n' | b'\r'))
+        let delimiter = memchr::memchr2(b'\n', b'\r', &self.bytes[self.scan_start..])
             .map(|offset| self.scan_start + offset);
-        let pending = delimiter.map_or(self.bytes.len(), |index| index + 1);
+        let pending = delimiter.map_or(self.bytes.len(), |index| index + 1) - self.cursor;
         if pending + self.frame_bytes > MAX_SSE_FRAME_BYTES {
             return Err(ClaudeError::Protocol("SSE frame exceeds 32 MiB".into()));
         }
@@ -1510,11 +1530,11 @@ impl SseState {
             self.scan_start = self.bytes.len();
             return Ok(None);
         };
-        self.frame_bytes += index + 1;
+        self.frame_bytes += index + 1 - self.cursor;
         self.skip_lf = self.bytes[index] == b'\r';
-        self.scan_start = 0;
-        let mut line = self.bytes.drain(..=index).collect::<Vec<_>>();
-        line.pop();
+        let line = self.bytes[self.cursor..index].to_vec();
+        self.cursor = index + 1;
+        self.scan_start = self.cursor;
 
         let mut line = String::from_utf8(line)
             .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))?;
@@ -1527,11 +1547,25 @@ impl SseState {
         Ok(Some(line))
     }
 
+    fn push(&mut self, chunk: &[u8]) {
+        if self.cursor > 0 {
+            self.bytes.copy_within(self.cursor.., 0);
+            self.bytes.truncate(self.bytes.len() - self.cursor);
+            self.scan_start -= self.cursor;
+            self.cursor = 0;
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
     fn take_data(&mut self) -> Option<String> {
         if self.data.is_empty() {
             None
+        } else if self.data.len() == 1 {
+            self.data.pop()
         } else {
-            Some(std::mem::take(&mut self.data).join("\n"))
+            let data = self.data.join("\n");
+            self.data.clear();
+            Some(data)
         }
     }
 }

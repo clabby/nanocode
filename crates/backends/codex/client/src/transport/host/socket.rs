@@ -3,7 +3,7 @@ use crate::client::{OpenAiAuthSnapshot, ResponsesError, monotonic_now_ns};
 use super::{HostConnectRequest, HostConnection, HostError, HostMessage, HostTransport};
 use crate::client::transport::{EncodedRequest, wire::turn_state_from_event};
 
-pub(crate) use crate::client::transport::wire::{decode_event, parse_raw_json};
+pub(crate) use crate::client::transport::wire::decode_event;
 
 pub(crate) struct ConnectionMetadata {
     pub status: u16,

@@ -16,6 +16,7 @@ pub mod queue;
 pub mod scheduler;
 pub mod spinner;
 pub mod terminal;
+mod text;
 pub mod theme;
 pub mod transcript;
 pub mod tree;

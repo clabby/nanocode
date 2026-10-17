@@ -1,1 +1,3 @@
 Keep the official provider's discovered tool definitions unchanged. Cache catalogs separately by their complete configuration, inherited environment and provider-file fingerprint so concurrent hosts with different environments do not evict one another. Verify the fingerprint and catalog on every cache hit. Promote a matching legacy cua-catalog.json entry for compatibility; invalidate the matching entries when live discovery disagrees. A genuinely new provider configuration still requires discovery before advertising its tools.
+
+Validate complete Base64 media payloads before accepting them. MIME sniffing needs at most the 12-byte RIFF/WebP header, represented by the first 16 Base64 characters; decode only that prefix after validation.

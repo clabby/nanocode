@@ -25,15 +25,26 @@ impl EncodedRequest {
     }
 }
 
-pub(crate) fn parse_raw_json(text: &str) -> Result<&RawValue, ResponsesError> {
-    serde_json::from_str(text).map_err(ResponsesError::InvalidJson)
+pub(crate) struct DecodedEvent<'a, T> {
+    pub(crate) raw: &'a str,
+    pub(crate) decoded: Result<T, ResponsesError>,
 }
 
-pub(crate) fn decode_event<T: DeserializeOwned>(event: &RawValue) -> Result<T, ResponsesError> {
-    serde_json::from_str(event.get()).map_err(|source| ResponsesError::InvalidPayload {
-        source,
-        event: event.get().to_owned(),
-    })
+pub(crate) fn decode_event<T: DeserializeOwned>(
+    text: &str,
+) -> Result<DecodedEvent<'_, T>, ResponsesError> {
+    let raw = text.trim_matches([' ', '\t', '\n', '\r']);
+    let decoded = match serde_json::from_str(raw) {
+        Ok(event) => Ok(event),
+        Err(source) => {
+            serde_json::from_str::<&RawValue>(text).map_err(ResponsesError::InvalidJson)?;
+            Err(ResponsesError::InvalidPayload {
+                source,
+                event: raw.to_owned(),
+            })
+        }
+    };
+    Ok(DecodedEvent { raw, decoded })
 }
 
 pub(crate) fn turn_state_from_event(text: &str) -> Option<String> {

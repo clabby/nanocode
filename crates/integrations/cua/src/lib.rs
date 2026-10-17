@@ -785,7 +785,13 @@ pub fn output(value: Value) -> ToolResult {
                     return Err("Unsupported CUA image type".into());
                 }
                 let data = item["data"].as_str().ok_or("Invalid CUA image")?;
-                let bytes = STANDARD.decode(data)?;
+                base64_simd::STANDARD
+                    .check(data.as_bytes())
+                    .or_else(|_| STANDARD.decode(data).map(|_| ()))?;
+                let header = &data.as_bytes()[..data.len().min(16)];
+                let mut bytes = [0; 12];
+                let bytes = base64_simd::STANDARD
+                    .decode(header, base64_simd::Out::from_slice(&mut bytes))?;
                 let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
                     "image/png"
                 } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
@@ -806,7 +812,9 @@ pub fn output(value: Value) -> ToolResult {
                     return Err("Unsupported CUA audio type".into());
                 }
                 let data = item["data"].as_str().ok_or("Invalid CUA audio")?;
-                STANDARD.decode(data)?;
+                base64_simd::STANDARD
+                    .check(data.as_bytes())
+                    .or_else(|_| STANDARD.decode(data).map(|_| ()))?;
                 content.push(ToolOutputContent::InputAudio {
                     audio_url: format!("data:{mime};base64,{data}"),
                 });

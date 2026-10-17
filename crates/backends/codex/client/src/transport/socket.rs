@@ -17,7 +17,7 @@ use tokio_tungstenite::{
 use crate::client::{EncodedRequest, OpenAiAuthSnapshot, ResponsesError, connector::connect_async};
 use crate::client::{monotonic_now_ns, transport::wire::turn_state_from_event};
 
-pub(crate) use crate::client::transport::wire::{decode_event, parse_raw_json};
+pub(crate) use crate::client::transport::wire::decode_event;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);

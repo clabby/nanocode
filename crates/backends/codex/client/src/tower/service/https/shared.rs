@@ -3,7 +3,7 @@ use nanocode_platform::Instant;
 use crate::client::{
     AgentEventKind, EncodedRequest, OpenAiAuthMode, ResponsesError, ResponsesTransport,
     http::{HttpMetadata, ResponsesHttpStream},
-    telemetry::{ApiEvent, elapsed_ns},
+    telemetry::{ApiEvent, ApiEventData, elapsed_ns},
     tower::{
         ResponsesAttempt, ResponsesAttemptKind, ResponsesOutput, ResponsesServiceError,
         ResponsesServiceResponse,
@@ -51,7 +51,7 @@ pub(crate) async fn run(
             transport,
             phase: request.kind.phase(),
             model_call_index: request.call_index,
-            event: encoded.raw(),
+            event: ApiEventData::Encoded(encoded.raw()),
         },
     )?;
     let send_started_at = Instant::now();

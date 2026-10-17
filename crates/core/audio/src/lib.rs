@@ -80,7 +80,10 @@ fn audio_duration_seconds(audio_url: &str) -> Option<f64> {
         return None;
     }
 
-    let bytes = match BASE64_STANDARD.decode(payload) {
+    let bytes = match base64_simd::STANDARD
+        .decode_to_vec(payload)
+        .or_else(|_| BASE64_STANDARD.decode(payload))
+    {
         Ok(bytes) => bytes,
         Err(error) => {
             tracing::trace!(%error, "failed to decode audio payload for token estimation");

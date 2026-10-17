@@ -19,10 +19,7 @@ pub(super) fn decode_alpha(bytes: &[u8]) -> Result<Option<DynamicImage>, ImagePr
     let mut tuple = None;
     loop {
         let remaining = bytes.get(offset..).ok_or_else(invalid)?;
-        let length = remaining
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .ok_or_else(invalid)?;
+        let length = memchr::memchr(b'\n', remaining).ok_or_else(invalid)?;
         let line = std::str::from_utf8(&remaining[..length])
             .map_err(|_| invalid())?
             .trim();
@@ -78,10 +75,14 @@ pub(super) fn decode_alpha(bytes: &[u8]) -> Result<Option<DynamicImage>, ImagePr
         .ok_or_else(invalid)?;
     let dynamic = if sample_bytes == 1 {
         let factor = f32::from(u8::MAX) / maxval as f32;
-        let pixels = pixels
-            .iter()
-            .map(|value| (f32::from(*value) * factor).round() as u8)
-            .collect();
+        let pixels = if maxval == u32::from(u8::MAX) {
+            pixels.to_vec()
+        } else {
+            pixels
+                .iter()
+                .map(|value| (f32::from(*value) * factor).round() as u8)
+                .collect()
+        };
         if channels == 2 {
             DynamicImage::ImageLumaA8(
                 ImageBuffer::<LumaA<u8>, _>::from_raw(width, height, pixels).ok_or_else(invalid)?,
@@ -93,12 +94,19 @@ pub(super) fn decode_alpha(bytes: &[u8]) -> Result<Option<DynamicImage>, ImagePr
         }
     } else {
         let factor = f32::from(u16::MAX) / maxval as f32;
-        let pixels = pixels
-            .chunks_exact(2)
-            .map(|value| {
-                (f32::from(u16::from_be_bytes([value[0], value[1]])) * factor).round() as u16
-            })
-            .collect();
+        let pixels = if maxval == u32::from(u16::MAX) {
+            pixels
+                .chunks_exact(2)
+                .map(|value| u16::from_be_bytes([value[0], value[1]]))
+                .collect()
+        } else {
+            pixels
+                .chunks_exact(2)
+                .map(|value| {
+                    (f32::from(u16::from_be_bytes([value[0], value[1]])) * factor).round() as u16
+                })
+                .collect()
+        };
         if channels == 2 {
             DynamicImage::ImageLumaA16(
                 ImageBuffer::<LumaA<u16>, _>::from_raw(width, height, pixels)

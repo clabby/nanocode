@@ -9,6 +9,7 @@ use crate::theme::Theme;
 pub struct FileFinder {
     files: Vec<String>,
     query: String,
+    normalized: Vec<(String, usize)>,
     matches: Vec<usize>,
     selected: usize,
 }
@@ -17,6 +18,14 @@ impl FileFinder {
     #[must_use]
     pub fn new(files: Vec<String>) -> Self {
         let mut finder = Self {
+            normalized: files
+                .iter()
+                .map(|path| {
+                    let normalized = path.to_lowercase();
+                    let name_start = normalized.rfind('/').map_or(0, |index| index + 1);
+                    (normalized, name_start)
+                })
+                .collect(),
             files,
             ..Self::default()
         };
@@ -79,11 +88,11 @@ impl FileFinder {
         .entered();
         let query = self.query.to_lowercase();
         let mut scored = self
-            .files
+            .normalized
             .iter()
             .enumerate()
-            .filter_map(|(index, path)| {
-                score(&path.to_lowercase(), &query).map(|score| (score, index))
+            .filter_map(|(index, (path, name_start))| {
+                score(path, *name_start, &query).map(|score| (score, index))
             })
             .collect::<Vec<_>>();
         scored.sort_by(|left, right| {
@@ -140,17 +149,20 @@ impl FileFinder {
     }
 }
 
-fn score(path: &str, query: &str) -> Option<i64> {
+fn score(path: &str, name_start: usize, query: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
     }
-    let name_start = path.rfind('/').map_or(0, |index| index + 1);
     let bytes = path.as_bytes();
     let mut score = 0_i64;
     let mut position = 0;
     let mut previous: Option<usize> = None;
     for character in query.chars() {
-        let found = path[position..].find(character)? + position;
+        let found = if character.is_ascii() {
+            memchr::memchr(character as u8, &bytes[position..])?
+        } else {
+            path[position..].find(character)?
+        } + position;
         score += 1;
         if previous.is_some_and(|previous| previous + 1 == found) {
             score += 5;

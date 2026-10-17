@@ -194,14 +194,13 @@ fn scan_regex(bytes: &[u8], start: usize) -> usize {
 fn scan_string(bytes: &[u8], start: usize) -> usize {
     let quote = bytes[start];
     let mut index = start + 1;
-    while index < bytes.len() {
+    while let Some(offset) = memchr::memchr3(b'\\', b'\n', quote, &bytes[index..]) {
+        index += offset;
         match bytes[index] {
-            b'\\' => index += 1,
+            b'\\' => index = (index + 2).min(bytes.len()),
             b'\n' => return index,
-            byte if byte == quote => return index + 1,
-            _ => {}
+            _ => return index + 1,
         }
-        index += 1;
     }
     bytes.len()
 }
@@ -209,9 +208,10 @@ fn scan_string(bytes: &[u8], start: usize) -> usize {
 fn scan_template(source: &str, start: usize) -> usize {
     let bytes = source.as_bytes();
     let mut index = start + 1;
-    while index < bytes.len() {
+    while let Some(offset) = memchr::memchr3(b'\\', b'`', b'$', &bytes[index..]) {
+        index += offset;
         match bytes[index] {
-            b'\\' => index += 1,
+            b'\\' => index = (index + 1).min(bytes.len() - 1),
             b'`' => return index + 1,
             b'$' if bytes.get(index + 1) == Some(&b'{') => {
                 index = scan(source, index + 2, true).1;

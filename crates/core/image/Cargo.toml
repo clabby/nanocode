@@ -9,6 +9,8 @@ license.workspace = true
 repository.workspace = true
 description = "Shared prompt image preparation"
 [dependencies]
+memchr.workspace = true
+base64-simd.workspace = true
 tracing = { workspace = true  }
 nanocode-types-core = { workspace = true  }
 base64 = { workspace = true  }

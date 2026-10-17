@@ -12,7 +12,10 @@ pub(super) fn wav_duration_seconds(audio_url: &str) -> Option<f64> {
     {
         return None;
     }
-    let bytes = BASE64_STANDARD.decode(payload).ok()?;
+    let bytes = base64_simd::STANDARD
+        .decode_to_vec(payload)
+        .or_else(|_| BASE64_STANDARD.decode(payload))
+        .ok()?;
     if bytes.get(..4)? != b"RIFF" || bytes.get(8..12)? != b"WAVE" {
         return None;
     }

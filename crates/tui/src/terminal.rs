@@ -147,17 +147,22 @@ impl TerminalSession {
         if self.stale {
             self.previous.reset();
         }
-        let updates =
-            tracing::info_span!("tui.terminal.diff").in_scope(|| self.previous.diff(&self.current));
-        span.record("frame.changed_cells", updates.len());
-        if !self.stale && updates.is_empty() && cursor == self.cursor {
+        let diff_encode = tracing::info_span!("tui.terminal.diff_encode").entered();
+        let mut changed_cells = 0;
+        let mut updates = self
+            .previous
+            .diff_iter(&self.current)
+            .inspect(|_| changed_cells += 1)
+            .peekable();
+        let has_updates = updates.peek().is_some();
+        if !self.stale && !has_updates && cursor == self.cursor {
+            span.record("frame.changed_cells", 0);
             span.record("frame.skipped", true);
             self.stats.skipped += 1;
             std::mem::swap(&mut self.previous, &mut self.current);
             return Ok(());
         }
         self.bytes.clear();
-        let encode = tracing::info_span!("tui.terminal.encode").entered();
         queue!(self.bytes, BeginSynchronizedUpdate)?;
         if self.stale {
             queue!(self.bytes, SetAttribute(Attribute::Reset))?;
@@ -165,19 +170,20 @@ impl TerminalSession {
                 queue!(self.bytes, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
             }
         }
-        if !updates.is_empty() {
+        if has_updates {
             if self.cursor.is_some() {
                 queue!(self.bytes, Hide)?;
             }
-            CrosstermBackend::new(&mut self.bytes).draw(updates.into_iter())?;
+            CrosstermBackend::new(&mut self.bytes).draw(updates)?;
         }
+        span.record("frame.changed_cells", changed_cells);
         match cursor {
             Some(position) => queue!(self.bytes, MoveTo(position.x, position.y), Show)?,
             None if self.cursor.is_some() => queue!(self.bytes, Hide)?,
             None => {}
         }
         queue!(self.bytes, EndSynchronizedUpdate)?;
-        drop(encode);
+        drop(diff_encode);
         span.record("frame.bytes", self.bytes.len());
         tracing::info_span!("tui.terminal.write", bytes = self.bytes.len()).in_scope(|| {
             self.output.write_all(&self.bytes)?;
@@ -272,14 +278,28 @@ fn truecolor() -> bool {
 }
 
 fn downsample(buffer: &mut Buffer) {
+    let mut foreground = None;
+    let mut background = None;
     for cell in &mut buffer.content {
         if let Color::Rgb(red, green, blue) = cell.fg {
-            cell.fg = Color::Indexed(ansi256(red, green, blue));
+            cell.fg = indexed_color(&mut foreground, red, green, blue);
         }
         if let Color::Rgb(red, green, blue) = cell.bg {
-            cell.bg = Color::Indexed(ansi256(red, green, blue));
+            cell.bg = indexed_color(&mut background, red, green, blue);
         }
     }
+}
+
+fn indexed_color(cache: &mut Option<((u8, u8, u8), Color)>, red: u8, green: u8, blue: u8) -> Color {
+    let rgb = (red, green, blue);
+    if let Some((previous, indexed)) = *cache
+        && previous == rgb
+    {
+        return indexed;
+    }
+    let indexed = Color::Indexed(ansi256(red, green, blue));
+    *cache = Some((rgb, indexed));
+    indexed
 }
 
 const fn ansi256(red: u8, green: u8, blue: u8) -> u8 {

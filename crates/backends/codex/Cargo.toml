@@ -14,6 +14,7 @@
 "metadata" = { "docs" = { "rs" = {  "rustdoc-args" = ["-D", "warnings"] } } }
 
 ["dependencies"]
+base64-simd.workspace = true
 nanocode-backend-codex-client.workspace = true
 nanocode-process-contracts.workspace = true
 nanocode-agent-config.workspace = true

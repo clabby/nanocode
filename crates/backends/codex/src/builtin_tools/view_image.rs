@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use base64::{Engine, engine::general_purpose::STANDARD};
 use nanocode_tools::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
@@ -101,10 +100,11 @@ impl Tool for ViewImageHandler {
             }
         };
 
-        let image_url = format!(
-            "data:application/octet-stream;base64,{}",
-            STANDARD.encode(bytes)
+        let mut image_url = String::with_capacity(
+            DATA_URL_PREFIX.len() + base64_simd::STANDARD.encoded_length(bytes.len()),
         );
+        image_url.push_str(DATA_URL_PREFIX);
+        base64_simd::STANDARD.encode_append(bytes, &mut image_url);
         Ok(ToolOutput::content(vec![ToolOutputContent::InputImage {
             image_url: image_url.clone(),
             detail,
@@ -116,7 +116,8 @@ impl Tool for ViewImageHandler {
     }
 }
 
-const DATA_URL_PREFIX_BYTES: u64 = 37;
+const DATA_URL_PREFIX: &str = "data:application/octet-stream;base64,";
+const DATA_URL_PREFIX_BYTES: u64 = DATA_URL_PREFIX.len() as u64;
 const VIEW_IMAGE_WIRE_COPIES: u64 = 2;
 const VIEW_IMAGE_WIRE_HEADROOM_BYTES: u64 = 4 * 1024;
 const INITIAL_IMAGE_READ_CAPACITY_BYTES: u64 = 64 * 1024;

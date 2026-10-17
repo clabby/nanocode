@@ -22,11 +22,12 @@ use crate::client::{
     attempt::{ResponsesAttempt, ResponsesAttemptKind, ResponsesOutput, ResponsesServiceResponse},
     middleware::{DefaultResponsesService, ResponsesRetryPolicy},
     service_error::{FailurePhase, ResponsesServiceError},
-    socket::{ConnectionMetadata, ResponsesSocket, decode_event, parse_raw_json},
+    socket::{ConnectionMetadata, ResponsesSocket, decode_event},
     stream,
     telemetry::{
-        ApiEvent, AttemptFailed, AttemptStarted, ConnectionCompleted, ConnectionFailed,
-        ConnectionPurpose, ConnectionStarted, TRANSPORT, display_endpoint, duration_ns, elapsed_ns,
+        ApiEvent, ApiEventData, AttemptFailed, AttemptStarted, ConnectionCompleted,
+        ConnectionFailed, ConnectionPurpose, ConnectionStarted, TRANSPORT, display_endpoint,
+        duration_ns, elapsed_ns,
     },
     transport::platform::{self, ServiceFuture},
 };
@@ -364,7 +365,7 @@ impl ResponsesService {
                 transport: TRANSPORT,
                 phase: request.kind.phase(),
                 model_call_index: request.call_index,
-                event: encoded.raw(),
+                event: ApiEventData::Encoded(encoded.raw()),
             },
         )?;
         if connection.socket.is_none() {
@@ -836,13 +837,14 @@ async fn receive_warmup(
 ) -> Result<WarmupResponse, ResponsesServiceError> {
     loop {
         let received = socket.next_text().await?;
-        let raw_event = parse_raw_json(received.text.as_str())?;
+        let parsed = decode_event::<WarmupServerEvent>(received.text.as_str())?;
+        let raw_event = parsed.raw;
         tracing::trace!(
             target: "nanocode_codex",
             direction = "inbound",
             transport = TRANSPORT,
             phase = "warmup",
-            api.event = %raw_event.get(),
+            api.event = %raw_event,
             "OpenAI Responses API event"
         );
         request.observer.events.emit_with_source_sequence(
@@ -852,16 +854,16 @@ async fn receive_warmup(
                 transport: TRANSPORT,
                 phase: "warmup",
                 model_call_index: None,
-                event: raw_event,
+                event: ApiEventData::Received(raw_event),
             },
             Some(received.received_ns),
         )?;
-        match decode_event::<WarmupServerEvent>(raw_event)? {
+        match parsed.decoded? {
             WarmupServerEvent::Completed { response } => return Ok(response),
             WarmupServerEvent::Error
             | WarmupServerEvent::Failed
             | WarmupServerEvent::Incomplete => {
-                return Err(ResponsesError::api_event(raw_event.get().to_owned()).into());
+                return Err(ResponsesError::api_event(raw_event.to_owned()).into());
             }
             WarmupServerEvent::Created { response } => drop(response.id),
             WarmupServerEvent::Other => {}

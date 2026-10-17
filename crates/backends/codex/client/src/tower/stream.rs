@@ -12,8 +12,8 @@ use crate::client::{
     ResponsesError,
     attempt::ResponsesObserver,
     service_error::ResponsesServiceError,
-    socket::{ResponsesSocket, decode_event, parse_raw_json},
-    telemetry::{ApiEvent, elapsed_ns},
+    socket::{ResponsesSocket, decode_event},
+    telemetry::{ApiEvent, ApiEventData, elapsed_ns},
 };
 
 #[derive(Deserialize, Serialize)]
@@ -536,12 +536,11 @@ where
         .event_bytes
         .saturating_add(u64::try_from(received.text.len()).unwrap_or(u64::MAX));
 
-    let parse_started_at = Instant::now();
-    let raw_event = parse_raw_json(received.text.as_str())?;
-    timing.pipeline.parse_duration_ns = timing
-        .pipeline
-        .parse_duration_ns
-        .saturating_add(elapsed_ns(parse_started_at));
+    let decode_started_at = Instant::now();
+    let parsed = decode_event::<ServerEvent>(received.text.as_str())?;
+    let initial_decode_duration_ns = elapsed_ns(decode_started_at);
+    let raw_event = parsed.raw;
+    let decoded = parsed.decoded;
     let elapsed = elapsed_ns(timing.started_at);
     timing.first_event_ns.get_or_insert(elapsed);
 
@@ -551,20 +550,15 @@ where
         transport,
         phase,
         model.call_index = call_index,
-        api.event = %raw_event.get(),
+        api.event = %raw_event,
         "OpenAI Responses API event"
     );
 
-    let decode_started_at = Instant::now();
-    let decoded = decode_event::<ServerEvent>(raw_event);
-    let initial_decode_duration_ns = elapsed_ns(decode_started_at);
     let failure = matches!(
         &decoded,
         Ok(ServerEvent::Error | ServerEvent::Failed | ServerEvent::Incomplete)
     )
-    .then(|| {
-        ResponsesError::api_event_received(raw_event.get().to_owned(), received.retry_receipt)
-    });
+    .then(|| ResponsesError::api_event_received(raw_event.to_owned(), received.retry_receipt));
     let emit_started_at = Instant::now();
     let api_event_seq = observer.events.emit_with_source_sequence(
         AgentEventKind::ApiEvent,
@@ -573,7 +567,7 @@ where
             transport,
             phase,
             model_call_index: Some(call_index),
-            event: raw_event,
+            event: ApiEventData::Received(raw_event),
         },
         Some(received.received_ns),
     )?;

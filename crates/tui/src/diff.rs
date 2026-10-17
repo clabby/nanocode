@@ -540,6 +540,9 @@ fn hard_wrap(text: &str, width: u16) -> Vec<String> {
 }
 
 fn truncate(text: &str, width: u16) -> String {
+    if crate::text::ascii_prefix(text, false) == text.len() {
+        return text[..text.len().min(usize::from(width))].to_owned();
+    }
     let mut rendered = String::new();
     let mut used = 0_u16;
     for grapheme in text.graphemes(true) {

@@ -8,23 +8,31 @@ use crate::client::{attempt::ResponsesAttemptKind, service_error::FailurePhase};
 
 pub const TRANSPORT: &str = "responses_websocket_v2";
 
-pub(crate) fn serialize_compact_raw_json<S>(
-    event: &&RawValue,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    if event
-        .get()
-        .bytes()
-        .any(|byte| matches!(byte, b'\n' | b'\r'))
+pub(crate) enum ApiEventData<'a> {
+    Encoded(&'a RawValue),
+    Received(&'a str),
+}
+
+impl Serialize for ApiEventData<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
     {
-        let value =
-            serde_json::from_str::<Value>(event.get()).map_err(serde::ser::Error::custom)?;
-        value.serialize(serializer)
-    } else {
-        event.serialize(serializer)
+        let text = match self {
+            Self::Encoded(raw) => raw.get(),
+            Self::Received(text) => text,
+        };
+        if memchr::memchr2(b'\n', b'\r', text.as_bytes()).is_some() {
+            let value = serde_json::from_str::<Value>(text).map_err(serde::ser::Error::custom)?;
+            value.serialize(serializer)
+        } else {
+            match self {
+                Self::Encoded(raw) => raw.serialize(serializer),
+                Self::Received(text) => serde_json::from_str::<&RawValue>(text)
+                    .map_err(serde::ser::Error::custom)?
+                    .serialize(serializer),
+            }
+        }
     }
 }
 
@@ -35,8 +43,7 @@ pub(crate) struct ApiEvent<'a> {
     pub(crate) phase: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) model_call_index: Option<u32>,
-    #[serde(serialize_with = "serialize_compact_raw_json")]
-    pub(crate) event: &'a RawValue,
+    pub(crate) event: ApiEventData<'a>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

@@ -66,19 +66,46 @@ impl Parser {
     }
 
     pub fn feed(&mut self, chunk: &[u8], events: &mut Vec<Event>) -> Result<(), EventTooLarge> {
-        for &byte in chunk {
-            if !self.started {
-                if byte == BOM[self.bom_matched] {
-                    self.bom_matched += 1;
-                    self.started = self.bom_matched == BOM.len();
-                    continue;
-                }
-                self.started = true;
-                for &prefix in &BOM[..self.bom_matched] {
-                    self.push_byte(prefix, events)?;
-                }
+        let mut offset = 0;
+        while offset < chunk.len() && !self.started {
+            let byte = chunk[offset];
+            offset += 1;
+            if byte == BOM[self.bom_matched] {
+                self.bom_matched += 1;
+                self.started = self.bom_matched == BOM.len();
+                continue;
+            }
+            self.started = true;
+            for &prefix in &BOM[..self.bom_matched] {
+                self.push_byte(prefix, events)?;
             }
             self.push_byte(byte, events)?;
+        }
+        while offset < chunk.len() {
+            if self.previous_was_cr {
+                self.previous_was_cr = false;
+                if chunk[offset] == b'\n' {
+                    offset += 1;
+                    continue;
+                }
+            }
+            let remaining = &chunk[offset..];
+            let available = self
+                .max_event_size
+                .saturating_sub(self.retained_size.saturating_add(self.line.len()));
+            let scan = &remaining[..remaining.len().min(available.saturating_add(1))];
+            let length = memchr::memchr2(b'\r', b'\n', scan).unwrap_or(scan.len());
+            if length > available {
+                self.line
+                    .extend_from_slice(&remaining[..available.saturating_add(1)]);
+                return self.check_limit();
+            }
+            self.line.extend_from_slice(&remaining[..length]);
+            offset += length;
+            if offset < chunk.len() {
+                self.push_byte(chunk[offset], events)?;
+                offset += 1;
+            }
         }
         Ok(())
     }
@@ -128,7 +155,14 @@ impl Parser {
     }
 
     fn finish_line(&mut self, events: &mut Vec<Event>) -> Result<(), EventTooLarge> {
-        let line = std::mem::take(&mut self.line);
+        let mut line = std::mem::take(&mut self.line);
+        let result = self.process_line(&line, events);
+        line.clear();
+        self.line = line;
+        result
+    }
+
+    fn process_line(&mut self, line: &[u8], events: &mut Vec<Event>) -> Result<(), EventTooLarge> {
         if line.is_empty() {
             self.retained_size = 0;
             if std::mem::take(&mut self.has_fields) {
@@ -144,7 +178,7 @@ impl Parser {
             .saturating_add(line.len())
             .saturating_add(1);
         self.check_limit()?;
-        let line = String::from_utf8_lossy(&line);
+        let line = String::from_utf8_lossy(line);
         let (field, value) = match line.split_once(':') {
             Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
             None => (line.as_ref(), ""),

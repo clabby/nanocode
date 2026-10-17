@@ -110,10 +110,25 @@ fn wrap_plain_with_whitespace(
     style: Style,
     preserve_whitespace: bool,
 ) -> Vec<Line<'static>> {
-    let logical = sanitize(text);
+    if width == 0 {
+        return vec![Line::default()];
+    }
+    let logical = sanitize_terminal_text(text);
+    if let Some(lines) = wrap_ascii_spans(
+        std::iter::once((logical.as_ref(), style, None)),
+        width,
+        true,
+        preserve_whitespace,
+    ) {
+        return if lines.is_empty() {
+            vec![Line::default()]
+        } else {
+            lines.into_iter().map(|(line, _)| line).collect()
+        };
+    }
     let mut lines = Vec::new();
     for line in logical.split('\n') {
-        let spans = vec![Span::styled(line.to_owned(), style)];
+        let spans = vec![Span::styled(line, style)];
         lines.extend(wrap_spans_with_whitespace(
             &spans,
             width,
@@ -755,7 +770,7 @@ pub fn wrap_spans(spans: &[Span<'static>], width: u16, prefer_words: bool) -> Ve
 }
 
 fn wrap_spans_with_whitespace(
-    spans: &[Span<'static>],
+    spans: &[Span<'_>],
     width: u16,
     prefer_words: bool,
     preserve_whitespace: bool,
@@ -763,18 +778,26 @@ fn wrap_spans_with_whitespace(
     if width == 0 {
         return Vec::new();
     }
+    if let Some(lines) = wrap_ascii_spans(
+        spans
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style, None)),
+        width,
+        prefer_words,
+        preserve_whitespace,
+    ) {
+        return lines.into_iter().map(|(line, _)| line).collect();
+    }
     let graphemes = spans
         .iter()
         .flat_map(|span| {
-            graphemes(&span.content)
-                .map(|text| StyledGrapheme {
-                    text: text.to_owned(),
-                    style: span.style,
-                    link: None,
-                    width: u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX),
-                    whitespace: text.chars().all(char::is_whitespace),
-                })
-                .collect::<Vec<_>>()
+            graphemes(&span.content).map(|text| StyledGrapheme {
+                text,
+                style: span.style,
+                link: None,
+                width: u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX),
+                whitespace: text.chars().all(char::is_whitespace),
+            })
         })
         .collect::<Vec<_>>();
     wrap_graphemes(&graphemes, width, prefer_words, preserve_whitespace)
@@ -791,18 +814,30 @@ fn wrap_tagged_spans(
     if width == 0 {
         return Vec::new();
     }
+    if let Some(lines) = wrap_ascii_spans(
+        spans.iter().map(|tagged| {
+            (
+                tagged.span.content.as_ref(),
+                tagged.span.style,
+                tagged.link.as_ref(),
+            )
+        }),
+        width,
+        prefer_words,
+        false,
+    ) {
+        return lines;
+    }
     let graphemes = spans
         .iter()
         .flat_map(|tagged| {
-            graphemes(&tagged.span.content)
-                .map(|text| StyledGrapheme {
-                    text: text.to_owned(),
-                    style: tagged.span.style,
-                    link: tagged.link.as_ref().map(Arc::clone),
-                    width: u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX),
-                    whitespace: text.chars().all(char::is_whitespace),
-                })
-                .collect::<Vec<_>>()
+            graphemes(&tagged.span.content).map(|text| StyledGrapheme {
+                text,
+                style: tagged.span.style,
+                link: tagged.link.as_ref(),
+                width: u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX),
+                whitespace: text.chars().all(char::is_whitespace),
+            })
         })
         .collect::<Vec<_>>();
     wrap_graphemes(&graphemes, width, prefer_words, false)
@@ -824,7 +859,7 @@ fn graphemes(text: &str) -> impl Iterator<Item = &str> {
 }
 
 fn wrap_graphemes(
-    graphemes: &[StyledGrapheme],
+    graphemes: &[StyledGrapheme<'_>],
     width: u16,
     prefer_words: bool,
     preserve_whitespace: bool,
@@ -861,7 +896,7 @@ fn wrap_graphemes(
 }
 
 fn wrap_visual_line(
-    graphemes: &[StyledGrapheme],
+    graphemes: &[StyledGrapheme<'_>],
     width: u16,
     prefer_words: bool,
     preserve_whitespace: bool,
@@ -919,16 +954,16 @@ fn wrap_visual_line(
     lines
 }
 
-struct StyledGrapheme {
-    text: String,
+struct StyledGrapheme<'a> {
+    text: &'a str,
     style: Style,
-    link: Option<Arc<str>>,
+    link: Option<&'a Arc<str>>,
     width: u16,
     whitespace: bool,
 }
 
 fn graphemes_to_line(
-    graphemes: &[StyledGrapheme],
+    graphemes: &[StyledGrapheme<'_>],
     preserve_whitespace: bool,
 ) -> (Line<'static>, Vec<LinkSpan>) {
     let mut spans = Vec::<Span<'static>>::new();
@@ -942,15 +977,16 @@ fn graphemes_to_line(
             .rposition(|grapheme| !grapheme.whitespace)
             .map_or(0, |index| index.saturating_add(1))
     };
-    for grapheme in &graphemes[..rendered_len] {
-        if let Some(last) = spans.last_mut()
-            && last.style == grapheme.style
-        {
-            last.content.to_mut().push_str(&grapheme.text);
-        } else {
-            spans.push(Span::styled(grapheme.text.clone(), grapheme.style));
+    for run in graphemes[..rendered_len].chunk_by(|left, right| left.style == right.style) {
+        let mut content =
+            String::with_capacity(run.iter().map(|grapheme| grapheme.text.len()).sum());
+        for grapheme in run {
+            content.push_str(grapheme.text);
         }
-        if let Some(destination) = &grapheme.link
+        spans.push(Span::styled(content, run[0].style));
+    }
+    for grapheme in &graphemes[..rendered_len] {
+        if let Some(destination) = grapheme.link
             && grapheme.width > 0
         {
             let end = column.saturating_add(grapheme.width);
@@ -972,9 +1008,94 @@ fn graphemes_to_line(
     (Line::from(spans), links)
 }
 
+fn wrap_ascii_spans<'a>(
+    spans: impl Iterator<Item = (&'a str, Style, Option<&'a Arc<str>>)>,
+    width: u16,
+    prefer_words: bool,
+    preserve_whitespace: bool,
+) -> Option<Vec<(Line<'static>, Vec<LinkSpan>)>> {
+    if width == 0 {
+        return Some(Vec::new());
+    }
+    let spans = spans
+        .filter(|(text, _, _)| !text.is_empty())
+        .collect::<Vec<_>>();
+    if spans
+        .iter()
+        .any(|(text, _, _)| crate::text::ascii_prefix(text, true) != text.len())
+    {
+        return None;
+    }
+    let text = if spans.len() == 1 {
+        std::borrow::Cow::Borrowed(spans[0].0)
+    } else {
+        std::borrow::Cow::Owned(spans.iter().map(|(text, _, _)| *text).collect::<String>())
+    };
+    let mut index = 0;
+    let mut offset = 0;
+    let mut lines = Vec::new();
+    for range in
+        crate::text::ascii_rows(&text, usize::from(width), prefer_words, preserve_whitespace)
+    {
+        while index < spans.len() && offset + spans[index].0.len() <= range.start {
+            offset += spans[index].0.len();
+            index += 1;
+        }
+        let mut position = range.start;
+        let mut rendered = Vec::<Span<'static>>::new();
+        let mut links = Vec::<LinkSpan>::new();
+        while position < range.end {
+            let (content, style, link) = spans[index];
+            let end = range.end.min(offset + content.len());
+            let slice = &text[position..end];
+            if let Some(last) = rendered.last_mut()
+                && last.style == style
+            {
+                last.content.to_mut().push_str(slice);
+            } else {
+                rendered.push(Span::styled(slice.to_owned(), style));
+            }
+            if let Some(destination) = link {
+                let start = (position - range.start) as u16;
+                let end = (end - range.start) as u16;
+                if let Some(last) = links.last_mut()
+                    && last.destination == *destination
+                    && last.end == start
+                {
+                    last.end = end;
+                } else {
+                    links.push(LinkSpan {
+                        destination: Arc::clone(destination),
+                        start,
+                        end,
+                    });
+                }
+            }
+            position = end;
+            if position == offset + content.len() {
+                offset += content.len();
+                index += 1;
+            }
+        }
+        lines.push((Line::from(rendered), links));
+    }
+    Some(lines)
+}
+
 fn hard_wrap(text: &str, width: u16) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
+    }
+    if width > 0 && crate::text::ascii_prefix(text, false) == text.len() {
+        return text
+            .as_bytes()
+            .chunks(usize::from(width))
+            .scan(0, |offset, chunk| {
+                let line = text[*offset..*offset + chunk.len()].to_owned();
+                *offset += chunk.len();
+                Some(line)
+            })
+            .collect();
     }
     let mut lines = Vec::new();
     let mut line = String::new();
@@ -1018,6 +1139,9 @@ fn code_block_header(language: Option<&str>, width: u16, theme: &Theme) -> Line<
 }
 
 fn truncate_graphemes(text: &str, width: u16) -> String {
+    if crate::text::ascii_prefix(text, false) == text.len() {
+        return text[..text.len().min(usize::from(width))].to_owned();
+    }
     let mut rendered = String::new();
     let mut used = 0_u16;
     for grapheme in text.graphemes(true) {

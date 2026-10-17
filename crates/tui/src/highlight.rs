@@ -140,6 +140,24 @@ pub(crate) fn wrap_spans(spans: &[Span<'_>], width: u16) -> Vec<Vec<Span<'static
     let mut lines = vec![Vec::<Span<'static>>::new()];
     let mut used = 0_u16;
     for span in spans {
+        if width > 0 && crate::text::ascii_prefix(&span.content, false) == span.content.len() {
+            let mut remaining = span.content.as_ref();
+            while !remaining.is_empty() {
+                if used == width {
+                    lines.push(Vec::new());
+                    used = 0;
+                }
+                let length = remaining.len().min(usize::from(width - used));
+                push_grapheme(
+                    lines.last_mut().expect("a line always exists"),
+                    &remaining[..length],
+                    span.style,
+                );
+                used += length as u16;
+                remaining = &remaining[length..];
+            }
+            continue;
+        }
         for grapheme in span.content.graphemes(true) {
             let grapheme_width =
                 u16::try_from(UnicodeWidthStr::width(grapheme)).unwrap_or(u16::MAX);

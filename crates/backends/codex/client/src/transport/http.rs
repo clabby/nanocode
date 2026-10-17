@@ -196,6 +196,7 @@ impl ResponsesHttpStream {
 pub(crate) struct SseDecoder {
     bytes: Vec<u8>,
     cursor: usize,
+    scan_start: usize,
     data: Vec<String>,
     finished: bool,
     retry_receipt: Option<super::RetryReceipt>,
@@ -219,15 +220,15 @@ impl SseDecoder {
 
     pub(crate) fn next(&mut self) -> Result<Option<String>, ResponsesError> {
         loop {
-            let Some(relative_newline) = self.bytes[self.cursor..]
-                .iter()
-                .position(|byte| *byte == b'\n')
+            let Some(relative_newline) = memchr::memchr(b'\n', &self.bytes[self.scan_start..])
             else {
+                self.scan_start = self.bytes.len();
                 return Ok(None);
             };
             let line_start = self.cursor;
-            let newline = line_start + relative_newline;
+            let newline = self.scan_start + relative_newline;
             self.cursor = newline + 1;
+            self.scan_start = self.cursor;
             let line_end = if newline > line_start && self.bytes.get(newline - 1) == Some(&b'\r') {
                 newline - 1
             } else {
@@ -245,8 +246,13 @@ impl SseDecoder {
                     }
                     continue;
                 }
-                let event = self.data.join("\n");
-                self.data.clear();
+                let event = if self.data.len() == 1 {
+                    self.data.pop().expect("one SSE data line exists")
+                } else {
+                    let event = self.data.join("\n");
+                    self.data.clear();
+                    event
+                };
                 if event == "[DONE]" {
                     continue;
                 }
@@ -266,6 +272,7 @@ impl SseDecoder {
         let remaining = self.bytes.len() - self.cursor;
         self.bytes.copy_within(self.cursor.., 0);
         self.bytes.truncate(remaining);
+        self.scan_start -= self.cursor;
         self.cursor = 0;
     }
 }
