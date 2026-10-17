@@ -73,6 +73,8 @@ pub enum ClaudeModel {
 
     Fable51,
 
+    Mythos51,
+
     Opus46,
 
     Sonnet46,
@@ -81,11 +83,12 @@ pub enum ClaudeModel {
 }
 
 impl ClaudeModel {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Opus55,
         Self::Sonnet55,
         Self::Haiku55,
         Self::Fable51,
+        Self::Mythos51,
         Self::Opus46,
         Self::Sonnet46,
         Self::Haiku45,
@@ -97,6 +100,7 @@ impl ClaudeModel {
             Self::Sonnet55 => "claude-sonnet-5-5",
             Self::Haiku55 => "claude-haiku-5-5",
             Self::Fable51 => "claude-fable-5-1",
+            Self::Mythos51 => "claude-mythos-5-1",
             Self::Opus46 => "claude-opus-4-6",
             Self::Sonnet46 => "claude-sonnet-4-6",
             Self::Haiku45 => "claude-haiku-4-5",
@@ -131,11 +135,12 @@ impl FromStr for ClaudeModel {
             "claude-sonnet-5-5" | "sonnet" => Ok(Self::Sonnet55),
             "claude-haiku-5-5" | "haiku" => Ok(Self::Haiku55),
             "claude-fable-5-1" | "fable" => Ok(Self::Fable51),
+            "claude-mythos-5-1" | "mythos" => Ok(Self::Mythos51),
             "claude-opus-4-6" => Ok(Self::Opus46),
             "claude-sonnet-4-6" => Ok(Self::Sonnet46),
             "claude-haiku-4-5" | "claude-haiku-4-5-20251001" => Ok(Self::Haiku45),
             _ => Err(
-                "unsupported Claude routing model; use opus, sonnet, fable, haiku or a supported Claude model ID",
+                "unsupported Claude routing model; use opus, sonnet, fable, mythos, haiku or a supported Claude model ID",
             ),
         }
     }
@@ -494,6 +499,7 @@ fn display_name(model: &ModelSelection) -> &'static str {
         (_, Some(ClaudeModel::Sonnet55)) => "Claude Sonnet 5.5",
         (_, Some(ClaudeModel::Haiku55)) => "Claude Haiku 5.5",
         (_, Some(ClaudeModel::Fable51)) => "Claude Fable 5.1",
+        (_, Some(ClaudeModel::Mythos51)) => "Claude Mythos 5.1",
         (_, Some(ClaudeModel::Opus46)) => "Claude Opus 4.6",
         (_, Some(ClaudeModel::Sonnet46)) => "Claude Sonnet 4.6",
         (_, Some(ClaudeModel::Haiku45)) => "Claude Haiku 4.5",
