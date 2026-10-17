@@ -1324,6 +1324,8 @@ impl ClaudeClient {
                 "expected text/event-stream response".into(),
             ));
         }
+        #[cfg(target_family = "wasm")]
+        let response = response.bytes_stream();
         let decode_subscription = self.subscription_compatibility;
         Ok(Box::pin(stream::unfold(
             SseState::new(response, credentials),
@@ -1332,80 +1334,58 @@ impl ClaudeClient {
                     return None;
                 }
                 loop {
-                    let line = match state.pop_line() {
-                        Ok(line) => line,
+                    let frame = match state.pop_frame() {
+                        Ok(frame) => frame,
                         Err(error) => {
                             state.done = true;
                             return Some((Err(redact_error(error, &state.credentials)), state));
                         }
                     };
-                    if let Some(line) = line {
-                        if line.is_empty() {
-                            state.frame_bytes = 0;
-                            let event_name = state.event_name.take();
-                            if let Some(data) = state.take_data() {
-                                let parsed = decode_stream_event(&data, event_name.as_deref());
-                                let event = match parsed {
-                                    Ok(StreamEvent::Error { error }) => {
-                                        Err(ClaudeError::StreamError {
-                                            kind: error.kind,
-                                            message: error.message,
-                                        })
-                                    }
-                                    other => other,
-                                };
-                                match event {
-                                    Ok(StreamEvent::Other | StreamEvent::Ping) => continue,
-                                    Ok(StreamEvent::MessageStop) => {
-                                        state.done = true;
-                                        return Some((Ok(StreamEvent::MessageStop), state));
-                                    }
-                                    Err(error) => {
-                                        state.done = true;
-                                        return Some((
-                                            Err(redact_error(error, &state.credentials)),
-                                            state,
-                                        ));
-                                    }
-                                    Ok(mut event) => {
-                                        if decode_subscription {
-                                            match &mut event {
-                                                StreamEvent::ContentBlockStart {
-                                                    content_block:
-                                                        ContentBlock::ToolUse { name, .. },
-                                                    ..
-                                                } => subscription_wire::strip(name),
-                                                StreamEvent::MessageStart { message } => {
-                                                    for block in &mut message.content {
-                                                        if let ContentBlock::ToolUse {
-                                                            name, ..
-                                                        } = block
-                                                        {
-                                                            subscription_wire::strip(name);
-                                                        }
-                                                    }
+                    if let Some((event_name, data)) = frame {
+                        let parsed = decode_stream_event(&data, event_name.as_deref());
+                        let event = match parsed {
+                            Ok(StreamEvent::Error { error }) => Err(ClaudeError::StreamError {
+                                kind: error.kind,
+                                message: error.message,
+                            }),
+                            other => other,
+                        };
+                        match event {
+                            Ok(StreamEvent::Other | StreamEvent::Ping) => continue,
+                            Ok(StreamEvent::MessageStop) => {
+                                state.done = true;
+                                return Some((Ok(StreamEvent::MessageStop), state));
+                            }
+                            Err(error) => {
+                                state.done = true;
+                                return Some((Err(redact_error(error, &state.credentials)), state));
+                            }
+                            Ok(mut event) => {
+                                if decode_subscription {
+                                    match &mut event {
+                                        StreamEvent::ContentBlockStart {
+                                            content_block: ContentBlock::ToolUse { name, .. },
+                                            ..
+                                        } => subscription_wire::strip(name),
+                                        StreamEvent::MessageStart { message } => {
+                                            for block in &mut message.content {
+                                                if let ContentBlock::ToolUse { name, .. } = block {
+                                                    subscription_wire::strip(name);
                                                 }
-                                                _ => {}
                                             }
                                         }
-                                        return Some((Ok(event), state));
+                                        _ => {}
                                     }
                                 }
-                            }
-                        } else {
-                            let (field, value) = line.split_once(':').unwrap_or((&line, ""));
-                            let value = value.strip_prefix(' ').unwrap_or(value);
-                            match field {
-                                "event" => {
-                                    state.event_name = (!value.is_empty()).then(|| value.to_owned())
-                                }
-                                "data" => state.data.push(value.to_owned()),
-                                _ => {}
+                                return Some((Ok(event), state));
                             }
                         }
-                        continue;
                     }
-                    match state.response.next().await {
+                    #[cfg(not(target_family = "wasm"))]
+                    let chunk = state.response.chunk().await.transpose();
+                    #[cfg(target_family = "wasm")]
+                    let chunk = state.response.next().await;
+                    match chunk {
                         Some(Ok(chunk)) => {
                             state.push(&chunk);
                         }
@@ -1444,9 +1424,9 @@ impl<T: Future> ToolFuture for T {}
 const MAX_SSE_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(not(target_family = "wasm"))]
-type ResponseBytes = Pin<Box<dyn Stream<Item = Result<Vec<u8>, HttpError>> + Send>>;
+type ResponseBytes = HttpResponse;
 #[cfg(target_family = "wasm")]
-type ResponseBytes = Pin<Box<dyn Stream<Item = Result<Vec<u8>, HttpError>>>>;
+type ResponseBytes = transport::HttpBody;
 
 fn redact_error(error: ClaudeError, credentials: &[String]) -> ClaudeError {
     let scrub = |mut text: String| {
@@ -1489,14 +1469,10 @@ struct SseState {
 }
 
 impl SseState {
-    fn new(response: HttpResponse, credentials: Vec<String>) -> Self {
+    const fn new(response: ResponseBytes, credentials: Vec<String>) -> Self {
         Self {
             credentials,
-            response: Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|chunk| chunk.map(|bytes| bytes.to_vec())),
-            ),
+            response,
             bytes: Vec::new(),
             data: Vec::new(),
             done: false,
@@ -1509,42 +1485,56 @@ impl SseState {
         }
     }
 
-    fn pop_line(&mut self) -> Result<Option<String>, ClaudeError> {
-        if self.skip_lf {
-            if self.cursor == self.bytes.len() {
+    fn pop_frame(&mut self) -> Result<Option<(Option<String>, String)>, ClaudeError> {
+        loop {
+            if self.skip_lf {
+                if self.cursor == self.bytes.len() {
+                    return Ok(None);
+                }
+                if self.bytes[self.cursor] == b'\n' {
+                    self.cursor += 1;
+                    self.scan_start = self.cursor;
+                }
+                self.skip_lf = false;
+            }
+            let delimiter = memchr::memchr2(b'\n', b'\r', &self.bytes[self.scan_start..])
+                .map(|offset| self.scan_start + offset);
+            let pending = delimiter.map_or(self.bytes.len(), |index| index + 1) - self.cursor;
+            if pending + self.frame_bytes > MAX_SSE_FRAME_BYTES {
+                return Err(ClaudeError::Protocol("SSE frame exceeds 32 MiB".into()));
+            }
+            let Some(index) = delimiter else {
+                self.scan_start = self.bytes.len();
                 return Ok(None);
-            }
-            if self.bytes[self.cursor] == b'\n' {
-                self.cursor += 1;
-                self.scan_start = self.cursor;
-            }
-            self.skip_lf = false;
-        }
-        let delimiter = memchr::memchr2(b'\n', b'\r', &self.bytes[self.scan_start..])
-            .map(|offset| self.scan_start + offset);
-        let pending = delimiter.map_or(self.bytes.len(), |index| index + 1) - self.cursor;
-        if pending + self.frame_bytes > MAX_SSE_FRAME_BYTES {
-            return Err(ClaudeError::Protocol("SSE frame exceeds 32 MiB".into()));
-        }
-        let Some(index) = delimiter else {
-            self.scan_start = self.bytes.len();
-            return Ok(None);
-        };
-        self.frame_bytes += index + 1 - self.cursor;
-        self.skip_lf = self.bytes[index] == b'\r';
-        let line = self.bytes[self.cursor..index].to_vec();
-        self.cursor = index + 1;
-        self.scan_start = self.cursor;
+            };
+            self.frame_bytes += index + 1 - self.cursor;
+            self.skip_lf = self.bytes[index] == b'\r';
+            let start = self.cursor;
+            self.cursor = index + 1;
+            self.scan_start = self.cursor;
 
-        let mut line = String::from_utf8(line)
-            .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))?;
-        if self.first_line {
-            self.first_line = false;
-            if line.starts_with('\u{feff}') {
-                line.drain(..'\u{feff}'.len_utf8());
+            let mut line = std::str::from_utf8(&self.bytes[start..index])
+                .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))?;
+            if self.first_line {
+                self.first_line = false;
+                line = line.strip_prefix('\u{feff}').unwrap_or(line);
+            }
+            if line.is_empty() {
+                self.frame_bytes = 0;
+                let event_name = self.event_name.take();
+                if let Some(data) = self.take_data() {
+                    return Ok(Some((event_name, data)));
+                }
+                continue;
+            }
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => self.event_name = (!value.is_empty()).then(|| value.to_owned()),
+                "data" => self.data.push(value.to_owned()),
+                _ => {}
             }
         }
-        Ok(Some(line))
     }
 
     fn push(&mut self, chunk: &[u8]) {

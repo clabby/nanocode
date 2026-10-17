@@ -16,7 +16,8 @@ pub struct FileFinder {
 
 impl FileFinder {
     #[must_use]
-    pub fn new(files: Vec<String>) -> Self {
+    pub fn new(mut files: Vec<String>) -> Self {
+        files.sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
         let mut finder = Self {
             normalized: files
                 .iter()
@@ -29,7 +30,7 @@ impl FileFinder {
             files,
             ..Self::default()
         };
-        finder.refresh();
+        finder.refresh("", false);
         finder
     }
 
@@ -50,8 +51,10 @@ impl FileFinder {
 
     pub fn set_query(&mut self, query: &str) {
         if self.query != query {
+            let normalized = query.to_lowercase();
+            let narrowed = normalized.starts_with(&self.query.to_lowercase());
             query.clone_into(&mut self.query);
-            self.refresh();
+            self.refresh(&normalized, narrowed);
         }
     }
 
@@ -79,30 +82,35 @@ impl FileFinder {
         }
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self, query: &str, narrowed: bool) {
         let _span = tracing::info_span!(
             "tui.finder.filter",
             files = self.files.len(),
             query.bytes = self.query.len()
         )
         .entered();
-        let query = self.query.to_lowercase();
+        if query.is_empty() {
+            self.matches.clear();
+            self.matches.extend(0..self.normalized.len());
+            self.selected = 0;
+            return;
+        }
+        if !narrowed {
+            self.matches.clear();
+            self.matches.extend(0..self.normalized.len());
+        }
         let mut scored = self
-            .normalized
+            .matches
             .iter()
-            .enumerate()
-            .filter_map(|(index, (path, name_start))| {
-                score(path, *name_start, &query).map(|score| (score, index))
+            .filter_map(|index| {
+                let (path, name_start) = &self.normalized[*index];
+                score(path, *name_start, query).map(|score| (std::cmp::Reverse(score), *index))
             })
             .collect::<Vec<_>>();
-        scored.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| self.files[left.1].len().cmp(&self.files[right.1].len()))
-                .then_with(|| self.files[left.1].cmp(&self.files[right.1]))
-        });
-        self.matches = scored.into_iter().map(|(_, index)| index).collect();
+        scored.sort_unstable();
+        self.matches.clear();
+        self.matches
+            .extend(scored.into_iter().map(|(_, index)| index));
         self.selected = 0;
     }
 

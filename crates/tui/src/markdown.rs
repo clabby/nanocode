@@ -795,7 +795,11 @@ fn wrap_spans_with_whitespace(
                 text,
                 style: span.style,
                 link: None,
-                width: u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX),
+                width: if matches!(text.as_bytes(), [b' '..=b'~']) {
+                    1
+                } else {
+                    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+                },
                 whitespace: text.chars().all(char::is_whitespace),
             })
         })
@@ -835,7 +839,11 @@ fn wrap_tagged_spans(
                 text,
                 style: tagged.span.style,
                 link: tagged.link.as_ref(),
-                width: u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX),
+                width: if matches!(text.as_bytes(), [b' '..=b'~']) {
+                    1
+                } else {
+                    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+                },
                 whitespace: text.chars().all(char::is_whitespace),
             })
         })
@@ -844,17 +852,33 @@ fn wrap_tagged_spans(
 }
 
 fn graphemes(text: &str) -> impl Iterator<Item = &str> {
-    let ascii = text.bytes().all(|byte| matches!(byte, b' '..=b'~' | b'\n'));
-    let mut segmented = text.graphemes(true);
     let mut offset = 0;
+    let mut ascii_end = 0;
+    let mut segmented = None::<unicode_segmentation::Graphemes<'_>>;
     std::iter::from_fn(move || {
-        if ascii {
-            let grapheme = text.get(offset..offset + 1)?;
-            offset += 1;
-            Some(grapheme)
-        } else {
-            segmented.next()
+        if segmented.is_none() {
+            if offset >= ascii_end {
+                ascii_end = offset + crate::text::ascii_prefix(&text[offset..], true);
+                if ascii_end < text.len() {
+                    ascii_end = ascii_end.saturating_sub(1).max(offset);
+                }
+            }
+            if offset < ascii_end {
+                offset += 1;
+                return Some(&text[offset - 1..offset]);
+            }
+            segmented = Some(text[offset..].graphemes(true));
         }
+        let grapheme = segmented.as_mut()?.next()?;
+        offset += grapheme.len();
+        if text
+            .as_bytes()
+            .get(offset)
+            .is_some_and(|byte| matches!(byte, b' '..=b'~' | b'\n'))
+        {
+            segmented = None;
+        }
+        Some(grapheme)
     })
 }
 
