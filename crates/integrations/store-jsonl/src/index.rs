@@ -290,6 +290,14 @@ impl Journal {
     }
 
     pub(super) fn persist_index(&mut self) {
+        if std::fs::metadata(&self.path)
+            .ok()
+            .and_then(|metadata| identity(&metadata).ok())
+            .as_deref()
+            != Some(self.index.source.as_str())
+        {
+            return;
+        }
         if self.persisted_offset == Some(self.index.offset) && !self.index.migrated {
             return;
         }
@@ -329,10 +337,7 @@ impl Journal {
     fn write_index(&mut self) -> io::Result<()> {
         self.index.anchor = digest_anchor(&mut self.reads, self.index.last)?;
         let path = self.index_path();
-        let directory = path
-            .parent()
-            .ok_or_else(|| io::Error::other("JSONL index has no parent directory"))?;
-        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        let mut temporary = self.temporary(".index-")?;
         temporary.write_all(MAGIC)?;
         let mut states = HashMap::with_capacity(self.index.states.len());
         for (id, state) in &self.index.states {

@@ -1,6 +1,9 @@
 #![cfg(not(target_family = "wasm"))]
 
+mod compact;
 mod index;
+
+pub use compact::CompactionStats;
 
 use nanocode_durability_core::{
     OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoreRecord, StoreUpdate,
@@ -147,7 +150,7 @@ struct Indexed<'a> {
     records: Option<Vec<IndexedRecord<'a>>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct IndexedRecord<'a> {
     #[serde(borrow)]
     key: Cow<'a, str>,
@@ -160,7 +163,7 @@ struct Text;
 impl<'de> Deserialize<'de> for Text {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         raw_text(deserializer)?;
-        Ok(Text)
+        Ok(Self)
     }
 }
 
@@ -231,7 +234,7 @@ impl Record {
         Self::value(id, key, position + start as u64, value.get().as_bytes())
     }
 
-    fn location(self) -> Location {
+    const fn location(self) -> Location {
         match self {
             Self::Entry(location) | Self::Value { location, .. } => location,
         }
@@ -322,6 +325,7 @@ struct Journal {
     file: File,
     reads: File,
     path: PathBuf,
+    lineage: String,
     index: index::Index,
     persisted_offset: Option<u64>,
     ready: bool,
@@ -332,23 +336,27 @@ struct Journal {
 impl Journal {
     fn open(path: &Path) -> Result<Self, StoreError> {
         let _span = tracing::info_span!("durability.jsonl.open").entered();
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(backend)?;
-        let path = std::fs::canonicalize(path).map_err(backend)?;
-        let reads = File::open(&path).map_err(backend)?;
-        let source = identity(&file.metadata().map_err(backend)?)?;
-        if identity(&reads.metadata().map_err(backend)?)? != source {
-            return Err(identity_changed());
-        }
+        let (file, path, mut reads, source) = loop {
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .map_err(backend)?;
+            let canonical = std::fs::canonicalize(path).map_err(backend)?;
+            let reads = File::open(&canonical).map_err(backend)?;
+            let source = identity(&file.metadata().map_err(backend)?)?;
+            if identity(&reads.metadata().map_err(backend)?)? == source {
+                break (file, canonical, reads, source);
+            }
+        };
+        let lineage = compact::lineage(&mut reads, &source)?;
         let mut store = Self {
             file,
             reads,
             path,
+            lineage,
             index: index::Index::new(source),
             persisted_offset: None,
             ready: false,
@@ -357,6 +365,7 @@ impl Journal {
         };
         store.restore_index();
         store.locked(|store| {
+            store.clear_temporaries().map_err(backend)?;
             if store.persisted_offset.is_none() {
                 store.persist_index();
             }
@@ -364,6 +373,54 @@ impl Journal {
         })?;
         store.ready = true;
         Ok(store)
+    }
+
+    fn temporary(&self, suffix: &str) -> std::io::Result<tempfile::NamedTempFile> {
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("journal has no directory"))?;
+        let mut prefix = self
+            .path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("journal has no filename"))?
+            .to_os_string();
+        prefix.push(suffix);
+        tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempfile_in(directory)
+    }
+
+    fn clear_temporaries(&self) -> std::io::Result<()> {
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("journal has no directory"))?;
+        let name = self
+            .path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("journal has no filename"))?;
+        let prefixes: Vec<_> = [".compact-", ".index-"]
+            .into_iter()
+            .map(|suffix| {
+                let mut prefix = name.to_os_string();
+                prefix.push(suffix);
+                prefix
+            })
+            .collect();
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if prefixes.iter().any(|prefix| {
+                entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(prefix.as_encoded_bytes())
+            }) && entry.file_type()?.is_file()
+            {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
     }
 
     fn home(home: &Path) -> Result<PathBuf, StoreError> {
@@ -385,12 +442,31 @@ impl Journal {
         );
         let _entered = span.enter();
         let started = Instant::now();
-        self.file.lock().map_err(backend)?;
+        loop {
+            self.file.lock().map_err(backend)?;
+            let current = std::fs::metadata(&self.path)
+                .map_err(backend)
+                .and_then(|metadata| identity(&metadata));
+            match current {
+                Ok(source) if source == self.index.source => break,
+                Ok(_) => {
+                    self.file.unlock().map_err(backend)?;
+                    self.reopen_compacted()?;
+                }
+                Err(error) => {
+                    self.file.unlock().map_err(backend)?;
+                    return Err(error);
+                }
+            }
+        }
         span.record("lock.wait_ms", started.elapsed().as_secs_f64() * 1_000.0);
         if !self.ready && self.persisted_offset.is_none() && self.index.offset == 0 {
             self.restore_index();
         }
-        let result = self.refresh_index().and_then(|()| action(self));
+        let result = self.refresh_index().and_then(|()| {
+            self.ready = true;
+            action(self)
+        });
         let unlocked = self.file.unlock().map_err(backend);
         match result {
             Ok(value) => unlocked.map(|()| value),
@@ -702,22 +778,28 @@ impl Journal {
         Ok(value)
     }
 
-    fn validate_records(&mut self, id: &str, records: &[StoreRecord]) -> Result<(), StoreError> {
+    fn validate_records(
+        &mut self,
+        id: &str,
+        records: &[StoreRecord],
+    ) -> Result<Vec<bool>, StoreError> {
         let mut staged = HashMap::new();
+        let mut fresh = Vec::with_capacity(records.len());
         for record in records {
             let existing = self.record(id, &record.key)?;
             let retained = existing
-                .as_ref()
-                .or_else(|| staged.get(&record.key).copied());
-            if retained.is_some_and(|value| value != &record.value) {
+                .as_deref()
+                .or_else(|| staged.get(record.key.as_str()).copied());
+            if retained.is_some_and(|value| value != record.value) {
                 return Err(StoreError::NotCommitted(format!(
                     "durability record `{}` has conflicting content",
                     record.key
                 )));
             }
-            staged.insert(record.key.clone(), &record.value);
+            fresh.push(retained.is_none());
+            staged.insert(record.key.as_str(), record.value.as_str());
         }
-        Ok(())
+        Ok(fresh)
     }
 
     fn append(&mut self, entry: Entry) -> Result<(), StoreError> {
@@ -885,13 +967,20 @@ impl Journal {
                     .revision
                     .checked_add(1)
                     .ok_or_else(|| StoreError::NotCommitted("JSONL revision overflow".into()))?;
-                store.rebuilt(|store| store.validate_records(id, &replacement.records))?;
+                let fresh =
+                    store.rebuilt(|store| store.validate_records(id, &replacement.records))?;
+                let records = replacement
+                    .records
+                    .into_iter()
+                    .zip(fresh)
+                    .filter_map(|(record, fresh)| fresh.then_some(record))
+                    .collect();
                 entries.push(Entry::Replace {
                     state_id: id.into(),
                     owner: owner.clone(),
                     revision,
                     payload: replacement.payload.clone(),
-                    records: replacement.records,
+                    records,
                 });
                 state = StoredState {
                     revision,
@@ -974,7 +1063,7 @@ impl Journal {
         records: Vec<StoreRecord>,
     ) -> Result<u64, StoreError> {
         self.locked(|store| {
-            let revision = store.rebuilt(|store| {
+            let (revision, fresh) = store.rebuilt(|store| {
                 if store.index.owners.get(id) != Some(owner) {
                     return Err(StoreError::Fenced);
                 }
@@ -985,9 +1074,14 @@ impl Journal {
                 let revision = actual
                     .checked_add(1)
                     .ok_or_else(|| StoreError::NotCommitted("JSONL revision overflow".into()))?;
-                store.validate_records(id, &records)?;
-                Ok(revision)
+                let fresh = store.validate_records(id, &records)?;
+                Ok((revision, fresh))
             })?;
+            let records = records
+                .into_iter()
+                .zip(fresh)
+                .filter_map(|(record, fresh)| fresh.then_some(record))
+                .collect();
             store.append(Entry::Replace {
                 state_id: id.into(),
                 owner: owner.clone(),
@@ -1040,6 +1134,10 @@ impl JsonlStore {
             journal
         })?)
         .await
+    }
+
+    pub async fn compact(&mut self) -> Result<CompactionStats, StoreError> {
+        self.write(Journal::compact).await
     }
 
     pub async fn close(self) -> Result<(), StoreError> {

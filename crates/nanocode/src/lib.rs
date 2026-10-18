@@ -158,4 +158,4 @@ pub mod backend {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub use nanocode_store_jsonl::JsonlStore;
+pub use nanocode_store_jsonl::{CompactionStats, JsonlStore};
