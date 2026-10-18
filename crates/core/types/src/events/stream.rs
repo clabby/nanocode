@@ -63,6 +63,13 @@ impl AgentEvents {
         self.receiver.recv().await
     }
 
+    pub fn poll_recv_timed(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<TimedAgentEvent>> {
+        self.receiver.poll_recv(context)
+    }
+
     #[doc(hidden)]
     pub fn try_recv_timed(&mut self) -> Option<TimedAgentEvent> {
         self.receiver.try_recv().ok()

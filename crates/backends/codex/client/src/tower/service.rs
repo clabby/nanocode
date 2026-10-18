@@ -46,6 +46,14 @@ struct ConnectionState {
     logical_turn: Option<u64>,
 }
 
+struct SentRequest {
+    bytes: usize,
+    connect_ns: Option<u64>,
+    encode_ns: u64,
+    send_ns: u64,
+    sent_ns: Option<u64>,
+}
+
 struct EstablishedConnection {
     socket: ResponsesSocket,
     metadata: ConnectionMetadata,
@@ -268,6 +276,7 @@ impl ResponsesService {
         connection: &mut ConnectionState,
         request: &ResponsesAttempt,
         transport: ResponsesTransport,
+        queue_ns: u64,
     ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
         request
             .observer
@@ -275,6 +284,7 @@ impl ResponsesService {
             .response_attempts
             .fetch_add(1, Ordering::Relaxed);
         let started_at = Instant::now();
+        let attempt_started_ns = request.model_call_started_at.map(elapsed_ns);
         request.observer.emit(
             AgentEventKind::ModelAttemptStarted,
             AttemptStarted {
@@ -295,7 +305,14 @@ impl ResponsesService {
         } else {
             https::run(self, &mut guard, request, started_at).await
         }
-        .map_err(|error| error.with_request_input(active_request.as_ref()));
+        .map_err(|error| error.with_request_input(active_request.as_ref()))
+        .map(|mut response| {
+            if let ResponsesOutput::Generation(output) = &mut response.output {
+                output.timing.queue_ns = Some(queue_ns);
+                output.timing.attempt_started_ns = attempt_started_ns;
+            }
+            response
+        });
         guard.complete();
         drop(guard);
         tracing::Span::current().record(
@@ -344,8 +361,7 @@ impl ResponsesService {
         request: &mut Cow<'_, ResponsesAttempt>,
         started_at: Instant,
     ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
-        let (request_bytes, encode_duration_ns, send_duration_ns) =
-            self.send_websocket(connection, request).await?;
+        let sent = self.send_websocket(connection, request).await?;
         let request = request.as_ref();
         let generation = connection.generation;
         let span = tracing::Span::current();
@@ -362,17 +378,23 @@ impl ResponsesService {
                     .await
                     .map_err(|error| error.with_connection_generation(generation))?,
             ),
-            ResponsesAttemptKind::Generation => ResponsesOutput::Generation(
-                stream::receive(
+            ResponsesAttemptKind::Generation => {
+                let mut output = stream::receive(
                     socket,
                     ResponsesTransport::WebSocket.as_str(),
                     &request.observer,
                     required_call_index(request)?,
                     started_at,
+                    request.model_call_started_at,
                 )
                 .await
-                .map_err(|error| error.with_connection_generation(generation))?,
-            ),
+                .map_err(|error| error.with_connection_generation(generation))?;
+                output.timing.connect_ns = sent.connect_ns;
+                output.timing.encode_ns = Some(sent.encode_ns);
+                output.timing.send_ns = Some(sent.send_ns);
+                output.timing.request_sent_ns = sent.sent_ns;
+                ResponsesOutput::Generation(output)
+            }
             ResponsesAttemptKind::Compaction => ResponsesOutput::Compaction(
                 stream::receive_compaction(
                     socket,
@@ -391,13 +413,7 @@ impl ResponsesService {
             ResponsesOutput::Compaction(result) => Some(result.pipeline_stats),
         };
         if let Some(stats) = pipeline_stats {
-            record_pipeline_stats(
-                &span,
-                request_bytes,
-                encode_duration_ns,
-                send_duration_ns,
-                stats,
-            );
+            record_pipeline_stats(&span, sent.bytes, sent.encode_ns, sent.send_ns, stats);
         }
         Ok(ResponsesServiceResponse {
             output,
@@ -411,8 +427,9 @@ impl ResponsesService {
         &self,
         connection: &mut ConnectionState,
         request: &mut Cow<'_, ResponsesAttempt>,
-    ) -> Result<(usize, u64, u64), ResponsesServiceError> {
+    ) -> Result<SentRequest, ResponsesServiceError> {
         let mut reused = connection.socket.is_some();
+        let mut connect_ns = None;
         if connection
             .socket
             .as_ref()
@@ -424,7 +441,7 @@ impl ResponsesService {
         }
         loop {
             if connection.socket.is_none() {
-                self.connect(connection, request.as_ref()).await?;
+                connect_ns = Some(self.connect(connection, request.as_ref()).await?);
             }
             let generation = connection.generation;
             let encode_started_at = Instant::now();
@@ -478,7 +495,13 @@ impl ResponsesService {
             span.record("request.send.duration_ns", send_duration_ns);
             match outcome {
                 SendOutcome::Sent => {
-                    return Ok((request_bytes, encode_duration_ns, send_duration_ns));
+                    return Ok(SentRequest {
+                        bytes: request_bytes,
+                        connect_ns,
+                        encode_ns: encode_duration_ns,
+                        send_ns: send_duration_ns,
+                        sent_ns: request.model_call_started_at.map(elapsed_ns),
+                    });
                 }
                 SendOutcome::Disconnected if reused => {
                     connection.invalidate(ConnectionPurpose::Reconnect);
@@ -551,7 +574,7 @@ impl ResponsesService {
         &self,
         connection: &mut ConnectionState,
         request: &ResponsesAttempt,
-    ) -> Result<(), ResponsesServiceError> {
+    ) -> Result<u64, ResponsesServiceError> {
         let purpose = connection.next_purpose;
         let generation = connection.generation + 1;
         let established = self
@@ -596,7 +619,7 @@ impl ResponsesService {
             },
         )?;
         connection.socket = Some(socket);
-        Ok(())
+        Ok(duration_ns)
     }
 
     async fn establish_connection(
@@ -859,7 +882,8 @@ impl Service<ResponsesAttempt> for ResponsesService {
             async move {
                 let queued_at = Instant::now();
                 let mut connection = service.connection.lock().await;
-                tracing::Span::current().record("request.queue.duration_ns", elapsed_ns(queued_at));
+                let queue_ns = elapsed_ns(queued_at);
+                tracing::Span::current().record("request.queue.duration_ns", queue_ns);
                 connection.enter_logical_turn(request.logical_turn);
                 let transport = request.effective_transport(service.config.responses_transport);
                 tracing::Span::current().record("transport", transport.as_str());
@@ -890,7 +914,9 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 tracing::Span::current().record("replay.mode", request.replay_mode());
                 tracing::Span::current()
                     .record("model.input.item_count", request.input_item_count());
-                service.run(&mut connection, &request, transport).await
+                service
+                    .run(&mut connection, &request, transport, queue_ns)
+                    .await
             }
             .instrument(span)
             .await

@@ -3991,8 +3991,11 @@ impl State {
                          attempt: u32,
                          first_event: u64,
                          first_output: Option<u64>,
-                         dispatch: Option<u64>| {
+                         dispatch: Option<u64>,
+                         mut timing: telemetry::CallTiming| {
             let Some(events) = events else { return };
+            let duration_ns = elapsed_ns();
+            timing.total_ns = duration_ns;
             telemetry::record_model_response(
                 &tracing::Span::current(),
                 response,
@@ -4016,7 +4019,7 @@ impl State {
                 "attempt": attempt,
                 "connection_generation": 0,
                 "status": response.stop_reason.unwrap_or(StopReason::Unknown),
-                "duration_ns": elapsed_ns(),
+                "duration_ns": duration_ns,
                 "time_to_first_event_ns": first_event,
                 "time_to_first_output_ns": first_output,
                 "time_to_dispatch_ns": dispatch,
@@ -4030,6 +4033,7 @@ impl State {
                     "output_tokens": response.usage.output_tokens,
                     "total_tokens": input_tokens.saturating_add(response.usage.output_tokens),
                 },
+                "timing": timing,
             }));
         };
         let client = self.client.restore_wire_profile(context.wire_profile);
@@ -4089,7 +4093,17 @@ impl State {
             ),
             Step::Replay(value) => {
                 let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
-                completed(&response, 0, 0, None, None);
+                completed(
+                    &response,
+                    0,
+                    0,
+                    None,
+                    None,
+                    telemetry::CallTiming {
+                        replayed: true,
+                        ..telemetry::CallTiming::default()
+                    },
+                );
                 return Ok(ResponseOutcome {
                     message: response,
                     upgrade: None,
@@ -4136,7 +4150,17 @@ impl State {
                     .await?
             {
                 let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
-                completed(&response, 0, 0, None, None);
+                completed(
+                    &response,
+                    0,
+                    0,
+                    None,
+                    None,
+                    telemetry::CallTiming {
+                        replayed: true,
+                        ..telemetry::CallTiming::default()
+                    },
+                );
                 return Ok(ResponseOutcome {
                     message: response,
                     upgrade: Some(upgrade.clone()),
@@ -4160,10 +4184,15 @@ impl State {
             let attempt_span =
                 telemetry::attempt_span(index.saturating_add(1), attempt, max_attempts);
             let attempt_started = Instant::now();
+            let attempt_started_ns = elapsed_ns();
             let mut accepted = false;
             let mut published_text = false;
             let mut first_event = None;
             let mut first_output = None;
+            let mut response_headers_ns = None;
+            let mut send_ns = None;
+            let mut response_completed_ns = None;
+            let mut pipeline = telemetry::CallPipeline::default();
 
             let mut message_id: Option<String> = None;
 
@@ -4177,6 +4206,10 @@ impl State {
                     return Err(ResponseFailure { error: NanocodexError::TurnCancelled, recovery });
                 }
             };
+            if opened.is_ok() {
+                response_headers_ns = Some(elapsed_ns());
+                send_ns = Some(telemetry::elapsed_ns(attempt_started));
+            }
             request.messages = Vec::new();
             let result = match opened {
                 Err(error) => Err(error),
@@ -4184,6 +4217,7 @@ impl State {
                     accepted = true;
                     let mut captured = Vec::new();
                     loop {
+                        let receive_started = Instant::now();
                         let event = tokio::select! {
                             event = stream.next() => event,
                             () = cancel.cancelled() => {
@@ -4191,12 +4225,17 @@ impl State {
                                 return Err(ResponseFailure { error: NanocodexError::TurnCancelled, recovery });
                             }
                         };
+                        pipeline.receive_decode_ns = pipeline
+                            .receive_decode_ns
+                            .saturating_add(telemetry::elapsed_ns(receive_started));
                         let event = match event {
                             Some(Ok(event)) => event,
                             Some(Err(error)) => break Err(error),
                             None => break Err(ClaudeError::IncompleteStream),
                         };
-                        first_event.get_or_insert_with(&elapsed_ns);
+                        let received_ns = elapsed_ns();
+                        pipeline.event_count = pipeline.event_count.saturating_add(1);
+                        first_event.get_or_insert(received_ns);
                         if let Some(recovery) = &mut recovery {
                             recovery.observe(&event);
                         }
@@ -4234,18 +4273,33 @@ impl State {
                             _ => None,
                         };
                         if let Some((kind, item_id, text)) = display {
-                            first_output.get_or_insert_with(&elapsed_ns);
+                            let model_elapsed_ns = elapsed_ns();
+                            first_output.get_or_insert(model_elapsed_ns);
                             if let Some(events) = events {
                                 published_text = true;
-                                self.emit(events, kind, json!({"model_call_index":index,"item_id":item_id,"phase":null,"text":text}));
+                                let bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+                                let emit_started = Instant::now();
+                                self.emit(events, kind, json!({"model_call_index":index.saturating_add(1),"item_id":item_id,"phase":null,"text":text,"model_elapsed_ns":model_elapsed_ns}));
+                                pipeline.display_delta_emit_ns = pipeline
+                                    .display_delta_emit_ns
+                                    .saturating_add(telemetry::elapsed_ns(emit_started));
+                                pipeline.display_delta_count =
+                                    pipeline.display_delta_count.saturating_add(1);
+                                pipeline.display_delta_bytes =
+                                    pipeline.display_delta_bytes.saturating_add(bytes);
                             }
                         }
                         let terminal = matches!(event, StreamEvent::MessageStop);
                         captured.push(event);
                         if terminal {
+                            response_completed_ns = Some(received_ns);
                             let first = captured.remove(0);
                             let rest = captured.into_iter().map(Ok);
-                            break collect_stream(first, futures_util::stream::iter(rest)).await;
+                            let collect_started = Instant::now();
+                            let collected =
+                                collect_stream(first, futures_util::stream::iter(rest)).await;
+                            pipeline.collect_ns = telemetry::elapsed_ns(collect_started);
+                            break collected;
                         }
                     }
                 }
@@ -4274,6 +4328,18 @@ impl State {
                         first_event.unwrap_or_default(),
                         first_output,
                         dispatched,
+                        telemetry::CallTiming {
+                            replayed: false,
+                            preparation_ns: dispatched,
+                            attempt_started_ns: Some(attempt_started_ns),
+                            send_ns,
+                            response_headers_ns,
+                            first_event_ns: first_event,
+                            first_output_ns: first_output,
+                            response_completed_ns,
+                            total_ns: 0,
+                            pipeline: Some(pipeline),
+                        },
                     );
                     return Ok(ResponseOutcome {
                         message: response,

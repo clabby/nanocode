@@ -24,4 +24,5 @@ pub use service_error::ResponsesServiceError;
 #[doc(inline)]
 pub use stream::{
     CodeCall, CodeCallKind, CompactionOutput, GenerationOutput, ResponsePipelineStats,
+    ResponseTiming,
 };

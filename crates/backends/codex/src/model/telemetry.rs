@@ -1,7 +1,11 @@
 use std::time::Duration;
 
 use crate::client::{
-    __private::ModelConfig, Thinking, pricing::ServiceTier, responses::Usage,
+    __private::ModelConfig,
+    Thinking,
+    pricing::ServiceTier,
+    responses::Usage,
+    tower::{ResponsePipelineStats, ResponseTiming},
     transport::TransportStatsDelta,
 };
 use nanocode_platform::Instant;
@@ -60,6 +64,85 @@ pub(super) struct ModelCallCompleted<'a> {
     pub(super) time_to_first_output_ns: Option<u64>,
     pub(super) tool_calls: usize,
     pub(super) usage: Option<&'a Usage>,
+    pub(super) timing: ModelCallTiming,
+}
+
+#[derive(Serialize)]
+pub(super) struct ModelCallTiming {
+    pub(super) replayed: bool,
+    pub(super) preparation_ns: Option<u64>,
+    pub(super) queue_ns: Option<u64>,
+    pub(super) attempt_started_ns: Option<u64>,
+    pub(super) connect_ns: Option<u64>,
+    pub(super) encode_ns: Option<u64>,
+    pub(super) send_ns: Option<u64>,
+    pub(super) request_sent_ns: Option<u64>,
+    pub(super) response_headers_ns: Option<u64>,
+    pub(super) first_event_ns: Option<u64>,
+    pub(super) first_output_ns: Option<u64>,
+    pub(super) response_completed_ns: Option<u64>,
+    pub(super) total_ns: u64,
+    pub(super) pipeline: ModelCallPipeline,
+}
+
+#[derive(Serialize)]
+pub(super) struct ModelCallPipeline {
+    pub(super) event_count: u64,
+    pub(super) event_bytes: u64,
+    pub(super) receive_wait_ns: u64,
+    pub(super) decode_ns: u64,
+    pub(super) api_event_emit_ns: u64,
+    pub(super) response_forward_ns: u64,
+    pub(super) display_delta_emit_ns: u64,
+    pub(super) socket_queue_ns: u64,
+    pub(super) display_delta_count: u64,
+    pub(super) display_delta_bytes: u64,
+    pub(super) inter_delta_gap_max_ns: u64,
+    pub(super) inter_delta_stall_50ms_count: u64,
+    pub(super) inter_delta_stall_100ms_count: u64,
+    pub(super) inter_delta_stall_250ms_count: u64,
+}
+
+impl ModelCallTiming {
+    pub(super) const fn new(
+        replayed: bool,
+        preparation_ns: Option<u64>,
+        total_ns: u64,
+        timing: &ResponseTiming,
+        stats: &ResponsePipelineStats,
+    ) -> Self {
+        Self {
+            replayed,
+            preparation_ns,
+            queue_ns: timing.queue_ns,
+            attempt_started_ns: timing.attempt_started_ns,
+            connect_ns: timing.connect_ns,
+            encode_ns: timing.encode_ns,
+            send_ns: timing.send_ns,
+            request_sent_ns: timing.request_sent_ns,
+            response_headers_ns: timing.response_headers_ns,
+            first_event_ns: timing.first_event_ns,
+            first_output_ns: timing.first_output_ns,
+            response_completed_ns: timing.response_completed_ns,
+            total_ns,
+            pipeline: ModelCallPipeline {
+                event_count: stats.event_count,
+                event_bytes: stats.event_bytes,
+                receive_wait_ns: stats.receive_wait_duration_ns,
+                decode_ns: stats.decode_duration_ns,
+                api_event_emit_ns: stats.emit_duration_ns,
+                response_forward_ns: stats.response_forward_duration_ns,
+                display_delta_emit_ns: stats.display_delta_emit_duration_ns,
+                socket_queue_ns: stats.socket_queue_duration_ns,
+                display_delta_count: stats.display_delta_count,
+                display_delta_bytes: stats.display_delta_bytes,
+                inter_delta_gap_max_ns: stats.inter_delta_gap_max_ns,
+                inter_delta_stall_50ms_count: stats.inter_delta_stall_50ms_count,
+                inter_delta_stall_100ms_count: stats.inter_delta_stall_100ms_count,
+                inter_delta_stall_250ms_count: stats.inter_delta_stall_250ms_count,
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]

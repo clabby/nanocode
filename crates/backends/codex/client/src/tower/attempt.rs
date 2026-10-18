@@ -14,6 +14,7 @@ use crate::client::{
     session::state::RequestHistory,
     tower::transport_policy::SessionTransport,
 };
+use nanocode_platform::Instant;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
@@ -160,6 +161,7 @@ pub struct ResponsesAttempt {
     full_replay: bool,
     pub(crate) logical_turn: u64,
     session_transport: Arc<SessionTransport>,
+    pub(crate) model_call_started_at: Option<Instant>,
 }
 
 impl ResponsesAttempt {
@@ -189,6 +191,7 @@ impl ResponsesAttempt {
             full_replay: false,
             logical_turn: 0,
             session_transport,
+            model_call_started_at: None,
         }
     }
 
@@ -224,6 +227,7 @@ impl ResponsesAttempt {
             full_replay: previous_response_id.is_none(),
             logical_turn: 0,
             session_transport,
+            model_call_started_at: None,
         }
     }
 
@@ -260,7 +264,14 @@ impl ResponsesAttempt {
             full_replay: previous_response_id.is_none(),
             logical_turn: 0,
             session_transport,
+            model_call_started_at: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_model_call_started_at(mut self, started_at: Instant) -> Self {
+        self.model_call_started_at = Some(started_at);
+        self
     }
 
     pub(crate) fn input(&self) -> ResponsesInput<'_> {

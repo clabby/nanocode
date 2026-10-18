@@ -1,5 +1,6 @@
 use super::{ClaudeError, ContentBlock, Lineage, NanocodexError, Result, StopReason, TurnResult};
 use crate::MessageResponse;
+use serde::Serialize;
 use tracing::{Span, field::Empty, info_span};
 
 pub(super) struct TurnLabels<'a> {
@@ -110,6 +111,34 @@ pub(super) struct ModelCallTiming {
     pub(super) first_event_ns: u64,
     pub(super) first_output_ns: Option<u64>,
     pub(super) dispatch_ns: Option<u64>,
+}
+
+#[derive(Default, Serialize)]
+pub(super) struct CallTiming {
+    pub(super) replayed: bool,
+    pub(super) preparation_ns: Option<u64>,
+    pub(super) attempt_started_ns: Option<u64>,
+    pub(super) send_ns: Option<u64>,
+    pub(super) response_headers_ns: Option<u64>,
+    pub(super) first_event_ns: Option<u64>,
+    pub(super) first_output_ns: Option<u64>,
+    pub(super) response_completed_ns: Option<u64>,
+    pub(super) total_ns: u64,
+    pub(super) pipeline: Option<CallPipeline>,
+}
+
+#[derive(Default, Serialize)]
+pub(super) struct CallPipeline {
+    pub(super) event_count: u64,
+    pub(super) receive_decode_ns: u64,
+    pub(super) display_delta_emit_ns: u64,
+    pub(super) collect_ns: u64,
+    pub(super) display_delta_count: u64,
+    pub(super) display_delta_bytes: u64,
+}
+
+pub(super) fn elapsed_ns(started: nanocode_platform::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 pub(super) fn record_model_response(
