@@ -1,5 +1,6 @@
 pub use nanocode_tool_runtime::attachment::{
-    AttachmentError, Runner, RunnerEvent, RunnerPool, RunnerServerConfig, RunnerStatus,
+    AttachmentError, Runner, RunnerEvent, RunnerPool, RunnerProtocol, RunnerServerConfig,
+    RunnerStatus,
 };
 
 use std::{
@@ -74,7 +75,7 @@ impl RunnerAgents {
             });
         }
         for runner in runners {
-            if let Err(error) = self.pool.start(runner) {
+            if let Err(error) = self.pool.keep_connected(runner) {
                 state
                     .startup
                     .push(tokio::sync::watch::channel(Some(Err(error))).1);
@@ -133,9 +134,12 @@ impl RunnerAgents {
 
     fn summary(&self) -> String {
         let runners = self.pool.list();
-        let mounts = runners
-            .iter()
-            .filter(|runner| runner.status == RunnerStatus::Ready)
+        let ready = |protocol| {
+            runners.iter().filter(move |runner| {
+                runner.status == RunnerStatus::Ready && runner.protocol == protocol
+            })
+        };
+        let mounts = ready(RunnerProtocol::Tools)
             .map(|runner| {
                 format!(
                     "/{} (mode: {:?}, tools: {})",
@@ -143,23 +147,52 @@ impl RunnerAgents {
                 )
             })
             .collect::<Vec<_>>();
-        if mounts.is_empty() {
+        let executors = ready(RunnerProtocol::CodeMode)
+            .map(|runner| {
+                format!(
+                    "{} (mode: {:?}, workspace: {}, tools: {})",
+                    runner.name,
+                    runner.mode,
+                    runner
+                        .workspace
+                        .as_ref()
+                        .map_or_else(|| "unadvertised".into(), |path| path.display().to_string()),
+                    runner.tool_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut summary = if mounts.is_empty() {
             "Runner mounts: no remote runners are currently available.".to_owned()
         } else {
             format!("Runner mounts currently available: {}.", mounts.join("; "))
+        };
+        if !executors.is_empty() {
+            summary.push_str(&format!(
+                " Code Mode executors connected: {}. The runners tool with action=select runs a session's exec cells on one.",
+                executors.join("; ")
+            ));
         }
+        summary
     }
 
     fn notify(&self, event: RunnerEvent) {
         let notice = match event {
             RunnerEvent::StatusChanged { info } => match info.status {
                 RunnerStatus::Ready | RunnerStatus::Disconnected | RunnerStatus::Failed(_) => {
-                    format!(
-                        "Runner /{} status: {:?}. {}",
-                        info.name,
-                        info.status,
-                        self.summary()
-                    )
+                    match info.protocol {
+                        RunnerProtocol::Tools => format!(
+                            "Runner /{} status: {:?}. {}",
+                            info.name,
+                            info.status,
+                            self.summary()
+                        ),
+                        RunnerProtocol::CodeMode => format!(
+                            "Code Mode executor {} status: {:?}. {}",
+                            info.name,
+                            info.status,
+                            self.summary()
+                        ),
+                    }
                 }
                 RunnerStatus::Connecting => return,
             },
@@ -181,6 +214,7 @@ impl RunnerAgents {
     }
 
     pub(crate) fn unregister(&self, session_id: &str) {
+        self.pool.code_mode_executors().forget(session_id);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.agents.retain(|(id, _, _)| id != session_id);
         state.folded.retain(|(id, _, _)| id != session_id);

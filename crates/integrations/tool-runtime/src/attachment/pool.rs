@@ -1,5 +1,10 @@
 use super::{
-    AttachmentError, AttachmentTarget, RemoteMode, RemoteRunner, RunnerConnection, routing::Route,
+    AttachmentError, AttachmentTarget, RemoteMode, RemoteRunner, RunnerConnection,
+    host::DialedSocket, routing::Route,
+};
+use crate::{
+    embedded::CodeModeHost,
+    remote::{CodeModeExecutors, SocketPolicy, SocketShutdown, SocketTransport},
 };
 use futures_util::{SinkExt, StreamExt, future};
 use std::{
@@ -26,6 +31,7 @@ pub struct Runner {
     endpoint: String,
     token: String,
     name: String,
+    named: bool,
     mode: RemoteMode,
     timeout: Option<Duration>,
     workspace: Option<PathBuf>,
@@ -58,6 +64,7 @@ impl Runner {
             endpoint: url.into(),
             token: String::new(),
             name: "runner".into(),
+            named: false,
             mode: RemoteMode::Alongside,
             timeout: None,
             workspace: None,
@@ -69,6 +76,7 @@ impl Runner {
     }
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self.named = true;
         self
     }
     pub fn alongside(mut self) -> Self {
@@ -175,6 +183,11 @@ pub enum RunnerStatus {
     Disconnected,
     Failed(String),
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunnerProtocol {
+    Tools,
+    CodeMode,
+}
 #[derive(Clone, Debug)]
 pub struct RunnerInfo {
     pub name: String,
@@ -183,6 +196,7 @@ pub struct RunnerInfo {
     pub status: RunnerStatus,
     pub workspace: Option<PathBuf>,
     pub tool_count: usize,
+    pub protocol: RunnerProtocol,
 }
 #[derive(Clone, Debug)]
 pub enum RunnerEvent {
@@ -206,14 +220,50 @@ impl Default for RunnerPool {
 #[derive(Default)]
 struct PoolInner {
     state: Mutex<PoolState>,
+    code_mode: CodeModeExecutors,
 }
 #[derive(Default)]
 struct PoolState {
     runners: BTreeMap<String, Entry>,
+    executors: BTreeMap<String, ExecutorEntry>,
     revocations: HashSet<(String, Box<str>)>,
     servers: Vec<Arc<ServerInner>>,
     subscribers: Vec<mpsc::UnboundedSender<RunnerEvent>>,
     closed: bool,
+}
+struct ExecutorEntry {
+    endpoint: String,
+    mode: RemoteMode,
+    status: watch::Sender<RunnerStatus>,
+    workspace: Option<PathBuf>,
+    tool_count: usize,
+    identity: Arc<()>,
+    runtime_id: Option<Box<str>>,
+    shutdown: SocketShutdown,
+    closed: watch::Receiver<Option<String>>,
+    host: Arc<dyn CodeModeHost>,
+    monitor: Option<AbortHandle>,
+}
+impl Drop for ExecutorEntry {
+    fn drop(&mut self) {
+        self.shutdown.close();
+        if let Some(monitor) = self.monitor.take() {
+            monitor.abort();
+        }
+    }
+}
+impl ExecutorEntry {
+    fn info(&self, name: &str) -> RunnerInfo {
+        RunnerInfo {
+            name: name.into(),
+            endpoint: self.endpoint.clone(),
+            mode: self.mode,
+            status: self.status.borrow().clone(),
+            workspace: self.workspace.clone(),
+            tool_count: self.tool_count,
+            protocol: RunnerProtocol::CodeMode,
+        }
+    }
 }
 struct Entry {
     remote: RemoteRunner,
@@ -279,6 +329,7 @@ impl Entry {
                     .and_then(|tools| tools.workspace().map(PathBuf::from))
             }),
             tool_count: tools.map_or(0, |tools| tools.iter().count()),
+            protocol: RunnerProtocol::Tools,
         }
     }
 }
@@ -302,6 +353,9 @@ impl RunnerPool {
     pub fn model_management_enabled(&self) -> bool {
         self.model_management
     }
+    pub fn code_mode_executors(&self) -> CodeModeExecutors {
+        self.inner.code_mode.clone()
+    }
     pub fn report_failure(&self, name: impl Into<String>, failure: impl Into<String>) {
         emit(
             &mut self.inner.state(),
@@ -324,13 +378,17 @@ impl RunnerPool {
     }
     pub fn start(&self, config: Runner) -> Result<RunnerHandle, AttachmentError> {
         let name = config.name.clone();
-        let result = self.start_inner(config);
+        let result = self.start_inner(config, None);
         if let Err(error) = &result {
             self.report_failure(name, error.to_string());
         }
         result
     }
-    fn start_inner(&self, config: Runner) -> Result<RunnerHandle, AttachmentError> {
+    fn start_inner(
+        &self,
+        config: Runner,
+        initial: Option<(DialedSocket, String)>,
+    ) -> Result<RunnerHandle, AttachmentError> {
         config.validate()?;
         tokio::runtime::Handle::try_current().map_err(error)?;
         super::install_default_rustls_crypto_provider();
@@ -351,7 +409,7 @@ impl RunnerPool {
                 "a replacement listener is already configured".into(),
             ));
         }
-        let connection = remote.connect(target)?;
+        let connection = remote.connect_established(target, initial)?;
         let status = watch::channel(RunnerStatus::Connecting).0;
         let identity = Arc::new(());
         let handle = RunnerHandle {
@@ -360,7 +418,7 @@ impl RunnerPool {
             endpoint: config.endpoint.clone(),
             mode: config.mode,
             workspace: config.workspace.clone(),
-            remote: remote.clone(),
+            kind: HandleKind::Tools(remote.clone()),
             identity: identity.clone(),
             status: status.subscribe(),
         };
@@ -389,36 +447,183 @@ impl RunnerPool {
         emit(&mut state, RunnerEvent::StatusChanged { info });
         Ok(handle)
     }
+    pub fn keep_connected(&self, config: Runner) -> Result<(), AttachmentError> {
+        config.validate()?;
+        tokio::runtime::Handle::try_current().map_err(error)?;
+        tokio::spawn(supervise(Arc::downgrade(&self.inner), config));
+        Ok(())
+    }
     pub fn connect<'call>(
         &'call self,
         config: Runner,
     ) -> futures_util::future::BoxFuture<'call, Result<RunnerHandle, AttachmentError>> {
         Box::pin(async move {
-            let timeout = config.timeout;
-            let handle = self.start(config)?;
-            let wait = handle.ready();
-            let result = match timeout {
-                Some(timeout) => tokio::time::timeout(timeout, wait)
-                    .await
-                    .map_err(error)
-                    .and_then(|result| result),
-                None => wait.await,
-            };
-            if let Err(error) = result {
-                self.report_failure(handle.name.clone(), error.to_string());
-                handle.disconnect().await?;
-                return Err(error);
+            let name = config.name.clone();
+            let result = self.connect_detected(config).await;
+            if let Err(error) = &result {
+                self.report_failure(name, error.to_string());
             }
-            Ok(handle)
+            result
         })
     }
+    async fn connect_detected(&self, config: Runner) -> Result<RunnerHandle, AttachmentError> {
+        config.validate()?;
+        tokio::runtime::Handle::try_current().map_err(error)?;
+        super::install_default_rustls_crypto_provider();
+        validate_registration(&self.inner.state(), &config.name, config.mode)?;
+        let target = AttachmentTarget::new(&config.endpoint, config.token.clone())?;
+        let (socket, first) = dial(&target).await?;
+        if code_mode_catalog(&first) {
+            let transport =
+                SocketTransport::established(socket, first, SocketPolicy::runner(), config.timeout)
+                    .await
+                    .map_err(|failure| AttachmentError::Catalog(failure.to_string().into()))?;
+            let name = match transport.name() {
+                Some(advertised) if !config.named => {
+                    validate_registration(&self.inner.state(), advertised, config.mode)?;
+                    advertised.to_owned()
+                }
+                _ => config.name,
+            };
+            return self.register_executor(
+                name,
+                config.endpoint,
+                config.mode,
+                config.workspace,
+                transport,
+                false,
+            );
+        }
+        let timeout = config.timeout;
+        let handle = self.start_inner(config, Some((socket, first)))?;
+        let wait = handle.ready();
+        let result = match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, wait)
+                .await
+                .map_err(error)
+                .and_then(|result| result),
+            None => wait.await,
+        };
+        if let Err(error) = result {
+            handle.disconnect().await?;
+            return Err(error);
+        }
+        Ok(handle)
+    }
+    fn register_executor(
+        &self,
+        name: String,
+        endpoint: String,
+        mode: RemoteMode,
+        workspace: Option<PathBuf>,
+        transport: SocketTransport,
+        reconnect: bool,
+    ) -> Result<RunnerHandle, AttachmentError> {
+        RemoteRunner::new(&name)?;
+        let workspace = workspace.or_else(|| transport.workspace().map(PathBuf::from));
+        let tool_count = transport.definitions().len();
+        let runtime_id = transport.runtime_id().map(Box::<str>::from);
+        let closed = transport.closed();
+        let shutdown = transport.shutdown_handle();
+        let host: Arc<dyn CodeModeHost> = Arc::new(transport.into_host());
+        let identity = Arc::new(());
+        let mut state = self.inner.state();
+        if state.closed {
+            return Err(AttachmentError::Closed);
+        }
+        if reconnect {
+            if let Some(runtime_id) = &runtime_id
+                && state
+                    .revocations
+                    .contains(&(name.clone(), runtime_id.clone()))
+            {
+                shutdown.revoke();
+                return Err(AttachmentError::Fenced(
+                    super::driver::ATTACHMENT_REVOKED_REASON.into(),
+                ));
+            }
+        } else {
+            state.revocations.retain(|(revoked, _)| *revoked != name);
+        }
+        let duplicate = state.runners.get(&name).is_some_and(|entry| entry.active)
+            || state.executors.get(&name).is_some_and(|entry| {
+                *entry.status.borrow() == RunnerStatus::Ready
+                    && !(reconnect && runtime_id.is_some() && entry.runtime_id == runtime_id)
+            });
+        if duplicate {
+            if reconnect {
+                shutdown.reject(DUPLICATE_EXECUTOR);
+            }
+            return Err(AttachmentError::Catalog(
+                format!("runner `{name}` is already registered").into(),
+            ));
+        }
+        if mode == RemoteMode::Replace
+            && self
+                .inner
+                .code_mode
+                .default_executor()
+                .is_some_and(|current| *current != *name)
+        {
+            return Err(AttachmentError::Catalog(
+                "a replacement Code Mode executor is already configured".into(),
+            ));
+        }
+        let status = watch::channel(RunnerStatus::Ready).0;
+        let handle = RunnerHandle {
+            pool: self.clone(),
+            name: name.clone(),
+            endpoint: endpoint.clone(),
+            mode,
+            workspace: workspace.clone(),
+            kind: HandleKind::CodeMode { tool_count },
+            identity: identity.clone(),
+            status: status.subscribe(),
+        };
+        let monitor = executor_monitor(
+            Arc::downgrade(&self.inner),
+            name.clone(),
+            identity.clone(),
+            Arc::clone(&host),
+            closed.clone(),
+        );
+        state.executors.insert(
+            name.clone(),
+            ExecutorEntry {
+                endpoint,
+                mode,
+                status,
+                workspace,
+                tool_count,
+                identity,
+                runtime_id,
+                shutdown,
+                closed,
+                host: Arc::clone(&host),
+                monitor: Some(monitor),
+            },
+        );
+        self.inner.code_mode.insert(name.as_str(), host);
+        if mode == RemoteMode::Replace {
+            self.inner
+                .code_mode
+                .set_default(Some(Arc::from(name.as_str())));
+        }
+        let info = state.executors[&name].info(&name);
+        tracing::info!(target: "nanocode_code_mode::attachment", runner = name, "Code Mode executor registered");
+        emit(&mut state, RunnerEvent::StatusChanged { info });
+        Ok(handle)
+    }
     pub fn list(&self) -> Vec<RunnerInfo> {
-        self.inner
-            .state()
+        let state = self.inner.state();
+        let mut runners = state
             .runners
             .iter()
             .map(|(name, entry)| entry.info(name))
-            .collect()
+            .chain(state.executors.iter().map(|(name, entry)| entry.info(name)))
+            .collect::<Vec<_>>();
+        runners.sort_by(|left, right| left.name.cmp(&right.name));
+        runners
     }
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<RunnerEvent> {
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -436,7 +641,52 @@ impl RunnerPool {
         name: &str,
         identity: Option<&Arc<()>>,
     ) -> Result<(), AttachmentError> {
+        if let Some(closed) = self.disconnect_executor(name, identity, true)? {
+            Self::executor_closed(closed).await;
+            return Ok(());
+        }
         Self::wait_disconnected(self.begin_disconnect(name, identity)?).await
+    }
+    fn disconnect_executor(
+        &self,
+        name: &str,
+        identity: Option<&Arc<()>>,
+        revoke: bool,
+    ) -> Result<Option<watch::Receiver<Option<String>>>, AttachmentError> {
+        let entry = {
+            let mut state = self.inner.state();
+            let Some(entry) = state.executors.get(name) else {
+                return Ok(None);
+            };
+            if identity.is_some_and(|identity| !Arc::ptr_eq(&entry.identity, identity)) {
+                return Err(error(format!(
+                    "runner handle `{name}` is stale; the name belongs to a newer registration"
+                )));
+            }
+            let Some(entry) = state.executors.remove(name) else {
+                return Ok(None);
+            };
+            entry.status.send_replace(RunnerStatus::Disconnected);
+            let info = entry.info(name);
+            if revoke && let Some(runtime_id) = &entry.runtime_id {
+                state
+                    .revocations
+                    .insert((name.to_owned(), runtime_id.clone()));
+            }
+            emit(&mut state, RunnerEvent::StatusChanged { info });
+            entry
+        };
+        self.inner.code_mode.remove_host(name, &entry.host);
+        self.inner.code_mode.clear_selections(name);
+        if revoke {
+            entry.shutdown.revoke();
+        } else {
+            entry.shutdown.close();
+        }
+        Ok(Some(entry.closed.clone()))
+    }
+    async fn executor_closed(mut closed: watch::Receiver<Option<String>>) {
+        let _ = closed.wait_for(Option::is_some).await;
     }
     fn begin_disconnect(
         &self,
@@ -487,21 +737,29 @@ impl RunnerPool {
         &'call self,
     ) -> futures_util::future::BoxFuture<'call, Result<(), AttachmentError>> {
         Box::pin(async move {
-            let (names, servers) = {
+            let (names, executors, servers) = {
                 let mut state = self.inner.state();
                 state.closed = true;
                 (
                     state.runners.keys().cloned().collect::<Vec<_>>(),
+                    state.executors.keys().cloned().collect::<Vec<_>>(),
                     std::mem::take(&mut state.servers),
                 )
             };
             for inner in &servers {
                 inner.cancel.cancel();
             }
+            let executors = executors
+                .iter()
+                .map(|name| self.disconnect_executor(name, None, false))
+                .collect::<Result<Vec<_>, _>>()?;
             let remotes = names
                 .into_iter()
                 .map(|name| self.begin_disconnect(&name, None))
                 .collect::<Result<Vec<_>, _>>()?;
+            for closed in executors.into_iter().flatten() {
+                Self::executor_closed(closed).await;
+            }
             for remote in remotes {
                 Self::wait_disconnected(remote).await?;
             }
@@ -629,7 +887,12 @@ fn validate_registration(
     if state.closed {
         return Err(AttachmentError::Closed);
     }
-    if state.runners.get(name).is_some_and(|entry| entry.active) {
+    if state.runners.get(name).is_some_and(|entry| entry.active)
+        || state
+            .executors
+            .get(name)
+            .is_some_and(|entry| *entry.status.borrow() == RunnerStatus::Ready)
+    {
         return Err(AttachmentError::Catalog(
             format!("runner `{name}` is already registered").into(),
         ));
@@ -644,6 +907,178 @@ fn validate_registration(
             "a replacement runner is already configured".into(),
         ));
     }
+    Ok(())
+}
+async fn supervise(pool: Weak<PoolInner>, config: Runner) {
+    let mut backoff = super::INITIAL_TRANSPORT_BACKOFF;
+    let mut reported = false;
+    loop {
+        let Some(inner) = pool.upgrade() else {
+            return;
+        };
+        let pool_handle = RunnerPool {
+            inner,
+            model_management: true,
+        };
+        match pool_handle.connect_detected(config.clone()).await {
+            Ok(handle) => {
+                backoff = super::INITIAL_TRANSPORT_BACKOFF;
+                reported = false;
+                let HandleKind::CodeMode { .. } = handle.kind else {
+                    return;
+                };
+                let (name, identity, mut status) = (
+                    handle.name.clone(),
+                    handle.identity.clone(),
+                    handle.subscribe(),
+                );
+                drop((handle, pool_handle));
+                if status
+                    .wait_for(|status| {
+                        matches!(status, RunnerStatus::Disconnected | RunnerStatus::Failed(_))
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let Some(inner) = pool.upgrade() else {
+                    return;
+                };
+                let dropped = inner
+                    .state()
+                    .executors
+                    .get(&name)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.identity, &identity));
+                if !dropped {
+                    return;
+                }
+            }
+            Err(failure @ (AttachmentError::Transport(_) | AttachmentError::Timeout { .. })) => {
+                if !reported {
+                    pool_handle.report_failure(config.name.clone(), failure.to_string());
+                    reported = true;
+                }
+                drop(pool_handle);
+                tokio::time::sleep(super::reconnect_delay(&mut backoff)).await;
+            }
+            Err(failure) => {
+                pool_handle.report_failure(config.name.clone(), failure.to_string());
+                return;
+            }
+        }
+    }
+}
+fn executor_monitor(
+    pool: Weak<PoolInner>,
+    name: String,
+    identity: Arc<()>,
+    host: Arc<dyn CodeModeHost>,
+    mut closed: watch::Receiver<Option<String>>,
+) -> AbortHandle {
+    tokio::spawn(async move {
+        let reason = match closed.wait_for(Option::is_some).await {
+            Ok(reason) => reason.clone().unwrap_or_default(),
+            Err(_) => crate::remote::LOCAL_CLOSED.to_owned(),
+        };
+        let Some(pool) = pool.upgrade() else {
+            return;
+        };
+        pool.code_mode.remove_host(&name, &host);
+        let mut state = pool.state();
+        let Some(entry) = state.executors.get_mut(&name) else {
+            return;
+        };
+        if !Arc::ptr_eq(&entry.identity, &identity) {
+            return;
+        }
+        let status = if matches!(
+            reason.as_str(),
+            crate::remote::PEER_CLOSED | crate::remote::LOCAL_CLOSED
+        ) {
+            RunnerStatus::Disconnected
+        } else {
+            RunnerStatus::Failed(reason)
+        };
+        tracing::info!(target: "nanocode_code_mode::attachment", runner = name, ?status, "Code Mode executor closed");
+        entry.status.send_replace(status);
+        let info = entry.info(&name);
+        emit(&mut state, RunnerEvent::StatusChanged { info });
+    })
+    .abort_handle()
+}
+async fn dial(target: &AttachmentTarget) -> Result<(DialedSocket, String), AttachmentError> {
+    use tungstenite::client::IntoClientRequest;
+    let mut request = target
+        .endpoint()
+        .as_str()
+        .into_client_request()
+        .map_err(error)?;
+    let mut authorization =
+        http::HeaderValue::from_str(&format!("Bearer {}", target.bearer())).map_err(error)?;
+    authorization.set_sensitive(true);
+    request
+        .headers_mut()
+        .insert(http::header::AUTHORIZATION, authorization);
+    let (mut socket, _) = tokio::time::timeout(
+        super::driver::HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(request, None, true),
+    )
+    .await
+    .map_err(error)?
+    .map_err(|failure| match failure {
+        tungstenite::Error::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
+            AttachmentError::Authentication("runner rejected the bearer credential".into())
+        }
+        failure => error(failure),
+    })?;
+    let first = tokio::time::timeout(super::driver::HANDSHAKE_TIMEOUT, first_text(&mut socket))
+        .await
+        .map_err(error)??;
+    Ok((socket, first))
+}
+async fn first_text<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> Result<String, AttachmentError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(message) = socket.next().await {
+        match message.map_err(error)? {
+            Message::Text(text) => return Ok(text.to_string()),
+            Message::Binary(_) => return Err(error("runner sent a binary frame")),
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    Err(error("runner closed before publishing its catalog"))
+}
+fn code_mode_catalog(first: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(first).is_ok_and(|frame| {
+        frame.get("type").and_then(serde_json::Value::as_str) == Some("catalog")
+            && frame.get("definitions").is_some()
+    })
+}
+const UNNAMED_EXECUTOR: &str = "executor";
+const DUPLICATE_EXECUTOR: &str = "another runner already uses this name; pass a different --name";
+async fn incoming_executor(
+    socket: tokio_tungstenite::WebSocketStream<TcpStream>,
+    first: String,
+    pool: Weak<PoolInner>,
+    endpoint: String,
+    timeout: Option<Duration>,
+    mode: RemoteMode,
+    workspace: Option<PathBuf>,
+) -> Result<(), AttachmentError> {
+    let transport = SocketTransport::established(socket, first, SocketPolicy::runner(), timeout)
+        .await
+        .map_err(|failure| AttachmentError::Catalog(failure.to_string().into()))?;
+    let name = transport.name().unwrap_or(UNNAMED_EXECUTOR).to_owned();
+    let pool = RunnerPool {
+        inner: pool.upgrade().ok_or(AttachmentError::Closed)?,
+        model_management: true,
+    };
+    pool.register_executor(name, endpoint, mode, workspace, transport, true)?;
     Ok(())
 }
 fn monitor(
@@ -672,24 +1107,43 @@ pub struct RunnerHandle {
     endpoint: String,
     mode: RemoteMode,
     workspace: Option<PathBuf>,
-    remote: RemoteRunner,
+    kind: HandleKind,
     identity: Arc<()>,
     status: watch::Receiver<RunnerStatus>,
 }
+#[derive(Clone)]
+enum HandleKind {
+    Tools(RemoteRunner),
+    CodeMode { tool_count: usize },
+}
 impl RunnerHandle {
     pub fn info(&self) -> RunnerInfo {
-        let tools = self.remote.tools_snapshot();
-        RunnerInfo {
-            name: self.name.clone(),
-            endpoint: self.endpoint.clone(),
-            mode: self.mode,
-            status: self.status(),
-            workspace: self.workspace.clone().or_else(|| {
-                tools
-                    .as_ref()
-                    .and_then(|tools| tools.workspace().map(PathBuf::from))
-            }),
-            tool_count: tools.map_or(0, |tools| tools.iter().count()),
+        match &self.kind {
+            HandleKind::Tools(remote) => {
+                let tools = remote.tools_snapshot();
+                RunnerInfo {
+                    name: self.name.clone(),
+                    endpoint: self.endpoint.clone(),
+                    mode: self.mode,
+                    status: self.status(),
+                    workspace: self.workspace.clone().or_else(|| {
+                        tools
+                            .as_ref()
+                            .and_then(|tools| tools.workspace().map(PathBuf::from))
+                    }),
+                    tool_count: tools.map_or(0, |tools| tools.iter().count()),
+                    protocol: RunnerProtocol::Tools,
+                }
+            }
+            HandleKind::CodeMode { tool_count } => RunnerInfo {
+                name: self.name.clone(),
+                endpoint: self.endpoint.clone(),
+                mode: self.mode,
+                status: self.status(),
+                workspace: self.workspace.clone(),
+                tool_count: *tool_count,
+                protocol: RunnerProtocol::CodeMode,
+            },
         }
     }
     pub fn status(&self) -> RunnerStatus {
@@ -713,7 +1167,10 @@ impl RunnerHandle {
             match status.borrow().clone() {
                 RunnerStatus::Ready => return Ok(()),
                 RunnerStatus::Failed(reason) => {
-                    let failure = self.remote.failure_status().borrow().clone();
+                    let failure = match &self.kind {
+                        HandleKind::Tools(remote) => remote.failure_status().borrow().clone(),
+                        HandleKind::CodeMode { .. } => None,
+                    };
                     return Err(failure.unwrap_or_else(|| error(reason)));
                 }
                 RunnerStatus::Disconnected => return Err(AttachmentError::Closed),
@@ -872,13 +1329,19 @@ async fn incoming(
             Err(response)
         }
     };
-    let socket = tokio::time::timeout(
+    let mut socket = tokio::time::timeout(
         super::driver::HANDSHAKE_TIMEOUT,
         tokio_tungstenite::accept_hdr_async(stream, authenticate),
     )
     .await
     .map_err(error)?
     .map_err(error)?;
+    let first = tokio::time::timeout(super::driver::HANDSHAKE_TIMEOUT, first_text(&mut socket))
+        .await
+        .map_err(error)??;
+    if code_mode_catalog(&first) {
+        return incoming_executor(socket, first, pool, endpoint, timeout, mode, workspace).await;
+    }
     let mut frames = socket
         .with(|text: String| future::ready(Ok::<_, tungstenite::Error>(Message::text(text))))
         .filter_map(|message| {
@@ -892,11 +1355,6 @@ async fn incoming(
                 Err(error) => Some(Err(error)),
             })
         });
-    let first = tokio::time::timeout(super::driver::HANDSHAKE_TIMEOUT, frames.next())
-        .await
-        .map_err(error)?
-        .ok_or(AttachmentError::Closed)?
-        .map_err(error)?;
     let catalog: serde_json::Value = serde_json::from_str(&first).map_err(error)?;
     if catalog.get("type").and_then(serde_json::Value::as_str) != Some("catalog") {
         return Err(AttachmentError::Catalog(

@@ -137,6 +137,8 @@ pub trait CodeModeHost: Send + Sync + 'static {
         })
     }
 
+    fn link_session(&self, _session_id: &str, _root_session_id: &str) {}
+
     fn begin_turn(&self, _session_id: &str) {}
 
     fn detach_turn(
@@ -232,6 +234,9 @@ impl<T: CodeModeHost + ?Sized> CodeModeHost for std::sync::Arc<T> {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
         (**self).execute_tool(name, input, context)
+    }
+    fn link_session(&self, session_id: &str, root_session_id: &str) {
+        (**self).link_session(session_id, root_session_id);
     }
     fn begin_turn(&self, session_id: &str) {
         (**self).begin_turn(session_id);

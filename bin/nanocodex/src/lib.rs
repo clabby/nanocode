@@ -457,6 +457,9 @@ async fn runner(args: RunnerArgs) -> Result<()> {
         name: args.name.clone(),
     };
     let mut tools = nanocode::claude::runner_tools(workspace.clone())?.into_builder();
+    if args.code_mode {
+        tools = tools.add(nanocode::tools::WorkspaceTools::new(workspace.clone()));
+    }
     if args.cua {
         let computer =
             nanocode::ComputerTools::connect(nanocode::ComputerConfig::installed()?).await?;
@@ -472,6 +475,15 @@ async fn runner(args: RunnerArgs) -> Result<()> {
             args.name,
             workspace.display()
         );
+    }
+    if args.code_mode {
+        nanocode::tools::remote::run_code_mode_runner(
+            config,
+            tools.build()?,
+            nanocode::tools::remote::SocketPolicy::runner(),
+        )
+        .await?;
+        return Ok(());
     }
     run_runner_with_tools(config, tools.build()?).await?;
     Ok(())

@@ -28,7 +28,10 @@ pub const COMMANDS: [(&str, &str); 30] = [
     ("/detach", "remove pending image attachments"),
     ("/session", "show session, model and tool details"),
     ("/id", "show the session id and copy it to the clipboard"),
-    ("/runner", "list, connect, listen or disconnect runners"),
+    (
+        "/runner",
+        "list, connect, listen, select or disconnect runners and Code Mode executors",
+    ),
     ("/expand", "expand or collapse tools and reasoning"),
     ("/mouse", "toggle mouse capture for native text selection"),
     ("/help", "show key bindings"),
@@ -86,6 +89,12 @@ pub enum RunnerAction {
         address: std::net::SocketAddr,
         #[arg(long)]
         token: Option<String>,
+    },
+    #[command(
+        about = "Run this session's exec cells on a connected Code Mode executor, or on this machine without a name"
+    )]
+    Select {
+        name: Option<String>,
     },
     Disconnect {
         name: String,

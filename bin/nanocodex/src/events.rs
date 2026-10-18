@@ -1081,6 +1081,7 @@ pub fn runner_routes(runtime: &nanocode::Nanocodex) -> Vec<RunnerRoute> {
     runtime
         .list_runners()
         .into_iter()
+        .filter(|runner| runner.protocol == nanocode::RunnerProtocol::Tools)
         .map(|runner| RunnerRoute {
             replace: runner.mode == nanocode::code_mode::attachment::RemoteMode::Replace,
             name: runner.name,

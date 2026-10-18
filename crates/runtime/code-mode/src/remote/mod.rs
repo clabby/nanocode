@@ -1,4 +1,8 @@
+mod executors;
+
 use std::sync::Arc;
+
+pub use executors::{CodeModeExecutors, ExecutorRoute, ExecutorSelection};
 
 use crate::embedded::{CodeModeUpdate, NestedToolCall};
 use serde::{Deserialize, Serialize};
@@ -296,6 +300,12 @@ impl CodeModeHost for RemoteCodeModeHost {
 pub enum RemoteFrame {
     Catalog {
         definitions: Vec<ToolDefinition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_id: Option<String>,
     },
     Request {
         id: u64,

@@ -8,9 +8,10 @@ use std::{
 use clap::Parser;
 use futures_util::StreamExt;
 use nanocode::{
-    AgentStatus, HarnessFamily, ModelSelection, PromptRequest, PromptRoute, Runner, RunnerEvent,
-    RunnerInfo, RunnerServer, RunnerServerConfig, RunnerStatus, ScopedAgentUpdate, ServiceTier,
-    SessionCheckpoint, Thinking, TurnControl, TurnResult,
+    AgentStatus, ExecutorSelection, HarnessFamily, ModelSelection, PromptRequest, PromptRoute,
+    Runner, RunnerEvent, RunnerInfo, RunnerProtocol, RunnerServer, RunnerServerConfig,
+    RunnerStatus, ScopedAgentUpdate, ServiceTier, SessionCheckpoint, Thinking, TurnControl,
+    TurnResult,
     agent::{
         Agent, AgentEvents,
         events::{AgentEvent, AgentEventKind},
@@ -488,8 +489,12 @@ fn runner_info(info: &RunnerInfo) -> String {
         .as_ref()
         .map(|workspace| workspace.display().to_string())
         .unwrap_or_else(|| "pending workspace".into());
+    let kind = match info.protocol {
+        RunnerProtocol::Tools => "tool runner",
+        RunnerProtocol::CodeMode => "Code Mode executor",
+    };
     format!(
-        "{} {} ({}, {:?}, {} tools, {workspace})",
+        "{} {} ({kind}, {}, {:?}, {} tools, {workspace})",
         info.name,
         runner_status_label(&info.status),
         info.endpoint,
@@ -500,7 +505,9 @@ fn runner_info(info: &RunnerInfo) -> String {
 
 fn listener_notice(server: &RunnerServer) -> String {
     format!(
-        "listening {} · token {}\nStart a runner: nc runner --connect {} --token {}",
+        "listening {} · token {}\nStart a runner: nc runner --connect {} --token {}\nStart a Code Mode executor: nc runner --code-mode --connect {} --token {}",
+        server.endpoint(),
+        server.token(),
         server.endpoint(),
         server.token(),
         server.endpoint(),
@@ -1945,10 +1952,26 @@ impl App {
         if runners.is_empty() && self.host.runtime.runner_servers().is_empty() {
             return "local tools".into();
         }
-        let mut lines = runners
-            .into_iter()
-            .map(|runner| format!("{} {}", runner.name, runner_status_label(&runner.status)))
-            .collect::<Vec<_>>();
+        let selected = self.agent.as_ref().and_then(|agent| {
+            match self
+                .host
+                .runtime
+                .runner_pool()
+                .code_mode_executors()
+                .selection(agent.session_id())
+            {
+                ExecutorSelection::Executor(name) => Some(name),
+                ExecutorSelection::Local => None,
+            }
+        });
+        let mut lines =
+            selected
+                .map(|name| format!("exec on {name}"))
+                .into_iter()
+                .chain(runners.into_iter().map(|runner| {
+                    format!("{} {}", runner.name, runner_status_label(&runner.status))
+                }))
+                .collect::<Vec<_>>();
         lines.extend(
             self.host
                 .runtime
@@ -2024,12 +2047,27 @@ impl App {
                 } else {
                     runner.alongside()
                 };
+                let session = self
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.session_id().to_owned());
                 tokio::spawn(async move {
                     let (level, message) = match runtime.connect_runner(runner).await {
-                        Ok(handle) => (
-                            NoticeLevel::Info,
-                            format!("connected runner {}", runner_info(&handle.info())),
-                        ),
+                        Ok(handle) => {
+                            let info = handle.info();
+                            if let Some(session) = session
+                                .filter(|_| info.protocol == RunnerProtocol::CodeMode && !replace)
+                            {
+                                runtime.runner_pool().code_mode_executors().select(
+                                    &session,
+                                    Some(ExecutorSelection::Executor(info.name.as_str().into())),
+                                );
+                            }
+                            (
+                                NoticeLevel::Info,
+                                format!("connected runner {}", runner_info(&info)),
+                            )
+                        }
                         Err(error) => (
                             NoticeLevel::Error,
                             format!("runner connection failed: {error}"),
@@ -2052,6 +2090,33 @@ impl App {
                     drop(tx.send(AppEvent::RunnerListening(result)));
                 });
                 self.flash("opening runner listener…");
+            }
+            crate::commands::RunnerAction::Select { name } => {
+                let Some(session) = self
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.session_id().to_owned())
+                else {
+                    self.notice(NoticeLevel::Error, "no active session to route");
+                    return;
+                };
+                let executors = runtime.runner_pool().code_mode_executors();
+                let (selection, message) = match name {
+                    Some(name) => {
+                        if let Err(error) = executors.connected(&name) {
+                            self.notice(NoticeLevel::Error, error.to_string());
+                            return;
+                        }
+                        let message = format!("exec cells run on {name}");
+                        (ExecutorSelection::Executor(name.into()), message)
+                    }
+                    None => (
+                        ExecutorSelection::Local,
+                        "exec cells run on this machine".to_owned(),
+                    ),
+                };
+                executors.select(&session, Some(selection));
+                self.notice(NoticeLevel::Info, message);
             }
             crate::commands::RunnerAction::Disconnect { name } => {
                 tokio::spawn(async move {

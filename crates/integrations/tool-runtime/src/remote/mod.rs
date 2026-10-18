@@ -6,4 +6,9 @@ pub use nanocode_code_mode::remote::*;
 #[cfg(not(target_family = "wasm"))]
 mod native;
 #[cfg(not(target_family = "wasm"))]
-pub use native::{SocketPolicy, SocketTransport, serve_accept, serve_connect};
+pub use native::{
+    ExecutorOptions, SocketPolicy, SocketTransport, run_code_mode_runner, serve_accept,
+    serve_connect, serve_connect_with, serve_stream,
+};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use native::{LOCAL_CLOSED, PEER_CLOSED, SocketShutdown};

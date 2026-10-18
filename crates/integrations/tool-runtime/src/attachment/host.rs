@@ -1250,10 +1250,21 @@ impl Drop for RunnerConnection {
     }
 }
 
+pub(crate) type DialedSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 impl RemoteRunner {
     pub fn connect(
         &self,
         target: super::AttachmentTarget,
+    ) -> Result<RunnerConnection, AttachmentError> {
+        self.connect_established(target, None)
+    }
+
+    pub(crate) fn connect_established(
+        &self,
+        target: super::AttachmentTarget,
+        mut initial: Option<(DialedSocket, String)>,
     ) -> Result<RunnerConnection, AttachmentError> {
         use tungstenite::client::IntoClientRequest;
         let mut request = target
@@ -1271,17 +1282,24 @@ impl RemoteRunner {
         Ok(RunnerConnection(tokio::spawn(async move {
             let mut backoff = super::driver::INITIAL_TRANSPORT_BACKOFF;
             loop {
-                match tokio::time::timeout(
-                    super::driver::HANDSHAKE_TIMEOUT,
-                    tokio_tungstenite::connect_async(request.clone()),
-                )
-                .await
-                .map_err(|error| {
-                    tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, error))
-                })
-                .and_then(|result| result)
-                {
-                    Ok((socket, _)) => {
+                let connected = match initial.take() {
+                    Some((socket, first)) => Ok((socket, Some(first))),
+                    None => tokio::time::timeout(
+                        super::driver::HANDSHAKE_TIMEOUT,
+                        tokio_tungstenite::connect_async(request.clone()),
+                    )
+                    .await
+                    .map_err(|error| {
+                        tungstenite::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            error,
+                        ))
+                    })
+                    .and_then(|result| result)
+                    .map(|(socket, _)| (socket, None)),
+                };
+                match connected {
+                    Ok((socket, first)) => {
                         let mut frames = socket.with(|text: String| future::ready(Ok::<_, tungstenite::Error>(Message::text(text)))).filter_map(|message| future::ready(match message {
                             Ok(Message::Text(text)) => Some(Ok(text.to_string())),
                             Ok(Message::Close(_)) => None,
@@ -1289,9 +1307,13 @@ impl RemoteRunner {
                             Ok(_) => None,
                             Err(error) => Some(Err(error)),
                         }));
+                        let served = match first {
+                            Some(first) => runner.serve_catalog(first, &mut frames).await,
+                            None => runner.serve(&mut frames).await,
+                        };
                         if let Err(
                             error @ (AttachmentError::Catalog(_) | AttachmentError::Fenced(_)),
-                        ) = runner.serve(&mut frames).await
+                        ) = served
                         {
                             runner.inner.failure.send_replace(Some(error));
                             return;

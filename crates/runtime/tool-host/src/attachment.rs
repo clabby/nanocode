@@ -1,6 +1,7 @@
 use std::{any::Any, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
+use nanocode_code_mode::remote::CodeModeExecutors;
 use nanocode_tool_contracts::ToolError;
 use serde_json::Value;
 
@@ -109,12 +110,29 @@ pub trait WorkspaceRouter: Send + Sync + 'static {
 pub struct RunnerRouting {
     pool: Arc<dyn Any + Send + Sync>,
     router: Arc<dyn WorkspaceRouter>,
+    executors: Option<CodeModeExecutors>,
 }
 
 impl RunnerRouting {
     #[doc(hidden)]
     pub fn new(pool: Arc<dyn Any + Send + Sync>, router: Arc<dyn WorkspaceRouter>) -> Self {
-        Self { pool, router }
+        Self {
+            pool,
+            router,
+            executors: None,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_code_mode_executors(mut self, executors: CodeModeExecutors) -> Self {
+        self.executors = Some(executors);
+        self
+    }
+
+    #[must_use]
+    pub const fn code_mode_executors(&self) -> Option<&CodeModeExecutors> {
+        self.executors.as_ref()
     }
 
     #[doc(hidden)]

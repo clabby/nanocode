@@ -18,18 +18,59 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpListener,
-    sync::{mpsc, oneshot},
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, oneshot, watch},
 };
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{self, Message, client::IntoClientRequest},
 };
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 #[derive(Clone, Copy)]
 pub struct SocketPolicy {
     pub max_frame_bytes: usize,
     pub request_timeout: Duration,
+}
+
+impl SocketPolicy {
+    #[must_use]
+    pub fn runner() -> Self {
+        Self {
+            max_frame_bytes: tungstenite::protocol::WebSocketConfig::default()
+                .max_message_size
+                .unwrap_or(usize::MAX),
+            request_timeout: crate::attachment::HEARTBEAT_INTERVAL * 2,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ExecutorOptions {
+    pub name: Option<String>,
+    pub runtime_id: Option<String>,
+    pub callback_timeout: Option<Duration>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SocketShutdown {
+    token: CancellationToken,
+    reason: Arc<Mutex<Option<&'static str>>>,
+}
+
+impl SocketShutdown {
+    pub(crate) fn close(&self) {
+        self.token.cancel();
+    }
+
+    pub(crate) fn reject(&self, reason: &'static str) {
+        *self.reason.lock().unwrap() = Some(reason);
+        self.token.cancel();
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.reject(nanocode_tool_host::attachment::ATTACHMENT_REVOKED_REASON);
+    }
 }
 
 use super::RemoteFrame as Frame;
@@ -46,14 +87,19 @@ struct Client {
     callbacks: Mutex<HashMap<(String, String), CallbackState>>,
     next: AtomicU64,
     turns: Mutex<HashMap<String, u64>>,
-    policy: SocketPolicy,
+    operation_timeout: Option<Duration>,
     failure: Mutex<Option<String>>,
+    closed: watch::Sender<Option<String>>,
 }
 
 pub struct SocketTransport {
     client: Arc<Client>,
     definitions: Vec<ToolDefinition>,
-    _closed: oneshot::Sender<()>,
+    name: Option<String>,
+    workspace: Option<String>,
+    runtime_id: Option<String>,
+    shutdown: SocketShutdown,
+    _shutdown: DropGuard,
 }
 
 fn error(value: impl std::fmt::Display) -> CodeModeHostError {
@@ -122,6 +168,9 @@ impl Liveness {
     }
 }
 
+pub(crate) const PEER_CLOSED: &str = "runner disconnected";
+pub(crate) const LOCAL_CLOSED: &str = "remote connection closed";
+
 const UNRESPONSIVE: &str =
     "remote peer did not answer a WebSocket heartbeat ping within half of request_timeout";
 
@@ -143,22 +192,37 @@ fn config(policy: SocketPolicy) -> tungstenite::protocol::WebSocketConfig {
         .max_frame_size(Some(policy.max_frame_bytes))
 }
 
+type DialedSocket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+enum Dial {
+    Rejected(CodeModeHostError),
+    Failed(CodeModeHostError),
+}
+
 async fn connect(
     target: crate::attachment::AttachmentTarget,
     policy: SocketPolicy,
-) -> Result<
-    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    CodeModeHostError,
-> {
-    validate_policy(policy)?;
+) -> Result<DialedSocket, CodeModeHostError> {
+    dial(&target, policy)
+        .await
+        .map_err(|failure| match failure {
+            Dial::Rejected(error) | Dial::Failed(error) => error,
+        })
+}
+
+async fn dial(
+    target: &crate::attachment::AttachmentTarget,
+    policy: SocketPolicy,
+) -> Result<DialedSocket, Dial> {
+    validate_policy(policy).map_err(Dial::Rejected)?;
     nanocode_tls::install_default_rustls_crypto_provider();
     let mut request = target
         .endpoint()
         .as_str()
         .into_client_request()
-        .map_err(error)?;
-    let mut bearer =
-        http::HeaderValue::from_str(&format!("Bearer {}", target.bearer())).map_err(error)?;
+        .map_err(|issue| Dial::Rejected(error(issue)))?;
+    let mut bearer = http::HeaderValue::from_str(&format!("Bearer {}", target.bearer()))
+        .map_err(|issue| Dial::Rejected(error(issue)))?;
     bearer.set_sensitive(true);
     request
         .headers_mut()
@@ -168,26 +232,43 @@ async fn connect(
         tokio_tungstenite::connect_async_with_config(request, Some(config(policy)), true),
     )
     .await
-    .map_err(error)?
+    .map_err(|issue| Dial::Failed(error(issue)))?
     .map(|(socket, _)| socket)
-    .map_err(error)
+    .map_err(|issue| match issue {
+        tungstenite::Error::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
+            Dial::Rejected(error(format!(
+                "brain rejected the runner credential with HTTP {}",
+                response.status()
+            )))
+        }
+        issue => Dial::Failed(error(issue)),
+    })
 }
 
 async fn accept(
     listener: &TcpListener,
     bearer: &str,
     policy: SocketPolicy,
-) -> Result<WebSocketStream<tokio::net::TcpStream>, CodeModeHostError> {
+) -> Result<WebSocketStream<TcpStream>, CodeModeHostError> {
     validate_policy(policy)?;
     if !listener.local_addr().map_err(error)?.ip().is_loopback() {
         return Err(error(
             "plaintext runner listeners require loopback; use a TLS proxy for remote access",
         ));
     }
+    let (stream, _) = listener.accept().await.map_err(error)?;
+    handshake(stream, bearer, policy).await
+}
+
+async fn handshake(
+    stream: TcpStream,
+    bearer: &str,
+    policy: SocketPolicy,
+) -> Result<WebSocketStream<TcpStream>, CodeModeHostError> {
+    validate_policy(policy)?;
     if bearer.is_empty() {
         return Err(error("runner bearer must not be empty"));
     }
-    let (stream, _) = listener.accept().await.map_err(error)?;
     stream.set_nodelay(true).map_err(error)?;
     let authenticate = |request: &tungstenite::handshake::server::Request,
                         response: tungstenite::handshake::server::Response| {
@@ -225,7 +306,12 @@ async fn read<S: Stream<Item = Result<Message, tungstenite::Error>> + Unpin>(
         liveness.touch();
         match message {
             Message::Text(text) => return serde_json::from_str(&text).map(Some).map_err(error),
-            Message::Close(_) => return Ok(None),
+            Message::Close(frame) => {
+                return match frame.filter(|frame| !frame.reason.is_empty()) {
+                    Some(frame) => Err(error(frame.reason.as_str())),
+                    None => Ok(None),
+                };
+            }
             Message::Ping(_) | Message::Pong(_) => {}
             _ => return Err(error("remote code mode requires JSON text frames")),
         }
@@ -260,6 +346,7 @@ fn writer<S: Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static>
     mut sink: S,
     policy: SocketPolicy,
     liveness: Arc<Liveness>,
+    reason: Arc<Mutex<Option<&'static str>>>,
 ) -> (mpsc::UnboundedSender<Frame>, Writer) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
@@ -270,7 +357,18 @@ fn writer<S: Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static>
             tokio::select! {
                 frame = rx.recv() => match frame {
                     Some(frame) => write(&mut sink, frame, policy).await?,
-                    None => return Ok(()),
+                    None => {
+                        let reason = *reason.lock().unwrap();
+                        let close = reason.map(|reason| tungstenite::protocol::CloseFrame {
+                            code: tungstenite::protocol::frame::coding::CloseCode::Policy,
+                            reason: reason.into(),
+                        });
+                        tokio::time::timeout(policy.request_timeout, sink.send(Message::Close(close)))
+                            .await
+                            .map_err(|_| error("remote write deadline elapsed"))?
+                            .map_err(error)?;
+                        return Ok(());
+                    }
                 },
                 _ = heartbeat.tick() => {
                     let started_us = liveness.elapsed_us();
@@ -291,17 +389,53 @@ impl SocketTransport {
         target: crate::attachment::AttachmentTarget,
         policy: SocketPolicy,
     ) -> Result<Self, CodeModeHostError> {
-        Self::start(connect(target, policy).await?, policy).await
+        Self::start(
+            connect(target, policy).await?,
+            None,
+            policy,
+            Some(policy.request_timeout),
+        )
+        .await
     }
     pub async fn accept(
         listener: &TcpListener,
         bearer: &str,
         policy: SocketPolicy,
     ) -> Result<Self, CodeModeHostError> {
-        Self::start(accept(listener, bearer, policy).await?, policy).await
+        Self::start(
+            accept(listener, bearer, policy).await?,
+            None,
+            policy,
+            Some(policy.request_timeout),
+        )
+        .await
+    }
+    pub(crate) async fn established<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        socket: WebSocketStream<S>,
+        catalog: String,
+        policy: SocketPolicy,
+        operation_timeout: Option<Duration>,
+    ) -> Result<Self, CodeModeHostError> {
+        validate_policy(policy)?;
+        Self::start(socket, Some(catalog), policy, operation_timeout).await
     }
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.clone()
+    }
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+    pub(crate) fn workspace(&self) -> Option<&str> {
+        self.workspace.as_deref()
+    }
+    pub(crate) fn closed(&self) -> watch::Receiver<Option<String>> {
+        self.client.closed.subscribe()
+    }
+    pub(crate) fn runtime_id(&self) -> Option<&str> {
+        self.runtime_id.as_deref()
+    }
+    pub(crate) fn shutdown_handle(&self) -> SocketShutdown {
+        self.shutdown.clone()
     }
     pub fn into_host(self) -> RemoteCodeModeHost {
         let definitions = self.definitions();
@@ -310,13 +444,24 @@ impl SocketTransport {
 
     async fn start<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         mut socket: WebSocketStream<S>,
+        catalog: Option<String>,
         policy: SocketPolicy,
+        operation_timeout: Option<Duration>,
     ) -> Result<Self, CodeModeHostError> {
         let liveness = Liveness::new();
-        let catalog = tokio::time::timeout(policy.request_timeout, read(&mut socket, &liveness))
-            .await
-            .map_err(error)??;
-        let Some(Frame::Catalog { definitions }) = catalog else {
+        let catalog = match catalog {
+            Some(text) => Some(serde_json::from_str::<Frame>(&text).map_err(error)?),
+            None => tokio::time::timeout(policy.request_timeout, read(&mut socket, &liveness))
+                .await
+                .map_err(error)??,
+        };
+        let Some(Frame::Catalog {
+            definitions,
+            name,
+            workspace,
+            runtime_id,
+        }) = catalog
+        else {
             return Err(error("runner did not publish a code mode catalog"));
         };
         crate::host::validate_public_tool_catalog_names(
@@ -328,19 +473,29 @@ impl SocketTransport {
             ))
         })?;
         let (sink, mut socket) = socket.split();
-        let (wire, mut writer) = writer(sink, policy, Arc::clone(&liveness));
+        let shutdown = SocketShutdown {
+            token: CancellationToken::new(),
+            reason: Arc::default(),
+        };
+        let (wire, mut writer) = writer(
+            sink,
+            policy,
+            Arc::clone(&liveness),
+            Arc::clone(&shutdown.reason),
+        );
         let (outgoing, mut incoming) = mpsc::unbounded_channel();
         let client = Arc::new(Client {
             outgoing,
             pending: Mutex::new(HashMap::new()),
             callbacks: Mutex::new(HashMap::new()),
             next: AtomicU64::new(0),
-            policy,
+            operation_timeout,
             turns: Mutex::new(HashMap::new()),
             failure: Mutex::new(None),
+            closed: watch::channel(None).0,
         });
         let weak = Arc::downgrade(&client);
-        let (closed, mut closed_rx) = oneshot::channel();
+        let stopped = shutdown.token.clone();
         tokio::spawn(async move {
             let watchdog = liveness.watch(policy.request_timeout / 2);
             tokio::pin!(watchdog);
@@ -350,7 +505,10 @@ impl SocketTransport {
             let result: Result<(), CodeModeHostError> = async {
                 loop {
                     tokio::select! {
-                        _ = &mut closed_rx => return Ok(()),
+                        () = stopped.cancelled() => {
+                            drop(wire);
+                            return (&mut writer.0).await.map_err(error)?;
+                        },
                         result = &mut writer.0 => return result.map_err(error)?,
                         frame = incoming.recv() => match frame {
                             Some(frame) => {
@@ -366,7 +524,7 @@ impl SocketTransport {
                         },
                         Some(completed) = callback_tasks.join_next(), if !callback_tasks.is_empty() => { if let Ok(id) = completed { callback_aborts.remove(&id); } },
                         frame = read_live(&mut socket, &liveness, watchdog.as_mut()) => {
-                            let Some(frame) = frame.map_err(|issue| error(format!("runner connection failed: {issue}")))? else { return Err(error("runner disconnected")); };
+                            let Some(frame) = frame.map_err(|issue| error(format!("runner connection failed: {issue}")))? else { return Err(error(PEER_CLOSED)); };
                             let Some(client) = weak.upgrade() else { return Ok(()); };
                             match frame {
                                 Frame::Reply { id, .. } | Frame::Update { id, .. } => {
@@ -407,23 +565,28 @@ impl SocketTransport {
                 client.callbacks.lock().unwrap().clear();
                 let message = result
                     .err()
-                    .map_or_else(|| "remote connection closed".into(), |e| e.to_string());
+                    .map_or_else(|| LOCAL_CLOSED.into(), |e| e.to_string());
                 let uncertain = format!(
                     "{message}; the dispatched operation has an unknown outcome and was not retried"
                 );
-                *client.failure.lock().unwrap() = Some(message);
+                *client.failure.lock().unwrap() = Some(message.clone());
                 for (id, channel) in client.pending.lock().unwrap().drain() {
                     let _ = channel.send(Frame::Reply {
                         id,
                         result: Err(uncertain.clone()),
                     });
                 }
+                client.closed.send_replace(Some(message));
             }
         });
         Ok(Self {
             client,
             definitions,
-            _closed: closed,
+            name,
+            workspace,
+            runtime_id,
+            _shutdown: shutdown.token.clone().drop_guard(),
+            shutdown,
         })
     }
 }
@@ -512,16 +675,31 @@ impl RemoteTransport for SocketTransport {
                 .outgoing
                 .send(Frame::Request { id, operation })
                 .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
-            let result: Result<Option<CodeModeExecution>, CodeModeHostError> = tokio::time::timeout(self.client.policy.request_timeout, async {
+            let reply = async {
                 while let Some(frame) = rx.recv().await {
                     match frame {
-                        Frame::Reply { result, .. } => return result.map_err(error)?.map(|value| serde_json::from_value(value).map_err(error)).transpose(),
-                        Frame::Update { update, .. } => if let Some(observer) = observer.as_deref_mut() { deliver_update(observer, update)?; },
+                        Frame::Reply { result, .. } => {
+                            return result
+                                .map_err(error)?
+                                .map(|value| serde_json::from_value(value).map_err(error))
+                                .transpose();
+                        }
+                        Frame::Update { update, .. } => {
+                            if let Some(observer) = observer.as_deref_mut() {
+                                deliver_update(observer, update)?;
+                            }
+                        }
                         _ => return Err(error("unexpected operation reply")),
                     }
                 }
-                Err(error("remote reply channel closed; operation outcome unknown"))
-            }).await.map_err(|_| error("remote operation deadline elapsed; outcome unknown; cancellation requested; no retry"))?;
+                Err(error(
+                    "remote reply channel closed; operation outcome unknown",
+                ))
+            };
+            let result: Result<Option<CodeModeExecution>, CodeModeHostError> = match self.client.operation_timeout {
+                Some(deadline) => tokio::time::timeout(deadline, reply).await.map_err(|_| error("remote operation deadline elapsed; outcome unknown; cancellation requested; no retry"))?,
+                None => reply.await,
+            };
             if let (Some(session), Ok(Some(execution))) = (&session_id, &result) {
                 if let Some(cell) = &execution.cell {
                     if cell.running {
@@ -656,7 +834,7 @@ struct CallbackBus {
     outgoing: mpsc::UnboundedSender<Frame>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     next: AtomicU64,
-    timeout: Duration,
+    timeout: Option<Duration>,
 }
 struct CallbackPending {
     bus: Arc<CallbackBus>,
@@ -704,12 +882,17 @@ impl Tool for CallbackTool {
                 context: RemoteContext::from_context(context),
             })
             .map_err(|e| -> ToolError { e.to_string().into() })?;
-        let result = tokio::time::timeout(self.bus.timeout, rx).await;
-        let value = result
-            .map_err(|_| -> ToolError {
-                "brain callback deadline elapsed; outcome unknown".into()
-            })?
-            .map_err(|e| -> ToolError { e.to_string().into() })??;
+        let result = match self.bus.timeout {
+            Some(deadline) => {
+                tokio::time::timeout(deadline, rx)
+                    .await
+                    .map_err(|_| -> ToolError {
+                        "brain callback deadline elapsed; outcome unknown".into()
+                    })?
+            }
+            None => rx.await,
+        };
+        let value = result.map_err(|e| -> ToolError { e.to_string().into() })??;
         ToolOutput::from_wire(serde_json::from_value::<ToolOutputWire>(value)?).map_err(Into::into)
     }
 }
@@ -885,6 +1068,11 @@ pub async fn serve_connect(
         workspace.to_owned(),
         tools,
         policy,
+        ExecutorOptions {
+            name: None,
+            runtime_id: None,
+            callback_timeout: Some(policy.request_timeout),
+        },
     )
     .await
 }
@@ -900,8 +1088,151 @@ pub async fn serve_accept(
         workspace.to_owned(),
         tools,
         policy,
+        ExecutorOptions {
+            name: None,
+            runtime_id: None,
+            callback_timeout: Some(policy.request_timeout),
+        },
     )
     .await
+}
+pub async fn serve_connect_with(
+    target: crate::attachment::AttachmentTarget,
+    workspace: &Path,
+    tools: crate::Tools,
+    policy: SocketPolicy,
+    options: ExecutorOptions,
+) -> Result<(), CodeModeHostError> {
+    serve(
+        connect(target, policy).await?,
+        workspace.to_owned(),
+        tools,
+        policy,
+        options,
+    )
+    .await
+}
+pub async fn serve_stream(
+    stream: TcpStream,
+    bearer: &str,
+    workspace: &Path,
+    tools: crate::Tools,
+    policy: SocketPolicy,
+    options: ExecutorOptions,
+) -> Result<(), CodeModeHostError> {
+    serve(
+        handshake(stream, bearer, policy).await?,
+        workspace.to_owned(),
+        tools,
+        policy,
+        options,
+    )
+    .await
+}
+
+pub fn run_code_mode_runner(
+    config: crate::attachment::RunnerConfig,
+    tools: crate::Tools,
+    policy: SocketPolicy,
+) -> futures_util::future::BoxFuture<'static, Result<(), CodeModeHostError>> {
+    Box::pin(async move {
+        validate_policy(policy)?;
+        let workspace = tokio::fs::canonicalize(&config.workspace)
+            .await
+            .map_err(error)?;
+        let options = ExecutorOptions {
+            name: Some(config.name),
+            runtime_id: Some(uuid::Uuid::new_v4().to_string()),
+            callback_timeout: None,
+        };
+        match config.endpoint {
+            crate::attachment::RunnerEndpoint::Connect(endpoint) => {
+                let target = crate::attachment::AttachmentTarget::new(endpoint, config.token)
+                    .map_err(error)?;
+                let mut backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
+                loop {
+                    eprintln!("executor: connecting {}", target.endpoint());
+                    let dialed = tokio::select! {
+                        dialed = dial(&target, policy) => dialed,
+                        signal = tokio::signal::ctrl_c() => return signal.map_err(error),
+                    };
+                    match dialed {
+                        Ok(socket) => {
+                            eprintln!("executor: connected");
+                            let started = std::time::Instant::now();
+                            let served = tokio::select! {
+                                served = serve(socket, workspace.clone(), tools.clone(), policy, options.clone()) => served,
+                                signal = tokio::signal::ctrl_c() => return signal.map_err(error),
+                            };
+                            match served {
+                                Ok(()) => eprintln!("executor: brain closed the connection"),
+                                Err(issue)
+                                    if issue.message()
+                                        == nanocode_tool_host::attachment::ATTACHMENT_REVOKED_REASON =>
+                                {
+                                    eprintln!("executor: the brain disconnected this executor; stopping");
+                                    return Ok(());
+                                }
+                                Err(issue) => eprintln!("executor: disconnected ({issue})"),
+                            }
+                            if started.elapsed() >= crate::attachment::STABLE_CONNECTION {
+                                backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
+                            }
+                        }
+                        Err(Dial::Rejected(issue)) => return Err(issue),
+                        Err(Dial::Failed(issue)) => {
+                            eprintln!("executor: connection failed ({issue})");
+                        }
+                    }
+                    let delay = crate::attachment::reconnect_delay(&mut backoff);
+                    eprintln!("executor: retrying in {}ms", delay.as_millis());
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        signal = tokio::signal::ctrl_c() => return signal.map_err(error),
+                    }
+                }
+            }
+            crate::attachment::RunnerEndpoint::Listen(address) => {
+                if !address.ip().is_loopback() {
+                    return Err(error(
+                        "plaintext runner listeners require a loopback address; use a TLS proxy for remote access",
+                    ));
+                }
+                let listener = TcpListener::bind(address).await.map_err(error)?;
+                eprintln!(
+                    "executor: listening ws://{}",
+                    listener.local_addr().map_err(error)?
+                );
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => match accepted {
+                            Ok((stream, peer)) => {
+                                eprintln!("executor: brain connected from {peer}");
+                                let token = config.token.clone();
+                                let workspace = workspace.clone();
+                                let tools = tools.clone();
+                                let options = options.clone();
+                                connections.spawn(async move {
+                                    serve_stream(stream, &token, &workspace, tools, policy, options).await
+                                });
+                            }
+                            Err(issue) => eprintln!("executor: accept failed ({issue})"),
+                        },
+                        Some(finished) = connections.join_next(), if !connections.is_empty() => match finished {
+                            Ok(Ok(())) => eprintln!("executor: brain closed a connection"),
+                            Ok(Err(issue)) => eprintln!("executor: connection ended ({issue})"),
+                            Err(issue) => eprintln!("executor: connection task failed ({issue})"),
+                        },
+                        signal = tokio::signal::ctrl_c() => {
+                            connections.shutdown().await;
+                            return signal.map_err(error);
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 struct Sessions(HashMap<String, (Arc<ToolRuntime>, CallbackCatalog)>);
@@ -931,21 +1262,32 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     workspace: PathBuf,
     tools: crate::Tools,
     policy: SocketPolicy,
+    options: ExecutorOptions,
 ) -> Result<(), CodeModeHostError> {
     let catalog_runtime = ToolRuntime::new_with_tools(workspace.clone(), Vec::new(), &tools);
     let definitions = catalog_runtime.registered_code_mode_definitions();
     catalog_runtime.control().cancel().await;
-    write(&mut socket, Frame::Catalog { definitions }, policy).await?;
+    write(
+        &mut socket,
+        Frame::Catalog {
+            definitions,
+            name: options.name,
+            workspace: Some(workspace.display().to_string()),
+            runtime_id: options.runtime_id,
+        },
+        policy,
+    )
+    .await?;
     let (sink, mut socket) = socket.split();
     let liveness = Liveness::new();
     let watchdog = liveness.watch(policy.request_timeout / 2);
     tokio::pin!(watchdog);
-    let (outgoing, mut writer) = writer(sink, policy, Arc::clone(&liveness));
+    let (outgoing, mut writer) = writer(sink, policy, Arc::clone(&liveness), Arc::default());
     let bus = Arc::new(CallbackBus {
         outgoing: outgoing.clone(),
         pending: Mutex::new(HashMap::new()),
         next: AtomicU64::new(0),
-        timeout: policy.request_timeout,
+        timeout: options.callback_timeout,
     });
     let mut runtimes = Sessions(HashMap::new());
     let mut tasks = tokio::task::JoinSet::new();

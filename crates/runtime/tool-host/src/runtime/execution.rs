@@ -1,4 +1,7 @@
 use super::*;
+use crate::embedded::{CodeModeHost, CodeModeHostError};
+use nanocode_code_mode::remote::{CodeModeExecutors, ExecutorRoute};
+use std::sync::{Mutex, PoisonError};
 
 pub struct ToolRuntime {
     inner: Runtime,
@@ -348,6 +351,8 @@ struct NativeToolRuntime {
     current_turn: Arc<AtomicU64>,
     default_shell_name: Arc<str>,
     working_directory: Arc<str>,
+    executors: Option<CodeModeExecutors>,
+    sessions: Arc<Mutex<HashSet<Arc<str>>>>,
 }
 
 #[doc(hidden)]
@@ -356,6 +361,14 @@ struct NativeToolRuntimeControl {
     code_mode: code_mode::CodeModeControl,
     workspace: Option<Arc<dyn crate::workspace_runtime::WorkspaceExecutor>>,
     current_turn: Arc<AtomicU64>,
+    executors: Option<CodeModeExecutors>,
+    sessions: Arc<Mutex<HashSet<Arc<str>>>>,
+}
+
+struct IgnoreUpdates;
+
+impl CodeModeObserver for IgnoreUpdates {
+    fn update(&mut self, _update: crate::embedded::CodeModeUpdate<'_>) {}
 }
 
 impl NativeToolRuntime {
@@ -398,6 +411,8 @@ impl NativeToolRuntime {
             current_turn,
             default_shell_name,
             working_directory,
+            executors: None,
+            sessions: Arc::default(),
         }
     }
 
@@ -444,7 +459,96 @@ impl NativeToolRuntime {
         if let Some(default_shell) = &tools.default_shell {
             self.default_shell_name = Arc::clone(default_shell);
         }
+        self.executors.clone_from(&tools.code_mode_executors);
         self
+    }
+
+    fn track(&self, session_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        if !sessions.contains(session_id) {
+            sessions.insert(Arc::from(session_id));
+        }
+    }
+
+    fn route(&self, session_id: &str) -> Result<ExecutorRoute, CodeModeHostError> {
+        let Some(executors) = &self.executors else {
+            return Ok(None);
+        };
+        self.track(session_id);
+        executors.route(session_id)
+    }
+
+    fn record(&self, session_id: &str, executor: Option<&Arc<str>>, execution: &CodeModeExecution) {
+        if let Some(executors) = &self.executors {
+            executors.record(session_id, executor, execution);
+        }
+    }
+
+    async fn execute_remote(
+        &self,
+        name: &Arc<str>,
+        host: &Arc<dyn CodeModeHost>,
+        source: &str,
+        context: ToolContext<'_>,
+        observer: Option<&mut dyn CodeModeObserver>,
+    ) -> Result<CodeModeExecution, CodeModeHostError> {
+        let remote = match host.tool_definitions(context.session_id()) {
+            Ok(definitions) => definitions
+                .iter()
+                .map(|definition| definition.name().to_owned())
+                .collect::<HashSet<_>>(),
+            Err(error) => return Ok(CodeModeExecutors::failed(&error)),
+        };
+        let observer = observer.map(|observer| &mut *observer as &mut dyn CodeModeObserver);
+        match host
+            .execute_with_local_tools(
+                source,
+                context,
+                self.registry.callback_tools(&remote),
+                observer,
+            )
+            .await
+        {
+            Ok(execution) => {
+                self.record(context.session_id(), Some(name), &execution);
+                Ok(execution)
+            }
+            Err(error) => Ok(CodeModeExecutors::failed(&error)),
+        }
+    }
+
+    async fn execute_routed(
+        &self,
+        source: &str,
+        context: OwnedToolContext,
+        observer: Option<&mut dyn CodeModeObserver>,
+    ) -> Result<CodeModeExecution, CodeModeHostError> {
+        match self.route(&context.session_id) {
+            Ok(Some((name, host))) => {
+                return self
+                    .execute_remote(&name, &host, source, context.as_context(), observer)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => return Ok(CodeModeExecutors::failed(&error)),
+        }
+        let session_id = self.executors.is_some().then(|| context.session_id.clone());
+        let execution = match observer {
+            Some(observer) => {
+                self.code_mode
+                    .execute_with_updates(source, self.registry.clone(), context, observer)
+                    .await
+            }
+            None => {
+                self.code_mode
+                    .execute(source, self.registry.clone(), context)
+                    .await
+            }
+        };
+        if let Some(session_id) = session_id {
+            self.record(&session_id, None, &execution);
+        }
+        Ok(execution)
     }
 
     #[must_use]
@@ -464,6 +568,8 @@ impl NativeToolRuntime {
             code_mode: self.code_mode.control(),
             workspace: self.workspace.clone(),
             current_turn: Arc::clone(&self.current_turn),
+            executors: self.executors.clone(),
+            sessions: Arc::clone(&self.sessions),
         }
     }
 
@@ -539,16 +645,7 @@ impl NativeToolRuntime {
         'call,
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
-        Box::pin(async move {
-            Ok(self
-                .code_mode
-                .execute(
-                    source,
-                    self.registry.clone(),
-                    OwnedToolContext::from_context(context),
-                )
-                .await)
-        })
+        Box::pin(self.execute_routed(source, OwnedToolContext::from_context(context), None))
     }
 
     #[doc(hidden)]
@@ -561,17 +658,11 @@ impl NativeToolRuntime {
         'call,
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
-        Box::pin(async move {
-            Ok(self
-                .code_mode
-                .execute_with_updates(
-                    source,
-                    self.registry.clone(),
-                    OwnedToolContext::from_context(context),
-                    observer,
-                )
-                .await)
-        })
+        Box::pin(self.execute_routed(
+            source,
+            OwnedToolContext::from_context(context),
+            Some(observer),
+        ))
     }
 
     #[doc(hidden)]
@@ -583,12 +674,7 @@ impl NativeToolRuntime {
         'call,
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
-        Box::pin(async move {
-            Ok(self
-                .code_mode
-                .execute(source, self.registry.clone(), context)
-                .await)
-        })
+        Box::pin(self.execute_routed(source, context, None))
     }
 
     #[doc(hidden)]
@@ -601,12 +687,7 @@ impl NativeToolRuntime {
         'call,
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
-        Box::pin(async move {
-            Ok(self
-                .code_mode
-                .execute_with_updates(source, self.registry.clone(), context, observer)
-                .await)
-        })
+        Box::pin(self.execute_routed(source, context, Some(observer)))
     }
 
     pub fn wait_for_code<'call>(
@@ -617,20 +698,75 @@ impl NativeToolRuntime {
         'call,
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
-        Box::pin(async move { Ok(self.code_mode.wait(input, context).await) })
+        Box::pin(async move {
+            self.wait_for_code_with_updates(input, context, &mut IgnoreUpdates)
+                .await
+        })
     }
 
     #[doc(hidden)]
     pub fn wait_for_code_with_updates<'call>(
         &'call self,
         input: &'call str,
-        _context: ToolContext<'call>,
+        context: ToolContext<'call>,
         observer: &'call mut dyn CodeModeObserver,
     ) -> futures_util::future::BoxFuture<
         'call,
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
-        Box::pin(async move { Ok(self.code_mode.wait_with_updates(input, observer).await) })
+        Box::pin(async move {
+            let Some(executors) = &self.executors else {
+                return Ok(self.code_mode.wait_with_updates(input, observer).await);
+            };
+            let session_id = context.session_id();
+            self.track(session_id);
+            let places = executors.wait_route(session_id);
+            let remaining = places.len();
+            let mut failure = None;
+            let mut missing = None;
+            for (index, place) in places.into_iter().enumerate() {
+                let execution = match &place {
+                    None => {
+                        self.code_mode
+                            .wait_with_updates(input, &mut *observer)
+                            .await
+                    }
+                    Some(name) => {
+                        let waited = match executors.connected(name) {
+                            Ok(host) => {
+                                host.wait_with_updates(
+                                    input,
+                                    context,
+                                    &mut *observer as &mut dyn CodeModeObserver,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        match waited {
+                            Ok(execution) => execution,
+                            Err(error) => {
+                                failure = Some(error);
+                                continue;
+                            }
+                        }
+                    }
+                };
+                if CodeModeExecutors::missing_cell(&execution) && index + 1 < remaining {
+                    missing = Some(execution);
+                    continue;
+                }
+                executors.record(session_id, place.as_ref(), &execution);
+                return Ok(execution);
+            }
+            Ok(match (missing, failure) {
+                (Some(execution), _) => execution,
+                (None, Some(error)) => CodeModeExecutors::failed(&error),
+                (None, None) => CodeModeExecutors::failed(&CodeModeHostError::new(
+                    "no Code Mode placement is available for this session",
+                )),
+            })
+        })
     }
 
     pub fn execute_tool<'call>(
@@ -642,7 +778,20 @@ impl NativeToolRuntime {
         'call,
         Result<ToolOutput, crate::embedded::CodeModeHostError>,
     > {
-        Box::pin(async move { Ok(self.registry.execute_direct(name, input, context).await) })
+        Box::pin(async move {
+            if self.registry.workspace_tool(name) {
+                match self.route(context.session_id()) {
+                    Ok(Some((executor, _))) => {
+                        return Ok(ToolOutput::error(format!(
+                            "Code Mode for this session runs on executor `{executor}`; call `tools.{name}` inside exec to run it there. No direct handler was invoked."
+                        )));
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Ok(ToolOutput::error(error.to_string())),
+                }
+            }
+            Ok(self.registry.execute_direct(name, input, context).await)
+        })
     }
 }
 
@@ -690,13 +839,53 @@ fn group_direct_code_mode_definitions(
 }
 
 impl NativeToolRuntimeControl {
+    fn sessions(&self) -> Vec<Arc<str>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn remote(&self) -> Vec<(Arc<str>, Arc<dyn CodeModeHost>)> {
+        let Some(executors) = &self.executors else {
+            return Vec::new();
+        };
+        self.sessions()
+            .into_iter()
+            .flat_map(|session| {
+                executors
+                    .touched(&session)
+                    .into_iter()
+                    .map(move |host| (Arc::clone(&session), host))
+            })
+            .collect()
+    }
+
+    fn settle_cells(&self) {
+        if let Some(executors) = &self.executors {
+            for session in self.sessions() {
+                executors.settle_cells(&session);
+            }
+        }
+    }
+
     pub fn settle_preempt(&self) {
         self.code_mode.settle_preempt();
+        for (session, host) in self.remote() {
+            host.settle_preempt(&session);
+        }
     }
 
     pub fn preempt_turn<'call>(&'call self) -> futures_util::future::BoxFuture<'call, ()> {
         Box::pin(async move {
             self.code_mode.preempt_turn();
+            for (session, host) in self.remote() {
+                if let Err(error) = host.preempt_turn(&session).await {
+                    tracing::warn!(target: "nanocode_code_mode", %error, "remote Code Mode preemption failed");
+                }
+            }
         })
     }
 
@@ -707,6 +896,9 @@ impl NativeToolRuntimeControl {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |turn| {
                 Some(turn.saturating_add(1))
             });
+        for (session, host) in self.remote() {
+            host.begin_turn(&session);
+        }
     }
 
     pub fn detach_turn_with_updates<'call>(
@@ -715,7 +907,10 @@ impl NativeToolRuntimeControl {
     ) -> futures_util::future::BoxFuture<'call, ()> {
         Box::pin(async move {
             let turn_id = self.current_turn.load(Ordering::Acquire);
-            self.code_mode.detach_turn(turn_id, observer).await;
+            self.code_mode.detach_turn(turn_id, &mut *observer).await;
+            for (session, host) in self.remote() {
+                host.detach_turn(&session, &mut *observer);
+            }
         })
     }
 
@@ -724,6 +919,12 @@ impl NativeToolRuntimeControl {
         Box::pin(async move {
             let turn_id = self.current_turn.load(Ordering::Acquire);
             self.code_mode.terminate_turn(turn_id, None).await;
+            for (session, host) in self.remote() {
+                if let Err(error) = host.cancel_turn(&session).await {
+                    tracing::warn!(target: "nanocode_code_mode", %error, "remote Code Mode turn cancellation failed");
+                }
+            }
+            self.settle_cells();
         })
     }
 
@@ -734,7 +935,18 @@ impl NativeToolRuntimeControl {
         Box::pin(async move {
             let turn_id = self.current_turn.load(Ordering::Acquire);
 
-            self.code_mode.terminate_turn(turn_id, Some(observer)).await;
+            self.code_mode
+                .terminate_turn(turn_id, Some(&mut *observer))
+                .await;
+            for (session, host) in self.remote() {
+                if let Err(error) = host
+                    .cancel_turn_with_updates(&session, &mut *observer as &mut dyn CodeModeObserver)
+                    .await
+                {
+                    tracing::warn!(target: "nanocode_code_mode", %error, "remote Code Mode turn cancellation failed");
+                }
+            }
+            self.settle_cells();
         })
     }
 
@@ -745,6 +957,12 @@ impl NativeToolRuntimeControl {
             if let Some(workspace) = &self.workspace {
                 workspace.cancel().await;
             }
+            for (session, host) in self.remote() {
+                if let Err(error) = host.cancel(&session).await {
+                    tracing::warn!(target: "nanocode_code_mode", %error, "remote Code Mode cancellation failed");
+                }
+            }
+            self.settle_cells();
         })
     }
 
@@ -753,10 +971,19 @@ impl NativeToolRuntimeControl {
         observer: &'call mut dyn CodeModeObserver,
     ) -> futures_util::future::BoxFuture<'call, ()> {
         Box::pin(async move {
-            let _code_mode_quiescence = self.code_mode.terminate_all(Some(observer)).await;
+            let _code_mode_quiescence = self.code_mode.terminate_all(Some(&mut *observer)).await;
             if let Some(workspace) = &self.workspace {
                 workspace.cancel().await;
             }
+            for (session, host) in self.remote() {
+                if let Err(error) = host
+                    .cancel_with_updates(&session, &mut *observer as &mut dyn CodeModeObserver)
+                    .await
+                {
+                    tracing::warn!(target: "nanocode_code_mode", %error, "remote Code Mode cancellation failed");
+                }
+            }
+            self.settle_cells();
         })
     }
 }

@@ -5,11 +5,17 @@ pub(crate) mod management;
 mod pool;
 #[cfg(not(target_family = "wasm"))]
 pub use pool::{
-    Runner, RunnerEvent, RunnerHandle, RunnerInfo, RunnerPool, RunnerServer, RunnerServerConfig,
-    RunnerStatus,
+    Runner, RunnerEvent, RunnerHandle, RunnerInfo, RunnerPool, RunnerProtocol, RunnerServer,
+    RunnerServerConfig, RunnerStatus,
 };
 pub(crate) mod process_routes;
 mod protocol;
+pub(crate) use driver::{INITIAL_TRANSPORT_BACKOFF, STABLE_CONNECTION};
+pub(crate) use protocol::HEARTBEAT_INTERVAL;
+
+pub(crate) fn reconnect_delay(backoff: &mut std::time::Duration) -> std::time::Duration {
+    driver::Failure::Transport.delay(backoff, None)
+}
 pub use nanocode_tool_host::attachment::{
     AttachmentCallOutcome, AttachmentError, ProcessRouteStore, RemoteMode, RunnerRouting,
 };

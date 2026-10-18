@@ -339,7 +339,10 @@ pub fn runner_configs(args: &RemoteArgs) -> Result<(Vec<Runner>, Vec<RunnerServe
                 .runner_token
                 .as_ref()
                 .ok_or("--runner-connect requires --runner-token or NANOCODEX_RUNNER_TOKEN")?;
-            let mut runner = Runner::connect(url).token(token).name(&args.runner_name);
+            let mut runner = Runner::connect(url).token(token);
+            if let Some(name) = &args.runner_name {
+                runner = runner.name(name);
+            }
             runner = match args.runner_mode {
                 RunnerModeArg::Alongside => runner.alongside(),
                 RunnerModeArg::Replace => runner.replace(),

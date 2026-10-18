@@ -27,8 +27,8 @@ pub use nanocode_agent::{Model, ReasoningMode, Thinking};
 pub use nanocode_backend_claude::{Claude, ClaudeClient};
 #[cfg(not(target_family = "wasm"))]
 pub use runners::{
-    AttachmentError, Runner, RunnerEvent, RunnerHandle, RunnerInfo, RunnerPool, RunnerServer,
-    RunnerServerConfig, RunnerStatus,
+    AttachmentError, Runner, RunnerEvent, RunnerHandle, RunnerInfo, RunnerPool, RunnerProtocol,
+    RunnerServer, RunnerServerConfig, RunnerStatus,
 };
 
 pub use nanocode_backend_codex::{Codex, client::OpenAi};
@@ -37,7 +37,9 @@ pub use nanocode_code_mode::Tool;
 pub use nanocode_code_mode::embedded::{
     CodeModeExecution, CodeModeHost, CodeModeHostError, CodeModeObserver, CodeModeUpdate,
 };
-pub use nanocode_code_mode::remote::{RemoteCodeModeHost, RemoteTransport};
+pub use nanocode_code_mode::remote::{
+    CodeModeExecutors, ExecutorSelection, RemoteCodeModeHost, RemoteTransport,
+};
 pub use nanocode_code_mode::tool;
 pub use nanocode_tool_runtime::Tools;
 

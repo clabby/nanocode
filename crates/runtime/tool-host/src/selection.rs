@@ -99,6 +99,8 @@ pub struct Tools {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) runner_pool: Option<RunnerRouting>,
     #[cfg(not(target_family = "wasm"))]
+    pub(crate) code_mode_executors: Option<nanocode_code_mode::remote::CodeModeExecutors>,
+    #[cfg(not(target_family = "wasm"))]
     pub(super) deferred_tools_guidance_enabled: bool,
 
     pub(crate) embedded_host: Option<Arc<dyn crate::embedded::CodeModeHost>>,
@@ -141,6 +143,8 @@ impl Default for Tools {
             process_route_store: None,
             #[cfg(not(target_family = "wasm"))]
             runner_pool: None,
+            #[cfg(not(target_family = "wasm"))]
+            code_mode_executors: None,
             #[cfg(not(target_family = "wasm"))]
             deferred_tools_guidance_enabled: false,
 
@@ -292,8 +296,30 @@ impl Tools {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn with_runner_pool(mut self, pool: impl Into<RunnerRouting>) -> Self {
-        self.runner_pool = Some(pool.into());
+        let pool = pool.into();
+        if self.code_mode_executors.is_none() {
+            self.code_mode_executors = pool.code_mode_executors().cloned();
+        }
+        self.runner_pool = Some(pool);
         self
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn with_code_mode_executors(
+        mut self,
+        executors: nanocode_code_mode::remote::CodeModeExecutors,
+    ) -> Self {
+        self.code_mode_executors = Some(executors);
+        self
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub const fn code_mode_executors(
+        &self,
+    ) -> Option<&nanocode_code_mode::remote::CodeModeExecutors> {
+        self.code_mode_executors.as_ref()
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -355,8 +381,14 @@ impl Tools {
     #[must_use]
     pub fn for_session(mut self, session: &crate::SessionEnvironment) -> Self {
         self.embedded_session_id = Some(Arc::from(session.session_id()));
+        if let Some(host) = &self.embedded_host {
+            host.link_session(session.session_id(), session.root_session_id());
+        }
         #[cfg(not(target_family = "wasm"))]
         {
+            if let Some(executors) = &self.code_mode_executors {
+                executors.link(session.session_id(), session.root_session_id());
+            }
             for (name, value) in session.os_variables() {
                 self.insert_process_environment(name, value);
             }
@@ -440,7 +472,17 @@ impl ToolsBuilder {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn runner_pool(mut self, pool: impl Into<RunnerRouting>) -> Self {
-        self.tools.runner_pool = Some(pool.into());
+        self.tools = self.tools.with_runner_pool(pool);
+        self
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn code_mode_executors(
+        mut self,
+        executors: nanocode_code_mode::remote::CodeModeExecutors,
+    ) -> Self {
+        self.tools.code_mode_executors = Some(executors);
         self
     }
 

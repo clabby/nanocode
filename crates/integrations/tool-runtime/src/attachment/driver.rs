@@ -30,7 +30,7 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 
-const STABLE_CONNECTION: Duration = Duration::from_secs(30);
+pub(crate) const STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 const HEARTBEAT_TIMEOUT_REASON: &str = "attachment heartbeat timed out";
 

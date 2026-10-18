@@ -22,7 +22,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    #[command(about = "Serve this machine's workspace tools to a remote nanocodex agent")]
+    #[command(
+        about = "Serve this machine to a remote nanocodex agent, as workspace tools or as a Code Mode executor"
+    )]
     Runner(RunnerArgs),
     #[command(about = "List saved sessions (current workspace unless --all)")]
     Sessions(SessionsArgs),
@@ -219,6 +221,7 @@ impl SessionArgs {
                 runner_connect: self.remote.runner_connect.or(root.remote.runner_connect),
                 runner_host: self.remote.runner_host.or(root.remote.runner_host),
                 runner_token: self.remote.runner_token.or(root.remote.runner_token),
+                runner_name: self.remote.runner_name.or(root.remote.runner_name),
                 runner_workspace: self
                     .remote
                     .runner_workspace
@@ -260,10 +263,9 @@ pub struct RemoteArgs {
 
     #[arg(
         long,
-        default_value = "runner",
-        help = "Runner name; also the mount point /<name> in alongside mode"
+        help = "Runner name; also the mount point /<name> in alongside mode. Defaults to runner, or to the name a Code Mode executor advertises"
     )]
-    pub runner_name: String,
+    pub runner_name: Option<String>,
 
     #[arg(
         long,
@@ -330,6 +332,12 @@ pub struct RunnerArgs {
 
     #[arg(long, help = "Also serve computer use from the installed provider")]
     pub cua: bool,
+
+    #[arg(
+        long,
+        help = "Run the agent's exec cells on this machine as a remote Code Mode executor; with --connect, reconnect until stopped"
+    )]
+    pub code_mode: bool,
 }
 
 #[derive(Clone, Debug, Args)]

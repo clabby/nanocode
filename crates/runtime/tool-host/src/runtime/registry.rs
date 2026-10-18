@@ -282,6 +282,32 @@ impl ToolRegistry {
         }
     }
 
+    pub(crate) fn workspace_tool(&self, name: &str) -> bool {
+        self.policies
+            .iter()
+            .any(|policy| policy.workspace_routing(name).is_some())
+    }
+
+    pub(crate) fn callback_tools(&self, remote: &HashSet<String>) -> Vec<Arc<dyn Tool>> {
+        self.ordered
+            .iter()
+            .zip(&self.definitions)
+            .zip(&self.exposures)
+            .filter(|((_, definition), exposure)| {
+                let name = definition.name();
+                exposure.is_available_in_code_mode()
+                    && matches!(
+                        definition,
+                        ToolDefinition::Function { .. } | ToolDefinition::Custom { .. }
+                    )
+                    && !host_owned_name(name)
+                    && !remote.contains(name)
+                    && !self.workspace_tool(name)
+            })
+            .map(|((tool, _), _)| Arc::clone(tool))
+            .collect()
+    }
+
     pub(crate) fn nested_tool_metadata(&self) -> Vec<Value> {
         self.code_mode_definitions()
             .into_iter()

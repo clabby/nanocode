@@ -57,7 +57,8 @@ impl ToolSource for RemoteTools {
 
 impl From<RunnerPool> for RunnerRouting {
     fn from(pool: RunnerPool) -> Self {
-        Self::new(Arc::new(pool), Arc::new(AttachmentRouter))
+        let executors = pool.code_mode_executors();
+        Self::new(Arc::new(pool), Arc::new(AttachmentRouter)).with_code_mode_executors(executors)
     }
 }
 
