@@ -605,7 +605,8 @@ where
         timing.first_output_ns.get_or_insert(elapsed);
     }
     if let Some(failure) = failure {
-        return Err(failure.into());
+        return Err(ResponsesServiceError::from(failure)
+            .with_connection_renewal(timing.pipeline.event_count == 1));
     }
     Ok(ReceivedServerEvent {
         event,

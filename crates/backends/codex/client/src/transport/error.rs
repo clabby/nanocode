@@ -3,8 +3,9 @@ use std::{borrow::Cow, sync::Arc};
 use super::RetryAfter;
 
 use super::api_error::{
-    api_error_has_code, api_error_is_checkpoint_missing, api_error_is_terminal,
-    invalid_tool_schema_path, retryable_api_error, retryable_api_error_received,
+    api_error_has_code, api_error_is_checkpoint_missing, api_error_is_connection_expired,
+    api_error_is_terminal, invalid_tool_schema_path, retryable_api_error,
+    retryable_api_error_received,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -261,6 +262,10 @@ impl ResponsesError {
     #[must_use]
     pub fn is_checkpoint_missing(&self) -> bool {
         matches!(self, Self::Api { event, .. } if api_error_is_checkpoint_missing(event))
+    }
+
+    pub(crate) fn is_connection_expired(&self) -> bool {
+        matches!(self, Self::Api { event, .. } if api_error_is_connection_expired(event))
     }
 
     #[must_use]

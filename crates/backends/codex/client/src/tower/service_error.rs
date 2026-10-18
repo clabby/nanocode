@@ -12,6 +12,7 @@ pub struct ResponsesServiceError {
     class: &'static str,
     pub(crate) retry_advice: Option<RetryAdvice>,
     pub(crate) connection_generation: u32,
+    connection_renewal: bool,
 }
 
 impl ResponsesServiceError {
@@ -28,7 +29,20 @@ impl ResponsesServiceError {
             class,
             retry_advice,
             connection_generation,
+            connection_renewal: false,
         }
+    }
+
+    pub(crate) fn with_connection_renewal(mut self, first_event: bool) -> Self {
+        self.connection_renewal = first_event
+            && self
+                .responses_error()
+                .is_some_and(ResponsesError::is_connection_expired);
+        self
+    }
+
+    pub(crate) const fn can_renew_connection(&self) -> bool {
+        self.connection_renewal
     }
 
     pub(crate) fn responses(

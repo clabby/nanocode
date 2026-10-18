@@ -55,6 +55,15 @@ pub(super) fn api_error_has_code(event: &str, expected: &str) -> bool {
     event.code() == Some(expected)
 }
 
+pub(super) fn api_error_is_connection_expired(event: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<ApiErrorEnvelope>(event) else {
+        return false;
+    };
+    event.event_type.as_deref() == Some("error")
+        && !event.is_terminal()
+        && event.code() == Some("websocket_connection_limit_reached")
+}
+
 pub(super) fn invalid_tool_schema_path(event: &str) -> Option<Vec<usize>> {
     let event: ApiErrorEnvelope = serde_json::from_str(event).ok()?;
     let (code, param) = if event.code.is_some() {

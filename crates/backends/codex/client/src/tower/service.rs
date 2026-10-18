@@ -358,6 +358,37 @@ impl ResponsesService {
         request: &mut Cow<'_, ResponsesAttempt>,
         started_at: Instant,
     ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
+        let generation = connection.generation;
+        match self
+            .run_websocket_once(connection, request, started_at)
+            .await
+        {
+            Err(error)
+                if generation > 0
+                    && connection.generation == generation
+                    && error.can_renew_connection() =>
+            {
+                connection.invalidate(ConnectionPurpose::Reconnect);
+                request.to_mut().force_full_replay();
+                tracing::info!(
+                    target: "nanocode_codex",
+                    generation,
+                    reason = "websocket_connection_limit_reached",
+                    "renewing expired Responses connection before response progress"
+                );
+                self.run_websocket_once(connection, request, started_at)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn run_websocket_once(
+        &self,
+        connection: &mut AttemptGuard<'_>,
+        request: &mut Cow<'_, ResponsesAttempt>,
+        started_at: Instant,
+    ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
         let (request_bytes, encode_duration_ns, send_duration_ns) =
             self.send_websocket(connection, request).await?;
         let request = request.as_ref();
@@ -947,6 +978,7 @@ async fn receive_warmup(
     request: &ResponsesAttempt,
     credentials: &Credentials,
 ) -> Result<WarmupResponse, ResponsesServiceError> {
+    let mut first_event = true;
     loop {
         let received = socket.next_text().await?;
         let parsed = decode_event::<WarmupServerEvent>(received.text.as_str())?;
@@ -976,11 +1008,15 @@ async fn receive_warmup(
             WarmupServerEvent::Error
             | WarmupServerEvent::Failed
             | WarmupServerEvent::Incomplete => {
-                return Err(ResponsesError::api_event(raw_event.to_owned()).into());
+                return Err(ResponsesServiceError::from(ResponsesError::api_event(
+                    raw_event.to_owned(),
+                ))
+                .with_connection_renewal(first_event));
             }
             WarmupServerEvent::Created { response } => drop(response.id),
             WarmupServerEvent::Other => {}
         }
+        first_event = false;
     }
 }
 
