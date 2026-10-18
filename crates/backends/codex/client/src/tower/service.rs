@@ -4,6 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use crate::client::OpenAiAuthMode;
@@ -17,6 +18,8 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, info_span};
 
 mod https;
+
+const RESPONSES_WEBSOCKET_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 use crate::client::{
     EncodedRequest, ResponsesError,
@@ -39,6 +42,7 @@ use crate::client::{
 
 struct ConnectionState {
     socket: Option<ResponsesSocket>,
+    connected_at: Option<Instant>,
 
     turn_state: Option<String>,
     generation: u32,
@@ -61,6 +65,7 @@ impl ConnectionState {
     const fn new() -> Self {
         Self {
             socket: None,
+            connected_at: None,
             turn_state: None,
             generation: 0,
             next_purpose: ConnectionPurpose::Initial,
@@ -89,13 +94,21 @@ impl ConnectionState {
     fn invalidate(&mut self, purpose: ConnectionPurpose) {
         self.capture_turn_state();
         self.socket = None;
+        self.connected_at = None;
         self.next_purpose = purpose;
     }
 
     fn cancel_in_flight(&mut self) {
-        self.capture_turn_state();
-        self.socket = None;
-        self.next_purpose = ConnectionPurpose::Reconnect;
+        self.invalidate(ConnectionPurpose::Reconnect);
+    }
+
+    fn socket_needs_renewal(&self) -> bool {
+        self.socket.as_ref().is_some_and(|socket| {
+            socket.is_closed()
+                || self.connected_at.is_some_and(|connected_at| {
+                    connected_at.elapsed() >= RESPONSES_WEBSOCKET_LIFETIME
+                })
+        })
     }
 
     fn enter_logical_turn(&mut self, logical_turn: u64) {
@@ -461,11 +474,7 @@ impl ResponsesService {
         request: &mut Cow<'_, ResponsesAttempt>,
     ) -> Result<(usize, u64, u64), ResponsesServiceError> {
         let mut reused = connection.socket.is_some();
-        if connection
-            .socket
-            .as_ref()
-            .is_some_and(ResponsesSocket::is_closed)
-        {
+        if connection.socket_needs_renewal() {
             connection.invalidate(ConnectionPurpose::Reconnect);
             request.to_mut().force_full_replay();
             reused = false;
@@ -602,6 +611,7 @@ impl ResponsesService {
     ) -> Result<(), ResponsesServiceError> {
         let purpose = connection.next_purpose;
         let generation = connection.generation + 1;
+        let connected_at = Instant::now();
         let established = self
             .establish_connection(
                 request,
@@ -647,6 +657,7 @@ impl ResponsesService {
             },
         )?;
         connection.socket = Some(socket);
+        connection.connected_at = Some(connected_at);
         Ok(())
     }
 
@@ -943,10 +954,7 @@ impl Service<ResponsesAttempt> for ResponsesService {
                     connection.socket = None;
                 }
                 if matches!(transport, ResponsesTransport::WebSocket)
-                    && connection
-                        .socket
-                        .as_ref()
-                        .is_some_and(ResponsesSocket::is_closed)
+                    && connection.socket_needs_renewal()
                 {
                     connection.invalidate(ConnectionPurpose::Reconnect);
                 }
