@@ -24,6 +24,7 @@ pub struct SubagentView {
 }
 
 pub struct FocusReady {
+    root: String,
     id: AgentId,
     role: String,
     model: Option<String>,
@@ -189,6 +190,7 @@ impl App {
                     None => Vec::new(),
                 };
                 Ok::<_, String>(FocusReady {
+                    root: root.clone(),
                     id,
                     role: entry.role,
                     model: entry.model.as_ref().map(ToString::to_string),
@@ -204,11 +206,15 @@ impl App {
 
     pub(crate) fn focus_ready(&mut self, ready: FocusReady) {
         let FocusReady {
+            root,
             id,
             role,
             model,
             history,
         } = ready;
+        if self.session_id().as_deref() != Some(root.as_str()) {
+            return;
+        }
         let view = self
             .views
             .entry(id)

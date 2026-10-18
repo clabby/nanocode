@@ -276,6 +276,7 @@ async fn journal_writer(
     let mut saved = None;
     let mut recorded = HashMap::new();
     let mut pending = Vec::new();
+    let mut failures = 0_u32;
     loop {
         for _ in 0..requests.len() {
             if let Ok(request) = requests.try_recv() {
@@ -285,7 +286,7 @@ async fn journal_writer(
         let Some(live) = registry.upgrade() else {
             return;
         };
-        let finished = live
+        let (finished, failed) = live
             .write_journal(
                 &root_session_id,
                 std::mem::take(&mut pending),
@@ -293,6 +294,11 @@ async fn journal_writer(
                 &mut recorded,
             )
             .await;
+        failures = if failed {
+            failures.saturating_add(1)
+        } else {
+            0
+        };
         if finished {
             let mut writers = lock_unpoisoned(&live.journal_writers);
             while let Ok(request) = requests.try_recv() {
@@ -305,6 +311,12 @@ async fn journal_writer(
             continue;
         }
         drop(live);
+        let retry = async {
+            match failures {
+                0 => std::future::pending().await,
+                attempt => platform::sleep(completion_retry_delay(attempt)).await,
+            }
+        };
         tokio::select! {
             changed = revision.changed() => {
                 if changed.is_err() {
@@ -315,6 +327,7 @@ async fn journal_writer(
                 Some(request) => pending.push(request),
                 None => return,
             },
+            () = retry => {}
         }
     }
 }
@@ -1040,17 +1053,33 @@ impl RegistryState {
         let root_session_id = self.authorize(session_id, id)?;
         let ids = self.subtree_shutdown_order(&root_session_id, id)?;
         let harnesses = self.harnesses(&root_session_id, &ids, true)?;
-        let status_updates = ids
-            .iter()
-            .copied()
-            .map(|id| (id, AgentStatus::Closing))
-            .collect();
+        let status_updates = self.closing_updates(&root_session_id, &ids);
         Ok(CloseRequest {
             root_session_id,
             ids,
             harnesses,
             status_updates,
         })
+    }
+
+    fn closing_updates(
+        &self,
+        root_session_id: &str,
+        ids: &[AgentId],
+    ) -> Vec<(AgentId, AgentStatus)> {
+        let Some(scope) = self.scopes.get(root_session_id) else {
+            return Vec::new();
+        };
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                scope
+                    .sessions
+                    .get(id)
+                    .is_some_and(|session| matches!(session.status, AgentStatus::Closing))
+            })
+            .map(|id| (id, AgentStatus::Closing))
+            .collect()
     }
 
     fn request_close_all(&mut self, session_id: &str) -> std::io::Result<CloseRequest> {
@@ -1061,11 +1090,7 @@ impl RegistryState {
             scope.topology.all_postorder()
         };
         let harnesses = self.harnesses(&root_session_id, &ids, true)?;
-        let status_updates = ids
-            .iter()
-            .copied()
-            .map(|id| (id, AgentStatus::Closing))
-            .collect();
+        let status_updates = self.closing_updates(&root_session_id, &ids);
         Ok(CloseRequest {
             root_session_id,
             ids,
@@ -1106,7 +1131,7 @@ impl RegistryState {
                 .sessions
                 .get_mut(id)
                 .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {id}")))?;
-            if closing {
+            if closing && !matches!(session.status, AgentStatus::Closed) {
                 session.status = AgentStatus::Closing;
             }
             harnesses.extend(session.harness.iter().cloned());
@@ -1627,7 +1652,7 @@ impl Registry {
         requests: Vec<JournalRequest>,
         saved: &mut Option<String>,
         recorded: &mut HashMap<String, Arc<str>>,
-    ) -> bool {
+    ) -> (bool, bool) {
         let (restoring, background) = {
             let restored = self
                 .restored
@@ -1665,7 +1690,7 @@ impl Registry {
             {
                 let _ = done.send(Err(std::io::Error::other("no subagent store is installed")));
             }
-            return true;
+            return (true, false);
         };
         let frozen = || {
             Err(std::io::Error::other(
@@ -1745,6 +1770,7 @@ impl Registry {
         for (_, done) in waiters {
             let _ = done.send(result.as_ref().copied().map_err(copy_error));
         }
+        let failed = result.is_err();
         let closed = !finals.is_empty();
         for (write, done) in finals {
             *saved = None;
@@ -1753,7 +1779,7 @@ impl Registry {
                     .await,
             );
         }
-        finished || closed
+        (finished || closed, failed)
     }
 
     async fn record_children(
@@ -2867,9 +2893,15 @@ impl Registry {
         )?;
         drop(state);
         self.changed();
-        if self.store_for(&root_session_id).is_some()
-            && let Err(error) = self.save_scope(&root_session_id).await
-        {
+        let mut cancellation = self.batch_startup();
+        cancellation.track(&root_session_id, id);
+        let saved = if self.store_for(&root_session_id).is_some() {
+            self.save_scope(&root_session_id).await
+        } else {
+            Ok(())
+        };
+        cancellation.cleanup = None;
+        if let Err(error) = saved {
             if let Some(session) = self
                 .state
                 .lock()
@@ -3899,8 +3931,27 @@ impl Registry {
             self.send_status(&root_session_id, AgentUpdate::Status { id, status });
         }
         self.changed();
-        self.stop_and_close(root_session_id, ids, harnesses, false)
+        let summaries = self
+            .stop_and_close(root_session_id.clone(), ids, harnesses, false)
+            .await?;
+        let frozen = self
+            .state
+            .lock()
             .await
+            .scopes
+            .get(&root_session_id)
+            .is_some_and(|scope| scope.journal_frozen);
+        if self.store_for(&root_session_id).is_some() && !frozen {
+            self.persist_durably(&root_session_id)
+                .await
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("agent {id} closed, but its closure is not durable yet: {error}"),
+                    )
+                })?;
+        }
+        Ok(summaries)
     }
 
     async fn close_batch(&self, root_session_id: &str, ids: Vec<AgentId>) -> std::io::Result<()> {

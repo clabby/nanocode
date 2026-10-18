@@ -42,7 +42,7 @@ impl SubagentRoster {
                 let Some(node) = self.agent_mut(*id) else {
                     return false;
                 };
-                if node.status == *status {
+                if node.status == *status || matches!(node.status, AgentStatus::Closed) {
                     return false;
                 }
                 node.status = status.clone();

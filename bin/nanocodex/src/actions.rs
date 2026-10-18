@@ -190,17 +190,28 @@ impl App {
         match scoped.update {
             AgentUpdate::Added(descriptor) => {
                 self.track_subagent(&descriptor);
+                let id = descriptor.id.to_string();
+                let mut existing = None;
+                self.tree.update(&id, |node| {
+                    existing = Some((node.status, node.label.clone()))
+                });
+                let (status, label) = existing.unwrap_or_else(|| {
+                    (
+                        NodeStatus::Pending,
+                        format!("#{} {}", descriptor.id, descriptor.role),
+                    )
+                });
                 self.tree.upsert(TreeNode {
-                    id: descriptor.id.to_string(),
+                    id,
                     parent: descriptor.parent.map(|parent| parent.to_string()),
-                    label: format!("#{} {}", descriptor.id, descriptor.role),
+                    label,
                     detail: descriptor
                         .task
                         .lines()
                         .next()
                         .unwrap_or_default()
                         .to_owned(),
-                    status: NodeStatus::Pending,
+                    status,
                 });
             }
             AgentUpdate::Status { id, status } => {
@@ -209,7 +220,9 @@ impl App {
                 }
                 let (status, detail) = subagent_status(&status);
                 self.tree.update(&id.to_string(), |node| {
-                    node.status = status;
+                    if node.status != NodeStatus::Closed {
+                        node.status = status;
+                    }
                     if !detail.is_empty() {
                         node.detail = detail;
                     }
@@ -222,7 +235,9 @@ impl App {
                 let (node_status, detail) = subagent_status(&status);
                 let key = id.to_string();
                 self.tree.update(&key, |node| {
-                    node.status = node_status;
+                    if node.status != NodeStatus::Closed {
+                        node.status = node_status;
+                    }
                     if !detail.is_empty() {
                         node.detail = detail;
                     }
