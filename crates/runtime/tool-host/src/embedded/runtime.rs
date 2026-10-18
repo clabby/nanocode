@@ -117,7 +117,7 @@ impl EmbeddedToolRuntime {
         let mode = self
             .host
             .as_ref()
-            .map_or(EmbeddedToolMode::Code, |host| host.tool_mode());
+            .map_or(EmbeddedToolMode::Direct, |host| host.tool_mode());
         let mut definitions = self.host.as_ref().map_or_else(Vec::new, |host| {
             match host.tool_definitions(session_id) {
                 Ok(definitions) => definitions,
@@ -379,9 +379,9 @@ impl EmbeddedToolRuntime {
                 .unwrap_or_else(|error| ToolOutput::error(error.to_string())));
         }
         let Some(host) = &self.host else {
-            return Err(CodeModeHostError::new(
-                "no embedded tool adapter is configured",
-            ));
+            return Ok(ToolOutput::error(format!(
+                "tool `{name}` is unavailable because no embedded tool adapter is configured; no handler was invoked"
+            )));
         };
         if !self.contains(name) {
             return Ok(ToolOutput::error(format!(
@@ -397,9 +397,7 @@ impl EmbeddedToolRuntime {
         context: ToolContext<'_>,
     ) -> Result<CodeModeExecution, CodeModeHostError> {
         let Some(host) = &self.host else {
-            return Err(CodeModeHostError::new(
-                "no embedded Code Mode adapter is configured",
-            ));
+            return Ok(code_mode_unavailable("exec"));
         };
         if host.tool_mode() == EmbeddedToolMode::CodeOnly {
             return host
@@ -447,9 +445,7 @@ impl EmbeddedToolRuntime {
         observer: &mut dyn CodeModeObserver,
     ) -> Result<CodeModeExecution, CodeModeHostError> {
         let Some(host) = &self.host else {
-            return Err(CodeModeHostError::new(
-                "no embedded Code Mode adapter is configured",
-            ));
+            return Ok(code_mode_unavailable("exec"));
         };
         if host.tool_mode() == EmbeddedToolMode::CodeOnly {
             return host
@@ -485,11 +481,22 @@ impl EmbeddedToolRuntime {
         observer: &mut dyn CodeModeObserver,
     ) -> Result<CodeModeExecution, CodeModeHostError> {
         let Some(host) = &self.host else {
-            return Err(CodeModeHostError::new(
-                "no embedded Code Mode adapter is configured",
-            ));
+            return Ok(code_mode_unavailable("wait"));
         };
         host.wait_with_updates(input, context, observer).await
+    }
+}
+
+fn code_mode_unavailable(name: &str) -> CodeModeExecution {
+    CodeModeExecution {
+        cell: None,
+        output: ToolOutput::error(format!(
+            "`{name}` is unavailable because no embedded Code Mode adapter is configured; no code was executed"
+        ))
+        .output,
+        success: false,
+        nested_calls: Vec::new(),
+        notifications: Vec::new(),
     }
 }
 
