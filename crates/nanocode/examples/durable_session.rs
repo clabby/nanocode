@@ -2,6 +2,9 @@
 #[path = "support/agents.rs"]
 mod agents;
 #[cfg(not(target_family = "wasm"))]
+#[path = "support/stream.rs"]
+mod stream;
+#[cfg(not(target_family = "wasm"))]
 mod support;
 
 #[cfg(not(target_family = "wasm"))]
@@ -34,14 +37,12 @@ async fn run() -> support::Result<()> {
             restored
         };
         eprintln!("session {}", agent.session_id());
-        let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-        let answer = agent
-            .prompt(PromptRequest::new(args[4..].join(" ")).request_id(&args[3]))
-            .await?
-            .result()
-            .await;
-        drain.abort();
-        println!("{}", answer?.final_message());
+        stream::prompt(
+            &agent,
+            &mut events,
+            PromptRequest::new(args[4..].join(" ")).request_id(&args[3]),
+        )
+        .await?;
         agent.flush().await?;
         let saved = store.load(agent.session_id()).await?;
         eprintln!("persisted {} turns", saved.turns.len());

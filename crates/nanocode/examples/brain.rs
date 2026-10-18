@@ -1,4 +1,8 @@
 #[cfg(not(target_family = "wasm"))]
+#[path = "support/stream.rs"]
+mod stream;
+
+#[cfg(not(target_family = "wasm"))]
 mod native {
     use std::{error::Error, path::PathBuf, time::Duration};
 
@@ -34,7 +38,8 @@ No shell, filesystem, CUA, or runner management tools run on this brain.
 Remote execution requires a separately running executor. Reconnect it on resume.
 Without a prompt, a new session drafts a book swap plan using one subagent.
 With --resume and no prompt, only interrupted prompts are replayed.
-Session IDs appear on stderr before inference; final answers appear on stdout.
+Session IDs appear on stderr before inference. Answers stream to stdout;
+reasoning summaries and tool calls stream to stderr.
 
 Examples:
   cargo run --locked -p nanocode --example brain --
@@ -314,17 +319,16 @@ Examples:
             None => runtime.spawn().build().await?,
         };
         eprintln!("session {}", agent.session_id());
-        let events = tokio::spawn(async move { while events.recv().await.is_some() {} });
         let outcome: Result<()> = async {
             for turn in pending {
                 eprintln!("resuming interrupted turn {}", turn.id);
                 let prompt = agent.decode_durable_prompt(turn.input)?;
-                let result = agent
-                    .prompt(PromptRequest::new(prompt).request_id(turn.id))
-                    .await?
-                    .result()
-                    .await?;
-                println!("{}", result.final_message());
+                crate::stream::prompt(
+                    &agent,
+                    &mut events,
+                    PromptRequest::new(prompt).request_id(turn.id),
+                )
+                .await?;
             }
             let prompt = args.prompt.join(" ");
             let prompt = if prompt.trim().is_empty() && args.resume.is_none() {
@@ -333,14 +337,12 @@ Examples:
                 &prompt
             };
             if !prompt.trim().is_empty() {
-                let result = agent.prompt(prompt).await?.result().await?;
-                println!("{}", result.final_message());
+                crate::stream::prompt(&agent, &mut events, prompt).await?;
             }
             agent.flush().await?;
             Ok(())
         }
         .await;
-        events.abort();
         outcome
     }
 

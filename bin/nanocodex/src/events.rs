@@ -282,7 +282,7 @@ impl EventMapper {
                             }
                         });
                     }
-                    _ if !text.trim().is_empty() => {
+                    _ if !text.is_empty() => {
                         let index = transcript.push(CellKind::Reasoning(text.to_owned()));
                         self.reasoning.insert(call, index);
                     }

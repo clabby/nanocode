@@ -222,7 +222,7 @@ impl Transcript {
             revision: 0,
             scroll: 0,
             mode: DisplayMode::Collapsed,
-            reasoning: false,
+            reasoning: true,
             policy,
             last_height: 0,
             last_total: None,

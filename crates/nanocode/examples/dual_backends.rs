@@ -2,6 +2,9 @@
 #[path = "support/agents.rs"]
 mod agents;
 #[cfg(not(target_family = "wasm"))]
+#[path = "support/stream.rs"]
+mod stream;
+#[cfg(not(target_family = "wasm"))]
 mod support;
 
 #[cfg(not(target_family = "wasm"))]
@@ -24,10 +27,7 @@ async fn run() -> support::Result<()> {
         for backend in ["claude", "codex"] {
             let (agent, mut events) = agents::spawn(&runtime, backend).await?;
             eprintln!("{backend} session {}", agent.session_id());
-            let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-            let answer = agent.prompt(prompt.clone()).await?.result().await;
-            drain.abort();
-            println!("{backend}: {}", answer?.final_message());
+            stream::prompt(&agent, &mut events, prompt.clone()).await?;
             agent.flush().await?;
         }
         Ok(())

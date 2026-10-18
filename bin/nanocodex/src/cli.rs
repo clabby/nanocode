@@ -26,7 +26,9 @@ pub enum Command {
     Runner(RunnerArgs),
     #[command(about = "List saved sessions (current workspace unless --all)")]
     Sessions(SessionsArgs),
-    #[command(about = "Run one prompt without the terminal interface and print the final reply")]
+    #[command(
+        about = "Run one prompt without the terminal interface, streaming the reply to stdout and reasoning summaries and tool calls to stderr"
+    )]
     Exec(SessionArgs),
     #[command(about = "List models per harness with thinking levels and speed tiers")]
     Models,
