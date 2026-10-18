@@ -72,7 +72,69 @@ fn validate_policy(policy: SocketPolicy) -> Result<(), CodeModeHostError> {
     {
         return Err(error("request_timeout exceeds the clock range"));
     }
+    if (policy.request_timeout / 2).is_zero() {
+        return Err(error(
+            "request_timeout must be at least 2ns so the heartbeat can ping every half request_timeout",
+        ));
+    }
     Ok(())
+}
+
+struct Liveness {
+    origin: tokio::time::Instant,
+    last_inbound_us: AtomicU64,
+    probe_us: AtomicU64,
+}
+
+impl Liveness {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            origin: tokio::time::Instant::now(),
+            last_inbound_us: AtomicU64::new(0),
+            probe_us: AtomicU64::new(0),
+        })
+    }
+    fn elapsed_us(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+    fn touch(&self) {
+        self.last_inbound_us
+            .store(self.elapsed_us(), Ordering::Relaxed);
+    }
+    fn probe_sent(&self, started_us: u64) {
+        if self.probe_us.load(Ordering::Relaxed) <= self.last_inbound_us.load(Ordering::Relaxed) {
+            self.probe_us.store(started_us, Ordering::Relaxed);
+        }
+    }
+    fn unanswered_probe_age(&self) -> Option<Duration> {
+        let probe = self.probe_us.load(Ordering::Relaxed);
+        (probe > self.last_inbound_us.load(Ordering::Relaxed))
+            .then(|| Duration::from_micros(self.elapsed_us().saturating_sub(probe)))
+    }
+    async fn watch(&self, window: Duration) {
+        loop {
+            match self.unanswered_probe_age() {
+                Some(age) if age >= window => return,
+                Some(age) => tokio::time::sleep(window - age).await,
+                None => tokio::time::sleep(window).await,
+            }
+        }
+    }
+}
+
+const UNRESPONSIVE: &str =
+    "remote peer did not answer a WebSocket heartbeat ping within half of request_timeout";
+
+async fn read_live<S: Stream<Item = Result<Message, tungstenite::Error>> + Unpin>(
+    socket: &mut S,
+    liveness: &Liveness,
+    watchdog: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+) -> Result<Option<Frame>, CodeModeHostError> {
+    tokio::select! {
+        biased;
+        frame = read(socket, liveness) => frame,
+        () = watchdog => Err(error(UNRESPONSIVE)),
+    }
 }
 
 fn config(policy: SocketPolicy) -> tungstenite::protocol::WebSocketConfig {
@@ -156,9 +218,12 @@ async fn accept(
 
 async fn read<S: Stream<Item = Result<Message, tungstenite::Error>> + Unpin>(
     socket: &mut S,
+    liveness: &Liveness,
 ) -> Result<Option<Frame>, CodeModeHostError> {
     while let Some(message) = socket.next().await {
-        match message.map_err(error)? {
+        let message = message.map_err(error)?;
+        liveness.touch();
+        match message {
             Message::Text(text) => return serde_json::from_str(&text).map(Some).map_err(error),
             Message::Close(_) => return Ok(None),
             Message::Ping(_) | Message::Pong(_) => {}
@@ -194,13 +259,29 @@ impl Drop for Writer {
 fn writer<S: Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static>(
     mut sink: S,
     policy: SocketPolicy,
+    liveness: Arc<Liveness>,
 ) -> (mpsc::UnboundedSender<Frame>, Writer) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            write(&mut sink, frame, policy).await?;
+        let period = policy.request_timeout / 2;
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                frame = rx.recv() => match frame {
+                    Some(frame) => write(&mut sink, frame, policy).await?,
+                    None => return Ok(()),
+                },
+                _ = heartbeat.tick() => {
+                    let started_us = liveness.elapsed_us();
+                    tokio::time::timeout(policy.request_timeout, sink.send(Message::Ping(Default::default())))
+                        .await
+                        .map_err(|_| error("remote write deadline elapsed"))?
+                        .map_err(error)?;
+                    liveness.probe_sent(started_us);
+                }
+            }
         }
-        Ok(())
     });
     (tx, Writer(task))
 }
@@ -231,7 +312,8 @@ impl SocketTransport {
         mut socket: WebSocketStream<S>,
         policy: SocketPolicy,
     ) -> Result<Self, CodeModeHostError> {
-        let catalog = tokio::time::timeout(policy.request_timeout, read(&mut socket))
+        let liveness = Liveness::new();
+        let catalog = tokio::time::timeout(policy.request_timeout, read(&mut socket, &liveness))
             .await
             .map_err(error)??;
         let Some(Frame::Catalog { definitions }) = catalog else {
@@ -246,7 +328,7 @@ impl SocketTransport {
             ))
         })?;
         let (sink, mut socket) = socket.split();
-        let (wire, mut writer) = writer(sink, policy);
+        let (wire, mut writer) = writer(sink, policy, Arc::clone(&liveness));
         let (outgoing, mut incoming) = mpsc::unbounded_channel();
         let client = Arc::new(Client {
             outgoing,
@@ -260,6 +342,8 @@ impl SocketTransport {
         let weak = Arc::downgrade(&client);
         let (closed, mut closed_rx) = oneshot::channel();
         tokio::spawn(async move {
+            let watchdog = liveness.watch(policy.request_timeout / 2);
+            tokio::pin!(watchdog);
             let mut callback_tasks = tokio::task::JoinSet::new();
             let mut callback_aborts =
                 HashMap::<u64, (String, u64, tokio::task::AbortHandle)>::new();
@@ -281,7 +365,7 @@ impl SocketTransport {
                             }, None => return Ok(())
                         },
                         Some(completed) = callback_tasks.join_next(), if !callback_tasks.is_empty() => { if let Ok(id) = completed { callback_aborts.remove(&id); } },
-                        frame = read(&mut socket) => {
+                        frame = read_live(&mut socket, &liveness, watchdog.as_mut()) => {
                             let Some(frame) = frame.map_err(|issue| error(format!("runner connection failed: {issue}")))? else { return Err(error("runner disconnected")); };
                             let Some(client) = weak.upgrade() else { return Ok(()); };
                             match frame {
@@ -853,7 +937,10 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     catalog_runtime.control().cancel().await;
     write(&mut socket, Frame::Catalog { definitions }, policy).await?;
     let (sink, mut socket) = socket.split();
-    let (outgoing, mut writer) = writer(sink, policy);
+    let liveness = Liveness::new();
+    let watchdog = liveness.watch(policy.request_timeout / 2);
+    tokio::pin!(watchdog);
+    let (outgoing, mut writer) = writer(sink, policy, Arc::clone(&liveness));
     let bus = Arc::new(CallbackBus {
         outgoing: outgoing.clone(),
         pending: Mutex::new(HashMap::new()),
@@ -866,7 +953,7 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         loop {
             tokio::select! {
                 result = &mut writer.0 => return result.map_err(error)?,
-                frame = read(&mut socket) => {
+                frame = read_live(&mut socket, &liveness, watchdog.as_mut()) => {
                     let Some(frame) = frame? else { return Ok(()); };
                     match frame {
                         Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.lock().unwrap().remove(&id) { let _ = tx.send(result); } },
