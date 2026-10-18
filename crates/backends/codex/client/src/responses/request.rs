@@ -676,7 +676,7 @@ impl<'a> ResponseCreate<'a> {
                     .then(|| reasoning_mode.request_value())
                     .flatten(),
                 effort: policy.thinking.as_str(),
-                summary: None,
+                summary: "auto",
                 context: "all_turns",
             },
             store: store_responses,
@@ -745,8 +745,7 @@ struct ReasoningControls {
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
     effort: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary: Option<&'static str>,
+    summary: &'static str,
     context: &'static str,
 }
 
