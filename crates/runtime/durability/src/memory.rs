@@ -1,10 +1,19 @@
-use std::{collections::HashMap, future::Future};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, HashMap},
+    future::Future,
+};
 
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(not(target_family = "wasm"))]
 use crate::Error;
-use crate::{OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoredState};
+use crate::{
+    Committed, EventCursor, EventHit, EventHits, EventOrder, EventPage, EventQuery, EventRange,
+    IndexedState, OwnedState, OwnerId, OwnerToken, StateCommit, StateCursor, StatePage, StateQuery,
+    StateReader, StateStore, StateSummary, StoreError, StoreEvent, StoreFuture, StoredEvent,
+    StoredState, SummaryUpdate,
+};
 
 const COMMAND_CAPACITY: usize = 64;
 
@@ -14,18 +23,22 @@ enum Command {
         key: String,
         result: oneshot::Sender<Result<Option<String>, StoreError>>,
     },
+    ReadRecords {
+        state_id: String,
+        keys: Vec<String>,
+        result: oneshot::Sender<Result<Vec<Option<String>>, StoreError>>,
+    },
     AcquireOwner {
         state_id: String,
         owner_id: OwnerId,
         result: oneshot::Sender<Result<OwnedState, StoreError>>,
     },
-    Replace {
+    Commit {
         state_id: String,
         owner: OwnerToken,
         expected_revision: u64,
-        payload: String,
-        records: Vec<crate::StoreRecord>,
-        result: oneshot::Sender<Result<u64, StoreError>>,
+        write: Write,
+        result: oneshot::Sender<Result<Committed, StoreError>>,
     },
     Peek {
         state_id: String,
@@ -35,6 +48,338 @@ enum Command {
         limit: usize,
         result: oneshot::Sender<Result<Vec<String>, StoreError>>,
     },
+    ReadEvents {
+        state_id: String,
+        range: EventRange,
+        result: oneshot::Sender<Result<EventPage, StoreError>>,
+    },
+    QueryStates {
+        query: StateQuery,
+        result: oneshot::Sender<Result<StatePage, StoreError>>,
+    },
+    QueryEvents {
+        query: EventQuery,
+        result: oneshot::Sender<Result<EventHits, StoreError>>,
+    },
+}
+
+struct Write {
+    payload: String,
+    records: Vec<crate::StoreRecord>,
+    events: Vec<StoreEvent>,
+    summary: SummaryUpdate,
+}
+
+#[derive(Default)]
+struct Tables {
+    records: HashMap<(String, String), String>,
+    states: HashMap<String, StoredState>,
+    owners: HashMap<String, OwnerToken>,
+    created: Vec<String>,
+    events: HashMap<String, Vec<StoredEvent>>,
+    summaries: HashMap<String, (u64, Option<StateSummary>)>,
+}
+
+impl Tables {
+    fn acquire(&mut self, state_id: String, owner_id: OwnerId) -> Result<OwnedState, StoreError> {
+        let fence = self
+            .owners
+            .get(&state_id)
+            .map_or(Some(1), |owner| owner.fence().checked_add(1))
+            .ok_or_else(|| {
+                StoreError::NotCommitted("in-memory durability owner fence overflow".to_owned())
+            })?;
+        let owner = OwnerToken::new(owner_id, fence);
+        self.owners.insert(state_id.clone(), owner.clone());
+        Ok(OwnedState {
+            owner,
+            state: self.states.get(&state_id).cloned().unwrap_or_default(),
+        })
+    }
+
+    fn commit(
+        &mut self,
+        state_id: &str,
+        owner: &OwnerToken,
+        expected_revision: u64,
+        write: Write,
+    ) -> Result<Committed, StoreError> {
+        let Write {
+            payload,
+            records,
+            events,
+            summary,
+        } = write;
+        if self.owners.get(state_id) != Some(owner) {
+            return Err(StoreError::Fenced);
+        }
+        let current = self.states.get(state_id).map_or(0, |state| state.revision);
+        if current != expected_revision {
+            return Err(StoreError::Conflict {
+                expected: expected_revision,
+                actual: current,
+            });
+        }
+        let revision = current.checked_add(1).ok_or_else(|| {
+            StoreError::NotCommitted("in-memory durability revision overflow".to_owned())
+        })?;
+        let mut staged = HashMap::new();
+        for record in &records {
+            let retained = self
+                .records
+                .get(&(state_id.to_owned(), record.key.clone()))
+                .or_else(|| staged.get(&record.key).copied());
+            if retained.is_some_and(|value| value != &record.value) {
+                return Err(StoreError::NotCommitted(format!(
+                    "durability record `{}` has conflicting content",
+                    record.key
+                )));
+            }
+            staged.insert(record.key.clone(), &record.value);
+        }
+        let first_event = self
+            .events
+            .get(state_id)
+            .and_then(|events| events.last())
+            .map_or(Some(1), |last| last.seq.checked_add(1))
+            .filter(|first| first.checked_add(events.len() as u64).is_some())
+            .ok_or_else(|| {
+                StoreError::NotCommitted("in-memory durability event sequence overflow".to_owned())
+            })?;
+        drop(staged);
+        for record in records {
+            self.records
+                .entry((state_id.to_owned(), record.key))
+                .or_insert(record.value);
+        }
+        let state = self.states.entry(state_id.to_owned()).or_default();
+        if state.payload.is_none() {
+            self.created.push(state_id.to_owned());
+        }
+        state.payload = Some(payload);
+        state.revision = revision;
+        let appended = !events.is_empty();
+        self.events.entry(state_id.to_owned()).or_default().extend(
+            (first_event..).zip(events).map(|(seq, event)| StoredEvent {
+                seq,
+                revision,
+                event,
+            }),
+        );
+        match summary {
+            SummaryUpdate::Unchanged => {}
+            SummaryUpdate::Set(summary) => {
+                self.summaries
+                    .insert(state_id.to_owned(), (revision, Some(summary)));
+            }
+            SummaryUpdate::Remove => {
+                self.summaries.insert(state_id.to_owned(), (revision, None));
+            }
+        }
+        Ok(Committed {
+            revision,
+            first_event: appended.then_some(first_event),
+        })
+    }
+
+    fn read_events(&self, state_id: &str, range: &EventRange) -> EventPage {
+        if range.limit == 0 {
+            return EventPage::default();
+        }
+        let events = self.events.get(state_id).map_or(&[][..], Vec::as_slice);
+        let start = range.after.map_or(0, |after| {
+            events.partition_point(|event| event.seq <= after)
+        });
+        let end = range.before.map_or(events.len(), |before| {
+            events.partition_point(|event| event.seq < before)
+        });
+        let matching = events
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .filter(|event| matches_kind(&range.kinds, &event.event));
+        let mut events: Vec<&StoredEvent> = match range.order {
+            EventOrder::Ascending => matching.take(range.limit.saturating_add(1)).collect(),
+            EventOrder::Descending => matching.rev().take(range.limit.saturating_add(1)).collect(),
+        };
+        let more = events.len() > range.limit;
+        events.truncate(range.limit);
+        EventPage {
+            next: more.then(|| events.last().map(|event| event.seq)).flatten(),
+            events: events.into_iter().cloned().collect(),
+        }
+    }
+
+    fn query_states(&self, query: &StateQuery) -> StatePage {
+        if query.limit == 0 {
+            return StatePage::default();
+        }
+        let after = query
+            .after
+            .as_ref()
+            .map(|after| (after.updated_at_ms, after.state_id.as_str()));
+        let states = self
+            .summaries
+            .iter()
+            .filter_map(|(state_id, (revision, summary))| {
+                let summary = summary.as_ref()?;
+                let cursor = (summary.updated_at_ms, state_id.as_str());
+                let listed = after.is_none_or(|after| cursor < after)
+                    && matches_value(query.scope.as_ref(), summary.scope.as_ref())
+                    && matches_value(query.parent.as_ref(), summary.parent.as_ref())
+                    && query
+                        .attributes
+                        .iter()
+                        .all(|(key, value)| summary.attributes.get(key) == Some(value))
+                    && (query.text.is_empty()
+                        || matches_text(&query.text, summary.title.as_deref())
+                        || matches_text(&query.text, summary.preview.as_deref())
+                        || self.events.get(state_id).is_some_and(|events| {
+                            events
+                                .iter()
+                                .any(|event| matches_text(&query.text, event.event.text.as_deref()))
+                        }));
+                listed.then_some((cursor, (*revision, summary)))
+            });
+        let (states, more) = newest(states, query.limit);
+        StatePage {
+            next: more
+                .then(|| {
+                    states
+                        .last()
+                        .map(|((updated_at_ms, state_id), _)| StateCursor {
+                            updated_at_ms: *updated_at_ms,
+                            state_id: (*state_id).to_owned(),
+                        })
+                })
+                .flatten(),
+            states: states
+                .into_iter()
+                .map(|((_, state_id), (revision, summary))| IndexedState {
+                    state_id: state_id.to_owned(),
+                    revision,
+                    summary: summary.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn query_events(&self, query: &EventQuery) -> EventHits {
+        if query.limit == 0 {
+            return EventHits::default();
+        }
+        let after = query
+            .after
+            .as_ref()
+            .map(|after| (after.at_ms, after.state_id.as_str(), after.seq));
+        let hits = self
+            .summaries
+            .iter()
+            .filter_map(|(state_id, (_, summary))| Some((state_id, summary.as_ref()?)))
+            .filter(|(state_id, summary)| {
+                matches_value(query.state_id.as_ref(), Some(*state_id))
+                    && matches_value(query.scope.as_ref(), summary.scope.as_ref())
+            })
+            .flat_map(|(state_id, _)| {
+                self.events
+                    .get(state_id)
+                    .into_iter()
+                    .flatten()
+                    .map(move |event| ((event.event.at_ms, state_id.as_str(), event.seq), event))
+            })
+            .filter(|(cursor, event)| {
+                after.is_none_or(|after| *cursor < after)
+                    && matches_kind(&query.kinds, &event.event)
+                    && (query.text.is_empty()
+                        || matches_text(&query.text, event.event.text.as_deref()))
+            });
+        let (hits, more) = newest(hits, query.limit);
+        EventHits {
+            next: more
+                .then(|| {
+                    hits.last().map(|((at_ms, state_id, seq), _)| EventCursor {
+                        at_ms: *at_ms,
+                        state_id: (*state_id).to_owned(),
+                        seq: *seq,
+                    })
+                })
+                .flatten(),
+            hits: hits
+                .into_iter()
+                .map(|((_, state_id, _), event)| EventHit {
+                    state_id: state_id.to_owned(),
+                    event: event.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+struct Ranked<K, V>(K, V);
+
+impl<K: Ord, V> PartialEq for Ranked<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<K: Ord, V> Eq for Ranked<K, V> {}
+
+impl<K: Ord, V> PartialOrd for Ranked<K, V> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K: Ord, V> Ord for Ranked<K, V> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+fn newest<K: Ord, V>(items: impl Iterator<Item = (K, V)>, limit: usize) -> (Vec<(K, V)>, bool) {
+    let mut kept = BinaryHeap::new();
+    let mut more = false;
+    for (key, value) in items {
+        if kept.len() == limit {
+            more = true;
+            if kept
+                .peek()
+                .is_some_and(|Reverse(Ranked(oldest, _))| *oldest >= key)
+            {
+                continue;
+            }
+            kept.pop();
+        }
+        kept.push(Reverse(Ranked(key, value)));
+    }
+    let page = kept
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse(Ranked(key, value))| (key, value))
+        .collect();
+    (page, more)
+}
+
+fn matches_value(expected: Option<&String>, actual: Option<&String>) -> bool {
+    expected.is_none_or(|expected| actual == Some(expected))
+}
+
+fn matches_kind(kinds: &[String], event: &StoreEvent) -> bool {
+    kinds.is_empty() || kinds.contains(&event.kind)
+}
+
+fn matches_text(patterns: &[String], text: Option<&str>) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    patterns.iter().any(|pattern| {
+        pattern.is_empty()
+            || text
+                .as_bytes()
+                .windows(pattern.len())
+                .any(|window| window.eq_ignore_ascii_case(pattern.as_bytes()))
+    })
 }
 
 #[derive(Clone)]
@@ -46,10 +391,7 @@ impl MemoryStore {
     pub fn new() -> crate::Result<Self> {
         let (commands, mut receiver) = mpsc::channel(COMMAND_CAPACITY);
         let driver = async move {
-            let mut records = HashMap::<(String, String), String>::new();
-            let mut states = HashMap::<String, StoredState>::new();
-            let mut owners = HashMap::<String, OwnerToken>::new();
-            let mut created = Vec::<String>::new();
+            let mut tables = Tables::default();
             while let Some(command) = receiver.recv().await {
                 match command {
                     Command::ReadRecord {
@@ -57,100 +399,81 @@ impl MemoryStore {
                         key,
                         result,
                     } => {
-                        drop(result.send(Ok(records.get(&(state_id, key)).cloned())));
+                        drop(result.send(Ok(tables.records.get(&(state_id, key)).cloned())));
                     }
-
+                    Command::ReadRecords {
+                        state_id,
+                        keys,
+                        result,
+                    } => {
+                        drop(
+                            result.send(Ok(keys
+                                .into_iter()
+                                .map(|key| tables.records.get(&(state_id.clone(), key)).cloned())
+                                .collect())),
+                        );
+                    }
                     Command::AcquireOwner {
                         state_id,
                         owner_id,
                         result,
                     } => {
-                        let fence = owners
-                            .get(&state_id)
-                            .map_or(Some(1), |owner| owner.fence().checked_add(1));
-                        let outcome = fence
-                            .ok_or_else(|| {
-                                StoreError::NotCommitted(
-                                    "in-memory durability owner fence overflow".to_owned(),
-                                )
-                            })
-                            .map(|fence| {
-                                let owner = OwnerToken::new(owner_id, fence);
-                                owners.insert(state_id.clone(), owner.clone());
-                                OwnedState {
-                                    owner,
-                                    state: states.get(&state_id).cloned().unwrap_or_default(),
-                                }
-                            });
-                        drop(result.send(outcome));
+                        drop(result.send(tables.acquire(state_id, owner_id)));
                     }
-                    Command::Replace {
+                    Command::Commit {
                         state_id,
                         owner,
                         expected_revision,
-                        payload,
-                        records: new_records,
+                        write,
                         result,
                     } => {
-                        let outcome = if owners.get(&state_id) != Some(&owner) {
-                            Err(StoreError::Fenced)
-                        } else {
-                            let state = states.entry(state_id.clone()).or_default();
-                            if state.revision != expected_revision {
-                                Err(StoreError::Conflict {
-                                    expected: expected_revision,
-                                    actual: state.revision,
-                                })
-                            } else {
-                                match state.revision.checked_add(1) {
-                                    Some(revision) => {
-                                        let mut staged = HashMap::new();
-                                        let conflict = new_records.iter().find(|record| {
-                                            let retained = records
-                                                .get(&(state_id.clone(), record.key.clone()))
-                                                .or_else(|| staged.get(&record.key).copied());
-                                            let conflict = retained
-                                                .is_some_and(|value| value != &record.value);
-                                            staged.insert(record.key.clone(), &record.value);
-                                            conflict
-                                        });
-                                        if let Some(record) = conflict {
-                                            drop(result.send(Err(StoreError::NotCommitted(format!(
-                                                "durability record `{}` has conflicting content", record.key
-                                            )))));
-                                            continue;
-                                        }
-                                        for record in new_records {
-                                            records
-                                                .entry((state_id.clone(), record.key))
-                                                .or_insert(record.value);
-                                        }
-                                        if state.payload.is_none() {
-                                            created.push(state_id.clone());
-                                        }
-                                        state.payload = Some(payload);
-                                        state.revision = revision;
-                                        Ok(revision)
-                                    }
-                                    None => Err(StoreError::NotCommitted(
-                                        "in-memory durability revision overflow".to_owned(),
-                                    )),
-                                }
-                            }
-                        };
-                        drop(result.send(outcome));
+                        drop(result.send(tables.commit(
+                            &state_id,
+                            &owner,
+                            expected_revision,
+                            write,
+                        )));
                     }
                     Command::Peek { state_id, result } => {
-                        drop(result.send(Ok(states.get(&state_id).cloned().unwrap_or_default())));
+                        drop(result.send(Ok(
+                            tables.states.get(&state_id).cloned().unwrap_or_default(),
+                        )));
                     }
                     Command::ListStates { limit, result } => {
-                        drop(result.send(Ok(created.iter().rev().take(limit).cloned().collect())));
+                        drop(result.send(Ok(
+                            tables.created.iter().rev().take(limit).cloned().collect(),
+                        )));
+                    }
+                    Command::ReadEvents {
+                        state_id,
+                        range,
+                        result,
+                    } => {
+                        drop(result.send(Ok(tables.read_events(&state_id, &range))));
+                    }
+                    Command::QueryStates { query, result } => {
+                        drop(result.send(Ok(tables.query_states(&query))));
+                    }
+                    Command::QueryEvents { query, result } => {
+                        drop(result.send(Ok(tables.query_events(&query))));
                     }
                 }
             }
         };
         spawn_driver(driver)?;
         Ok(Self { commands })
+    }
+
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> Command,
+    ) -> Result<T, StoreError> {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(command(result))
+            .await
+            .map_err(|_| stopped())?;
+        receiver.await.map_err(|_| stopped())?
     }
 }
 
@@ -160,18 +483,11 @@ impl StateStore for MemoryStore {
         state_id: &'a str,
         key: &'a str,
     ) -> StoreFuture<'a, Result<Option<String>, StoreError>> {
-        Box::pin(async move {
-            let (result, receiver) = oneshot::channel();
-            self.commands
-                .send(Command::ReadRecord {
-                    state_id: state_id.to_owned(),
-                    key: key.to_owned(),
-                    result,
-                })
-                .await
-                .map_err(|_| stopped())?;
-            receiver.await.map_err(|_| stopped())?
-        })
+        Box::pin(self.request(|result| Command::ReadRecord {
+            state_id: state_id.to_owned(),
+            key: key.to_owned(),
+            result,
+        }))
     }
 
     fn acquire<'a>(
@@ -179,18 +495,11 @@ impl StateStore for MemoryStore {
         state_id: &'a str,
         owner_id: OwnerId,
     ) -> StoreFuture<'a, Result<OwnedState, StoreError>> {
-        Box::pin(async move {
-            let (result, receiver) = oneshot::channel();
-            self.commands
-                .send(Command::AcquireOwner {
-                    state_id: state_id.to_owned(),
-                    owner_id,
-                    result,
-                })
-                .await
-                .map_err(|_| stopped())?;
-            receiver.await.map_err(|_| stopped())?
-        })
+        Box::pin(self.request(|result| Command::AcquireOwner {
+            state_id: state_id.to_owned(),
+            owner_id,
+            result,
+        }))
     }
 
     fn replace<'a>(
@@ -202,51 +511,124 @@ impl StateStore for MemoryStore {
         records: &'a [crate::StoreRecord],
     ) -> StoreFuture<'a, Result<u64, StoreError>> {
         Box::pin(async move {
-            let (result, receiver) = oneshot::channel();
-            self.commands
-                .send(Command::Replace {
+            let committed = self
+                .request(|result| Command::Commit {
                     state_id: state_id.to_owned(),
                     owner: owner.clone(),
                     expected_revision,
-                    payload: payload.to_owned(),
-                    records: records.to_vec(),
+                    write: Write {
+                        payload: payload.to_owned(),
+                        records: records.to_vec(),
+                        events: Vec::new(),
+                        summary: SummaryUpdate::Unchanged,
+                    },
                     result,
                 })
-                .await
-                .map_err(|_| stopped())?;
-            receiver.await.map_err(|_| stopped())?
+                .await?;
+            Ok(committed.revision)
         })
+    }
+
+    fn supports_events(&self) -> bool {
+        true
+    }
+
+    fn supports_summaries(&self) -> bool {
+        true
+    }
+
+    fn commit<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        owner: &'a OwnerToken,
+        expected_revision: u64,
+        commit: StateCommit<'a>,
+    ) -> StoreFuture<'a, Result<Committed, StoreError>> {
+        Box::pin(self.request(move |result| Command::Commit {
+            state_id: state_id.to_owned(),
+            owner: owner.clone(),
+            expected_revision,
+            write: Write {
+                payload: commit.payload.to_owned(),
+                records: commit.records.to_vec(),
+                events: commit.events.to_vec(),
+                summary: commit.summary.clone(),
+            },
+            result,
+        }))
     }
 
     fn peek<'a>(
         &'a mut self,
         state_id: &'a str,
     ) -> StoreFuture<'a, Result<StoredState, StoreError>> {
-        Box::pin(async move {
-            let (result, receiver) = oneshot::channel();
-            self.commands
-                .send(Command::Peek {
-                    state_id: state_id.to_owned(),
-                    result,
-                })
-                .await
-                .map_err(|_| stopped())?;
-            receiver.await.map_err(|_| stopped())?
-        })
+        Box::pin(self.request(|result| Command::Peek {
+            state_id: state_id.to_owned(),
+            result,
+        }))
     }
 
     fn list_states<'a>(
         &'a mut self,
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
-        Box::pin(async move {
-            let (result, receiver) = oneshot::channel();
-            self.commands
-                .send(Command::ListStates { limit, result })
-                .await
-                .map_err(|_| stopped())?;
-            receiver.await.map_err(|_| stopped())?
-        })
+        Box::pin(self.request(move |result| Command::ListStates { limit, result }))
+    }
+}
+
+impl StateReader for MemoryStore {
+    fn read_state<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<StoredState, StoreError>> {
+        Box::pin(self.request(|result| Command::Peek {
+            state_id: state_id.to_owned(),
+            result,
+        }))
+    }
+
+    fn read_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        keys: &'a [String],
+    ) -> StoreFuture<'a, Result<Vec<Option<String>>, StoreError>> {
+        Box::pin(self.request(|result| Command::ReadRecords {
+            state_id: state_id.to_owned(),
+            keys: keys.to_vec(),
+            result,
+        }))
+    }
+
+    fn read_events<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        range: &'a EventRange,
+    ) -> StoreFuture<'a, Result<EventPage, StoreError>> {
+        Box::pin(self.request(|result| Command::ReadEvents {
+            state_id: state_id.to_owned(),
+            range: range.clone(),
+            result,
+        }))
+    }
+
+    fn query_states<'a>(
+        &'a mut self,
+        query: &'a StateQuery,
+    ) -> StoreFuture<'a, Result<StatePage, StoreError>> {
+        Box::pin(self.request(|result| Command::QueryStates {
+            query: query.clone(),
+            result,
+        }))
+    }
+
+    fn query_events<'a>(
+        &'a mut self,
+        query: &'a EventQuery,
+    ) -> StoreFuture<'a, Result<EventHits, StoreError>> {
+        Box::pin(self.request(|result| Command::QueryEvents {
+            query: query.clone(),
+            result,
+        }))
     }
 }
 
