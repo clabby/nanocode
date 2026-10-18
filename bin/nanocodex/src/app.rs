@@ -28,7 +28,7 @@ use nanocode_tui::{
     queue::{Queue, QueueKind, QueueState, QueuedPrompt},
     scheduler::RenderScheduler,
     spinner::Spinner,
-    terminal::TerminalSession,
+    terminal::{SelectionEvent, TerminalSession},
     theme::Theme,
     transcript::{CellKind, NoticeLevel, ToolStatus, Transcript, TranscriptPolicy},
     tree::{AgentTree, NodeStatus},
@@ -1382,7 +1382,7 @@ impl App {
                     let enabled = !terminal.mouse_capture();
                     drop(terminal.set_mouse_capture(enabled));
                     self.flash(if enabled {
-                        "mouse scrolling on"
+                        "mouse scrolling and drag-to-copy on"
                     } else {
                         "mouse scrolling off (native selection)"
                     });
@@ -1407,20 +1407,35 @@ impl App {
                 }
                 true
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::Down(_) => self.click_pane(mouse.column, mouse.row),
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    let transcript = self.transcript_at(mouse.column, mouse.row);
-                    let previous = transcript.scroll_offset();
-                    if mouse.kind == MouseEventKind::ScrollUp {
-                        transcript.scroll_up(3);
-                    } else {
-                        transcript.scroll_down(3);
+            Event::Mouse(mouse) => {
+                let selected = match terminal.select(mouse) {
+                    SelectionEvent::Ignored => false,
+                    SelectionEvent::Changed => true,
+                    SelectionEvent::Copied(_) => {
+                        self.flash("copied the selection to the clipboard");
+                        true
                     }
-                    transcript.scroll_offset() != previous
-                }
-                _ => false,
-            },
+                    SelectionEvent::Failed(error) => {
+                        self.flash(format!("copy failed: {error}"));
+                        true
+                    }
+                };
+                let handled = match mouse.kind {
+                    MouseEventKind::Down(_) => self.click_pane(mouse.column, mouse.row),
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let transcript = self.transcript_at(mouse.column, mouse.row);
+                        let previous = transcript.scroll_offset();
+                        if mouse.kind == MouseEventKind::ScrollUp {
+                            transcript.scroll_up(3);
+                        } else {
+                            transcript.scroll_down(3);
+                        }
+                        transcript.scroll_offset() != previous
+                    }
+                    _ => false,
+                };
+                selected || handled
+            }
             Event::Resize(..) => true,
             _ => false,
         }

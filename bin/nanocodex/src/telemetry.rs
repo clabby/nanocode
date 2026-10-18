@@ -47,6 +47,8 @@ pub fn input_span(event: &Event) -> Span {
             MouseEventKind::ScrollUp => "scroll_up",
             MouseEventKind::ScrollDown => "scroll_down",
             MouseEventKind::Down(_) => "pane_click",
+            MouseEventKind::Drag(_) => "select",
+            MouseEventKind::Up(_) => "release",
             _ => "mouse",
         },
         Event::Resize(..) => "resize",

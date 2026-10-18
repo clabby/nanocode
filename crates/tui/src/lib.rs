@@ -14,6 +14,7 @@ pub mod overlay;
 pub mod picker;
 pub mod queue;
 pub mod scheduler;
+mod selection;
 pub mod spinner;
 pub mod terminal;
 mod text;

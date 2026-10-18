@@ -11,7 +11,8 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute, queue,
     style::{Attribute, SetAttribute},
@@ -26,6 +27,8 @@ use ratatui::{
     layout::{Position, Rect},
     style::Color,
 };
+
+use crate::selection::Selection;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static MODES: AtomicU8 = AtomicU8::new(0);
@@ -53,6 +56,7 @@ pub struct Canvas<'a> {
     area: Rect,
     buffer: &'a mut Buffer,
     cursor: Option<Position>,
+    regions: &'a mut Vec<Rect>,
 }
 
 impl Canvas<'_> {
@@ -68,6 +72,10 @@ impl Canvas<'_> {
     pub fn set_cursor_position(&mut self, position: impl Into<Position>) {
         self.cursor = Some(position.into());
     }
+
+    pub fn selectable(&mut self, area: Rect) {
+        self.regions.push(area.intersection(self.area));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -78,6 +86,14 @@ pub struct FrameStats {
     pub bytes: u64,
 }
 
+#[derive(Debug)]
+pub enum SelectionEvent {
+    Ignored,
+    Changed,
+    Copied(String),
+    Failed(io::Error),
+}
+
 pub struct TerminalSession {
     output: Stdout,
     previous: Buffer,
@@ -86,9 +102,12 @@ pub struct TerminalSession {
     cursor: Option<Position>,
     bytes: Vec<u8>,
     truecolor: bool,
+    monochrome: bool,
     stats: FrameStats,
     options: TerminalOptions,
     active: bool,
+    regions: Vec<Rect>,
+    selection: Option<Selection>,
 }
 
 impl TerminalSession {
@@ -108,9 +127,12 @@ impl TerminalSession {
             cursor: None,
             bytes: Vec::new(),
             truecolor: truecolor(),
+            monochrome: crossterm::style::Colored::ansi_color_disabled_memoized(),
             stats: FrameStats::default(),
             options,
             active: true,
+            regions: Vec::new(),
+            selection: None,
         })
     }
 
@@ -131,17 +153,30 @@ impl TerminalSession {
             self.previous = Buffer::empty(area);
             self.current = Buffer::empty(area);
             self.stale = true;
+            self.selection = None;
         }
         span.record("repaint", self.stale);
         self.current.reset();
+        self.regions.clear();
+        self.regions.push(area);
         let mut canvas = Canvas {
             area,
             buffer: &mut self.current,
             cursor: None,
+            regions: &mut self.regions,
         };
         render(&mut canvas);
         let cursor = canvas.cursor.filter(|position| area.contains(*position));
-        if !self.truecolor {
+        if let Some(selection) = &mut self.selection
+            && selection.rebind(&self.regions)
+        {
+            selection.highlight(&mut self.current);
+        } else {
+            self.selection = None;
+        }
+        if self.monochrome {
+            monochrome(&mut self.current);
+        } else if !self.truecolor {
             downsample(&mut self.current);
         }
         if self.stale {
@@ -214,6 +249,7 @@ impl TerminalSession {
         if self.active {
             restore(&mut self.output);
             self.active = false;
+            self.selection = None;
         }
         Ok(())
     }
@@ -240,11 +276,80 @@ impl TerminalSession {
         } else {
             execute!(self.output, DisableMouseCapture)?;
             MODES.fetch_and(!MOUSE, Ordering::AcqRel);
+            self.selection = None;
         }
         Ok(())
     }
 
+    pub fn select(&mut self, mouse: MouseEvent) -> SelectionEvent {
+        let position = Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let visible = self.selection.is_some_and(|selection| selection.active());
+                self.selection = Selection::begin(&self.regions, position);
+                if visible {
+                    SelectionEvent::Changed
+                } else {
+                    SelectionEvent::Ignored
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left)
+                if self
+                    .selection
+                    .as_mut()
+                    .is_some_and(|selection| selection.extend(position)) =>
+            {
+                SelectionEvent::Changed
+            }
+            MouseEventKind::Up(_) => match self.selection.take() {
+                Some(selection) if selection.active() => {
+                    let text = selection.text(&self.previous);
+                    if text.is_empty() {
+                        return SelectionEvent::Changed;
+                    }
+                    match self.copy(&text) {
+                        Ok(()) => SelectionEvent::Copied(text),
+                        Err(error) => SelectionEvent::Failed(error),
+                    }
+                }
+                _ => SelectionEvent::Ignored,
+            },
+            MouseEventKind::Moved => match self.selection.take() {
+                Some(selection) if selection.active() => SelectionEvent::Changed,
+                _ => SelectionEvent::Ignored,
+            },
+            _ => SelectionEvent::Ignored,
+        }
+    }
+
     pub fn copy(&mut self, text: &str) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if !["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"]
+            .into_iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+        {
+            use std::process::{Command, Stdio};
+
+            let mut child = Command::new("pbcopy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let written = child
+                .stdin
+                .take()
+                .expect("pbcopy stdin is piped")
+                .write_all(text.as_bytes());
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                return Err(io::Error::other(format!(
+                    "pbcopy exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            return written;
+        }
         execute!(
             self.output,
             crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
@@ -275,6 +380,13 @@ fn truecolor() -> bool {
         let value = value.to_ascii_lowercase();
         value.contains("truecolor") || value.contains("24bit")
     })
+}
+
+fn monochrome(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        cell.fg = Color::Reset;
+        cell.bg = Color::Reset;
+    }
 }
 
 fn downsample(buffer: &mut Buffer) {

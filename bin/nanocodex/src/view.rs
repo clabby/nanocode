@@ -18,7 +18,7 @@ use crate::app::{App, Overlay, TurnState};
 
 pub const STATUS_VISIBLE: Duration = Duration::from_secs(4);
 
-pub const BINDINGS: [Binding; 32] = [
+pub const BINDINGS: [Binding; 33] = [
     Binding {
         keys: "enter",
         action: "send · queue while a turn runs",
@@ -102,6 +102,10 @@ pub const BINDINGS: [Binding; 32] = [
     Binding {
         keys: "pgup / pgdn · wheel",
         action: "scroll the transcript",
+    },
+    Binding {
+        keys: "drag",
+        action: "select text · release copies it to the clipboard",
     },
     Binding {
         keys: "ctrl+home / ctrl+end",
@@ -264,7 +268,11 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
         Some(Overlay::Picker(_, picker)) => picker.render(area, frame.buffer_mut(), &theme),
         Some(Overlay::Help) => keybindings::render(&BINDINGS, area, frame.buffer_mut(), &theme),
         Some(Overlay::Dial { dial, .. }) => dial.render(area, frame.buffer_mut(), &theme),
-        None => {}
+        None => {
+            frame.selectable(app.panes.main_area);
+            frame.selectable(app.panes.side_area);
+            frame.selectable(inner);
+        }
     }
 }
 
