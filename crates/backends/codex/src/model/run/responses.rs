@@ -7,6 +7,8 @@ struct RecordedModelResult {
     connection_generation: u32,
     server_reasoning_included: bool,
     duration_ns: u64,
+    #[serde(default)]
+    preparation_ns: Option<u64>,
 }
 
 pub(super) struct ModelCallOutcome {
@@ -42,17 +44,19 @@ impl ModelRun {
                 previous_response_id,
             },
         )?;
-        let request = factory.generation(
-            call_index,
-            &request_history,
-            model,
-            conversation.reasoning.request_effort(
+        let request = factory
+            .generation(
+                call_index,
+                &request_history,
                 model,
-                thinking,
-                self.config.supports_reasoning_effort_updates(model),
-            ),
-            service_tier,
-        );
+                conversation.reasoning.request_effort(
+                    model,
+                    thinking,
+                    self.config.supports_reasoning_effort_updates(model),
+                ),
+                service_tier,
+            )
+            .with_model_call_started_at(started_at);
         let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = model_call_span(
             call_index,
@@ -83,9 +87,11 @@ impl ModelRun {
         } else {
             None
         };
+        let replayed = recovered.is_some();
         let (recorded_result, transport_continuation_valid) = if let Some(output) = recovered {
             (output, false)
         } else {
+            let preparation_ns = elapsed_ns(started_at);
             let success = match self.client.execute(request).instrument(span.clone()).await {
                 Ok(success) => success,
                 Err(error) => {
@@ -115,6 +121,7 @@ impl ModelRun {
                 connection_generation,
                 server_reasoning_included,
                 duration_ns: elapsed_ns(started_at),
+                preparation_ns: Some(preparation_ns),
             };
             validate_provider_response_id(&output.response.id)?;
             if let Some(steps) = &execution_steps {
@@ -128,6 +135,7 @@ impl ModelRun {
             connection_generation,
             server_reasoning_included,
             duration_ns,
+            preparation_ns,
         } = recorded_result;
         validate_provider_response_id(&response.id)?;
         record_model_response(&span, &response);
@@ -156,6 +164,13 @@ impl ModelRun {
                 time_to_first_output_ns: response.time_to_first_output_ns,
                 tool_calls: response.code_calls.len(),
                 usage: response.usage.as_ref(),
+                timing: ModelCallTiming::new(
+                    replayed,
+                    preparation_ns,
+                    duration_ns,
+                    &response.timing,
+                    &response.pipeline_stats,
+                ),
             },
         )?;
         Ok(ModelCallOutcome {

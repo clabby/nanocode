@@ -64,21 +64,27 @@ pub(crate) async fn run(
     )
     .await
     .map_err(|error| ResponsesServiceError::responses(error, FailurePhase::Send, 0))?;
+    let response_headers_ns = request.model_call_started_at.map(elapsed_ns);
     connection.observe_turn_state(metadata.turn_state.as_deref());
     let send_duration_ns = elapsed_ns(send_started_at);
     span.record("request.send.duration_ns", send_duration_ns);
     let output = match request.kind {
-        ResponsesAttemptKind::Generation => ResponsesOutput::Generation(
-            stream::receive(
+        ResponsesAttemptKind::Generation => {
+            let mut output = stream::receive(
                 &mut response,
                 transport,
                 &request.observer,
                 &connection.credentials,
                 required_call_index(request)?,
                 started_at,
+                request.model_call_started_at,
             )
-            .await?,
-        ),
+            .await?;
+            output.timing.encode_ns = Some(encode_duration_ns);
+            output.timing.send_ns = Some(send_duration_ns);
+            output.timing.response_headers_ns = response_headers_ns;
+            ResponsesOutput::Generation(output)
+        }
         ResponsesAttemptKind::Compaction => ResponsesOutput::Compaction(
             stream::receive_compaction(
                 &mut response,

@@ -76,7 +76,11 @@ pub(super) fn install(
     }));
     for definition in flatten(runtime.model_specs(handle.session_id())) {
         let strict = match &definition {
-            RuntimeDefinition::Function { strict: true, .. } => Some(true),
+            RuntimeDefinition::Function {
+                strict: true,
+                parameters,
+                ..
+            } if !recursive_schema(parameters.as_value()) => Some(true),
             _ => None,
         };
         let output_schema = definition.output_schema().cloned();
@@ -382,4 +386,36 @@ fn block(item: ToolOutputContent) -> Value {
             "text": serde_json::to_string(&other).unwrap_or_default(),
         }),
     }
+}
+
+fn recursive_schema(schema: &Value) -> bool {
+    fn visit(value: &Value, root: &Value, references: &mut Vec<String>) -> bool {
+        match value {
+            Value::Object(object) => {
+                if let Some(reference) = object.get("$ref").and_then(Value::as_str)
+                    && let Some(pointer) = reference.strip_prefix('#')
+                    && let Some(target) = root.pointer(pointer)
+                {
+                    if references.iter().any(|active| active == reference) {
+                        return true;
+                    }
+                    references.push(reference.to_owned());
+                    let recursive = visit(target, root, references);
+                    references.pop();
+                    if recursive {
+                        return true;
+                    }
+                }
+                object.iter().any(|(key, value)| {
+                    !matches!(
+                        key.as_str(),
+                        "$defs" | "definitions" | "const" | "enum" | "default" | "examples"
+                    ) && visit(value, root, references)
+                })
+            }
+            Value::Array(values) => values.iter().any(|value| visit(value, root, references)),
+            _ => false,
+        }
+    }
+    visit(schema, schema, &mut Vec::new())
 }

@@ -504,6 +504,7 @@ pub struct ClaudeBuilder {
     max_tokens: Option<u32>,
     effort: Option<crate::Effort>,
     thinking_explicit: bool,
+    thinking_disabled: bool,
     automatic_cache: bool,
     cache_one_hour: bool,
     adaptive_thinking: bool,
@@ -547,7 +548,7 @@ impl ClaudeBuilder {
 
     pub(crate) fn durable_initial_settings(&self) -> Result<nanocode_durability::InitialSettings> {
         Ok(nanocode_durability::InitialSettings {
-            thinking: if self.thinking_explicit || self.effort.is_some() {
+            thinking: if self.thinking_explicit || self.thinking_disabled || self.effort.is_some() {
                 effort_thinking(self.effort)
             } else {
                 self.claude
@@ -570,6 +571,7 @@ impl ClaudeBuilder {
             max_tokens: None,
             effort: None,
             thinking_explicit: false,
+            thinking_disabled: false,
             automatic_cache: true,
             cache_one_hour: false,
             adaptive_thinking: false,
@@ -654,10 +656,11 @@ impl ClaudeBuilder {
         }
 
         if let Some(snapshot) = &restored
-            && (snapshot.effort.is_some() || snapshot.fast_mode)
+            && (snapshot.effort.is_some() || snapshot.thinking_disabled || snapshot.fast_mode)
         {
             if let Ok(model) = self.claude.model.parse::<ModelSelection>()
-                && (!model.supports_thinking(effort_thinking(snapshot.effort))
+                && (((snapshot.effort.is_some() || snapshot.thinking_disabled)
+                    && !model.supports_thinking(effort_thinking(snapshot.effort)))
                     || (snapshot.fast_mode && !model.supports_fast_mode()))
             {
                 return Err(NanocodexError::InvalidCheckpoint(format!(
@@ -666,6 +669,7 @@ impl ClaudeBuilder {
             }
             self.effort = snapshot.effort;
             self.adaptive_thinking = snapshot.effort.is_some();
+            self.thinking_disabled = snapshot.thinking_disabled;
             self.fast_mode = snapshot.fast_mode;
         }
         if let Some(restored) = restored {
@@ -720,6 +724,7 @@ impl ClaudeBuilder {
             .capabilities(ModelTransport::Native)
             .check_thinking(thinking)?;
         self.thinking_explicit = true;
+        self.thinking_disabled = thinking == Thinking::None;
         self.adaptive_thinking = thinking != Thinking::None;
         self.effort = match thinking {
             Thinking::None => None,
@@ -745,6 +750,10 @@ impl ClaudeBuilder {
         if stored.version != 1
             || ModelSelection::new(HarnessFamily::Claude, stored.model.clone()) != model
             || !model.supports_thinking(thinking)
+            || (stored.thinking_disabled
+                && (stored.effort.is_some()
+                    || stored.adaptive_thinking
+                    || thinking != Thinking::None))
             || (stored.fast_mode && !model.supports_fast_mode())
             || stored.max_tokens == Some(0)
             || stored.context_window_tokens == 0
@@ -760,7 +769,7 @@ impl ClaudeBuilder {
         self.max_tokens = stored.max_tokens;
         self.effort = stored.effort;
         self.adaptive_thinking = stored.adaptive_thinking;
-
+        self.thinking_disabled = stored.thinking_disabled;
         self.automatic_cache |= stored.automatic_cache;
         self.cache_one_hour |= stored.cache_one_hour;
         self.keep_thinking = stored.keep_thinking;
@@ -802,6 +811,7 @@ impl ClaudeBuilder {
 
     pub const fn effort(mut self, effort: crate::Effort) -> Self {
         self.effort = Some(effort);
+        self.thinking_disabled = false;
         self
     }
 
@@ -818,6 +828,7 @@ impl ClaudeBuilder {
 
     pub const fn adaptive_thinking(mut self) -> Self {
         self.adaptive_thinking = true;
+        self.thinking_disabled = false;
         self
     }
 
@@ -1495,6 +1506,7 @@ impl ClaudeBuilder {
             automatic_cache: self.automatic_cache,
             cache_one_hour: self.cache_one_hour,
             adaptive_thinking: AtomicBool::new(self.adaptive_thinking),
+            thinking_disabled: AtomicBool::new(self.thinking_disabled),
             keep_thinking: self.keep_thinking,
             fast_mode: AtomicBool::new(self.fast_mode),
             message_diagnostics: self.message_diagnostics,
@@ -2405,6 +2417,8 @@ struct NativeChildState {
     max_tokens: Option<u32>,
     effort: Option<crate::Effort>,
     adaptive_thinking: bool,
+    #[serde(default)]
+    thinking_disabled: bool,
     automatic_cache: bool,
     cache_one_hour: bool,
     keep_thinking: bool,
@@ -2480,6 +2494,7 @@ impl AgentFactory for ClaudeNativeFactory {
             recipe.claude.model = state.model();
             recipe.effort = state.effort();
             recipe.adaptive_thinking = state.adaptive_thinking.load(Ordering::SeqCst);
+            recipe.thinking_disabled = state.thinking_disabled.load(Ordering::SeqCst);
             recipe.fast_mode = state.fast_mode.load(Ordering::SeqCst);
             let child_id = nanocode_platform::uuid_v7().to_string();
             let lineage = Lineage::child_of(&state.lineage, state.session_id.as_str(), origin);
@@ -2525,11 +2540,7 @@ impl AgentFactory for ClaudeNativeFactory {
         Box::pin(async move {
             let state = state?;
             let model: ModelSelection = state.model().parse().map_err(unsupported)?;
-            let thinking = if state.effort().is_none() {
-                model.default_thinking()
-            } else {
-                state.thinking()
-            };
+            let thinking = state.selected_thinking(&model);
             Ok((model, thinking))
         })
     }
@@ -2563,6 +2574,7 @@ impl AgentFactory for ClaudeNativeFactory {
                 recipe.claude.model = native_model;
                 recipe.effort = state.effort();
                 recipe.adaptive_thinking = state.adaptive_thinking.load(Ordering::SeqCst);
+                recipe.thinking_disabled = state.thinking_disabled.load(Ordering::SeqCst);
                 recipe.fast_mode = state.fast_mode.load(Ordering::SeqCst);
                 if let Some(thinking) = options.selected_thinking() {
                     recipe = recipe.thinking(thinking)?;
@@ -2572,8 +2584,10 @@ impl AgentFactory for ClaudeNativeFactory {
             }
 
             let (model, thinking) = match state.model().parse::<ModelSelection>() {
-                Ok(model) if state.effort().is_none() => (model.clone(), model.default_thinking()),
-                Ok(model) => (model, state.thinking()),
+                Ok(model) => {
+                    let thinking = state.selected_thinking(&model);
+                    (model, thinking)
+                }
                 Err(_) => {
                     let model = HarnessFamily::Claude.default_model();
                     (model.clone(), model.default_thinking())
@@ -2695,6 +2709,7 @@ struct State {
     automatic_cache: bool,
     cache_one_hour: bool,
     adaptive_thinking: AtomicBool,
+    thinking_disabled: AtomicBool,
     keep_thinking: bool,
     fast_mode: AtomicBool,
     message_diagnostics: bool,
@@ -3261,6 +3276,8 @@ struct NativePolicy {
     max_tokens: Option<u32>,
     effort: Option<crate::Effort>,
     adaptive_thinking: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    thinking_disabled: bool,
     automatic_cache: bool,
     cache_one_hour: bool,
     keep_thinking: bool,
@@ -3282,7 +3299,7 @@ impl ClaudeBoundary {
         let invalid_checkpoint =
             |error: &dyn std::fmt::Display| NanocodexError::InvalidCheckpoint(error.to_string());
         let model = ModelSelection::new(HarnessFamily::Claude, self.policy.model.clone());
-        let thinking = if self.policy.effort.is_none() {
+        let thinking = if self.policy.effort.is_none() && !self.policy.thinking_disabled {
             model.default_thinking()
         } else {
             effort_thinking(self.policy.effort)
@@ -3331,6 +3348,7 @@ impl State {
             max_tokens: self.max_tokens,
             effort: self.effort(),
             adaptive_thinking: self.adaptive_thinking.load(Ordering::SeqCst),
+            thinking_disabled: self.thinking_disabled.load(Ordering::SeqCst),
             automatic_cache: self.automatic_cache,
             cache_one_hour: self.cache_one_hour,
             keep_thinking: self.keep_thinking,
@@ -3852,6 +3870,33 @@ impl State {
     fn thinking(&self) -> Thinking {
         effort_thinking(self.effort())
     }
+    fn selected_thinking(&self, model: &ModelSelection) -> Thinking {
+        if self.effort().is_none() && !self.thinking_disabled.load(Ordering::SeqCst) {
+            model.default_thinking()
+        } else {
+            self.thinking()
+        }
+    }
+    fn thinking_config(&self) -> Option<Value> {
+        if self.thinking_disabled.load(Ordering::SeqCst) {
+            return Some(json!({"type":"disabled"}));
+        }
+        (self.adaptive_thinking.load(Ordering::SeqCst)
+            || matches!(
+                self.model()
+                    .parse::<ModelSelection>()
+                    .ok()
+                    .and_then(|model| model.as_claude()),
+                Some(
+                    nanocode_agent_core::ClaudeModel::Opus55
+                        | nanocode_agent_core::ClaudeModel::Sonnet55
+                        | nanocode_agent_core::ClaudeModel::Haiku55
+                        | nanocode_agent_core::ClaudeModel::Fable51
+                        | nanocode_agent_core::ClaudeModel::Mythos51
+                )
+            ))
+        .then(|| json!({"type":"adaptive","display":"summarized"}))
+    }
     fn request_template(&self, speed: Option<crate::Speed>) -> MessagesRequest {
         MessagesRequest {
             model: self.model(),
@@ -3865,19 +3910,7 @@ impl State {
             output_config: self.effort().map(|effort| crate::OutputConfig { effort }),
             speed,
             tool_choice: None,
-            thinking: self.adaptive_thinking.load(Ordering::SeqCst).then(|| {
-                if matches!(
-                    self.model().as_str(),
-                    "claude-opus-5-5"
-                        | "claude-fable-5-1"
-                        | "claude-mythos-5-1"
-                        | "claude-sonnet-5-5"
-                ) {
-                    json!({"type":"adaptive","display":"updates"})
-                } else {
-                    json!({"type":"adaptive"})
-                }
-            }),
+            thinking: self.thinking_config(),
             context_management: self
                 .keep_thinking
                 .then(|| json!({"edits":[{"type":"clear_thinking_20251015","keep":"all"}]})),
@@ -3958,8 +3991,11 @@ impl State {
                          attempt: u32,
                          first_event: u64,
                          first_output: Option<u64>,
-                         dispatch: Option<u64>| {
+                         dispatch: Option<u64>,
+                         mut timing: telemetry::CallTiming| {
             let Some(events) = events else { return };
+            let duration_ns = elapsed_ns();
+            timing.total_ns = duration_ns;
             telemetry::record_model_response(
                 &tracing::Span::current(),
                 response,
@@ -3983,7 +4019,7 @@ impl State {
                 "attempt": attempt,
                 "connection_generation": 0,
                 "status": response.stop_reason.unwrap_or(StopReason::Unknown),
-                "duration_ns": elapsed_ns(),
+                "duration_ns": duration_ns,
                 "time_to_first_event_ns": first_event,
                 "time_to_first_output_ns": first_output,
                 "time_to_dispatch_ns": dispatch,
@@ -3997,6 +4033,7 @@ impl State {
                     "output_tokens": response.usage.output_tokens,
                     "total_tokens": input_tokens.saturating_add(response.usage.output_tokens),
                 },
+                "timing": timing,
             }));
         };
         let client = self.client.restore_wire_profile(context.wire_profile);
@@ -4056,7 +4093,17 @@ impl State {
             ),
             Step::Replay(value) => {
                 let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
-                completed(&response, 0, 0, None, None);
+                completed(
+                    &response,
+                    0,
+                    0,
+                    None,
+                    None,
+                    telemetry::CallTiming {
+                        replayed: true,
+                        ..telemetry::CallTiming::default()
+                    },
+                );
                 return Ok(ResponseOutcome {
                     message: response,
                     upgrade: None,
@@ -4103,7 +4150,17 @@ impl State {
                     .await?
             {
                 let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
-                completed(&response, 0, 0, None, None);
+                completed(
+                    &response,
+                    0,
+                    0,
+                    None,
+                    None,
+                    telemetry::CallTiming {
+                        replayed: true,
+                        ..telemetry::CallTiming::default()
+                    },
+                );
                 return Ok(ResponseOutcome {
                     message: response,
                     upgrade: Some(upgrade.clone()),
@@ -4127,10 +4184,15 @@ impl State {
             let attempt_span =
                 telemetry::attempt_span(index.saturating_add(1), attempt, max_attempts);
             let attempt_started = Instant::now();
+            let attempt_started_ns = elapsed_ns();
             let mut accepted = false;
             let mut published_text = false;
             let mut first_event = None;
             let mut first_output = None;
+            let mut response_headers_ns = None;
+            let mut send_ns = None;
+            let mut response_completed_ns = None;
+            let mut pipeline = telemetry::CallPipeline::default();
 
             let mut message_id: Option<String> = None;
 
@@ -4144,6 +4206,10 @@ impl State {
                     return Err(ResponseFailure { error: NanocodexError::TurnCancelled, recovery });
                 }
             };
+            if opened.is_ok() {
+                response_headers_ns = Some(elapsed_ns());
+                send_ns = Some(telemetry::elapsed_ns(attempt_started));
+            }
             request.messages = Vec::new();
             let result = match opened {
                 Err(error) => Err(error),
@@ -4151,6 +4217,7 @@ impl State {
                     accepted = true;
                     let mut captured = Vec::new();
                     loop {
+                        let receive_started = Instant::now();
                         let event = tokio::select! {
                             event = stream.next() => event,
                             () = cancel.cancelled() => {
@@ -4158,12 +4225,17 @@ impl State {
                                 return Err(ResponseFailure { error: NanocodexError::TurnCancelled, recovery });
                             }
                         };
+                        pipeline.receive_decode_ns = pipeline
+                            .receive_decode_ns
+                            .saturating_add(telemetry::elapsed_ns(receive_started));
                         let event = match event {
                             Some(Ok(event)) => event,
                             Some(Err(error)) => break Err(error),
                             None => break Err(ClaudeError::IncompleteStream),
                         };
-                        first_event.get_or_insert_with(&elapsed_ns);
+                        let received_ns = elapsed_ns();
+                        pipeline.event_count = pipeline.event_count.saturating_add(1);
+                        first_event.get_or_insert(received_ns);
                         if let Some(recovery) = &mut recovery {
                             recovery.observe(&event);
                         }
@@ -4172,6 +4244,16 @@ impl State {
                         }
 
                         let display = match &event {
+                            StreamEvent::ContentBlockStart {
+                                index: block_index,
+                                content_block: ContentBlock::Thinking { thinking, .. },
+                            } if !thinking.is_empty() => Some((
+                                AgentEventKind::ReasoningSummaryDelta,
+                                message_id
+                                    .as_ref()
+                                    .map(|id| format!("{id}:thinking:{block_index}")),
+                                thinking,
+                            )),
                             StreamEvent::ContentBlockDelta {
                                 delta: ContentDelta::TextDelta { text },
                                 ..
@@ -4191,18 +4273,33 @@ impl State {
                             _ => None,
                         };
                         if let Some((kind, item_id, text)) = display {
-                            first_output.get_or_insert_with(&elapsed_ns);
+                            let model_elapsed_ns = elapsed_ns();
+                            first_output.get_or_insert(model_elapsed_ns);
                             if let Some(events) = events {
                                 published_text = true;
-                                self.emit(events, kind, json!({"model_call_index":index,"item_id":item_id,"phase":null,"text":text}));
+                                let bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+                                let emit_started = Instant::now();
+                                self.emit(events, kind, json!({"model_call_index":index.saturating_add(1),"item_id":item_id,"phase":null,"text":text,"model_elapsed_ns":model_elapsed_ns}));
+                                pipeline.display_delta_emit_ns = pipeline
+                                    .display_delta_emit_ns
+                                    .saturating_add(telemetry::elapsed_ns(emit_started));
+                                pipeline.display_delta_count =
+                                    pipeline.display_delta_count.saturating_add(1);
+                                pipeline.display_delta_bytes =
+                                    pipeline.display_delta_bytes.saturating_add(bytes);
                             }
                         }
                         let terminal = matches!(event, StreamEvent::MessageStop);
                         captured.push(event);
                         if terminal {
+                            response_completed_ns = Some(received_ns);
                             let first = captured.remove(0);
                             let rest = captured.into_iter().map(Ok);
-                            break collect_stream(first, futures_util::stream::iter(rest)).await;
+                            let collect_started = Instant::now();
+                            let collected =
+                                collect_stream(first, futures_util::stream::iter(rest)).await;
+                            pipeline.collect_ns = telemetry::elapsed_ns(collect_started);
+                            break collected;
                         }
                     }
                 }
@@ -4231,6 +4328,18 @@ impl State {
                         first_event.unwrap_or_default(),
                         first_output,
                         dispatched,
+                        telemetry::CallTiming {
+                            replayed: false,
+                            preparation_ns: dispatched,
+                            attempt_started_ns: Some(attempt_started_ns),
+                            send_ns,
+                            response_headers_ns,
+                            first_event_ns: first_event,
+                            first_output_ns: first_output,
+                            response_completed_ns,
+                            total_ns: 0,
+                            pipeline: Some(pipeline),
+                        },
                     );
                     return Ok(ResponseOutcome {
                         message: response,
@@ -6398,6 +6507,9 @@ impl LifecycleBackend for Driver {
             state
                 .adaptive_thinking
                 .store(thinking != Thinking::None, Ordering::SeqCst);
+            state
+                .thinking_disabled
+                .store(thinking == Thinking::None, Ordering::SeqCst);
             Ok(())
         })
     }
@@ -6798,7 +6910,8 @@ impl nanocode_agent_core::BackendRegistration for ClaudeBuilder {
         self.claude.model.clone()
     }
     fn default_thinking(&self) -> Option<Thinking> {
-        (self.thinking_explicit || self.effort.is_some()).then(|| effort_thinking(self.effort))
+        (self.thinking_explicit || self.thinking_disabled || self.effort.is_some())
+            .then(|| effort_thinking(self.effort))
     }
     fn validate_model(&self, model: &str) -> Result<()> {
         nanocode_agent_core::BackendRegistration::validate_model(&self.claude, model)

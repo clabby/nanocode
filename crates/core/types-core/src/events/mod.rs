@@ -10,9 +10,9 @@ pub use data::OpenAiEvent;
 pub use data::{
     AcceptedInput, AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage,
     CompactionCompleted, CompactionFailed, CompactionStarted, ContextEvent, EventUsage,
-    ModelCallCompleted, ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted,
-    ModelWarmupFailed, ModelWarmupStarted, ReasoningEvent, ReasoningSummaryDelta, RunError,
-    RunEvent, RunMetrics, RunStarted, RunStatus, RunSteered, RunTerminal, ToolCall, ToolEvent,
-    ToolResultEvent, ToolStatus, TransportEvent,
+    ModelCallCompleted, ModelCallFailed, ModelCallPipeline, ModelCallStarted, ModelCallTiming,
+    ModelEvent, ModelWarmupCompleted, ModelWarmupFailed, ModelWarmupStarted, ReasoningEvent,
+    ReasoningSummaryDelta, RunError, RunEvent, RunMetrics, RunStarted, RunStatus, RunSteered,
+    RunTerminal, ToolCall, ToolEvent, ToolResultEvent, ToolStatus, TransportEvent,
 };
 pub use wire::{AGENT_EVENT_PROTOCOL_VERSION, AgentEvent, AgentEventKind};

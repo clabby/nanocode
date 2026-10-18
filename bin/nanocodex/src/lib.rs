@@ -13,6 +13,7 @@ mod models;
 mod sessions;
 mod side;
 mod split;
+mod stream;
 mod telemetry;
 mod view;
 
@@ -26,7 +27,6 @@ use clap::Parser;
 use futures_util::StreamExt;
 use nanocode::{
     ModelSelection, ServiceTier, Thinking,
-    agent::events::AgentEventKind,
     tools::attachment::{RunnerConfig, RunnerEndpoint, run_runner_with_tools},
 };
 
@@ -357,40 +357,26 @@ async fn exec(args: SessionArgs) -> Result<()> {
     tokio::spawn(async move { while events.recv().await.is_some() {} });
     for pending in pending {
         eprintln!("nanocodex: resuming interrupted turn {}", pending.id);
-        agent
+        let turn = agent
             .prompt(nanocode::PromptRequest::new(pending.prompt).request_id(&pending.id))
-            .await?
-            .result()
             .await?;
+        stream_turn(turn, std::io::stderr()).await?;
     }
-    let mut turn = agent.prompt(prompt.as_str()).await?;
+    stream_turn(agent.prompt(prompt.as_str()).await?, std::io::stdout()).await?;
     let mut stderr = std::io::stderr();
-    while let Some(event) = turn.next().await {
-        let payload =
-            serde_json::from_str::<serde_json::Value>(event.payload.get()).unwrap_or_default();
-        match event.kind {
-            AgentEventKind::ToolCall => {
-                drop(writeln!(
-                    stderr,
-                    "· {}",
-                    payload["tool"].as_str().unwrap_or("tool")
-                ));
-            }
-            AgentEventKind::RunError if payload["observational"] == true => {
-                drop(writeln!(
-                    stderr,
-                    "warning: {}",
-                    payload["error"].as_str().unwrap_or_default()
-                ));
-            }
-            _ => {}
-        }
-    }
-    let result = turn.await?;
-    println!("{}", result.final_message());
     drop(writeln!(stderr, "session {}", agent.session_id()));
     agent.flush().await?;
     host.runtime.shutdown().await?;
+    Ok(())
+}
+
+async fn stream_turn(mut turn: nanocode::agent::Turn, answers: impl Write) -> Result<()> {
+    let mut printer = stream::Printer::new(answers);
+    while let Some(event) = turn.next().await {
+        printer.event(&event)?;
+    }
+    let result = turn.await?;
+    printer.finish(result.final_message())?;
     Ok(())
 }
 

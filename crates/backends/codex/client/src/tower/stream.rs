@@ -41,6 +41,9 @@ pub struct GenerationOutput {
     pub time_to_first_output_ns: Option<u64>,
 
     pub pipeline_stats: ResponsePipelineStats,
+
+    #[serde(default)]
+    pub timing: ResponseTiming,
 }
 
 pub struct CompactionOutput {
@@ -60,6 +63,31 @@ pub struct CompactionOutput {
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResponseTiming {
+    pub queue_ns: Option<u64>,
+
+    pub attempt_started_ns: Option<u64>,
+
+    pub connect_ns: Option<u64>,
+
+    pub encode_ns: Option<u64>,
+
+    pub send_ns: Option<u64>,
+
+    pub request_sent_ns: Option<u64>,
+
+    pub response_headers_ns: Option<u64>,
+
+    pub first_event_ns: Option<u64>,
+
+    pub first_output_ns: Option<u64>,
+
+    pub response_completed_ns: Option<u64>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ResponsePipelineStats {
     pub event_count: u64,
 
@@ -72,6 +100,10 @@ pub struct ResponsePipelineStats {
     pub emit_duration_ns: u64,
 
     pub decode_duration_ns: u64,
+
+    pub response_forward_duration_ns: u64,
+
+    pub display_delta_emit_duration_ns: u64,
 
     pub socket_queue_duration_ns: u64,
 
@@ -121,6 +153,8 @@ struct AssistantTextDelta<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<MessagePhase>,
     text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_elapsed_ns: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -142,22 +176,30 @@ struct AssistantStreamItem {
 struct TextDelta<'a> {
     model_call_index: u32,
     text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_elapsed_ns: Option<u64>,
 }
 
 struct StreamTiming {
     started_at: Instant,
+    model_started_at: Option<Instant>,
     first_event_ns: Option<u64>,
     first_output_ns: Option<u64>,
+    first_event_model_ns: Option<u64>,
+    first_output_model_ns: Option<u64>,
     pipeline: ResponsePipelineStats,
     last_display_delta_received_ns: Option<u64>,
 }
 
 impl StreamTiming {
-    const fn new(started_at: Instant) -> Self {
+    const fn new(started_at: Instant, model_started_at: Option<Instant>) -> Self {
         Self {
             started_at,
+            model_started_at,
             first_event_ns: None,
             first_output_ns: None,
+            first_event_model_ns: None,
+            first_output_model_ns: None,
             pipeline: ResponsePipelineStats {
                 event_count: 0,
                 event_bytes: 0,
@@ -165,6 +207,8 @@ impl StreamTiming {
                 parse_duration_ns: 0,
                 emit_duration_ns: 0,
                 decode_duration_ns: 0,
+                response_forward_duration_ns: 0,
+                display_delta_emit_duration_ns: 0,
                 socket_queue_duration_ns: 0,
                 display_delta_count: 0,
                 display_delta_bytes: 0,
@@ -176,6 +220,10 @@ impl StreamTiming {
             },
             last_display_delta_received_ns: None,
         }
+    }
+
+    fn model_elapsed_ns(&self) -> Option<u64> {
+        self.model_started_at.map(elapsed_ns)
     }
 
     fn record_display_delta(&mut self, received_ns: u64, bytes: usize) {
@@ -212,6 +260,7 @@ struct ReceivedServerEvent {
     event: ServerEvent,
     received_ns: u64,
     api_event_seq: u64,
+    model_elapsed_ns: Option<u64>,
 }
 
 pub(crate) trait ResponseEventSource {
@@ -231,6 +280,7 @@ pub(crate) async fn receive<S>(
     credentials: &Credentials,
     call_index: u32,
     started_at: Instant,
+    model_started_at: Option<Instant>,
 ) -> Result<GenerationOutput, ResponsesServiceError>
 where
     S: ResponseEventSource,
@@ -238,7 +288,7 @@ where
     let mut done_items = Vec::with_capacity(2);
     let mut assistant_items = HashMap::new();
     let item_namespace = nanocode_platform::uuid_v4();
-    let mut timing = StreamTiming::new(started_at);
+    let mut timing = StreamTiming::new(started_at, model_started_at);
 
     loop {
         let received = next_event(
@@ -290,6 +340,7 @@ where
                         )),
                         phase: None,
                     });
+                let model_elapsed_ns = timing.model_elapsed_ns();
                 emit_display_delta(
                     &observer.events,
                     &mut timing,
@@ -299,6 +350,7 @@ where
                         item_id: item.item_id.as_deref(),
                         phase: item.phase,
                         text: &delta,
+                        model_elapsed_ns,
                     },
                     received.received_ns,
                     received.api_event_seq,
@@ -309,6 +361,7 @@ where
             ServerEvent::ReasoningSummaryTextDelta { delta, .. }
             | ServerEvent::ReasoningSummaryDelta { delta, .. }
             | ServerEvent::ReasoningContentDelta { delta, .. } => {
+                let model_elapsed_ns = timing.model_elapsed_ns();
                 emit_display_delta(
                     &observer.events,
                     &mut timing,
@@ -316,6 +369,7 @@ where
                     TextDelta {
                         model_call_index: call_index,
                         text: &delta,
+                        model_elapsed_ns,
                     },
                     received.received_ns,
                     received.api_event_seq,
@@ -370,6 +424,12 @@ where
                     time_to_first_event_ns: timing.first_event_ns.unwrap_or_default(),
                     time_to_first_output_ns: timing.first_output_ns,
                     pipeline_stats: timing.pipeline,
+                    timing: ResponseTiming {
+                        first_event_ns: timing.first_event_model_ns,
+                        first_output_ns: timing.first_output_model_ns,
+                        response_completed_ns: received.model_elapsed_ns,
+                        ..ResponseTiming::default()
+                    },
                 });
             }
             _ => {}
@@ -387,7 +447,12 @@ fn emit_display_delta<P: Serialize>(
     payload_bytes: usize,
 ) -> Result<(), ResponsesServiceError> {
     timing.record_display_delta(received_ns, payload_bytes);
+    let emit_started_at = Instant::now();
     let seq = events.emit_with_source_sequence(kind, payload, Some(received_ns))?;
+    timing.pipeline.display_delta_emit_duration_ns = timing
+        .pipeline
+        .display_delta_emit_duration_ns
+        .saturating_add(elapsed_ns(emit_started_at));
     tracing::trace!(
         target: "nanocodex_stream_timing",
         stage = "api_delta_emitted",
@@ -472,7 +537,7 @@ where
     S: ResponseEventSource,
 {
     let mut done_items = Vec::with_capacity(2);
-    let mut timing = StreamTiming::new(started_at);
+    let mut timing = StreamTiming::new(started_at, None);
 
     loop {
         let received = next_event(
@@ -549,7 +614,11 @@ where
     let raw_event = raw_event.as_ref();
     let decoded = parsed.decoded;
     let elapsed = elapsed_ns(timing.started_at);
+    let model_elapsed_ns = timing.model_elapsed_ns();
     timing.first_event_ns.get_or_insert(elapsed);
+    if timing.first_event_model_ns.is_none() {
+        timing.first_event_model_ns = model_elapsed_ns;
+    }
 
     tracing::trace!(
         target: "nanocode_codex",
@@ -585,14 +654,20 @@ where
 
     let decode_started_at = Instant::now();
     let event = decoded?;
-    if let Some(event) = event.normalized() {
-        observer.emit_response(event).await;
-    }
+    let normalized = event.normalized();
     timing.pipeline.decode_duration_ns = timing
         .pipeline
         .decode_duration_ns
         .saturating_add(initial_decode_duration_ns)
         .saturating_add(elapsed_ns(decode_started_at));
+    if let Some(normalized) = normalized {
+        let forward_started_at = Instant::now();
+        observer.emit_response(normalized).await;
+        timing.pipeline.response_forward_duration_ns = timing
+            .pipeline
+            .response_forward_duration_ns
+            .saturating_add(elapsed_ns(forward_started_at));
+    }
     if matches!(
         event,
         ServerEvent::OutputTextDelta { .. }
@@ -603,6 +678,9 @@ where
             | ServerEvent::OutputItemDone { .. }
     ) {
         timing.first_output_ns.get_or_insert(elapsed);
+        if timing.first_output_model_ns.is_none() {
+            timing.first_output_model_ns = model_elapsed_ns;
+        }
     }
     if let Some(failure) = failure {
         return Err(ResponsesServiceError::from(failure)
@@ -612,6 +690,7 @@ where
         event,
         received_ns: received.received_ns,
         api_event_seq,
+        model_elapsed_ns,
     })
 }
 

@@ -36,6 +36,9 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "net", "
 nanocode-cua.workspace = true
 nanocode-store-jsonl.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
+
 [lints]
 workspace = true
 

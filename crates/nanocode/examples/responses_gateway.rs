@@ -1,4 +1,7 @@
 #[cfg(not(target_family = "wasm"))]
+#[path = "support/stream.rs"]
+mod stream;
+#[cfg(not(target_family = "wasm"))]
 mod support;
 
 #[cfg(not(target_family = "wasm"))]
@@ -146,10 +149,7 @@ async fn run() -> support::Result<()> {
             .build()
             .await?;
         eprintln!("session {}", agent.session_id());
-        let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-        let answer = agent.prompt(prompt).await?.result().await;
-        drain.abort();
-        println!("{}", answer?.final_message());
+        stream::prompt(&agent, &mut events, prompt).await?;
         agent.flush().await?;
         Ok(())
     }

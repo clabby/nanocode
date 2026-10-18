@@ -111,6 +111,22 @@ impl AgentEventKind {
 }
 
 impl AgentEvent {
+    pub fn model_call_timing(&self) -> Result<Option<super::ModelCallTiming>, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct Payload {
+            timing: Option<super::ModelCallTiming>,
+        }
+        serde_json::from_str::<Payload>(self.payload.get()).map(|value| value.timing)
+    }
+
+    pub fn model_elapsed_ns(&self) -> Result<Option<u64>, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct Payload {
+            model_elapsed_ns: Option<u64>,
+        }
+        serde_json::from_str::<Payload>(self.payload.get()).map(|value| value.model_elapsed_ns)
+    }
+
     pub fn data(&self) -> Result<super::AgentEventData, serde_json::Error> {
         use super::{
             AgentEventData, AssistantEvent, ContextEvent, ModelEvent, ReasoningEvent, RunEvent,

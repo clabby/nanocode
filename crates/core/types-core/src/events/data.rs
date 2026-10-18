@@ -374,6 +374,74 @@ pub struct ModelCallCompleted {
     pub usage: Option<Usage>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ModelCallTiming {
+    pub replayed: bool,
+
+    pub preparation_ns: Option<u64>,
+
+    pub queue_ns: Option<u64>,
+
+    pub attempt_started_ns: Option<u64>,
+
+    pub connect_ns: Option<u64>,
+
+    pub encode_ns: Option<u64>,
+
+    pub send_ns: Option<u64>,
+
+    pub request_sent_ns: Option<u64>,
+
+    pub response_headers_ns: Option<u64>,
+
+    pub first_event_ns: Option<u64>,
+
+    pub first_output_ns: Option<u64>,
+
+    pub response_completed_ns: Option<u64>,
+
+    pub total_ns: Option<u64>,
+
+    pub pipeline: Option<ModelCallPipeline>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ModelCallPipeline {
+    pub event_count: Option<u64>,
+
+    pub event_bytes: Option<u64>,
+
+    pub receive_wait_ns: Option<u64>,
+
+    pub receive_decode_ns: Option<u64>,
+
+    pub decode_ns: Option<u64>,
+
+    pub api_event_emit_ns: Option<u64>,
+
+    pub response_forward_ns: Option<u64>,
+
+    pub display_delta_emit_ns: Option<u64>,
+
+    pub collect_ns: Option<u64>,
+
+    pub socket_queue_ns: Option<u64>,
+
+    pub display_delta_count: Option<u64>,
+
+    pub display_delta_bytes: Option<u64>,
+
+    pub inter_delta_gap_max_ns: Option<u64>,
+
+    pub inter_delta_stall_50ms_count: Option<u64>,
+
+    pub inter_delta_stall_100ms_count: Option<u64>,
+
+    pub inter_delta_stall_250ms_count: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelCallFailed {
     pub call_index: u32,

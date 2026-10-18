@@ -24,6 +24,8 @@ pub(super) struct Snapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) effort: Option<crate::Effort>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) thinking_disabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) fast_mode: bool,
 }
 impl Default for Snapshot {
@@ -40,6 +42,7 @@ impl Default for Snapshot {
             lineage: None,
             conversation_id: None,
             effort: None,
+            thinking_disabled: false,
             fast_mode: false,
         }
     }
@@ -296,6 +299,7 @@ impl State {
             lineage: Some(self.lineage.clone()),
             conversation_id: Some(self.conversation_id.clone()),
             effort: self.effort(),
+            thinking_disabled: self.thinking_disabled.load(Ordering::SeqCst),
             fast_mode: self.fast_mode.load(Ordering::SeqCst),
             ..Snapshot::default()
         })
@@ -695,6 +699,7 @@ pub fn rewind_checkpoint(
             model: latest.model.clone(),
             workspace: latest.workspace.clone(),
             effort: latest.effort,
+            thinking_disabled: latest.thinking_disabled,
             fast_mode: latest.fast_mode,
             ..Snapshot::default()
         },
@@ -775,6 +780,7 @@ pub fn session_checkpoint(
         max_tokens: None,
         effort: snapshot.effort,
         adaptive_thinking: snapshot.effort.is_some(),
+        thinking_disabled: snapshot.thinking_disabled,
         automatic_cache: false,
         cache_one_hour: false,
         keep_thinking: false,

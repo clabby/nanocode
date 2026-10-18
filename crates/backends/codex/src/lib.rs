@@ -66,10 +66,10 @@ pub mod events {
     pub use crate::client::events::{
         AcceptedInput, AgentEventData, AssistantDelta, AssistantEvent, AssistantMessage,
         CompactionCompleted, CompactionFailed, CompactionStarted, ContextEvent, EventUsage,
-        ModelCallCompleted, ModelCallFailed, ModelCallStarted, ModelEvent, ModelWarmupCompleted,
-        ModelWarmupFailed, ModelWarmupStarted, ReasoningEvent, ReasoningSummaryDelta, RunError,
-        RunEvent, RunMetrics, RunStarted, RunStatus, RunSteered, RunTerminal, ToolCall, ToolEvent,
-        ToolResultEvent, ToolStatus, TransportEvent,
+        ModelCallCompleted, ModelCallFailed, ModelCallPipeline, ModelCallStarted, ModelCallTiming,
+        ModelEvent, ModelWarmupCompleted, ModelWarmupFailed, ModelWarmupStarted, ReasoningEvent,
+        ReasoningSummaryDelta, RunError, RunEvent, RunMetrics, RunStarted, RunStatus, RunSteered,
+        RunTerminal, ToolCall, ToolEvent, ToolResultEvent, ToolStatus, TransportEvent,
     };
     pub use crate::client::events::{
         AgentEvent, AgentEventKind, AgentEventPublisher, AgentEventTiming, AgentEvents, EventError,
