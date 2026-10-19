@@ -656,7 +656,7 @@ impl Harness {
         self.rehydrated_assignment = None;
         self.contract_delivered = true;
         let control = turn.control();
-        let result = platform::spawn(turn);
+        let result = platform::spawn(turn.result());
         self.active = Some(ActiveTurn {
             control: control.clone(),
             result,
