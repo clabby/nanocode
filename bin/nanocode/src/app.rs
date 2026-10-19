@@ -285,6 +285,7 @@ pub struct App {
     reload_all: bool,
     pub(crate) submissions: tokio::task::JoinSet<()>,
     reload_side: Option<crate::side::SavedSide>,
+    pub(crate) reload_focus: Option<nanocode::subagents::AgentId>,
     quit_armed: Option<Instant>,
     esc_armed: Option<Instant>,
     stashed_draft: Option<String>,
@@ -354,6 +355,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         reload_all: false,
         submissions: tokio::task::JoinSet::new(),
         reload_side: None,
+        reload_focus: None,
         quit_armed: None,
         esc_armed: None,
         stashed_draft: None,
@@ -387,6 +389,9 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
     if launch.pick_session {
         app.starting = false;
         app.open_session_picker();
+        if let Some(path) = launch.reload_path {
+            tokio::fs::remove_file(path).await?;
+        }
     } else {
         let connection = app.connection(launch.resume.clone());
         match connection.await {
@@ -406,6 +411,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
     drop(terminal);
     let session = app.session_id();
     let moved = app.moved;
+    let executor = app.reload.then(|| app.reload_executor());
     if app.reload_all
         && let Err(error) = instance.broadcast().await
     {
@@ -436,10 +442,21 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
                 AppEvent::SteerSent { .. } => {
                     app.handle_app(event);
                 }
+                AppEvent::Side {
+                    pane,
+                    update:
+                        update @ (crate::side::SideUpdate::Event(_)
+                        | crate::side::SideUpdate::Forked(_)
+                        | crate::side::SideUpdate::Restored { .. }),
+                } => app.side_update(pane, update),
                 _ => {}
             }
         }
-        let state = instance.save(&app.reload_state()).await?;
+        let mut state = app.reload_state();
+        if let Some(executor) = executor {
+            state.executor = executor;
+        }
+        let state = instance.save(&state).await?;
         instance.close().await?;
         return Err(reload(session, state).into());
     }

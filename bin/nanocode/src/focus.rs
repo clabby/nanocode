@@ -455,6 +455,7 @@ impl App {
                 return;
             }
         };
+        let focus = self.reload_focus.take();
         for entry in entries {
             let id = entry.agent_id;
             let key = id.to_string();
@@ -466,6 +467,9 @@ impl App {
                 }
             });
             if known {
+                if focus == Some(id) {
+                    self.focus_on(id);
+                }
                 continue;
             }
             self.mapper.learn_agent(id, entry.role.clone());
@@ -473,6 +477,9 @@ impl App {
             self.views
                 .entry(id)
                 .or_insert_with(|| SubagentView::new(entry.role.clone(), model.clone()));
+            if focus == Some(id) {
+                self.focus_on(id);
+            }
             let (status, detail) = subagent_status(&entry.status);
             let label = match &model {
                 Some(model) => format!("#{id} {} · {model}", entry.role),

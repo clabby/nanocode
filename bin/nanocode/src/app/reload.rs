@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io, path::PathBuf};
 
-use nanocode::{ModelSelection, ServiceTier, Thinking, agent::input::Prompt};
+use nanocode::{ExecutorSelection, ModelSelection, ServiceTier, Thinking, agent::input::Prompt};
 use nanocode_tui::{
     queue::{QueueKind, QueueState, QueuedPrompt},
     theme::Theme,
@@ -27,6 +27,9 @@ pub(crate) struct State {
     pending_switch: Option<(ModelSelection, Thinking, ServiceTier)>,
     theme: Theme,
     side: Option<crate::side::SavedSide>,
+    focus: Option<nanocode::subagents::AgentId>,
+    #[serde(default)]
+    pub(super) executor: SavedExecutor,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -36,6 +39,16 @@ struct SavedPrompt {
     prompt: Prompt,
     steer: bool,
     durable: bool,
+    #[serde(default)]
+    attachments: Vec<PathBuf>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub(super) enum SavedExecutor {
+    #[default]
+    Local,
+    Names(Vec<String>),
+    All,
 }
 
 pub(crate) async fn read(path: &std::path::Path) -> Result<State> {
@@ -43,6 +56,23 @@ pub(crate) async fn read(path: &std::path::Path) -> Result<State> {
 }
 
 impl App {
+    pub(super) fn reload_executor(&self) -> SavedExecutor {
+        match self.agent.as_ref().map(|agent| {
+            self.host
+                .runtime
+                .runner_pool()
+                .code_mode_executors()
+                .selection(agent.session_id())
+        }) {
+            Some(ExecutorSelection::Executor(name)) => SavedExecutor::Names(vec![name.to_string()]),
+            Some(ExecutorSelection::Executors(names)) => {
+                SavedExecutor::Names(names.iter().map(ToString::to_string).collect())
+            }
+            Some(ExecutorSelection::All) => SavedExecutor::All,
+            _ => SavedExecutor::Local,
+        }
+    }
+
     pub(super) fn request_reload(&mut self, broadcast: bool) {
         if !cfg!(unix) {
             self.notice(
@@ -96,6 +126,11 @@ impl App {
                         prompt,
                         steer: item.kind == QueueKind::Steer,
                         durable,
+                        attachments: self
+                            .attachments_by_id
+                            .get(&item.id)
+                            .cloned()
+                            .unwrap_or_default(),
                     }
                 })
                 .collect(),
@@ -105,10 +140,26 @@ impl App {
             pending_switch: self.pending_switch.clone(),
             theme: self.theme.clone(),
             side: self.panes.saved(),
+            focus: self.focus,
+            executor: self.reload_executor(),
         }
     }
 
     pub(super) fn restore_reload(&mut self, state: State) {
+        if let Some(session) = &state.session {
+            let selection = match state.executor {
+                SavedExecutor::Local => ExecutorSelection::Local,
+                SavedExecutor::Names(names) => ExecutorSelection::Executors(
+                    names.into_iter().map(Into::into).collect::<Vec<_>>().into(),
+                ),
+                SavedExecutor::All => ExecutorSelection::All,
+            };
+            self.host
+                .runtime
+                .runner_pool()
+                .code_mode_executors()
+                .select(session, Some(selection));
+        }
         self.composer.set_text(state.draft);
         self.attachments = state.attachments;
         self.next_local = state.next_local;
@@ -117,8 +168,11 @@ impl App {
         self.pending_switch = state.pending_switch;
         self.theme = state.theme;
         self.reload_side = state.side;
+        self.reload_focus = state.focus;
         self.resumes = HashMap::new();
         for item in state.prompts {
+            self.attachments_by_id
+                .insert(item.id.clone(), item.attachments);
             self.resumes
                 .insert(item.id.clone(), (item.prompt, item.durable));
             self.queue.push(QueuedPrompt {
