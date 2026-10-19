@@ -1,7 +1,7 @@
 use crate::{
     ClaudeClient, ClaudeError, ClaudeToolSpec, ContentBlock, ContentDelta, Message,
-    MessagesRequest, Role, ServerToolDefinition, StopReason, StreamEvent, ToolDefinition,
-    ToolResultContent, Usage, collect_stream,
+    MessageAccumulator, MessagesRequest, Role, ServerToolDefinition, StopReason, StreamEvent,
+    ToolDefinition, ToolResultContent, Usage, collect_stream,
 };
 use futures_util::{FutureExt as _, StreamExt};
 use nanocode_agent_core::{
@@ -3517,6 +3517,13 @@ impl ServerRecovery {
         )
     }
 }
+struct PendingDisplay {
+    kind: AgentEventKind,
+    block: usize,
+    text: String,
+    model_elapsed_ns: u64,
+}
+
 struct ResponseFailure {
     error: NanocodeError,
     recovery: Option<ServerRecovery>,
@@ -3790,6 +3797,55 @@ impl State {
         let Ok(payload) = serde_json::value::to_raw_value(&payload) else {
             return;
         };
+        self.emit_raw(events, kind, payload);
+    }
+
+    fn flush_display(
+        &self,
+        events: &AgentEventPublisher,
+        index: u32,
+        message_id: Option<&str>,
+        pending: &PendingDisplay,
+        pipeline: &mut telemetry::CallPipeline,
+    ) {
+        #[derive(Serialize)]
+        struct DisplayDelta<'a> {
+            item_id: Option<&'a str>,
+            model_call_index: u32,
+            model_elapsed_ns: u64,
+            phase: Option<()>,
+            text: &'a str,
+            turn_id: &'a str,
+        }
+        let emit_started = Instant::now();
+        let thinking = (pending.kind == AgentEventKind::ReasoningSummaryDelta)
+            .then(|| message_id.map(|id| format!("{id}:thinking:{}", pending.block)));
+        let payload = serde_json::value::to_raw_value(&DisplayDelta {
+            item_id: thinking.as_ref().map_or(message_id, Option::as_deref),
+            model_call_index: index.saturating_add(1),
+            model_elapsed_ns: pending.model_elapsed_ns,
+            phase: None,
+            text: &pending.text,
+            turn_id: events.turn_id().unwrap_or(events.request_id()),
+        });
+        if let Ok(payload) = payload {
+            self.emit_raw(events, pending.kind, payload);
+        }
+        pipeline.display_delta_emit_ns = pipeline
+            .display_delta_emit_ns
+            .saturating_add(telemetry::elapsed_ns(emit_started));
+        pipeline.display_delta_count = pipeline.display_delta_count.saturating_add(1);
+        pipeline.display_delta_bytes = pipeline
+            .display_delta_bytes
+            .saturating_add(u64::try_from(pending.text.len()).unwrap_or(u64::MAX));
+    }
+
+    fn emit_raw(
+        &self,
+        events: &AgentEventPublisher,
+        kind: AgentEventKind,
+        payload: Box<serde_json::value::RawValue>,
+    ) {
         let mut event = AgentEvent {
             protocol_version: 1,
             request_id: Arc::from(events.request_id()),
@@ -4224,12 +4280,15 @@ impl State {
                 Err(error) => Err(error),
                 Ok(mut stream) => {
                     accepted = true;
-                    let mut captured = Vec::new();
+                    let cancelled = cancel.cancelled();
+                    tokio::pin!(cancelled);
+                    let mut accumulator: Option<MessageAccumulator> = None;
+                    let mut display: Option<PendingDisplay> = None;
                     loop {
                         let receive_started = Instant::now();
-                        let event = tokio::select! {
-                            event = stream.next() => event,
-                            () = cancel.cancelled() => {
+                        let mut next = tokio::select! {
+                            event = stream.next().instrument(attempt_span.clone()) => event,
+                            () = &mut cancelled => {
                                 telemetry::cancel_attempt(&attempt_span);
                                 return Err(ResponseFailure { error: NanocodeError::TurnCancelled, recovery });
                             }
@@ -4237,78 +4296,102 @@ impl State {
                         pipeline.receive_decode_ns = pipeline
                             .receive_decode_ns
                             .saturating_add(telemetry::elapsed_ns(receive_started));
-                        let event = match event {
-                            Some(Ok(event)) => event,
-                            Some(Err(error)) => break Err(error),
-                            None => break Err(ClaudeError::IncompleteStream),
-                        };
-                        let received_ns = elapsed_ns();
-                        pipeline.event_count = pipeline.event_count.saturating_add(1);
-                        first_event.get_or_insert(received_ns);
-                        if let Some(recovery) = &mut recovery {
-                            recovery.observe(&event);
-                        }
-                        if let StreamEvent::MessageStart { message } = &event {
-                            message_id = Some(message.id.clone());
-                        }
-
-                        let display = match &event {
-                            StreamEvent::ContentBlockStart {
-                                index: block_index,
-                                content_block: ContentBlock::Thinking { thinking, .. },
-                            } if !thinking.is_empty() => Some((
-                                AgentEventKind::ReasoningSummaryDelta,
-                                message_id
-                                    .as_ref()
-                                    .map(|id| format!("{id}:thinking:{block_index}")),
-                                thinking,
-                            )),
-                            StreamEvent::ContentBlockDelta {
-                                delta: ContentDelta::TextDelta { text },
-                                ..
-                            } if !text.is_empty() => {
-                                Some((AgentEventKind::AssistantDelta, message_id.clone(), text))
+                        let ended = loop {
+                            let event = match next {
+                                Some(Ok(event)) => event,
+                                Some(Err(error)) => break Some(Err(error)),
+                                None => break Some(Err(ClaudeError::IncompleteStream)),
+                            };
+                            pipeline.event_count = pipeline.event_count.saturating_add(1);
+                            if first_event.is_none() {
+                                first_event = Some(elapsed_ns());
                             }
-                            StreamEvent::ContentBlockDelta {
-                                index: block_index,
-                                delta: ContentDelta::ThinkingDelta { thinking },
-                            } if !thinking.is_empty() => Some((
-                                AgentEventKind::ReasoningSummaryDelta,
-                                message_id
-                                    .as_ref()
-                                    .map(|id| format!("{id}:thinking:{block_index}")),
-                                thinking,
-                            )),
-                            _ => None,
-                        };
-                        if let Some((kind, item_id, text)) = display {
-                            let model_elapsed_ns = elapsed_ns();
-                            first_output.get_or_insert(model_elapsed_ns);
-                            if let Some(events) = events {
-                                published_text = true;
-                                let bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
-                                let emit_started = Instant::now();
-                                self.emit(events, kind, json!({"model_call_index":index.saturating_add(1),"item_id":item_id,"phase":null,"text":text,"model_elapsed_ns":model_elapsed_ns}));
-                                pipeline.display_delta_emit_ns = pipeline
-                                    .display_delta_emit_ns
-                                    .saturating_add(telemetry::elapsed_ns(emit_started));
-                                pipeline.display_delta_count =
-                                    pipeline.display_delta_count.saturating_add(1);
-                                pipeline.display_delta_bytes =
-                                    pipeline.display_delta_bytes.saturating_add(bytes);
+                            if let Some(recovery) = &mut recovery {
+                                recovery.observe(&event);
                             }
+                            if let StreamEvent::MessageStart { message } = &event {
+                                message_id = Some(message.id.clone());
+                            }
+                            let shown = match &event {
+                                StreamEvent::ContentBlockStart {
+                                    index: block,
+                                    content_block: ContentBlock::Thinking { thinking, .. },
+                                } if !thinking.is_empty() => {
+                                    Some((AgentEventKind::ReasoningSummaryDelta, *block, thinking))
+                                }
+                                StreamEvent::ContentBlockDelta {
+                                    index: block,
+                                    delta: ContentDelta::TextDelta { text },
+                                } if !text.is_empty() => {
+                                    Some((AgentEventKind::AssistantDelta, *block, text))
+                                }
+                                StreamEvent::ContentBlockDelta {
+                                    index: block,
+                                    delta: ContentDelta::ThinkingDelta { thinking },
+                                } if !thinking.is_empty() => {
+                                    Some((AgentEventKind::ReasoningSummaryDelta, *block, thinking))
+                                }
+                                _ => None,
+                            };
+                            if let Some((kind, block, text)) = shown {
+                                let model_elapsed_ns = elapsed_ns();
+                                first_output.get_or_insert(model_elapsed_ns);
+                                if let Some(events) = events {
+                                    match &mut display {
+                                        Some(pending) if pending.kind == kind && pending.block == block => {
+                                            pending.text.push_str(text);
+                                        }
+                                        _ => {
+                                            if let Some(pending) = display.take() {
+                                                self.flush_display(events, index, message_id.as_deref(), &pending, &mut pipeline);
+                                                published_text = true;
+                                            }
+                                            display = Some(PendingDisplay {
+                                                kind,
+                                                block,
+                                                text: text.clone(),
+                                                model_elapsed_ns,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            let pushed = match &mut accumulator {
+                                Some(accumulator) => accumulator.push(event),
+                                None => MessageAccumulator::new(event).map(|started| {
+                                    accumulator = Some(started);
+                                    false
+                                }),
+                            };
+                            match pushed {
+                                Err(error) => break Some(Err(error)),
+                                Ok(true) => {
+                                    response_completed_ns = Some(elapsed_ns());
+                                    let collect_started = Instant::now();
+                                    let collected = accumulator
+                                        .take()
+                                        .map_or(Err(ClaudeError::IncompleteStream), MessageAccumulator::finish);
+                                    pipeline.collect_ns = telemetry::elapsed_ns(collect_started);
+                                    break Some(collected);
+                                }
+                                Ok(false) => {}
+                            }
+                            let receive_started = Instant::now();
+                            let ready = stream.next().now_or_never();
+                            pipeline.receive_decode_ns = pipeline
+                                .receive_decode_ns
+                                .saturating_add(telemetry::elapsed_ns(receive_started));
+                            match ready {
+                                Some(ready) => next = ready,
+                                None => break None,
+                            }
+                        };
+                        if let (Some(events), Some(pending)) = (events, display.take()) {
+                            self.flush_display(events, index, message_id.as_deref(), &pending, &mut pipeline);
+                            published_text = true;
                         }
-                        let terminal = matches!(event, StreamEvent::MessageStop);
-                        captured.push(event);
-                        if terminal {
-                            response_completed_ns = Some(received_ns);
-                            let first = captured.remove(0);
-                            let rest = captured.into_iter().map(Ok);
-                            let collect_started = Instant::now();
-                            let collected =
-                                collect_stream(first, futures_util::stream::iter(rest)).await;
-                            pipeline.collect_ns = telemetry::elapsed_ns(collect_started);
-                            break collected;
+                        if let Some(ended) = ended {
+                            break ended;
                         }
                     }
                 }

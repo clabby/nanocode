@@ -132,6 +132,7 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         }
     }
     #[doc(hidden)]
+    #[allow(clippy::boxed_local)]
     fn begin_model_step<'a>(
         &'a self,
         id: String,

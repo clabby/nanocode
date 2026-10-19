@@ -935,7 +935,54 @@ pub enum StreamEvent {
     Other,
 }
 
+#[derive(Deserialize)]
+struct DeltaFrame<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    index: usize,
+    #[serde(borrow)]
+    delta: DeltaPart<'a>,
+}
+
+#[derive(Deserialize)]
+struct DeltaPart<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    text: Option<String>,
+    thinking: Option<String>,
+    partial_json: Option<String>,
+    signature: Option<String>,
+}
+
+impl DeltaPart<'_> {
+    fn into_delta(self) -> Option<ContentDelta> {
+        match self.kind {
+            "text_delta" => self.text.map(|text| ContentDelta::TextDelta { text }),
+            "thinking_delta" => self
+                .thinking
+                .map(|thinking| ContentDelta::ThinkingDelta { thinking }),
+            "input_json_delta" => self
+                .partial_json
+                .map(|partial_json| ContentDelta::InputJsonDelta { partial_json }),
+            "signature_delta" => self
+                .signature
+                .map(|signature| ContentDelta::SignatureDelta { signature }),
+            _ => None,
+        }
+    }
+}
+
 fn decode_stream_event(data: &str, event_name: Option<&str>) -> Result<StreamEvent, ClaudeError> {
+    if event_name == Some("content_block_delta")
+        && let Ok(frame) = serde_json::from_str::<DeltaFrame<'_>>(data)
+        && frame.kind == "content_block_delta"
+        && let Some(delta) = frame.delta.into_delta()
+    {
+        return Ok(StreamEvent::ContentBlockDelta {
+            index: frame.index,
+            delta,
+        });
+    }
     if let Ok(event) = serde_json::from_str::<StreamEvent>(data) {
         let kind = match &event {
             StreamEvent::MessageStart { .. } => Some("message_start"),
@@ -1502,8 +1549,8 @@ impl ClaudeClient {
                             return Some((Err(redact_error(error, &state.credentials)), state));
                         }
                     };
-                    if let Some((event_name, data)) = frame {
-                        let parsed = decode_stream_event(&data, event_name.as_deref());
+                    if let Some(frame) = frame {
+                        let parsed = state.decode(&frame);
                         let event = match parsed {
                             Ok(StreamEvent::Error { error }) => Err(ClaudeError::StreamError {
                                 kind: error.kind,
@@ -1770,14 +1817,26 @@ struct SseState {
     credentials: Vec<String>,
     response: ResponseBytes,
     bytes: Vec<u8>,
-    data: Vec<String>,
+    data: Option<std::ops::Range<usize>>,
+    joined: Option<String>,
     done: bool,
     frame_bytes: usize,
-    event_name: Option<String>,
+    frame_start: usize,
+    event_name: Option<std::ops::Range<usize>>,
     first_line: bool,
     skip_lf: bool,
     scan_start: usize,
     cursor: usize,
+}
+
+enum FrameData {
+    Line(std::ops::Range<usize>),
+    Joined(String),
+}
+
+struct Frame {
+    event_name: Option<std::ops::Range<usize>>,
+    data: FrameData,
 }
 
 impl SseState {
@@ -1786,9 +1845,11 @@ impl SseState {
             credentials,
             response,
             bytes: Vec::new(),
-            data: Vec::new(),
+            data: None,
+            joined: None,
             done: false,
             frame_bytes: 0,
+            frame_start: 0,
             event_name: None,
             first_line: true,
             skip_lf: false,
@@ -1797,7 +1858,24 @@ impl SseState {
         }
     }
 
-    fn pop_frame(&mut self) -> Result<Option<(Option<String>, String)>, ClaudeError> {
+    fn text(&self, range: std::ops::Range<usize>) -> Result<&str, ClaudeError> {
+        std::str::from_utf8(&self.bytes[range])
+            .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))
+    }
+
+    fn decode(&self, frame: &Frame) -> Result<StreamEvent, ClaudeError> {
+        let event_name = frame
+            .event_name
+            .clone()
+            .map(|range| self.text(range))
+            .transpose()?;
+        match &frame.data {
+            FrameData::Line(range) => decode_stream_event(self.text(range.clone())?, event_name),
+            FrameData::Joined(data) => decode_stream_event(data, event_name),
+        }
+    }
+
+    fn pop_frame(&mut self) -> Result<Option<Frame>, ClaudeError> {
         loop {
             if self.skip_lf {
                 if self.cursor == self.bytes.len() {
@@ -1825,50 +1903,76 @@ impl SseState {
             self.cursor = index + 1;
             self.scan_start = self.cursor;
 
-            let mut line = std::str::from_utf8(&self.bytes[start..index])
+            let mut line_start = start;
+            let line = std::str::from_utf8(&self.bytes[start..index])
                 .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))?;
             if self.first_line {
                 self.first_line = false;
-                line = line.strip_prefix('\u{feff}').unwrap_or(line);
+                if line.starts_with('\u{feff}') {
+                    line_start += '\u{feff}'.len_utf8();
+                }
             }
+            let line = &self.bytes[line_start..index];
             if line.is_empty() {
                 self.frame_bytes = 0;
+                self.frame_start = self.cursor;
                 let event_name = self.event_name.take();
-                if let Some(data) = self.take_data() {
-                    return Ok(Some((event_name, data)));
-                }
-                continue;
+                let data = match (self.data.take(), self.joined.take()) {
+                    (_, Some(joined)) => FrameData::Joined(joined),
+                    (Some(range), None) => FrameData::Line(range),
+                    (None, None) => continue,
+                };
+                return Ok(Some(Frame { event_name, data }));
             }
-            let (field, value) = line.split_once(':').unwrap_or((line, ""));
-            let value = value.strip_prefix(' ').unwrap_or(value);
+            let (field, value) = match memchr::memchr(b':', line) {
+                Some(colon) => {
+                    let value = line_start + colon + 1;
+                    let value = if self.bytes.get(value) == Some(&b' ') && value < index {
+                        value + 1
+                    } else {
+                        value
+                    };
+                    (&line[..colon], value..index)
+                }
+                None => (line, index..index),
+            };
             match field {
-                "event" => self.event_name = (!value.is_empty()).then(|| value.to_owned()),
-                "data" => self.data.push(value.to_owned()),
+                b"event" => self.event_name = (!value.is_empty()).then_some(value),
+                b"data" => match self.data.clone() {
+                    None => self.data = Some(value),
+                    Some(first) => {
+                        let text = |range: std::ops::Range<usize>| {
+                            std::str::from_utf8(&self.bytes[range])
+                                .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))
+                        };
+                        let value = text(value)?;
+                        match &mut self.joined {
+                            Some(joined) => {
+                                joined.push('\n');
+                                joined.push_str(value);
+                            }
+                            None => self.joined = Some(format!("{}\n{value}", text(first)?)),
+                        }
+                    }
+                },
                 _ => {}
             }
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
-        if self.cursor > 0 {
-            self.bytes.copy_within(self.cursor.., 0);
-            self.bytes.truncate(self.bytes.len() - self.cursor);
-            self.scan_start -= self.cursor;
-            self.cursor = 0;
+        let shift = self.frame_start;
+        if shift > 0 {
+            self.bytes.copy_within(shift.., 0);
+            self.bytes.truncate(self.bytes.len() - shift);
+            self.scan_start -= shift;
+            self.cursor -= shift;
+            self.frame_start = 0;
+            for range in [&mut self.data, &mut self.event_name].into_iter().flatten() {
+                *range = range.start - shift..range.end - shift;
+            }
         }
         self.bytes.extend_from_slice(chunk);
-    }
-
-    fn take_data(&mut self) -> Option<String> {
-        if self.data.is_empty() {
-            None
-        } else if self.data.len() == 1 {
-            self.data.pop()
-        } else {
-            let data = self.data.join("\n");
-            self.data.clear();
-            Some(data)
-        }
     }
 }
 
@@ -2050,18 +2154,42 @@ pub async fn collect_stream<S>(
 where
     S: Stream<Item = Result<StreamEvent, ClaudeError>> + Unpin,
 {
-    let StreamEvent::MessageStart { mut message } = first else {
-        return Err(ClaudeError::Protocol("expected message_start".into()));
-    };
-    let mut active = BTreeMap::<usize, BlockAccumulator>::new();
-    let mut completed = BTreeMap::<usize, BlockAccumulator>::new();
+    let mut accumulator = MessageAccumulator::new(first)?;
     while let Some(event) = events.next().await {
-        match event? {
+        if accumulator.push(event?)? {
+            return accumulator.finish();
+        }
+    }
+    Err(ClaudeError::IncompleteStream)
+}
+
+pub struct MessageAccumulator {
+    message: MessageResponse,
+    active: BTreeMap<usize, BlockAccumulator>,
+    completed: BTreeMap<usize, BlockAccumulator>,
+    stopped: bool,
+}
+
+impl MessageAccumulator {
+    pub fn new(first: StreamEvent) -> Result<Self, ClaudeError> {
+        let StreamEvent::MessageStart { message } = first else {
+            return Err(ClaudeError::Protocol("expected message_start".into()));
+        };
+        Ok(Self {
+            message,
+            active: BTreeMap::new(),
+            completed: BTreeMap::new(),
+            stopped: false,
+        })
+    }
+
+    pub fn push(&mut self, event: StreamEvent) -> Result<bool, ClaudeError> {
+        match event {
             StreamEvent::ContentBlockStart {
                 index,
                 content_block,
             } => {
-                if active.contains_key(&index) || completed.contains_key(&index) {
+                if self.active.contains_key(&index) || self.completed.contains_key(&index) {
                     return Err(ClaudeError::Protocol(format!(
                         "duplicate content block {index}"
                     )));
@@ -2117,10 +2245,10 @@ where
                     },
                     other => BlockAccumulator::Other(other),
                 };
-                active.insert(index, block);
+                self.active.insert(index, block);
             }
             StreamEvent::ContentBlockDelta { index, delta } => {
-                match (active.get_mut(&index), delta) {
+                match (self.active.get_mut(&index), delta) {
                     (
                         Some(BlockAccumulator::Text { text, .. }),
                         ContentDelta::TextDelta { text: chunk },
@@ -2168,76 +2296,34 @@ where
                 }
             }
             StreamEvent::ContentBlockStop { index } => {
-                let block = active.remove(&index).ok_or_else(|| {
+                let block = self.active.remove(&index).ok_or_else(|| {
                     ClaudeError::Protocol(format!("unknown content block {index}"))
                 })?;
-                completed.insert(index, block);
+                self.completed.insert(index, block);
             }
             StreamEvent::MessageDelta { delta, usage } => {
                 if let Some(container) = delta.container {
-                    message.container = Some(container);
+                    self.message.container = Some(container);
                 }
                 if let Some(reason) = delta.stop_reason {
-                    message.stop_reason = Some(reason);
+                    self.message.stop_reason = Some(reason);
                 }
                 if let Some(input) = usage.input_tokens {
-                    message.usage.input_tokens = input;
+                    self.message.usage.input_tokens = input;
                 }
                 if let Some(cached) = usage.cache_read_input_tokens {
-                    message.usage.cache_read_input_tokens = cached;
+                    self.message.usage.cache_read_input_tokens = cached;
                 }
                 if let Some(created) = usage.cache_creation_input_tokens {
-                    message.usage.cache_creation_input_tokens = created;
+                    self.message.usage.cache_creation_input_tokens = created;
                 }
                 if let Some(output) = usage.output_tokens {
-                    message.usage.output_tokens = output;
+                    self.message.usage.output_tokens = output;
                 }
             }
             StreamEvent::MessageStop => {
-                if message.stop_reason.is_none() {
-                    return Err(ClaudeError::Protocol("missing final stop_reason".into()));
-                }
-                let truncated = message.stop_reason == Some(StopReason::MaxTokens);
-                for (index, block) in active {
-                    let block = match block {
-                        BlockAccumulator::Text { .. } if truncated => block,
-                        BlockAccumulator::ToolUse { id, name, .. } if truncated => {
-                            BlockAccumulator::Other(ContentBlock::text(format!(
-                                "Incomplete tool input for {name} ({id}) was not executed because the output token limit was reached. Issue a fresh complete call if needed."
-                            )))
-                        }
-                        _ => {
-                            return Err(ClaudeError::Protocol(format!(
-                                "message_stop before content_block_stop: stop_reason={}, block_kind={}, block_index={index}",
-                                match message.stop_reason {
-                                    Some(StopReason::EndTurn) => "end_turn",
-                                    Some(StopReason::MaxTokens) => "max_tokens",
-                                    Some(StopReason::StopSequence) => "stop_sequence",
-                                    Some(StopReason::ToolUse) => "tool_use",
-                                    Some(StopReason::PauseTurn) => "pause_turn",
-                                    Some(StopReason::Refusal) => "refusal",
-                                    Some(StopReason::ModelContextWindowExceeded) =>
-                                        "model_context_window_exceeded",
-                                    Some(StopReason::Unknown) => "unknown",
-                                    None => "missing",
-                                },
-                                block.diagnostic_kind(),
-                            )));
-                        }
-                    };
-                    completed.insert(index, block);
-                }
-                let count = completed.len();
-                if completed.keys().copied().ne(0..count) {
-                    return Err(ClaudeError::Protocol(
-                        "non-contiguous content block indices".into(),
-                    ));
-                }
-                message.content = completed
-                    .into_values()
-                    .map(|block| block.finish(truncated))
-                    .collect::<Result<Vec<_>, _>>()?;
-                return Ok(message);
+                self.stopped = true;
+                return Ok(true);
             }
             StreamEvent::Error { error } => {
                 return Err(ClaudeError::StreamError {
@@ -2250,8 +2336,64 @@ where
             }
             StreamEvent::Ping | StreamEvent::Other => {}
         }
+        Ok(false)
     }
-    Err(ClaudeError::IncompleteStream)
+
+    pub fn finish(self) -> Result<MessageResponse, ClaudeError> {
+        if !self.stopped {
+            return Err(ClaudeError::IncompleteStream);
+        }
+        let Self {
+            mut message,
+            active,
+            mut completed,
+            ..
+        } = self;
+        if message.stop_reason.is_none() {
+            return Err(ClaudeError::Protocol("missing final stop_reason".into()));
+        }
+        let truncated = message.stop_reason == Some(StopReason::MaxTokens);
+        for (index, block) in active {
+            let block = match block {
+                BlockAccumulator::Text { .. } if truncated => block,
+                BlockAccumulator::ToolUse { id, name, .. } if truncated => {
+                    BlockAccumulator::Other(ContentBlock::text(format!(
+                        "Incomplete tool input for {name} ({id}) was not executed because the output token limit was reached. Issue a fresh complete call if needed."
+                    )))
+                }
+                _ => {
+                    return Err(ClaudeError::Protocol(format!(
+                        "message_stop before content_block_stop: stop_reason={}, block_kind={}, block_index={index}",
+                        match message.stop_reason {
+                            Some(StopReason::EndTurn) => "end_turn",
+                            Some(StopReason::MaxTokens) => "max_tokens",
+                            Some(StopReason::StopSequence) => "stop_sequence",
+                            Some(StopReason::ToolUse) => "tool_use",
+                            Some(StopReason::PauseTurn) => "pause_turn",
+                            Some(StopReason::Refusal) => "refusal",
+                            Some(StopReason::ModelContextWindowExceeded) =>
+                                "model_context_window_exceeded",
+                            Some(StopReason::Unknown) => "unknown",
+                            None => "missing",
+                        },
+                        block.diagnostic_kind(),
+                    )));
+                }
+            };
+            completed.insert(index, block);
+        }
+        let count = completed.len();
+        if completed.keys().copied().ne(0..count) {
+            return Err(ClaudeError::Protocol(
+                "non-contiguous content block indices".into(),
+            ));
+        }
+        message.content = completed
+            .into_values()
+            .map(|block| block.finish(truncated))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(message)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
