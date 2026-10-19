@@ -154,7 +154,6 @@ impl Journal {
         self.invalid_index = None;
         self.cached = None;
         self.sealed = None;
-        self.ready = false;
         self.restore_index();
         Ok(())
     }
