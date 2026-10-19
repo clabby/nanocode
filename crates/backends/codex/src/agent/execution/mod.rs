@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     NanocodeError, Result, ServiceTier,
+    client::responses::{ResponseHistory, ResponseItem},
     session::{CommittedSession, SessionSnapshot},
     usage::TurnUsage,
 };
@@ -257,6 +258,35 @@ pub trait ExecutionPolicy: Send + Sync {
         continuation: ExecutionContinuation,
     ) -> ExecutionFuture<'a, Result<()>>;
 
+    #[doc(hidden)]
+    fn advance_history<'a>(
+        &'a self,
+        operation_id: String,
+        state_json: String,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+        next_step: Option<(String, String, String)>,
+    ) -> ExecutionFuture<'a, Result<Option<ExecutionStepAdmission>>> {
+        Box::pin(async move {
+            self.advance(
+                operation_id.clone(),
+                ExecutionContinuation {
+                    state_json,
+                    history: history.iter().cloned().collect(),
+                    prefix: prefix.to_vec(),
+                },
+            )
+            .await?;
+            match next_step {
+                Some((step_id, kind, input_json)) => self
+                    .begin_step(operation_id, step_id, kind, input_json)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn begin_step<'a>(
         &'a self,
         operation_id: String,
@@ -462,6 +492,35 @@ pub trait ExecutionPolicy: Send + Sync {
         operation_id: String,
         continuation: ExecutionContinuation,
     ) -> ExecutionFuture<'a, Result<()>>;
+
+    #[doc(hidden)]
+    fn advance_history<'a>(
+        &'a self,
+        operation_id: String,
+        state_json: String,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+        next_step: Option<(String, String, String)>,
+    ) -> ExecutionFuture<'a, Result<Option<ExecutionStepAdmission>>> {
+        Box::pin(async move {
+            self.advance(
+                operation_id.clone(),
+                ExecutionContinuation {
+                    state_json,
+                    history: history.iter().cloned().collect(),
+                    prefix: prefix.to_vec(),
+                },
+            )
+            .await?;
+            match next_step {
+                Some((step_id, kind, input_json)) => self
+                    .begin_step(operation_id, step_id, kind, input_json)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        })
+    }
 
     fn begin_step<'a>(
         &'a self,
@@ -1012,22 +1071,34 @@ impl ExecutionSteps {
             .transpose()
     }
 
-    pub(crate) async fn advance<T: Serialize>(
+    pub(crate) async fn advance<T, I, O>(
         &self,
         state: &T,
-        history: Vec<crate::client::responses::ResponseItem>,
-        prefix: Vec<crate::client::responses::ResponseItem>,
-    ) -> Result<()> {
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+        next_step: Option<(String, &str, &I)>,
+    ) -> Result<Option<ExecutionStep<O>>>
+    where
+        T: Serialize,
+        I: Serialize + ?Sized,
+        O: DeserializeOwned,
+    {
+        let next_step = next_step
+            .map(|(step_id, kind, input)| {
+                Ok::<_, NanocodeError>((step_id, kind.to_owned(), encode(input)?))
+            })
+            .transpose()?;
         self.policy
-            .advance(
+            .advance_history(
                 self.operation_id.clone(),
-                ExecutionContinuation {
-                    state_json: encode(state)?,
-                    history,
-                    prefix,
-                },
+                encode(state)?,
+                history,
+                prefix,
+                next_step,
             )
-            .await
+            .await?
+            .map(admitted_step)
+            .transpose()
     }
 
     pub(crate) async fn bind_steer(&self, steer_index: u32, model_call_index: u32) -> Result<()> {
@@ -1046,20 +1117,16 @@ impl ExecutionSteps {
         I: Serialize + ?Sized,
         O: DeserializeOwned,
     {
-        match self
-            .policy
-            .begin_step(
-                self.operation_id.clone(),
-                step_id.into(),
-                kind.into(),
-                encode(input)?,
-            )
-            .await?
-        {
-            ExecutionStepAdmission::Execute => Ok(ExecutionStep::Execute),
-            ExecutionStepAdmission::Interrupted => Ok(ExecutionStep::Interrupted),
-            ExecutionStepAdmission::Replay(output) => Ok(ExecutionStep::Replay(decode(&output)?)),
-        }
+        admitted_step(
+            self.policy
+                .begin_step(
+                    self.operation_id.clone(),
+                    step_id.into(),
+                    kind.into(),
+                    encode(input)?,
+                )
+                .await?,
+        )
     }
 
     pub(crate) async fn complete<O: Serialize + ?Sized>(
@@ -1070,6 +1137,16 @@ impl ExecutionSteps {
         self.policy
             .complete_step(self.operation_id.clone(), step_id.into(), encode(output)?)
             .await
+    }
+}
+
+fn admitted_step<O: DeserializeOwned>(
+    admission: ExecutionStepAdmission,
+) -> Result<ExecutionStep<O>> {
+    match admission {
+        ExecutionStepAdmission::Execute => Ok(ExecutionStep::Execute),
+        ExecutionStepAdmission::Interrupted => Ok(ExecutionStep::Interrupted),
+        ExecutionStepAdmission::Replay(output) => Ok(ExecutionStep::Replay(decode(&output)?)),
     }
 }
 

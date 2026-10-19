@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Deserialize)]
-struct RecordedModelResult {
+pub(super) struct RecordedModelResult {
     response: TurnResult,
     attempt: u32,
     connection_generation: u32,
@@ -78,8 +78,9 @@ impl ModelRun {
         call_index: u32,
         conversation: &ConversationState,
         factory: &ResponsesAttemptFactory,
+        admitted: Option<crate::agent::ExecutionStep<RecordedModelResult>>,
     ) -> Result<ModelCallOutcome> {
-        let step_id = format!("model-{call_index}");
+        let step_id = model_step_id(call_index);
         let model = self.model;
         let thinking = self.thinking;
         let reasoning_mode = self.config.reasoning_mode;
@@ -123,10 +124,15 @@ impl ModelRun {
         let request = request.with_input_trace(trace_content_enabled().then(|| span.clone()));
         let execution_steps = self.execution_steps.clone();
         let recovered = if let Some(steps) = &execution_steps {
-            match steps
-                .begin::<_, RecordedModelResult>(&step_id, "model_call", &())
-                .await?
-            {
+            let admitted = match admitted {
+                Some(admitted) => admitted,
+                None => {
+                    steps
+                        .begin::<_, RecordedModelResult>(&step_id, "model_call", &())
+                        .await?
+                }
+            };
+            match admitted {
                 crate::agent::ExecutionStep::Interrupted => {
                     return Err(NanocodeError::InvalidExecutionPolicy(
                         "non-tool step was admitted with an interrupted tool outcome".into(),
@@ -255,6 +261,10 @@ impl ModelRun {
         )?;
         Err(error)
     }
+}
+
+pub(super) fn model_step_id(call_index: u32) -> String {
+    format!("model-{call_index}")
 }
 
 pub(super) fn validate_provider_response_id(response_id: &str) -> Result<()> {

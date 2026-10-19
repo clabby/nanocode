@@ -209,11 +209,36 @@ impl ModelRun {
 
     pub(super) async fn retain_execution(
         &mut self,
-        session: &ModelSessionState,
+        session: &mut ModelSessionState,
         phase: ExecutionPhase,
     ) -> Result<()> {
+        self.retain_then_begin::<()>(session, phase, None)
+            .await
+            .map(drop)
+    }
+
+    pub(super) async fn retain_before_model_call(
+        &mut self,
+        session: &mut ModelSessionState,
+        call_index: u32,
+    ) -> Result<Option<crate::agent::ExecutionStep<RecordedModelResult>>> {
+        self.retain_then_begin(
+            session,
+            ExecutionPhase::Generate,
+            Some((model_step_id(call_index), "model_call")),
+        )
+        .await
+    }
+
+    async fn retain_then_begin<O: serde::de::DeserializeOwned>(
+        &mut self,
+        session: &mut ModelSessionState,
+        phase: ExecutionPhase,
+        next_step: Option<(String, &str)>,
+    ) -> Result<Option<crate::agent::ExecutionStep<O>>> {
+        session.conversation.commit_tail();
         if self.execution_steps.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         self.record_transport();
         let steps = self.execution_steps.as_ref().expect("durable execution");
@@ -248,10 +273,10 @@ impl ModelRun {
         steps
             .advance(
                 &saved,
-                session.conversation.flattened_history(),
-                session.factory.profile().prefix().to_vec(),
+                session.conversation.shared_history(),
+                session.factory.profile().shared_prefix(),
+                next_step.map(|(step_id, kind)| (step_id, kind, &())),
             )
-            .await?;
-        Ok(())
+            .await
     }
 }

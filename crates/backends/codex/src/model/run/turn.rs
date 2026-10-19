@@ -77,7 +77,7 @@ impl ModelRun {
             .prepare_request_policy(self.continuation_policy());
 
         if !resumed {
-            self.retain_execution(&session, ExecutionPhase::Compact)
+            self.retain_execution(&mut session, ExecutionPhase::Compact)
                 .await?;
         }
         let active_context_tokens = session.conversation.active_context_tokens();
@@ -595,7 +595,7 @@ impl ModelRun {
         };
 
         if !resumed {
-            self.retain_execution(&session, phase).await?;
+            self.retain_execution(&mut session, phase).await?;
         }
         match phase {
             ExecutionPhase::PrepareTurn => {
@@ -880,6 +880,7 @@ impl ModelRun {
                     self.config.supports_reasoning_effort_updates(self.model),
                 );
             }
+            let mut admitted = None;
             if !first_batch || !resumed {
                 let history_len = session.conversation.managed.history().len();
                 let update = session.conversation.reasoning.sampling_update(
@@ -891,8 +892,7 @@ impl ModelRun {
                 if let Some(update) = update {
                     session.conversation.append([update]);
                 }
-                self.retain_execution(session, ExecutionPhase::Generate)
-                    .await?;
+                admitted = self.retain_before_model_call(session, call_index).await?;
             }
             first_batch = false;
             Self::publish_fork_snapshot(session, fork_snapshots, self.global_instructions.as_ref());
@@ -902,7 +902,12 @@ impl ModelRun {
                 transport_continuation_valid,
                 server_reasoning_included,
             } = self
-                .perform_model_call(call_index, &session.conversation, &session.factory)
+                .perform_model_call(
+                    call_index,
+                    &session.conversation,
+                    &session.factory,
+                    admitted,
+                )
                 .await?;
             let TurnResult {
                 id,

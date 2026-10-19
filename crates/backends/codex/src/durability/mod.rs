@@ -9,13 +9,14 @@ use std::{
 use nanocode_agent_core::{ExecutionPolicyDisposition, NanocodeError, Result as AgentResult};
 use nanocode_durability::{
     Admission, BeginStep, Branches, DurableAgentExt, DurableOwner, DurableSession, EncodedPayload,
-    InitialAcquisition, InitialSettings, JournalClaim, JournalSeed, OperationStatus, SessionRecord,
-    SharedStore, agent_error,
+    InitialAcquisition, InitialSettings, JournalClaim, JournalSeed, OperationStatus, OwnerWrite,
+    SessionRecord, SharedStore, WriteOutcome, agent_error,
 };
 use serde_json::value::RawValue;
 
 use crate::{
     CodexBuilder,
+    client::responses::{ResponseHistory, ResponseItem},
     execution::{
         ExecutionAdmission, ExecutionContinuation, ExecutionFuture, ExecutionOutput,
         ExecutionPolicy, ExecutionSteer, ExecutionStepAdmission, IdentifiedExecutionSteer,
@@ -178,6 +179,7 @@ struct DurableExecution {
     state_id: String,
     branches: Option<Branches>,
     context_records: Mutex<HashSet<String>>,
+    continuation_cache: tokio::sync::Mutex<context::ContinuationCache>,
 }
 
 impl DurableExecution {
@@ -187,6 +189,7 @@ impl DurableExecution {
             state_id,
             branches,
             context_records: Mutex::new(HashSet::new()),
+            continuation_cache: tokio::sync::Mutex::default(),
         }
     }
 
@@ -206,6 +209,25 @@ impl DurableExecution {
             NanocodeError::InvalidExecutionPolicy("context cache poisoned".into())
         })? = keys;
         Ok(())
+    }
+
+    fn remember_more(&self, keys: HashSet<String>) -> AgentResult<()> {
+        self.context_records
+            .lock()
+            .map_err(|_| NanocodeError::InvalidExecutionPolicy("context cache poisoned".into()))?
+            .extend(keys);
+        Ok(())
+    }
+}
+
+fn step_admission(kind: &str, step: BeginStep) -> AgentResult<ExecutionStepAdmission> {
+    match step {
+        BeginStep::Execute => Ok(ExecutionStepAdmission::Execute),
+        BeginStep::Interrupted if kind == "tool_call" => Ok(ExecutionStepAdmission::Interrupted),
+        BeginStep::Interrupted => Ok(ExecutionStepAdmission::Execute),
+        BeginStep::Replay(output) => Ok(ExecutionStepAdmission::Replay(
+            output.json().map_err(agent_error)?.to_owned(),
+        )),
     }
 }
 
@@ -538,20 +560,64 @@ impl ExecutionPolicy for DurableExecution {
     ) -> ExecutionFuture<'a, AgentResult<ExecutionStepAdmission>> {
         Box::pin(async move {
             let input = raw(input_json)?;
-            match self
+            let step = self
                 .owner
                 .begin_step(operation_id, step_id, kind.clone(), &input)
                 .await
-            {
-                Ok(BeginStep::Execute) => Ok(ExecutionStepAdmission::Execute),
-                Ok(BeginStep::Interrupted) if kind == "tool_call" => {
-                    Ok(ExecutionStepAdmission::Interrupted)
+                .map_err(agent_error)?;
+            step_admission(&kind, step)
+        })
+    }
+
+    fn advance_history<'a>(
+        &'a self,
+        operation_id: String,
+        state_json: String,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+        next_step: Option<(String, String, String)>,
+    ) -> ExecutionFuture<'a, AgentResult<Option<ExecutionStepAdmission>>> {
+        Box::pin(async move {
+            let mut cache = self.continuation_cache.lock().await;
+            let prepared = {
+                let known = self.context_records.lock().map_err(|_| {
+                    NanocodeError::InvalidExecutionPolicy("context cache poisoned".into())
+                })?;
+                context::prepare_cached_continuation(
+                    state_json, &history, &prefix, &mut cache, &known,
+                )
+                .map_err(agent_error)?
+            };
+            let mut writes = vec![OwnerWrite::Advance {
+                continuation: prepared.payload,
+            }];
+            let kind = match next_step {
+                Some((step_id, kind, input_json)) => {
+                    writes.push(OwnerWrite::BeginStep {
+                        step_id,
+                        kind: kind.clone(),
+                        input: EncodedPayload::encode(&raw(input_json)?).map_err(agent_error)?,
+                    });
+                    Some(kind)
                 }
-                Ok(BeginStep::Interrupted) => Ok(ExecutionStepAdmission::Execute),
-                Ok(BeginStep::Replay(output)) => Ok(ExecutionStepAdmission::Replay(
-                    output.json().map_err(agent_error)?.to_owned(),
+                None => None,
+            };
+            let outcomes = self
+                .owner
+                .commit_writes(operation_id, writes)
+                .await
+                .map_err(agent_error)?;
+            cache.committed(history, prefix);
+            drop(cache);
+            self.remember_more(prepared.keys)?;
+            let Some(kind) = kind else {
+                return Ok(None);
+            };
+            match outcomes.into_iter().last() {
+                Some(WriteOutcome::Began(step)) => step_admission(&kind, step).map(Some),
+                _ => Err(NanocodeError::InvalidExecutionPolicy(
+                    "fused durable write did not report the begun step".into(),
                 )),
-                Err(error) => Err(agent_error(error)),
             }
         })
     }
@@ -1036,6 +1102,22 @@ impl ExecutionPolicy for LazyExecution {
         continuation: ExecutionContinuation,
     ) -> ExecutionFuture<'a, AgentResult<()>> {
         Box::pin(async move { self.get().await?.advance(operation_id, continuation).await })
+    }
+
+    fn advance_history<'a>(
+        &'a self,
+        operation_id: String,
+        state_json: String,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+        next_step: Option<(String, String, String)>,
+    ) -> ExecutionFuture<'a, AgentResult<Option<ExecutionStepAdmission>>> {
+        Box::pin(async move {
+            self.get()
+                .await?
+                .advance_history(operation_id, state_json, history, prefix, next_step)
+                .await
+        })
     }
 
     fn begin_step<'a>(

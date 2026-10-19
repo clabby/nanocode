@@ -1,12 +1,14 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use nanocode_durability::{
-    EncodedPayload, PagedWriter, PayloadReader, Prepared, Result, Sequence, load_sequence,
+    EncodedPayload, PagedWriter, PayloadReader, Prepared, Result, Sequence, SequenceCache,
+    load_sequence,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::{
+    client::responses::{ResponseHistory, ResponseItem},
     execution::ExecutionContinuation,
     session::{SessionSnapshot, SessionSnapshotHead},
 };
@@ -31,6 +33,49 @@ pub(crate) fn prepare_continuation(
         state,
         history,
         prefix,
+    })
+}
+
+#[derive(Default)]
+pub(crate) struct ContinuationCache {
+    history: ResponseHistory,
+    history_pages: SequenceCache,
+    prefix: Arc<[ResponseItem]>,
+    prefix_pages: SequenceCache,
+}
+
+impl ContinuationCache {
+    pub(crate) fn committed(&mut self, history: ResponseHistory, prefix: Arc<[ResponseItem]>) {
+        self.history = history;
+        self.history_pages.committed();
+        self.prefix = prefix;
+        self.prefix_pages.committed();
+    }
+}
+
+pub(crate) fn prepare_cached_continuation(
+    state_json: String,
+    history: &ResponseHistory,
+    prefix: &Arc<[ResponseItem]>,
+    cache: &mut ContinuationCache,
+    known: &HashSet<String>,
+) -> Result<Prepared> {
+    let mut writer = PagedWriter::new(known);
+    let items = history.iter().collect::<Vec<_>>();
+    let unchanged = cache.history.shared_prefix_len(history);
+    let history_sequence = writer.sequence_cached(&items, unchanged, &mut cache.history_pages)?;
+    let unchanged = if Arc::ptr_eq(&cache.prefix, prefix) {
+        prefix.len()
+    } else {
+        0
+    };
+    let prefix_sequence = writer.sequence_cached(prefix, unchanged, &mut cache.prefix_pages)?;
+    let state =
+        RawValue::from_string(state_json).map_err(nanocode_durability::Error::InvalidPayload)?;
+    writer.finish(&Continuation {
+        state,
+        history: history_sequence,
+        prefix: prefix_sequence,
     })
 }
 
