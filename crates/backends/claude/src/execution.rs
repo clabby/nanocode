@@ -39,6 +39,17 @@ pub enum JournalWrite {
 }
 
 #[doc(hidden)]
+pub enum Settlement {
+    Complete(Box<RawValue>),
+
+    Fail(String),
+
+    FailAttempt(String),
+
+    Cancel,
+}
+
+#[doc(hidden)]
 pub struct BeginRequest<'a> {
     pub step_id: String,
 
@@ -191,6 +202,30 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         self.fail(id, checkpoint, error)
     }
     fn cancel(&self, id: String, checkpoint: Value) -> PolicyFuture<'_, ()>;
+
+    #[doc(hidden)]
+    #[allow(clippy::boxed_local)]
+    fn settle_encoded(
+        &self,
+        id: String,
+        checkpoint: Box<RawValue>,
+        settlement: Settlement,
+    ) -> PolicyFuture<'_, ()> {
+        Box::pin(async move {
+            let checkpoint: Value =
+                serde_json::from_str(checkpoint.get()).map_err(crate::agent::provider_error)?;
+            match settlement {
+                Settlement::Complete(output) => {
+                    let output = serde_json::from_str(output.get())
+                        .map_err(crate::agent::provider_error)?;
+                    self.complete(id, checkpoint, output).await
+                }
+                Settlement::Fail(error) => self.fail(id, checkpoint, error).await,
+                Settlement::FailAttempt(error) => self.fail_attempt(id, checkpoint, error).await,
+                Settlement::Cancel => self.cancel(id, checkpoint).await,
+            }
+        })
+    }
 
     fn cancel_unstarted(&self, _id: String) -> PolicyFuture<'_, bool> {
         Box::pin(async { Ok(false) })

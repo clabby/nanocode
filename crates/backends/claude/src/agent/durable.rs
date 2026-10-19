@@ -1,5 +1,5 @@
 use super::*;
-use crate::execution::{BeginRequest, JournalWrite};
+use crate::execution::{BeginRequest, JournalWrite, Settlement};
 use serde_json::value::RawValue;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -579,31 +579,31 @@ impl State {
         }
         let mut snapshot = self.snapshot(&Conversation::default()).await?;
         snapshot.conversation = std::mem::take(conversation);
-        let checkpoint = serde_json::to_value(&snapshot).map_err(provider_error);
+        let checkpoint = snapshot
+            .conversation
+            .messages
+            .iter()
+            .try_for_each(HistoryMessage::cache_json)
+            .and_then(|()| serde_json::value::to_raw_value(&snapshot))
+            .map_err(provider_error);
         *conversation = snapshot.conversation;
         let checkpoint = checkpoint?;
-        let settled = match result {
-            Ok(result) => {
-                policy
-                    .complete(
-                        operation.clone(),
-                        checkpoint,
-                        json!({"final_message": result.final_message(), "usage":result.usage()}),
-                    )
-                    .await
-            }
-            Err(NanocodeError::TurnCancelled) => policy.cancel(operation.clone(), checkpoint).await,
+        let settlement = match result {
+            Ok(result) => Settlement::Complete(
+                serde_json::value::to_raw_value(
+                    &json!({"final_message": result.final_message(), "usage":result.usage()}),
+                )
+                .map_err(provider_error)?,
+            ),
+            Err(NanocodeError::TurnCancelled) => Settlement::Cancel,
             Err(NanocodeError::Response(error)) if self.code_only && error.retryable() => {
-                policy
-                    .fail_attempt(operation.clone(), checkpoint, error.to_string())
-                    .await
+                Settlement::FailAttempt(error.to_string())
             }
-            Err(error) => {
-                policy
-                    .fail(operation.clone(), checkpoint, error.to_string())
-                    .await
-            }
+            Err(error) => Settlement::Fail(error.to_string()),
         };
+        let settled = policy
+            .settle_encoded(operation.clone(), checkpoint, settlement)
+            .await;
         if settled.is_err() {
             self.stopped.store(true, Ordering::SeqCst);
         }

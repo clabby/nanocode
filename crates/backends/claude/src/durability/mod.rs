@@ -17,7 +17,7 @@ use crate::{
     Claude, ClaudeBuilder,
     execution::{
         Admission as ClaudeAdmission, BeginRequest, ClaudeExecutionPolicy, ClaudeSteer,
-        JournalWrite, PolicyFuture, Step,
+        JournalWrite, PolicyFuture, Settlement, Step,
     },
 };
 
@@ -445,6 +445,20 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         Box::pin(async move { self.get().await?.cancel(id, checkpoint).await })
     }
 
+    fn settle_encoded(
+        &self,
+        id: String,
+        checkpoint: Box<RawValue>,
+        settlement: Settlement,
+    ) -> PolicyFuture<'_, ()> {
+        Box::pin(async move {
+            self.get()
+                .await?
+                .settle_encoded(id, checkpoint, settlement)
+                .await
+        })
+    }
+
     fn release(&self, id: String) -> PolicyFuture<'_, ()> {
         Box::pin(async move {
             match self.ready.get() {
@@ -825,6 +839,24 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 .cancel(id, Some(payload(&checkpoint)?))
                 .await
                 .map_err(agent_error)
+        })
+    }
+
+    fn settle_encoded(
+        &self,
+        id: String,
+        checkpoint: Box<RawValue>,
+        settlement: Settlement,
+    ) -> PolicyFuture<'_, ()> {
+        Box::pin(async move {
+            let checkpoint = EncodedPayload::from_json(Arc::from(checkpoint.get()));
+            match settlement {
+                Settlement::Complete(output) => self.owner.complete(id, checkpoint, &*output).await,
+                Settlement::Fail(error) => self.owner.fail(id, checkpoint, error).await,
+                Settlement::FailAttempt(error) => self.owner.fail_attempt(id, error).await,
+                Settlement::Cancel => self.owner.cancel(id, Some(checkpoint)).await,
+            }
+            .map_err(agent_error)
         })
     }
 
