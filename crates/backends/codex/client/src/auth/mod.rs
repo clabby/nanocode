@@ -190,7 +190,16 @@ impl OpenAiAuth {
     pub fn gateway_managed() -> Self {
         Self {
             mode: OpenAiAuthMode::ApiKey,
-            source: Arc::new(GatewayManagedAuth),
+            source: Arc::new(GatewayManagedAuth(OpenAiAuthMode::ApiKey)),
+            gateway_managed: true,
+        }
+    }
+
+    #[must_use]
+    pub fn host_managed_chatgpt() -> Self {
+        Self {
+            mode: OpenAiAuthMode::ChatGpt,
+            source: Arc::new(GatewayManagedAuth(OpenAiAuthMode::ChatGpt)),
             gateway_managed: true,
         }
     }
@@ -313,7 +322,7 @@ impl OpenAiAuthSource for ChatGptHomeAuth {
     }
 }
 
-struct GatewayManagedAuth;
+struct GatewayManagedAuth(OpenAiAuthMode);
 
 impl OpenAiAuthSource for GatewayManagedAuth {
     fn validate(&self) -> Result<(), OpenAiAuthError> {
@@ -322,7 +331,7 @@ impl OpenAiAuthSource for GatewayManagedAuth {
 
     fn snapshot(&self) -> OpenAiAuthFuture<'_, Result<OpenAiAuthSnapshot, OpenAiAuthError>> {
         Box::pin(ready(Ok(OpenAiAuthSnapshot::new(
-            OpenAiAuthMode::ApiKey,
+            self.0,
             "",
             None::<Arc<str>>,
             false,
@@ -335,7 +344,10 @@ impl OpenAiAuthSource for GatewayManagedAuth {
         _rejected: &OpenAiAuthSnapshot,
     ) -> OpenAiAuthFuture<'_, Result<(), OpenAiAuthError>> {
         Box::pin(ready(Err(OpenAiAuthError::LoginRequired(Arc::from(
-            "the gateway rejected its configured credentials",
+            match self.0 {
+                OpenAiAuthMode::ApiKey => "the gateway rejected its configured credentials",
+                OpenAiAuthMode::ChatGpt => "the host transport rejected its ChatGPT authorization",
+            },
         )))))
     }
 }
