@@ -32,6 +32,7 @@ pub struct GenerationOutput {
 
     pub output_items: Vec<ResponseItem>,
 
+    #[serde(default)]
     pub code_calls: Vec<CodeCall>,
 
     pub usage: Option<Usage>,
@@ -44,6 +45,14 @@ pub struct GenerationOutput {
 
     #[serde(default)]
     pub timing: ResponseTiming,
+}
+
+impl GenerationOutput {
+    #[doc(hidden)]
+    pub fn restore_derived_fields(&mut self) {
+        self.code_calls = code_calls(&self.output_items);
+        self.final_message = final_message(&self.output_items);
+    }
 }
 
 pub struct CompactionOutput {

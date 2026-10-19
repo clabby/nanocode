@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct RecordedModelResult {
     response: TurnResult,
     attempt: u32,
@@ -9,6 +9,60 @@ struct RecordedModelResult {
     duration_ns: u64,
     #[serde(default)]
     preparation_ns: Option<u64>,
+}
+
+impl Serialize for RecordedModelResult {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct RecordedResponse<'a> {
+            id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reported_model: Option<&'a str>,
+            status: &'a str,
+            end_turn: Option<bool>,
+            output_items: &'a [ResponseItem],
+            usage: Option<&'a Usage>,
+            time_to_first_event_ns: u64,
+            time_to_first_output_ns: Option<u64>,
+            pipeline_stats: &'a ResponsePipelineStats,
+            timing: &'a ResponseTiming,
+        }
+
+        #[derive(Serialize)]
+        struct Record<'a> {
+            response: RecordedResponse<'a>,
+            attempt: u32,
+            connection_generation: u32,
+            server_reasoning_included: bool,
+            duration_ns: u64,
+            preparation_ns: Option<u64>,
+        }
+
+        let response = &self.response;
+        Record {
+            response: RecordedResponse {
+                id: &response.id,
+                reported_model: response.reported_model.as_deref(),
+                status: &response.status,
+                end_turn: response.end_turn,
+                output_items: &response.output_items,
+                usage: response.usage.as_ref(),
+                time_to_first_event_ns: response.time_to_first_event_ns,
+                time_to_first_output_ns: response.time_to_first_output_ns,
+                pipeline_stats: &response.pipeline_stats,
+                timing: &response.timing,
+            },
+            attempt: self.attempt,
+            connection_generation: self.connection_generation,
+            server_reasoning_included: self.server_reasoning_included,
+            duration_ns: self.duration_ns,
+            preparation_ns: self.preparation_ns,
+        }
+        .serialize(serializer)
+    }
 }
 
 pub(super) struct ModelCallOutcome {
@@ -79,7 +133,10 @@ impl ModelRun {
                     ));
                 }
                 crate::agent::ExecutionStep::Execute => None,
-                crate::agent::ExecutionStep::Replay(output) => Some(output),
+                crate::agent::ExecutionStep::Replay(mut output) => {
+                    output.response.restore_derived_fields();
+                    Some(output)
+                }
             }
         } else {
             None

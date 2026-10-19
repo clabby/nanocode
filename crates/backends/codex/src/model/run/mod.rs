@@ -30,11 +30,12 @@ use crate::client::{
     events::AgentEventKind,
     pricing::{ServiceTier, estimate_for_model},
     responses::{
-        ContentItem, MessageRole, RequestProfile, ResponseHistory, ResponseItem, ToolDefinition,
-        Usage,
+        ContentItem, FunctionOutputBody, MessageRole, RequestProfile, ResponseHistory,
+        ResponseItem, ToolDefinition, Usage,
     },
     tower::{
-        CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesOutput,
+        CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsePipelineStats,
+        ResponseTiming, ResponsesOutput,
     },
     transport::{ResponsesError, ResponsesTransport, TransportStats, TransportStatsSnapshot},
 };

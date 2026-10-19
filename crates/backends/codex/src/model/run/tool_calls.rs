@@ -1,4 +1,6 @@
 use super::*;
+use crate::client::responses::FunctionOutputContent;
+use nanocode_code_mode::contract::ToolOutputContent;
 
 #[derive(Clone)]
 pub(super) struct ActiveToolCall {
@@ -36,7 +38,8 @@ impl ActiveNestedToolCall {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
+#[serde(try_from = "CompletedToolCallRecord")]
 pub(super) struct CompletedToolCall {
     pub(super) cell: Option<nanocode_code_mode::code_mode::CodeModeCell>,
     pub(super) call_id: String,
@@ -48,6 +51,165 @@ pub(super) struct CompletedToolCall {
     pub(super) structured_result: Value,
     pub(super) metadata: Option<Box<RawValue>>,
     pub(super) response_items: Vec<ResponseItem>,
+}
+
+#[derive(Deserialize)]
+struct CompletedToolCallRecord {
+    cell: Option<nanocode_code_mode::code_mode::CodeModeCell>,
+    call_id: String,
+    tool: String,
+    success: bool,
+    duration_ns: u64,
+    work_duration_ns: u64,
+    #[serde(default)]
+    output: Option<ToolOutputBody>,
+    #[serde(default, deserialize_with = "present_value")]
+    structured_result: Option<Value>,
+    metadata: Option<Box<RawValue>>,
+    response_items: Vec<ResponseItem>,
+}
+
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+impl TryFrom<CompletedToolCallRecord> for CompletedToolCall {
+    type Error = &'static str;
+
+    fn try_from(record: CompletedToolCallRecord) -> std::result::Result<Self, Self::Error> {
+        let output = match record.output {
+            Some(output) => output,
+            None => primary_output(&record.response_items)
+                .and_then(restored_output)
+                .ok_or("tool step record has no output")?,
+        };
+        let structured_result = record
+            .structured_result
+            .unwrap_or_else(|| output.structured_result());
+        Ok(Self {
+            cell: record.cell,
+            call_id: record.call_id,
+            tool: record.tool,
+            success: record.success,
+            duration_ns: record.duration_ns,
+            work_duration_ns: record.work_duration_ns,
+            output,
+            structured_result,
+            metadata: record.metadata,
+            response_items: record.response_items,
+        })
+    }
+}
+
+impl Serialize for CompletedToolCall {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Record<'a> {
+            cell: &'a Option<nanocode_code_mode::code_mode::CodeModeCell>,
+            call_id: &'a str,
+            tool: &'a str,
+            success: bool,
+            duration_ns: u64,
+            work_duration_ns: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            output: Option<&'a ToolOutputBody>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            structured_result: Option<&'a Value>,
+            metadata: &'a Option<Box<RawValue>>,
+            response_items: &'a [ResponseItem],
+        }
+
+        let output_in_items = primary_output(&self.response_items)
+            .is_some_and(|primary| restorable_output(&self.output, primary));
+        let derived_structured_result = match (&self.output, &self.structured_result) {
+            (ToolOutputBody::Text(text), Value::String(value)) => text == value,
+            (ToolOutputBody::Text(_), _) => false,
+            (ToolOutputBody::Content(_), value) => self.output.structured_result() == *value,
+        };
+        Record {
+            cell: &self.cell,
+            call_id: &self.call_id,
+            tool: &self.tool,
+            success: self.success,
+            duration_ns: self.duration_ns,
+            work_duration_ns: self.work_duration_ns,
+            output: (!output_in_items).then_some(&self.output),
+            structured_result: (!derived_structured_result).then_some(&self.structured_result),
+            metadata: &self.metadata,
+            response_items: &self.response_items,
+        }
+        .serialize(serializer)
+    }
+}
+
+fn primary_output(items: &[ResponseItem]) -> Option<&FunctionOutputBody> {
+    match items.first()? {
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => Some(output),
+        _ => None,
+    }
+}
+
+fn restorable_output(output: &ToolOutputBody, primary: &FunctionOutputBody) -> bool {
+    match (output, primary) {
+        (ToolOutputBody::Text(text), FunctionOutputBody::Text(primary)) => text == &**primary,
+        (ToolOutputBody::Content(content), FunctionOutputBody::Content(primary)) => {
+            content.len() == primary.len()
+                && content
+                    .iter()
+                    .zip(primary)
+                    .all(|(part, primary)| match (part, primary) {
+                        (
+                            ToolOutputContent::InputText { text },
+                            FunctionOutputContent::InputText { text: primary },
+                        ) => text == &**primary,
+                        (
+                            ToolOutputContent::InputAudio { audio_url },
+                            FunctionOutputContent::InputAudio { audio_url: primary },
+                        ) => audio_url == &**primary,
+                        (
+                            ToolOutputContent::EncryptedContent { encrypted_content },
+                            FunctionOutputContent::EncryptedContent {
+                                encrypted_content: primary,
+                            },
+                        ) => encrypted_content == &**primary,
+                        _ => false,
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn restored_output(primary: &FunctionOutputBody) -> Option<ToolOutputBody> {
+    match primary {
+        FunctionOutputBody::Text(text) => Some(ToolOutputBody::Text(text.to_string())),
+        FunctionOutputBody::Content(content) => content
+            .iter()
+            .map(|part| match part {
+                FunctionOutputContent::InputText { text } => Some(ToolOutputContent::InputText {
+                    text: text.to_string(),
+                }),
+                FunctionOutputContent::InputAudio { audio_url } => {
+                    Some(ToolOutputContent::InputAudio {
+                        audio_url: audio_url.to_string(),
+                    })
+                }
+                FunctionOutputContent::EncryptedContent { encrypted_content } => {
+                    Some(ToolOutputContent::EncryptedContent {
+                        encrypted_content: encrypted_content.to_string(),
+                    })
+                }
+                FunctionOutputContent::InputImage { .. }
+                | FunctionOutputContent::InputImageFile { .. } => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(ToolOutputBody::Content),
+    }
 }
 
 pub(super) struct NestedToolEventObserver<'a> {
