@@ -175,10 +175,14 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment, com
     hasher.update(b"\n");
     hasher.update(version.as_bytes());
     hasher.update(b"\n");
+    let mut clippy = false;
     for wrapper in &args[..compiler - 1] {
-        let Ok(digest) = digest_file(Path::new(wrapper)) else {
+        let Some(digest) = tool_digest(cache, Path::new(wrapper)) else {
             return exec(&args, &environment);
         };
+        clippy |= Path::new(wrapper)
+            .file_name()
+            .is_some_and(|name| name.as_bytes().windows(6).any(|window| window == b"clippy"));
         hasher.update(digest.as_bytes());
         hasher.update(b"\n");
     }
@@ -198,7 +202,8 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment, com
     }
     for (name, value) in &environment {
         let name = name.as_bytes();
-        let relevant = (name.starts_with(b"CARGO_") && !matches!(name, b"CARGO_MAKEFLAGS" | b"CARGO_PRIMARY_PACKAGE"))
+        let relevant = (name.starts_with(b"CARGO_") && name != b"CARGO_MAKEFLAGS" && (clippy || name != b"CARGO_PRIMARY_PACKAGE"))
+            || (clippy && name.starts_with(b"CLIPPY_"))
             || matches!(name, b"OUT_DIR" | b"RUSTC_BOOTSTRAP" | b"MACOSX_DEPLOYMENT_TARGET" | b"SDKROOT");
         if relevant {
             hasher.update(name);
@@ -545,6 +550,33 @@ fn digest_file(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
+}
+
+fn tool_digest(cache: &Path, tool: &Path) -> Option<String> {
+    let mut name: Vec<u8> = tool
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|byte| if matches!(byte, b'/' | b' ') { b'_' } else { *byte })
+        .collect();
+    name.extend_from_slice(b".sha256");
+    let memo = cache.join("rustc").join(OsStr::from_bytes(&name));
+    if let (Some(binary), Some(memo_time)) = (modified(tool), modified(&memo))
+        && binary <= memo_time
+        && let Ok(text) = fs::read_to_string(&memo)
+        && let Some(line) = text.lines().next()
+        && line.len() == 64
+    {
+        return Some(line.to_owned());
+    }
+    let digest = digest_file(tool).ok()?;
+    let _ = fs::create_dir_all(cache.join("rustc"));
+    let mut staging = memo.clone().into_os_string();
+    staging.push(format!(".{}", std::process::id()));
+    if fs::write(&staging, format!("{digest}\n")).is_ok() {
+        let _ = fs::rename(&staging, &memo);
+    }
+    Some(digest)
 }
 
 fn rustc_version(cache: &Path, rustc: &Path) -> Option<String> {
