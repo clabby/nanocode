@@ -187,22 +187,14 @@ impl Effect<'_> {
             )
             .await
     }
-    pub(super) async fn begin_encoded(
-        &self,
-        kind: &str,
-        input: Box<serde_json::value::RawValue>,
-    ) -> Result<Step> {
+    pub(super) async fn begin_model(&self, wire: &crate::PreparedWire) -> Result<Step> {
         self.policy
-            .begin_step_encoded(
+            .begin_model_step(
                 self.operation.to_owned(),
                 self.step.clone(),
-                if kind == "model" && self.model_call {
-                    "model_call"
-                } else {
-                    kind
-                }
-                .to_owned(),
-                input,
+                if self.model_call { "model_call" } else { "model" }.to_owned(),
+                wire.durable_input().map_err(provider_error)?,
+                wire,
             )
             .await
     }

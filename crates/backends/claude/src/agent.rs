@@ -2305,6 +2305,34 @@ fn tool_batches<'a>(
     batches.into_iter().map(|(range, _)| range).collect()
 }
 
+fn wire_messages<'a>(
+    messages: &'a [Message],
+    suffix: &'a [Message],
+) -> Vec<std::borrow::Cow<'a, Message>> {
+    messages
+        .iter()
+        .chain(suffix)
+        .map(separated_tool_references)
+        .collect()
+}
+
+fn separated_tool_references(message: &Message) -> std::borrow::Cow<'_, Message> {
+    if !message.content.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolResult {
+                content: ToolResultContent::Blocks(blocks),
+                ..
+            } if blocks.iter().any(|block| block["type"] == "tool_reference")
+        )
+    }) {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    let mut message = message.clone();
+    separate_tool_references(std::slice::from_mut(&mut message));
+    std::borrow::Cow::Owned(message)
+}
+
 fn separate_tool_references(messages: &mut [Message]) {
     for message in messages {
         let mut companions = Vec::new();
@@ -3228,7 +3256,7 @@ async fn abandon_deferred(
 fn unsupported(message: &str) -> NanocodeError {
     NanocodeError::InvalidRequest(message.into())
 }
-fn provider_error(error: impl std::fmt::Display) -> NanocodeError {
+pub(crate) fn provider_error(error: impl std::fmt::Display) -> NanocodeError {
     unsupported(&format!("Claude Messages: {error}"))
 }
 
@@ -4044,13 +4072,6 @@ impl State {
             .unwrap_or_else(|| self.request_template(self.speed()));
 
         let mut suffix: Vec<Message> = Vec::new();
-        let fill = |request: &mut MessagesRequest, suffix: &[Message]| {
-            request.messages = Vec::with_capacity(messages.len() + suffix.len());
-            request.messages.extend_from_slice(messages);
-            request.messages.extend_from_slice(suffix);
-            separate_tool_references(&mut request.messages);
-        };
-        fill(&mut request, &suffix);
         request.tools = tools;
         request.container = context.container.map(str::to_owned);
         if request.diagnostics.is_some() {
@@ -4058,22 +4079,22 @@ impl State {
         }
         request.tool_choice = context.force_text.then(|| json!({"type":"none"}));
 
-        request.cache_system_prefix().map_err(provider_error)?;
-        client.prepare_request(&mut request);
-        if cancel.flag.load(Ordering::SeqCst) && context.effect.is_none() {
-            return Err(NanocodeError::TurnCancelled.into());
-        }
+        let mut wire = {
+            let messages = wire_messages(messages, &suffix);
+            request
+                .cache_system_prefix_with(&messages)
+                .map_err(provider_error)?;
+            if cancel.flag.load(Ordering::SeqCst) && context.effect.is_none() {
+                return Err(NanocodeError::TurnCancelled.into());
+            }
+            client
+                .prepare_wire(&request, &messages, true)
+                .map_err(provider_error)?
+        };
         let needs_upgrade = self.code_only && !durable::is_code_only_catalog(&request.tools);
 
         let admitted = match &context.effect {
-            Some(effect) => {
-                effect
-                    .begin_encoded(
-                        "model",
-                        client.durable_request(&request).map_err(provider_error)?,
-                    )
-                    .await?
-            }
+            Some(effect) => effect.begin_model(&wire).await?,
             None => Step::Execute,
         };
         let upgrade = match admitted {
@@ -4128,22 +4149,17 @@ impl State {
         let active_effect = replacement_effect.as_ref().or(context.effect.as_ref());
         if let Some(upgrade) = &upgrade {
             request.tools = upgrade.code_only_tools.clone();
-            request
-                .messages
-                .push(Message::text(Role::User, &upgrade.notice));
             suffix.push(Message::text(Role::User, &upgrade.notice));
+            wire = client
+                .prepare_wire(&request, &wire_messages(messages, &suffix), true)
+                .map_err(provider_error)?;
 
             recovery = Some(ServerRecovery {
                 retirement_notice: Some(upgrade.notice.clone()),
                 ..ServerRecovery::default()
             });
             if let Some(effect) = &replacement_effect
-                && let Step::Replay(value) = effect
-                    .begin_encoded(
-                        "model",
-                        client.durable_request(&request).map_err(provider_error)?,
-                    )
-                    .await?
+                && let Step::Replay(value) = effect.begin_model(&wire).await?
             {
                 let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
                 completed(
@@ -4193,11 +4209,8 @@ impl State {
 
             dispatched.get_or_insert_with(&elapsed_ns);
 
-            if attempt > 1 {
-                fill(&mut request, &suffix);
-            }
             let opened = tokio::select! {
-                result = client.stream(&request).instrument(attempt_span.clone()) => result,
+                result = client.stream_prepared(&wire).instrument(attempt_span.clone()) => result,
                 () = cancel.cancelled() => {
                     telemetry::cancel_attempt(&attempt_span);
                     return Err(ResponseFailure { error: NanocodeError::TurnCancelled, recovery });
@@ -4207,7 +4220,6 @@ impl State {
                 response_headers_ns = Some(elapsed_ns());
                 send_ns = Some(telemetry::elapsed_ns(attempt_started));
             }
-            request.messages = Vec::new();
             let result = match opened {
                 Err(error) => Err(error),
                 Ok(mut stream) => {

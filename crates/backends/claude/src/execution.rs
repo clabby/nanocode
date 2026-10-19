@@ -131,6 +131,20 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
             }),
         }
     }
+    #[doc(hidden)]
+    fn begin_model_step<'a>(
+        &'a self,
+        id: String,
+        step_id: String,
+        kind: String,
+        _digest: Box<RawValue>,
+        wire: &'a crate::PreparedWire,
+    ) -> PolicyFuture<'a, Step> {
+        match wire.legacy_durable_input() {
+            Ok(input) => self.begin_step_encoded(id, step_id, kind, input),
+            Err(error) => Box::pin(async move { Err(crate::agent::provider_error(error)) }),
+        }
+    }
     fn complete_step(&self, id: String, step_id: String, output: Value) -> PolicyFuture<'_, ()>;
     fn complete(&self, id: String, checkpoint: Value, output: Value) -> PolicyFuture<'_, ()>;
     fn fail(&self, id: String, checkpoint: Value, error: String) -> PolicyFuture<'_, ()>;

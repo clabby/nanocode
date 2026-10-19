@@ -1,4 +1,4 @@
-use crate::{ClaudeError, ContentBlock, MessagesRequest, Role};
+use crate::{ClaudeError, ContentBlock, Message, MessagesRequest, Role, WireMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -114,7 +114,7 @@ impl SubscriptionIdentity {
         Ok(json!({"user_id":serde_json::to_string(&user)?}))
     }
 }
-fn hex_digest(input: &[u8]) -> String {
+pub(crate) fn hex_digest(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(input);
     let mut hex = String::with_capacity(digest.len() * 2);
@@ -128,10 +128,10 @@ pub fn prefix(name: &str) -> String {
     name.into()
 }
 pub fn strip(_: &mut String) {}
-fn fingerprint(request: &MessagesRequest, version: &str) -> String {
-    let first = request
-        .messages
+fn fingerprint<M: WireMessage>(messages: &[M], version: &str) -> String {
+    let first = messages
         .iter()
+        .map(WireMessage::message)
         .find(|m| m.role == Role::User)
         .and_then(|m| {
             m.content.iter().find_map(|b| match b {
@@ -149,6 +149,16 @@ fn fingerprint(request: &MessagesRequest, version: &str) -> String {
     hex_digest(seed.as_bytes())[..3].into()
 }
 pub fn prepare(request: &mut MessagesRequest, identity: &SubscriptionIdentity) {
+    let messages = std::mem::take(&mut request.messages);
+    prepare_with(request, &messages, identity);
+    request.messages = messages;
+}
+
+fn prepare_with<M: WireMessage>(
+    request: &mut MessagesRequest,
+    messages: &[M],
+    identity: &SubscriptionIdentity,
+) {
     let mut existing = match request.system.take() {
         Some(Value::String(s)) => vec![json!({"type":"text","text":s})],
         Some(Value::Array(v)) => v,
@@ -191,7 +201,7 @@ pub fn prepare(request: &mut MessagesRequest, identity: &SubscriptionIdentity) {
     let billing = format!(
         "{BILLING} cc_version={}.{}; cc_entrypoint=cli; cch=00000;",
         identity.version(),
-        fingerprint(request, identity.version())
+        fingerprint(messages, identity.version())
     );
 
     let control = request.cache_control.as_ref().map_or_else(
@@ -229,32 +239,47 @@ fn stringify(value: &Value, out: &mut Vec<u8>) -> Result<(), ClaudeError> {
             }
             out.push(b']');
         }
-        Value::Object(map) => {
-            out.push(b'{');
-            let mut first = true;
-            for key in ["type", "text"]
-                .into_iter()
-                .filter(|k| map.contains_key(*k))
-                .chain(
-                    map.keys()
-                        .map(String::as_str)
-                        .filter(|k| !matches!(*k, "type" | "text")),
-                )
-            {
-                if !first {
-                    out.push(b',');
-                }
-                first = false;
-                serde_json::to_writer(&mut *out, key)?;
-                out.push(b':');
-                stringify(&map[key], out)?;
-            }
-            out.push(b'}');
-        }
+        Value::Object(map) => stringify_object(map, out, |_, value, out| stringify(value, out))?,
         _ => serde_json::to_writer(&mut *out, value)?,
     }
     Ok(())
 }
+
+fn stringify_object(
+    map: &serde_json::Map<String, Value>,
+    out: &mut Vec<u8>,
+    mut field: impl FnMut(&str, &Value, &mut Vec<u8>) -> Result<(), ClaudeError>,
+) -> Result<(), ClaudeError> {
+    out.push(b'{');
+    let mut first = true;
+    for key in ["type", "text"]
+        .into_iter()
+        .filter(|k| map.contains_key(*k))
+        .chain(
+            map.keys()
+                .map(String::as_str)
+                .filter(|k| !matches!(*k, "type" | "text")),
+        )
+    {
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+        serde_json::to_writer(&mut *out, key)?;
+        out.push(b':');
+        field(key, &map[key], out)?;
+    }
+    out.push(b'}');
+    Ok(())
+}
+
+pub(crate) fn encode_message(message: &Message) -> Result<String, ClaudeError> {
+    let mut bytes = Vec::new();
+    stringify(&serde_json::to_value(message)?, &mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|_| ClaudeError::Protocol("invalid subscription wire bytes".into()))
+}
+
 pub fn body(
     request: &MessagesRequest,
     streaming: bool,
@@ -262,29 +287,99 @@ pub fn body(
     session: &str,
     explicit_cache_tail: bool,
 ) -> Result<String, ClaudeError> {
-    identity.validate()?;
-    let mut prepared = request.clone();
-    prepare(&mut prepared, identity);
-    prepared.validate_cache_control()?;
+    wire(
+        request,
+        &request.messages,
+        streaming,
+        identity,
+        session,
+        explicit_cache_tail,
+    )
+}
 
-    if explicit_cache_tail {
-        prepared.explicit_cache_tail()?;
+pub(crate) fn wire<M: WireMessage>(
+    head: &MessagesRequest,
+    messages: &[M],
+    streaming: bool,
+    identity: &SubscriptionIdentity,
+    session: &str,
+    explicit_cache_tail: bool,
+) -> Result<String, ClaudeError> {
+    identity.validate()?;
+    let mut prepared = head.head();
+    prepare_with(&mut prepared, messages, identity);
+    crate::validate_cache_layout(
+        &prepared.tools,
+        prepared.system.as_ref(),
+        messages.iter().map(WireMessage::message),
+        prepared.cache_control.as_ref(),
+    )?;
+    let mut patched = None;
+    if explicit_cache_tail && let Some(control) = prepared.cache_control.take() {
+        let marker = serde_json::to_value(&control)?;
+        match crate::cache_tail(messages) {
+            Some((index, block)) => {
+                let mut message = messages[index].message().clone();
+                message.content[block]
+                    .extra_mut()
+                    .entry("cache_control".to_owned())
+                    .or_insert(marker);
+                patched = Some((index, message));
+            }
+            None => crate::mark_system_tail(prepared.system.as_mut(), marker),
+        }
     }
+    let encoded = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| match &patched {
+            Some((at, patched)) if *at == index => {
+                encode_message(patched).map(std::borrow::Cow::Owned)
+            }
+            _ => message.encoded(true, &encode_message),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut value = serde_json::to_value(&prepared)?;
     value["stream"] = json!(streaming);
     value["metadata"] = identity.metadata(session)?;
     if value.get("tools").is_none() {
         value["tools"] = json!([]);
     }
-    let mut bytes = Vec::new();
-    stringify(&value, &mut bytes)?;
-    if let Some(marker) = bytes.windows(MARKER.len()).position(|v| v == MARKER) {
+    let Value::Object(map) = &value else {
+        return Err(ClaudeError::Protocol(
+            "subscription wire request is not an object".into(),
+        ));
+    };
+    let mut head = Vec::new();
+    let mut at = None;
+    stringify_object(map, &mut head, |key, value, out| {
+        if key == "messages" {
+            at = Some(out.len());
+            Ok(())
+        } else {
+            stringify(value, out)
+        }
+    })?;
+    let at = at.ok_or_else(|| {
+        ClaudeError::Protocol("subscription wire request has no messages".into())
+    })?;
+    let mut bytes = Vec::with_capacity(
+        head.len() + 2 + encoded.iter().map(|message| message.len() + 1).sum::<usize>(),
+    );
+    bytes.extend_from_slice(&head[..at]);
+    bytes.push(b'[');
+    for (index, message) in encoded.iter().enumerate() {
+        if index > 0 {
+            bytes.push(b',');
+        }
+        bytes.extend_from_slice(message.as_bytes());
+    }
+    bytes.push(b']');
+    bytes.extend_from_slice(&head[at..]);
+    if let Some(marker) = memchr::memmem::find(&bytes, MARKER) {
         let start = marker + MARKER.len();
-        if let Some(offset) = bytes[start..]
-            .windows(PLACEHOLDER.len())
-            .position(|v| v == PLACEHOLDER)
-            && offset <= 150
-        {
+        let window = &bytes[start..bytes.len().min(start + 150 + PLACEHOLDER.len())];
+        if let Some(offset) = memchr::memmem::find(window, PLACEHOLDER) {
             let checksum = format!(
                 "{:05x}",
                 xxhash_rust::xxh64::xxh64(&bytes, 0x4d65_9218_e32a_3268) & 0xfffff

@@ -548,7 +548,134 @@ impl CacheLayout {
     }
 }
 
+#[doc(hidden)]
+pub trait WireMessage {
+    fn message(&self) -> &Message;
+
+    fn encoded<'a>(
+        &'a self,
+        _subscription: bool,
+        encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
+    ) -> Result<std::borrow::Cow<'a, str>, ClaudeError> {
+        encode(self.message()).map(std::borrow::Cow::Owned)
+    }
+}
+
+impl WireMessage for Message {
+    fn message(&self) -> &Message {
+        self
+    }
+}
+
+impl<T: WireMessage + ?Sized> WireMessage for &T {
+    fn message(&self) -> &Message {
+        (**self).message()
+    }
+
+    fn encoded<'a>(
+        &'a self,
+        subscription: bool,
+        encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
+    ) -> Result<std::borrow::Cow<'a, str>, ClaudeError> {
+        (**self).encoded(subscription, encode)
+    }
+}
+
+impl WireMessage for std::borrow::Cow<'_, Message> {
+    fn message(&self) -> &Message {
+        self
+    }
+}
+
+fn validate_cache_layout<'a>(
+    tools: &[ClaudeToolSpec],
+    system: Option<&Value>,
+    messages: impl Iterator<Item = &'a Message>,
+    automatic: Option<&CacheControl>,
+) -> Result<(), ClaudeError> {
+    let mut layout = CacheLayout::default();
+    for tool in tools {
+        let control = match tool {
+            ClaudeToolSpec::Server(tool) => tool.options.get("cache_control"),
+            ClaudeToolSpec::Client(_) => None,
+        };
+        layout.block(control, true)?;
+    }
+    match system {
+        Some(Value::String(text)) => layout.block(None, !text.is_empty())?,
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                layout.block(block.get("cache_control"), cacheable_json_block(block))?;
+            }
+        }
+        _ => {}
+    }
+    for message in messages {
+        for block in &message.content {
+            let (control, eligible) = block.cache_slot();
+            layout.block(control, eligible)?;
+        }
+    }
+    layout.validate(automatic)
+}
+
+fn cache_tail<M: WireMessage>(messages: &[M]) -> Option<(usize, usize)> {
+    messages.iter().enumerate().rev().find_map(|(index, message)| {
+        message
+            .message()
+            .content
+            .iter()
+            .rposition(|block| block.cache_slot().1)
+            .map(|block| (index, block))
+    })
+}
+
+fn mark_system_tail(system: Option<&mut Value>, marker: Value) {
+    if let Some(Value::Array(blocks)) = system
+        && let Some(block) = blocks
+            .iter_mut()
+            .rev()
+            .find(|block| cacheable_json_block(block))
+        && let Some(block) = block.as_object_mut()
+    {
+        block.entry("cache_control").or_insert(marker);
+    }
+}
+
 impl MessagesRequest {
+    fn head(&self) -> Self {
+        let Self {
+            model,
+            max_tokens,
+            cache_control,
+            output_config,
+            speed,
+            tool_choice,
+            thinking,
+            context_management,
+            diagnostics,
+            system,
+            messages: _,
+            container,
+            tools,
+        } = self;
+        Self {
+            model: model.clone(),
+            max_tokens: *max_tokens,
+            cache_control: cache_control.clone(),
+            output_config: output_config.clone(),
+            speed: *speed,
+            tool_choice: tool_choice.clone(),
+            thinking: thinking.clone(),
+            context_management: context_management.clone(),
+            diagnostics: diagnostics.clone(),
+            system: system.clone(),
+            messages: Vec::new(),
+            container: container.clone(),
+            tools: tools.clone(),
+        }
+    }
+
     pub fn apply_cache_ttl(&mut self) {
         let Some(ttl) = self.cache_control.as_ref().and_then(|control| control.ttl) else {
             return;
@@ -568,34 +695,31 @@ impl MessagesRequest {
     }
 
     pub fn validate_cache_control(&self) -> Result<(), ClaudeError> {
-        let mut layout = CacheLayout::default();
-        for tool in &self.tools {
-            let control = match tool {
-                ClaudeToolSpec::Server(tool) => tool.options.get("cache_control"),
-                ClaudeToolSpec::Client(_) => None,
-            };
-            layout.block(control, true)?;
-        }
-        match self.system.as_ref() {
-            Some(Value::String(text)) => layout.block(None, !text.is_empty())?,
-            Some(Value::Array(blocks)) => {
-                for block in blocks {
-                    layout.block(block.get("cache_control"), cacheable_json_block(block))?;
-                }
-            }
-            _ => {}
-        }
-        for message in &self.messages {
-            for block in &message.content {
-                let (control, eligible) = block.cache_slot();
-                layout.block(control, eligible)?;
-            }
-        }
-        layout.validate(self.cache_control.as_ref())
+        self.validate_cache_with(&self.messages)
+    }
+
+    fn validate_cache_with<M: WireMessage>(&self, messages: &[M]) -> Result<(), ClaudeError> {
+        validate_cache_layout(
+            &self.tools,
+            self.system.as_ref(),
+            messages.iter().map(WireMessage::message),
+            self.cache_control.as_ref(),
+        )
     }
 
     pub fn cache_system_prefix(&mut self) -> Result<(), ClaudeError> {
-        self.validate_cache_control()?;
+        let messages = std::mem::take(&mut self.messages);
+        let result = self.cache_system_prefix_with(&messages);
+        self.messages = messages;
+        result
+    }
+
+    #[doc(hidden)]
+    pub fn cache_system_prefix_with<M: WireMessage>(
+        &mut self,
+        messages: &[M],
+    ) -> Result<(), ClaudeError> {
+        self.validate_cache_with(messages)?;
         let Some(control) = self.cache_control.as_ref() else {
             return Ok(());
         };
@@ -623,7 +747,7 @@ impl MessagesRequest {
         };
         block["cache_control"] = serde_json::to_value(control)?;
         let previous = self.system.replace(Value::Array(blocks));
-        if self.validate_cache_control().is_err() {
+        if self.validate_cache_with(messages).is_err() {
             self.system = previous;
         }
         Ok(())
@@ -635,30 +759,15 @@ impl MessagesRequest {
             return Ok(());
         };
         let marker = serde_json::to_value(&control)?;
-        for block in self
-            .messages
-            .iter_mut()
-            .rev()
-            .flat_map(|message| message.content.iter_mut().rev())
-        {
-            if block.cache_slot().1 {
-                block
+        match cache_tail(&self.messages) {
+            Some((index, block)) => {
+                self.messages[index].content[block]
                     .extra_mut()
                     .entry("cache_control".to_owned())
                     .or_insert(marker);
-                return Ok(());
             }
+            None => mark_system_tail(self.system.as_mut(), marker),
         }
-        if let Some(Value::Array(blocks)) = self.system.as_mut()
-            && let Some(block) = blocks
-                .iter_mut()
-                .rev()
-                .find(|block| cacheable_json_block(block))
-            && let Some(block) = block.as_object_mut()
-        {
-            block.entry("cache_control").or_insert(marker);
-        }
-
         Ok(())
     }
 }
@@ -1079,26 +1188,63 @@ impl ClaudeClient {
         request: &MessagesRequest,
         streaming: bool,
     ) -> Result<String, ClaudeError> {
+        self.wire_body(request, &request.messages, streaming)
+    }
+
+    fn wire_body<M: WireMessage>(
+        &self,
+        head: &MessagesRequest,
+        messages: &[M],
+        streaming: bool,
+    ) -> Result<String, ClaudeError> {
         if self.subscription_compatibility {
-            subscription_wire::body(
-                request,
+            subscription_wire::wire(
+                head,
+                messages,
                 streaming,
                 &self.subscription_identity,
                 &self.subscription_session,
                 self.subscription_cache_tail,
             )
         } else {
-            #[derive(Serialize)]
-            struct Body<'a> {
-                #[serde(flatten)]
-                request: &'a MessagesRequest,
-                stream: bool,
-            }
-            Ok(serde_json::to_string(&Body {
-                request,
-                stream: streaming,
-            })?)
+            api_body(head, messages, streaming)
         }
+    }
+
+    #[doc(hidden)]
+    pub fn encode_message(&self, message: &Message) -> Result<String, ClaudeError> {
+        if self.subscription_compatibility {
+            subscription_wire::encode_message(message)
+        } else {
+            Ok(serde_json::to_string(message)?)
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_wire<M: WireMessage>(
+        &self,
+        head: &MessagesRequest,
+        messages: &[M],
+        streaming: bool,
+    ) -> Result<PreparedWire, ClaudeError> {
+        if !self.subscription_compatibility {
+            head.validate_cache_with(messages)?;
+        }
+        Ok(PreparedWire {
+            body: self.wire_body(head, messages, streaming)?,
+            subscription: self.subscription_compatibility,
+            streaming,
+            agent: !head.tools.is_empty() || head.thinking.is_some(),
+            thinking: head.thinking.is_some(),
+            thinking_updates: head
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.get("display"))
+                .and_then(Value::as_str)
+                == Some("updates"),
+            context_management: head.context_management.is_some(),
+            speed: head.speed.is_some(),
+        })
     }
 
     #[doc(hidden)]
@@ -1106,17 +1252,17 @@ impl ClaudeClient {
         &self,
         request: &MessagesRequest,
     ) -> Result<Box<serde_json::value::RawValue>, ClaudeError> {
-        if self.subscription_compatibility {
-            #[derive(Serialize)]
-            struct Wire {
-                subscription_wire_v1: String,
-            }
-            Ok(serde_json::value::to_raw_value(&Wire {
-                subscription_wire_v1: self.request_body(request, true)?,
-            })?)
-        } else {
-            Ok(serde_json::value::to_raw_value(request)?)
+        PreparedWire {
+            body: self.wire_body(request, &request.messages, true)?,
+            subscription: self.subscription_compatibility,
+            streaming: true,
+            agent: false,
+            thinking: false,
+            thinking_updates: false,
+            context_management: false,
+            speed: false,
         }
+        .legacy_durable_input()
     }
     fn decode_block(&self, block: &mut ContentBlock) {
         if self.subscription_compatibility
@@ -1126,14 +1272,7 @@ impl ClaudeClient {
         }
     }
 
-    async fn post(
-        &self,
-        request: &MessagesRequest,
-        streaming: bool,
-    ) -> Result<(HttpResponse, Vec<String>), ClaudeError> {
-        request.validate_cache_control()?;
-
-        let mut wire_body = Some(self.request_body(request, streaming)?);
+    async fn post(&self, wire: &PreparedWire) -> Result<(HttpResponse, Vec<String>), ClaudeError> {
         let mut retried = false;
 
         let mut credentials = Vec::<String>::new();
@@ -1178,7 +1317,7 @@ impl ClaudeClient {
                 }
             }
             if self.subscription_compatibility {
-                let agent = !request.tools.is_empty() || request.thinking.is_some();
+                let agent = wire.agent;
                 let defaults: &[&str] = if agent {
                     &[
                         "claude-code-20250219",
@@ -1201,7 +1340,7 @@ impl ClaudeClient {
                 };
                 let extras = std::mem::take(&mut betas);
                 betas.extend_from_slice(defaults);
-                if agent && request.thinking.is_some() && !betas.contains(&"effort-2025-11-24") {
+                if agent && wire.thinking && !betas.contains(&"effort-2025-11-24") {
                     betas.push("effort-2025-11-24");
                 }
                 if agent && !betas.contains(&"fallback-credit-2026-06-01") {
@@ -1213,24 +1352,15 @@ impl ClaudeClient {
                     }
                 }
             }
-            if request.context_management.is_some()
-                && !betas.contains(&"context-management-2025-06-27")
-            {
+            if wire.context_management && !betas.contains(&"context-management-2025-06-27") {
                 betas.push("context-management-2025-06-27");
             }
 
             const THINKING_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
-            if request
-                .thinking
-                .as_ref()
-                .and_then(|thinking| thinking.get("display"))
-                .and_then(Value::as_str)
-                == Some("updates")
-                && !betas.contains(&THINKING_UPDATES_BETA)
-            {
+            if wire.thinking_updates && !betas.contains(&THINKING_UPDATES_BETA) {
                 betas.push(THINKING_UPDATES_BETA);
             }
-            if request.speed.is_some() && !betas.contains(&FAST_MODE_BETA) {
+            if wire.speed && !betas.contains(&FAST_MODE_BETA) {
                 betas.push(FAST_MODE_BETA);
             }
             if !betas.is_empty() {
@@ -1295,11 +1425,8 @@ impl ClaudeClient {
                     }
                 }
             }
-            let body = match wire_body.take() {
-                Some(body) => body,
-                None => self.request_body(request, streaming)?,
-            };
-            let response = transport::post(&self.http, &self.endpoint, headers, body).await?;
+            let response =
+                transport::post(&self.http, &self.endpoint, headers, wire.body.clone()).await?;
 
             if response.status() == http::StatusCode::UNAUTHORIZED
                 && !retried
@@ -1330,7 +1457,8 @@ impl ClaudeClient {
     }
 
     pub async fn create(&self, request: &MessagesRequest) -> Result<MessageResponse, ClaudeError> {
-        let mut response: MessageResponse = self.post(request, false).await?.0.json().await?;
+        let wire = self.prepare_wire(request, &request.messages, false)?;
+        let mut response: MessageResponse = self.post(&wire).await?.0.json().await?;
         for block in &mut response.content {
             self.decode_block(block);
         }
@@ -1338,7 +1466,13 @@ impl ClaudeClient {
     }
 
     pub async fn stream(&self, request: &MessagesRequest) -> Result<ClaudeStream, ClaudeError> {
-        let (response, credentials) = self.post(request, true).await?;
+        let wire = self.prepare_wire(request, &request.messages, true)?;
+        self.stream_prepared(&wire).await
+    }
+
+    #[doc(hidden)]
+    pub async fn stream_prepared(&self, wire: &PreparedWire) -> Result<ClaudeStream, ClaudeError> {
+        let (response, credentials) = self.post(wire).await?;
 
         let is_sse = response
             .headers()
@@ -1429,6 +1563,157 @@ impl ClaudeClient {
             },
         )))
     }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct PreparedWire {
+    body: String,
+    subscription: bool,
+    streaming: bool,
+    agent: bool,
+    thinking: bool,
+    thinking_updates: bool,
+    context_management: bool,
+    speed: bool,
+}
+
+impl PreparedWire {
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub fn durable_input(&self) -> Result<Box<serde_json::value::RawValue>, ClaudeError> {
+        #[derive(Serialize)]
+        struct Digest<'a> {
+            wire: &'a str,
+            sha256: String,
+            bytes: usize,
+        }
+        Ok(serde_json::value::to_raw_value(&Digest {
+            wire: if self.subscription {
+                "subscription_wire_v1"
+            } else {
+                "messages_v1"
+            },
+            sha256: subscription_wire::hex_digest(self.body.as_bytes()),
+            bytes: self.body.len(),
+        })?)
+    }
+
+    pub fn legacy_durable_input(&self) -> Result<Box<serde_json::value::RawValue>, ClaudeError> {
+        if !self.streaming {
+            return Err(ClaudeError::Protocol(
+                "durable request inputs record streaming bodies".into(),
+            ));
+        }
+        if self.subscription {
+            #[derive(Serialize)]
+            struct Wire<'a> {
+                subscription_wire_v1: &'a str,
+            }
+            return Ok(serde_json::value::to_raw_value(&Wire {
+                subscription_wire_v1: &self.body,
+            })?);
+        }
+        let request = self
+            .body
+            .strip_suffix(",\"stream\":true}")
+            .ok_or_else(|| ClaudeError::Protocol("unexpected Messages request body".into()))?;
+        Ok(serde_json::value::RawValue::from_string(format!(
+            "{request}}}"
+        ))?)
+    }
+}
+
+fn api_body<M: WireMessage>(
+    head: &MessagesRequest,
+    messages: &[M],
+    streaming: bool,
+) -> Result<String, ClaudeError> {
+    let MessagesRequest {
+        model,
+        max_tokens,
+        cache_control,
+        output_config,
+        speed,
+        tool_choice,
+        thinking,
+        context_management,
+        diagnostics,
+        system,
+        messages: _,
+        container,
+        tools,
+    } = head;
+    #[derive(Serialize)]
+    struct Head<'a> {
+        model: &'a str,
+        max_tokens: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<&'a CacheControl>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_config: Option<&'a OutputConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speed: Option<Speed>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_choice: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_management: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diagnostics: Option<&'a Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system: Option<&'a Value>,
+    }
+    #[derive(Serialize)]
+    struct Tail<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        container: Option<&'a str>,
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        tools: &'a [ClaudeToolSpec],
+        stream: bool,
+    }
+    let encode = |message: &Message| serde_json::to_string(message).map_err(ClaudeError::from);
+    let encoded = messages
+        .iter()
+        .map(|message| message.encoded(false, &encode))
+        .collect::<Result<Vec<_>, _>>()?;
+    let head = serde_json::to_string(&Head {
+        model,
+        max_tokens: *max_tokens,
+        cache_control: cache_control.as_ref(),
+        output_config: output_config.as_ref(),
+        speed: *speed,
+        tool_choice: tool_choice.as_ref(),
+        thinking: thinking.as_ref(),
+        context_management: context_management.as_ref(),
+        diagnostics: diagnostics.as_ref(),
+        system: system.as_ref(),
+    })?;
+    let tail = serde_json::to_string(&Tail {
+        container: container.as_deref(),
+        tools,
+        stream: streaming,
+    })?;
+    let mut body = String::with_capacity(
+        head.len()
+            + tail.len()
+            + "\"messages\":[],".len()
+            + encoded.iter().map(|message| message.len() + 1).sum::<usize>(),
+    );
+    body.push_str(&head[..head.len() - 1]);
+    body.push_str(",\"messages\":[");
+    for (index, message) in encoded.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(message);
+    }
+    body.push_str("],");
+    body.push_str(&tail[1..]);
+    Ok(body)
 }
 
 #[cfg(not(target_family = "wasm"))]

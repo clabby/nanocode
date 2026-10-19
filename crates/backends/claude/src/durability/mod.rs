@@ -415,6 +415,22 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         Box::pin(async move { self.get().await?.begin_step(id, step_id, kind, input).await })
     }
 
+    fn begin_model_step<'a>(
+        &'a self,
+        id: String,
+        step_id: String,
+        kind: String,
+        digest: Box<RawValue>,
+        wire: &'a crate::PreparedWire,
+    ) -> PolicyFuture<'a, Step> {
+        Box::pin(async move {
+            self.get()
+                .await?
+                .begin_model_step(id, step_id, kind, digest, wire)
+                .await
+        })
+    }
+
     fn complete_step(&self, id: String, step_id: String, output: Value) -> PolicyFuture<'_, ()> {
         Box::pin(async move { self.get().await?.complete_step(id, step_id, output).await })
     }
@@ -676,17 +692,50 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         input: Box<RawValue>,
     ) -> PolicyFuture<'_, Step> {
         Box::pin(async move {
-            match self
+            let begun = self
                 .owner
                 .begin_step(id, step_id, kind.clone(), &*input)
+                .await;
+            admitted_step(begun, &kind)
+        })
+    }
+
+    fn begin_model_step<'a>(
+        &'a self,
+        id: String,
+        step_id: String,
+        kind: String,
+        digest: Box<RawValue>,
+        wire: &'a crate::PreparedWire,
+    ) -> PolicyFuture<'a, Step> {
+        Box::pin(async move {
+            let begun = match self
+                .owner
+                .begin_step(id.clone(), step_id.clone(), kind.clone(), &*digest)
                 .await
-                .map_err(agent_error)?
             {
-                BeginStep::Execute => Ok(Step::Execute),
-                BeginStep::Interrupted if kind == "tool" => Ok(Step::Interrupted),
-                BeginStep::Interrupted => Ok(Step::Execute),
-                BeginStep::Replay(value) => Ok(Step::Replay(value.decode().map_err(agent_error)?)),
-            }
+                Err(nanocode_durability::Error::InvalidState(message)) => {
+                    let legacy = wire
+                        .legacy_durable_input()
+                        .map_err(crate::agent::provider_error)?;
+                    let key = EncodedPayload::encode(&*legacy).map_err(agent_error)?;
+                    let state = self.session.state().await.map_err(agent_error)?;
+                    if !state
+                        .operation(&id)
+                        .and_then(|operation| operation.steps.get(&step_id))
+                        .is_some_and(|step| step.kind == kind && step.input.key() == key.key())
+                    {
+                        return Err(agent_error(nanocode_durability::Error::InvalidState(
+                            message,
+                        )));
+                    }
+                    self.owner
+                        .begin_step(id, step_id, kind.clone(), &*legacy)
+                        .await
+                }
+                begun => begun,
+            };
+            admitted_step(begun, &kind)
         })
     }
 
@@ -707,17 +756,11 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         input: Value,
     ) -> PolicyFuture<'_, Step> {
         Box::pin(async move {
-            match self
+            let begun = self
                 .owner
                 .begin_step(id, step_id, kind.clone(), &input)
-                .await
-                .map_err(agent_error)?
-            {
-                BeginStep::Execute => Ok(Step::Execute),
-                BeginStep::Interrupted if kind == "tool" => Ok(Step::Interrupted),
-                BeginStep::Interrupted => Ok(Step::Execute),
-                BeginStep::Replay(value) => Ok(Step::Replay(value.decode().map_err(agent_error)?)),
-            }
+                .await;
+            admitted_step(begun, &kind)
         })
     }
 
@@ -823,6 +866,18 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 .await
                 .map_err(agent_error)
         })
+    }
+}
+
+fn admitted_step(
+    begun: nanocode_durability::Result<BeginStep>,
+    kind: &str,
+) -> AgentResult<Step> {
+    match begun.map_err(agent_error)? {
+        BeginStep::Execute => Ok(Step::Execute),
+        BeginStep::Interrupted if kind == "tool" => Ok(Step::Interrupted),
+        BeginStep::Interrupted => Ok(Step::Execute),
+        BeginStep::Replay(value) => Ok(Step::Replay(value.decode().map_err(agent_error)?)),
     }
 }
 
