@@ -8,21 +8,57 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 pub fn render(source: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    render_rows(source, width, theme, usize::MAX).0
+}
+
+pub fn render_rows(
+    source: &str,
+    width: u16,
+    theme: &Theme,
+    rows: usize,
+) -> (Vec<Line<'static>>, usize) {
     let _span = tracing::info_span!("tui.diff.render", width, text.bytes = source.len()).entered();
     if width == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     let files = parse(source);
     let syntax_theme = super::highlight::theme();
-    let mut rendered = Vec::new();
+    let mut rendered = Rows {
+        lines: Vec::new(),
+        limit: rows,
+        total: 0,
+    };
     for file in files {
-        if !rendered.is_empty() {
+        if rendered.total > 0 {
             rendered.push(Line::default());
         }
         render_file(&mut rendered, &file, width, theme, syntax_theme);
     }
-    rendered
+    (rendered.lines, rendered.total)
+}
+
+struct Rows {
+    lines: Vec<Line<'static>>,
+    limit: usize,
+    total: usize,
+}
+
+impl Rows {
+    fn push(&mut self, line: Line<'static>) {
+        if !self.full() {
+            self.lines.push(line);
+        }
+        self.total += 1;
+    }
+
+    const fn skip(&mut self, rows: usize) {
+        self.total += rows;
+    }
+
+    const fn full(&self) -> bool {
+        self.lines.len() >= self.limit
+    }
 }
 
 #[derive(Default)]
@@ -290,7 +326,7 @@ fn is_diff_metadata(line: &str) -> bool {
 }
 
 fn render_file(
-    rendered: &mut Vec<Line<'static>>,
+    rendered: &mut Rows,
     file: &FileDiff,
     width: u16,
     theme: &Theme,
@@ -315,6 +351,13 @@ fn render_file(
         let mut old_highlighter = HighlightLines::new(syntax, syntax_theme);
         let mut new_highlighter = HighlightLines::new(syntax, syntax_theme);
         for line in &hunk.lines {
+            if rendered.full() {
+                rendered.skip(
+                    super::highlight::wrap_spans(&[Span::raw(line.text.as_str())], code_width)
+                        .len(),
+                );
+                continue;
+            }
             let spans = highlighted_diff_line(
                 line,
                 &mut old_highlighter,
@@ -355,7 +398,7 @@ fn line_number_width(file: &FileDiff) -> u16 {
 }
 
 fn render_narrow_file(
-    rendered: &mut Vec<Line<'static>>,
+    rendered: &mut Rows,
     label: &str,
     file: &FileDiff,
     width: u16,
@@ -374,6 +417,14 @@ fn render_narrow_file(
             Style::default().fg(theme.muted()),
         )));
         for line in &hunk.lines {
+            if rendered.full() {
+                rendered.skip(if code_width == 0 {
+                    1
+                } else {
+                    hard_wrap(&line.text, code_width).len()
+                });
+                continue;
+            }
             if code_width == 0 {
                 rendered.push(Line::from(Span::styled(
                     &marker(line.kind)[..1],

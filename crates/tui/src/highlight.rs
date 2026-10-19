@@ -70,23 +70,35 @@ pub fn theme() -> &'static SyntaxTheme {
 
 pub fn syntax_for_token<'a>(syntaxes: &'a SyntaxSet, token: &str) -> &'a SyntaxReference {
     let token = token.split_ascii_whitespace().next().unwrap_or_default();
-    syntaxes
-        .find_syntax_by_token(token)
-        .or_else(|| syntaxes.find_syntax_by_extension(token))
-        .or_else(|| syntaxes.find_syntax_by_name(token))
-        .unwrap_or_else(|| syntaxes.find_syntax_plain_text())
+    highlightable(
+        syntaxes,
+        syntaxes
+            .find_syntax_by_token(token)
+            .or_else(|| syntaxes.find_syntax_by_extension(token))
+            .or_else(|| syntaxes.find_syntax_by_name(token)),
+    )
 }
 
 pub fn syntax_for_path<'a>(syntaxes: &'a SyntaxSet, path: &str) -> &'a SyntaxReference {
     let path = Path::new(path);
-    path.extension()
+    let syntax = path
+        .extension()
         .and_then(|extension| extension.to_str())
         .and_then(|extension| syntaxes.find_syntax_by_extension(extension))
         .or_else(|| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .and_then(|name| syntaxes.find_syntax_by_extension(name))
-        })
+        });
+    highlightable(syntaxes, syntax)
+}
+
+fn highlightable<'a>(
+    syntaxes: &'a SyntaxSet,
+    syntax: Option<&'a SyntaxReference>,
+) -> &'a SyntaxReference {
+    syntax
+        .filter(|syntax| !matches!(syntax.name.as_str(), "Markdown" | "MultiMarkdown"))
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text())
 }
 

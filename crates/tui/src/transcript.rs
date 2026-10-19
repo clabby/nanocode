@@ -1463,13 +1463,16 @@ impl RenderContext<'_> {
                     }
                     _ => Cow::Borrowed(tool.input.as_str()),
                 };
-                let mut body = self.body(&input, tool.input_body, &tool.language, inner, &part);
+                let limit = self.limit(tool.input_body);
+                let rows = if collapsed { limit } else { usize::MAX };
+                let (mut body, total) =
+                    self.body(&input, tool.input_body, &tool.language, inner, &part, rows);
                 if matches!(input, Cow::Owned(_)) {
                     for (_, source) in &mut body {
                         *source = whole(part.clone());
                     }
                 }
-                self.preview(body, &part, self.limit(tool.input_body), false)
+                self.preview(body, total, &part, limit, false)
             });
             out.prefixed(
                 shown,
@@ -1494,8 +1497,8 @@ impl RenderContext<'_> {
             let part = Part::Output(id);
             let form = (body, inner, self.mode);
             let shown = formatted.get(&part, form, language, output, || {
-                let rows = self.body(output, body, language, inner, &part);
-                self.preview(rows, &part, self.limit(tool.output_body), true)
+                let (rows, total) = self.body(output, body, language, inner, &part, usize::MAX);
+                self.preview(rows, total, &part, self.limit(tool.output_body), true)
             });
             out.prefixed(
                 shown,
@@ -1512,7 +1515,8 @@ impl RenderContext<'_> {
         language: &str,
         width: u16,
         part: &Part,
-    ) -> Vec<Row> {
+        rows: usize,
+    ) -> (Vec<Row>, usize) {
         let _span = tracing::info_span!(
             "tui.tool.format",
             text.bytes = text.len(),
@@ -1523,29 +1527,41 @@ impl RenderContext<'_> {
         .entered();
         let text = sanitize_terminal_text(text.trim_end());
         match body {
-            ToolBody::Diff => diff::render(&text, width, self.theme)
-                .into_iter()
-                .map(|line| (line, whole(part.clone())))
-                .collect(),
-            ToolBody::Code => code_lines(&text, language, width)
-                .into_iter()
-                .map(|(line, index)| {
-                    (
-                        line,
-                        Some(Source {
-                            part: part.clone(),
-                            extent: Extent::Line(index),
-                        }),
-                    )
-                })
-                .collect(),
-            ToolBody::Text => plain(
-                &text,
-                width,
-                Style::default().fg(self.theme.muted()),
-                true,
-                part,
-            ),
+            ToolBody::Diff => {
+                let (lines, total) = diff::render_rows(&text, width, self.theme, rows);
+                let lines = lines
+                    .into_iter()
+                    .map(|line| (line, whole(part.clone())))
+                    .collect();
+                (lines, total)
+            }
+            ToolBody::Code => {
+                let (lines, total) = code_lines(&text, language, width, rows);
+                let lines = lines
+                    .into_iter()
+                    .map(|(line, index)| {
+                        (
+                            line,
+                            Some(Source {
+                                part: part.clone(),
+                                extent: Extent::Line(index),
+                            }),
+                        )
+                    })
+                    .collect();
+                (lines, total)
+            }
+            ToolBody::Text => {
+                let lines = plain(
+                    &text,
+                    width,
+                    Style::default().fg(self.theme.muted()),
+                    true,
+                    part,
+                );
+                let total = lines.len();
+                (lines, total)
+            }
         }
     }
 
@@ -1556,8 +1572,14 @@ impl RenderContext<'_> {
         }
     }
 
-    fn preview(&self, body: Vec<Row>, part: &Part, preview: usize, tail: bool) -> Vec<Row> {
-        let total = body.len();
+    fn preview(
+        &self,
+        body: Vec<Row>,
+        total: usize,
+        part: &Part,
+        preview: usize,
+        tail: bool,
+    ) -> Vec<Row> {
         let limit = if self.mode == DisplayMode::Collapsed {
             preview.min(total)
         } else {
@@ -1565,7 +1587,8 @@ impl RenderContext<'_> {
         };
         let hidden = total - limit;
         let mut shown: Vec<Row> = if tail {
-            body.into_iter().skip(hidden).collect()
+            let skipped = body.len() - limit;
+            body.into_iter().skip(skipped).collect()
         } else {
             body.into_iter().take(limit).collect()
         };
@@ -1589,7 +1612,12 @@ impl RenderContext<'_> {
     }
 }
 
-fn code_lines(text: &str, language: &str, width: u16) -> Vec<(Line<'static>, usize)> {
+fn code_lines(
+    text: &str,
+    language: &str,
+    width: u16,
+    rows: usize,
+) -> (Vec<(Line<'static>, usize)>, usize) {
     let _span = tracing::info_span!(
         "tui.code.highlight",
         text.bytes = text.len(),
@@ -1600,17 +1628,24 @@ fn code_lines(text: &str, language: &str, width: u16) -> Vec<(Line<'static>, usi
     let assets = highlight::assets();
     let syntax = highlight::syntax_for_token(&assets.syntaxes, language);
     let mut highlighter = HighlightLines::new(syntax, highlight::theme());
-    text.lines()
-        .enumerate()
-        .flat_map(|(index, line)| {
-            highlight::wrap(
-                highlight::line(&mut highlighter, line, &assets.syntaxes),
-                width,
-            )
-            .into_iter()
-            .map(move |spans| (Line::from(spans), index))
-        })
-        .collect()
+    let mut lines = Vec::new();
+    let mut total = 0;
+    for (index, line) in text.lines().enumerate() {
+        if lines.len() >= rows {
+            total += highlight::wrap_spans(&[Span::raw(line)], width).len();
+            continue;
+        }
+        for spans in highlight::wrap(
+            highlight::line(&mut highlighter, line, &assets.syntaxes),
+            width,
+        ) {
+            total += 1;
+            if lines.len() < rows {
+                lines.push((Line::from(spans), index));
+            }
+        }
+    }
+    (lines, total)
 }
 
 fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer) {
