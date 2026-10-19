@@ -2324,27 +2324,41 @@ fn wire_messages(messages: &[HistoryMessage], suffix: &[HistoryMessage]) -> Vec<
     messages
         .iter()
         .chain(suffix)
-        .map(separated_tool_references)
+        .map(separated_result_companions)
         .collect()
 }
 
-fn separated_tool_references(message: &HistoryMessage) -> HistoryMessage {
+fn separated_result_companions(message: &HistoryMessage) -> HistoryMessage {
     let mut message = message.clone();
     if message.content.iter().any(|block| {
         matches!(
             block,
             ContentBlock::ToolResult {
                 content: ToolResultContent::Blocks(blocks),
+                is_error,
                 ..
-            } if blocks.iter().any(|block| block["type"] == "tool_reference")
+            } if blocks.iter().any(|block| {
+                block["type"] == "tool_reference" || (*is_error && block["type"] != "text")
+            })
         )
     }) {
-        separate_tool_references(std::slice::from_mut(message.make_mut()));
+        separate_result_companions(std::slice::from_mut(message.make_mut()));
     }
     message
 }
 
-fn separate_tool_references(messages: &mut [Message]) {
+fn separate_result_companions(messages: &mut [Message]) {
+    fn companion(block: &Value) -> ContentBlock {
+        match serde_json::from_value::<ContentBlock>(block.clone()) {
+            Ok(
+                content @ (ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::Document { .. }),
+            ) => content,
+            _ => ContentBlock::text(block.to_string()),
+        }
+    }
+
     for message in messages {
         let mut companions = Vec::new();
         for block in &mut message.content {
@@ -2356,31 +2370,27 @@ fn separate_tool_references(messages: &mut [Message]) {
             else {
                 continue;
             };
-            if !blocks.iter().any(|block| block["type"] == "tool_reference") {
-                continue;
-            }
             if *is_error {
-                for block in blocks {
-                    if block["type"] == "tool_reference" {
+                blocks.retain_mut(|block| {
+                    if matches!(block["type"].as_str(), Some("image" | "document")) {
+                        companions.push(companion(block));
+                        return false;
+                    }
+                    if block["type"] != "text" {
                         *block = json!({"type":"text","text":block.to_string()});
                     }
-                }
+                    true
+                });
+                continue;
+            }
+            if !blocks.iter().any(|block| block["type"] == "tool_reference") {
                 continue;
             }
             blocks.retain(|block| {
                 if block["type"] == "tool_reference" {
                     return true;
                 }
-
-                let companion = match serde_json::from_value::<ContentBlock>(block.clone()) {
-                    Ok(
-                        content @ (ContentBlock::Text { .. }
-                        | ContentBlock::Image { .. }
-                        | ContentBlock::Document { .. }),
-                    ) => content,
-                    _ => ContentBlock::text(block.to_string()),
-                };
-                companions.push(companion);
+                companions.push(companion(block));
                 false
             });
         }
