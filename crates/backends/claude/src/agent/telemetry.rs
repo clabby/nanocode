@@ -199,7 +199,7 @@ pub(super) fn finish_model_call(span: &Span, duration_ns: u64, error: Option<&Na
 
 pub(super) fn attempt_span(call_index: u32, attempt: u32, max_attempts: u32) -> Span {
     info_span!(
-        target: "nanocodex_claude",
+        target: "nanocode_claude",
         "messages.attempt",
         otel.kind = "client",
         otel.status_code = Empty,
@@ -276,7 +276,7 @@ pub(super) fn fail_attempt(
         span.record("retry.delay_ns", delay_ns);
         span.record("retry.server_requested", retry_after);
     }
-    tracing::warn!(target: "nanocodex_claude", parent: span, error = %error, "Claude Messages attempt failed");
+    tracing::warn!(target: "nanocode_claude", parent: span, error = %error, "Claude Messages attempt failed");
 }
 
 fn finish(span: &Span, error: Option<&NanocodeError>, message: &'static str) {

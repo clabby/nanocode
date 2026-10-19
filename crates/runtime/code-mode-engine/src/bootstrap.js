@@ -1,11 +1,11 @@
 ((createCodeTools, valueHelpers) => {
   const { stringify, storeSnapshot, normalizeImage, normalizeAudio, generatedImageItems } = valueHelpers;
-  const nativeTool = __nanocodexTool;
-  const nativeContent = __nanocodexContent;
-  const nativeNotify = __nanocodexNotify;
-  const nativeYield = __nanocodexYield;
-  const nativeSetTimeout = __nanocodexSetTimeout;
-  const nativeClearTimeout = __nanocodexClearTimeout;
+  const nativeTool = __nanocodeTool;
+  const nativeContent = __nanocodeContent;
+  const nativeNotify = __nanocodeNotify;
+  const nativeYield = __nanocodeYield;
+  const nativeSetTimeout = __nanocodeSetTimeout;
+  const nativeClearTimeout = __nanocodeClearTimeout;
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const jsonParse = JSON.parse;
   const jsonStringify = JSON.stringify;

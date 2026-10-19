@@ -1,3 +1,3 @@
 fn main() -> std::process::ExitCode {
-    nanocodex::main()
+    nanocode_cli::main()
 }

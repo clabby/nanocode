@@ -132,7 +132,7 @@ fn clipboard_image(path: &Path) -> Result<(), String> {
 
 impl App {
     pub(crate) fn update_finder(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "update_finder", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "update_finder", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let Some((start, query)) = self.composer.mention('@') else {
             self.finder = None;
             self.finder_dismissed = None;
@@ -175,7 +175,7 @@ impl App {
     }
 
     pub(crate) fn accept_finder(&mut self) -> bool {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "accept_finder", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "accept_finder", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let Some(finder) = self.finder.take() else {
             return false;
         };
@@ -200,7 +200,7 @@ impl App {
     }
 
     pub(crate) fn run_shell(&mut self, command: String) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "run_shell", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "run_shell", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let mut cell = ToolCell::new(self.local_id_pub("shell"), "shell");
         cell.title = command.clone();
         let index = self.transcript.push(CellKind::Tool(cell));
@@ -208,7 +208,7 @@ impl App {
         let workspace = self.host.config.workspace.clone();
         let tx = self.tx.clone();
         let started = std::time::Instant::now();
-        let span = tracing::info_span!(target: "nanocodex", "nc.shell", command.bytes = command.len(), session.id = self.agent.as_ref().map(|agent| agent.session_id()), exit.code = tracing::field::Empty, otel.status_code = tracing::field::Empty);
+        let span = tracing::info_span!(target: "nanocode", "nc.shell", command.bytes = command.len(), session.id = self.agent.as_ref().map(|agent| agent.session_id()), exit.code = tracing::field::Empty, otel.status_code = tracing::field::Empty);
         tokio::spawn(tracing::Instrument::instrument(
             async move {
                 let output = tokio::process::Command::new("sh")
@@ -284,7 +284,7 @@ impl App {
     }
 
     pub(crate) fn paste_image(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "paste_image", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "paste_image", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let directory = self.home.join("images");
         let path = directory.join(format!("{}.png", uuid::Uuid::now_v7()));
         let tx = self.tx.clone();
@@ -299,13 +299,13 @@ impl App {
     }
 
     pub(crate) fn attach(&mut self, path: PathBuf) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "attach", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "attach", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         self.flash(format!("attached {}", path.display()));
         self.attachments.push(path);
     }
 
     pub(crate) fn open_theme_picker(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "open_theme_picker", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "open_theme_picker", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let current = self.theme.mode();
         let items = [ThemeMode::Auto, ThemeMode::Dark, ThemeMode::Light]
             .into_iter()
@@ -326,7 +326,7 @@ impl App {
     }
 
     pub(crate) fn set_theme(&mut self, name: &str) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "set_theme", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "set_theme", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let mode = match name {
             "auto" => ThemeMode::Auto,
             "dark" => ThemeMode::Dark,
@@ -345,7 +345,7 @@ impl App {
     }
 
     pub(crate) fn copy_last_reply(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "copy_last_reply", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "copy_last_reply", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let transcript = if self.panes.side_active() {
             self.active_transcript()
         } else {
@@ -369,7 +369,7 @@ impl App {
     }
 
     pub(crate) fn context_report(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "context_report", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "context_report", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let usage = self.mapper.session_usage();
         let last = self.mapper.last_usage();
         let session = self.session_id().unwrap_or_else(|| "not started".into());
@@ -392,7 +392,7 @@ impl App {
     }
 
     pub(crate) fn open_skills(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "open_skills", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "open_skills", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let skills = match nanocode_home::AgentHome::from_env() {
             Ok(home) => home.skills_for(&home.project(&self.host.config.workspace)),
             Err(error) => {

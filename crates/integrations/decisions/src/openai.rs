@@ -69,7 +69,7 @@ impl OpenAiDecisions {
         let response = self
             .client
             .post(&*self.endpoint)
-            .header(USER_AGENT, concat!("nanocodex/", env!("CARGO_PKG_VERSION")))
+            .header(USER_AGENT, concat!("nanocode/", env!("CARGO_PKG_VERSION")))
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .json(body)
             .send()

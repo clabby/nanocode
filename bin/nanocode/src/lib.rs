@@ -51,11 +51,11 @@ fn install_telemetry(cli: &Cli) -> Result<Option<nanocode_observability::Observa
         (false, _) => nanocode_observability::LogOutput::Disabled,
         (true, false) => nanocode_observability::LogOutput::Stderr,
         (true, true) => {
-            nanocode_observability::LogOutput::File(home.join("log").join("nanocodex.log"))
+            nanocode_observability::LogOutput::File(home.join("log").join("nanocode.log"))
         }
     };
     Ok(Some(
-        args.builder("nanocodex", env!("CARGO_PKG_VERSION"), output)
+        args.builder("nanocode", env!("CARGO_PKG_VERSION"), output)
             .otlp_directory(home.join("log").join("otel"))
             .shutdown_timeout(TELEMETRY_SHUTDOWN)
             .install()?,
@@ -70,12 +70,12 @@ pub fn main() -> ExitCode {
     let telemetry = match install_telemetry(&cli) {
         Ok(telemetry) => telemetry,
         Err(error) => {
-            eprintln!("nanocodex: failed to start telemetry: {error}");
+            eprintln!("nanocode: failed to start telemetry: {error}");
             return ExitCode::FAILURE;
         }
     };
     let startup = tracing::info_span!(
-        target: "nanocodex",
+        target: "nanocode",
         "nc.startup",
         process.pid = std::process::id(),
         cli.duration_ms = parsed.as_secs_f64() * 1_000.0,
@@ -91,7 +91,7 @@ pub fn main() -> ExitCode {
     }) {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("nanocodex: failed to start the async runtime: {error}");
+            eprintln!("nanocode: failed to start the async runtime: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -125,7 +125,7 @@ pub fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("nanocodex: {error}");
+            eprintln!("nanocode: {error}");
             ExitCode::FAILURE
         }
     }
@@ -206,12 +206,12 @@ async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Pre
     };
     let host = tracing::Instrument::instrument(
         Host::build(config, &model, thinking),
-        tracing::info_span!(target: "nanocodex", "nc.host.build"),
+        tracing::info_span!(target: "nanocode", "nc.host.build"),
     )
     .await?;
     tracing::Instrument::instrument(
         host.runtime.initialize_runners(),
-        tracing::info_span!(target: "nanocodex", "nc.runners.initialize"),
+        tracing::info_span!(target: "nanocode", "nc.runners.initialize"),
     )
     .await?;
     for server in host.runtime.runner_servers() {
@@ -257,7 +257,7 @@ async fn interactive(mut args: SessionArgs) -> Result<()> {
     }
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(
-            "the interactive interface needs a terminal; use `nanocodex exec <prompt>` for scripts"
+            "the interactive interface needs a terminal; use `nanocode exec <prompt>` for scripts"
                 .into(),
         );
     }
@@ -340,7 +340,7 @@ async fn exec(args: SessionArgs) -> Result<()> {
         .clone()
         .filter(|prompt| !prompt.trim().is_empty())
         .ok_or("exec requires a prompt")?;
-    let prepared = prepare(&args, &mut |message| eprintln!("nanocodex: {message}")).await?;
+    let prepared = prepare(&args, &mut |message| eprintln!("nanocode: {message}")).await?;
     let host = prepared.host;
     let resume = match (&args.resume, args.continue_last) {
         (Some(id), _) if !id.is_empty() => Some(id.clone()),
@@ -368,12 +368,12 @@ async fn exec(args: SessionArgs) -> Result<()> {
         }
     };
     if let Some(reason) = host.runtime.computer_use_unavailable() {
-        eprintln!("nanocodex: computer use unavailable, continuing without it: {reason}");
+        eprintln!("nanocode: computer use unavailable, continuing without it: {reason}");
     }
     tokio::spawn(async move { while events.recv().await.is_some() {} });
     let outcome: Result<()> = async {
         for pending in pending {
-            eprintln!("nanocodex: resuming interrupted turn {}", pending.id);
+            eprintln!("nanocode: resuming interrupted turn {}", pending.id);
             let turn = agent
                 .prompt(nanocode::PromptRequest::new(pending.prompt).request_id(&pending.id))
                 .await?;
@@ -472,7 +472,7 @@ async fn hand(args: HandArgs) -> Result<()> {
     }
     .name(&name)
     .directory(directory.clone());
-    eprintln!("nanocodex hand {name} in {}", directory.display());
+    eprintln!("nanocode hand {name} in {}", directory.display());
     let run = hand.run(|event| match event {
         HandEvent::Connecting { endpoint } => eprintln!("hand: connecting {endpoint}"),
         HandEvent::Connected { endpoint } => eprintln!("hand: connected to {endpoint}"),

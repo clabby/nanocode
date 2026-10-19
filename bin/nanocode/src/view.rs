@@ -155,8 +155,8 @@ pub const BINDINGS: [Binding; 33] = [
 
 pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
     let area = frame.area();
-    let _span = tracing::info_span!(target: "nanocodex", "nc.view", width = area.width, height = area.height).entered();
-    let layout = tracing::info_span!(target: "nanocodex", "nc.view.layout").entered();
+    let _span = tracing::info_span!(target: "nanocode", "nc.view", width = area.width, height = area.height).entered();
+    let layout = tracing::info_span!(target: "nanocode", "nc.view.layout").entered();
     let now = Instant::now();
     let spinner = app.spinner.frame(now);
     let theme = app.theme.clone();
@@ -277,12 +277,12 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
 }
 
 fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, spinner: &str) {
-    let _span = tracing::info_span!(target: "nanocodex", "nc.panes.render", side = app.panes.side.is_some(), active_side = app.panes.active, zoomed = app.panes.zoomed).entered();
+    let _span = tracing::info_span!(target: "nanocode", "nc.panes.render", side = app.panes.side.is_some(), active_side = app.panes.active, zoomed = app.panes.zoomed).entered();
     app.panes.main_area = Rect::default();
     app.panes.side_area = Rect::default();
     if app.panes.side.is_none() {
         let _pane =
-            tracing::info_span!(target: "nanocodex", "nc.pane.render", pane = "main").entered();
+            tracing::info_span!(target: "nanocode", "nc.pane.render", pane = "main").entered();
         app.panes.main_area = area;
         app.visible_transcript()
             .render(area, buffer, theme, spinner);
@@ -291,7 +291,7 @@ fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, sp
     let [tabs, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     tab_line(app, theme, spinner).render(tabs, buffer);
     if app.panes.zoomed {
-        let _pane = tracing::info_span!(target: "nanocodex", "nc.pane.render", pane = if app.panes.active { "side" } else { "main" }).entered();
+        let _pane = tracing::info_span!(target: "nanocode", "nc.pane.render", pane = if app.panes.active { "side" } else { "main" }).entered();
         if app.panes.active {
             app.panes.side_area = body;
         } else {
@@ -311,11 +311,11 @@ fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, sp
         ..body
     };
     let (main, side) = (app.panes.main_area, app.panes.side_area);
-    tracing::info_span!(target: "nanocodex", "nc.pane.render", pane = "main").in_scope(|| {
+    tracing::info_span!(target: "nanocode", "nc.pane.render", pane = "main").in_scope(|| {
         app.pane_transcript(false)
             .render(main, buffer, theme, spinner)
     });
-    tracing::info_span!(target: "nanocodex", "nc.pane.render", pane = "side").in_scope(|| {
+    tracing::info_span!(target: "nanocode", "nc.pane.render", pane = "side").in_scope(|| {
         app.pane_transcript(true)
             .render(side, buffer, theme, spinner)
     });
@@ -386,7 +386,7 @@ fn finder_popup(app: &App, composer_area: Rect, transcript_area: Rect, frame: &m
     if app.overlay.is_some() {
         return;
     }
-    let _span = tracing::info_span!(target: "nanocodex", "nc.finder.render", files = finder.finder.len(), matches = finder.finder.matches()).entered();
+    let _span = tracing::info_span!(target: "nanocode", "nc.finder.render", files = finder.finder.len(), matches = finder.finder.matches()).entered();
     let rows = FINDER_ROWS.min(usize::from(transcript_area.height.saturating_sub(1)));
     let lines = finder.finder.lines(rows, &app.theme);
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -428,7 +428,7 @@ fn command_popup(app: &App, composer_area: Rect, transcript_area: Rect, frame: &
         return;
     }
     let _span =
-        tracing::info_span!(target: "nanocodex", "nc.commands.render", matches = matches.len())
+        tracing::info_span!(target: "nanocode", "nc.commands.render", matches = matches.len())
             .entered();
     let height = u16::try_from(matches.len())
         .unwrap_or(u16::MAX)
@@ -467,7 +467,7 @@ fn command_popup(app: &App, composer_area: Rect, transcript_area: Rect, frame: &
 }
 
 fn status_line(app: &App, spinner: &str, now: Instant) -> Line<'static> {
-    let _span = tracing::info_span!(target: "nanocodex", "nc.status.render").entered();
+    let _span = tracing::info_span!(target: "nanocode", "nc.status.render").entered();
     let theme = &app.theme;
     if let Some((text, at)) = &app.status
         && now.duration_since(*at) < STATUS_VISIBLE
@@ -596,7 +596,7 @@ fn status_line(app: &App, spinner: &str, now: Instant) -> Line<'static> {
 }
 
 fn footer(app: &App) -> Line<'static> {
-    let _span = tracing::info_span!(target: "nanocodex", "nc.footer.render").entered();
+    let _span = tracing::info_span!(target: "nanocode", "nc.footer.render").entered();
     let theme = &app.theme;
     let mut spans = vec![
         Span::styled(

@@ -294,7 +294,7 @@ impl ClaudeTools {
     }
 
     #[doc(hidden)]
-    pub const HOST_INTERRUPTED: &'static str = "\0nanocodex.claude.host_interrupted";
+    pub const HOST_INTERRUPTED: &'static str = "\0nanocode.claude.host_interrupted";
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
@@ -1764,9 +1764,9 @@ fn top_level_event_fields(
         );
     }
     let metadata = match metadata {
-        Some(Value::Object(object)) if object.contains_key("_nanocodex_code") => {
+        Some(Value::Object(object)) if object.contains_key("_nanocode_code") => {
             let mut object = object.clone();
-            if let Some(code) = object.get_mut("_nanocodex_code")
+            if let Some(code) = object.get_mut("_nanocode_code")
                 && let Some(calls) = code.get("calls").and_then(Value::as_array)
             {
                 *code = json!({
@@ -5083,7 +5083,7 @@ impl State {
         if matches!(name, "exec" | "wait")
             && let Some(code) = metadata
                 .as_ref()
-                .and_then(|value| value.get("_nanocodex_code"))
+                .and_then(|value| value.get("_nanocode_code"))
             && let Some(calls) = code.get("calls").and_then(Value::as_array)
         {
             let parent = json!(code.get("origin_call_id"));
@@ -5101,7 +5101,7 @@ impl State {
 
         if metadata
             .as_ref()
-            .and_then(|value| value.get("_nanocodex_code"))
+            .and_then(|value| value.get("_nanocode_code"))
             .is_some_and(|code| code.get("running").and_then(Value::as_bool) != Some(false))
         {
             live.release_running();
@@ -5110,7 +5110,7 @@ impl State {
         if matches!(name, "exec" | "wait") {
             let mut calls = metadata
                 .as_ref()
-                .and_then(|value| value.get("_nanocodex_code"))
+                .and_then(|value| value.get("_nanocode_code"))
                 .and_then(|code| code.get("calls"))
                 .and_then(Value::as_array)
                 .map(|calls| {

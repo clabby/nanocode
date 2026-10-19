@@ -296,7 +296,7 @@ fn nested_call(call: &NestedToolCall) -> Value {
 
 fn code_reply(execution: CodeModeExecution, call_id: &str) -> ClaudeToolReply {
     let metadata = json!({
-        "_nanocodex_code": {
+        "_nanocode_code": {
             "calls": execution.nested_calls.iter().map(nested_call).collect::<Vec<_>>(),
             "origin_call_id": execution
                 .cell

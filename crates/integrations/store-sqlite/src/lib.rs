@@ -149,16 +149,16 @@ impl Database {
         connection
             .execute_batch(
                 "PRAGMA foreign_keys = ON;
-                 CREATE TABLE IF NOT EXISTS nanocodex_durable_records (
+                 CREATE TABLE IF NOT EXISTS nanocode_durable_records (
                    state_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
                    PRIMARY KEY (state_id, key)
                  ) WITHOUT ROWID;
-                 CREATE TABLE IF NOT EXISTS nanocodex_durable_owners (
+                 CREATE TABLE IF NOT EXISTS nanocode_durable_owners (
                    state_id TEXT PRIMARY KEY,
                    owner_id TEXT NOT NULL,
                    fence TEXT NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS nanocodex_durable_states (
+                 CREATE TABLE IF NOT EXISTS nanocode_durable_states (
                    state_id TEXT PRIMARY KEY,
                    revision INTEGER NOT NULL CHECK (revision > 0),
                    payload TEXT NOT NULL
@@ -183,7 +183,7 @@ impl Database {
         after_begin();
         let retained_fence = transaction
             .query_row(
-                "SELECT fence FROM nanocodex_durable_owners WHERE state_id = ?1",
+                "SELECT fence FROM nanocode_durable_owners WHERE state_id = ?1",
                 [state_id],
                 |row| row.get::<_, String>(0),
             )
@@ -200,7 +200,7 @@ impl Database {
         };
         transaction
             .execute(
-                "INSERT INTO nanocodex_durable_owners (state_id, owner_id, fence)
+                "INSERT INTO nanocode_durable_owners (state_id, owner_id, fence)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT (state_id) DO UPDATE
                  SET owner_id = excluded.owner_id, fence = excluded.fence",
@@ -229,7 +229,7 @@ impl Database {
         after_begin();
         let retained_owner = transaction
             .query_row(
-                "SELECT owner_id, fence FROM nanocodex_durable_owners WHERE state_id = ?1",
+                "SELECT owner_id, fence FROM nanocode_durable_owners WHERE state_id = ?1",
                 [state_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -247,7 +247,7 @@ impl Database {
         }
         let actual = transaction
             .query_row(
-                "SELECT revision FROM nanocodex_durable_states WHERE state_id = ?1",
+                "SELECT revision FROM nanocode_durable_states WHERE state_id = ?1",
                 [state_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -266,12 +266,12 @@ impl Database {
         })?;
         for record in records {
             transaction.execute(
-                "INSERT INTO nanocodex_durable_records (state_id, key, value) VALUES (?1, ?2, ?3)
+                "INSERT INTO nanocode_durable_records (state_id, key, value) VALUES (?1, ?2, ?3)
                  ON CONFLICT (state_id, key) DO NOTHING", params![state_id, record.key, record.value],
             ).map_err(backend)?;
             let retained: String = transaction
                 .query_row(
-                    "SELECT value FROM nanocodex_durable_records WHERE state_id = ?1 AND key = ?2",
+                    "SELECT value FROM nanocode_durable_records WHERE state_id = ?1 AND key = ?2",
                     params![state_id, record.key],
                     |row| row.get(0),
                 )
@@ -286,7 +286,7 @@ impl Database {
         let sql_revision = sql_counter(revision, "SQLite durability revision overflow")?;
         transaction
             .execute(
-                "INSERT INTO nanocodex_durable_states (state_id, revision, payload)
+                "INSERT INTO nanocode_durable_states (state_id, revision, payload)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT (state_id) DO UPDATE
                  SET revision = excluded.revision, payload = excluded.payload",
@@ -300,7 +300,7 @@ impl Database {
     fn read_record(&self, state_id: &str, key: &str) -> Result<Option<String>, StoreError> {
         self.connection
             .query_row(
-                "SELECT value FROM nanocodex_durable_records WHERE state_id = ?1 AND key = ?2",
+                "SELECT value FROM nanocode_durable_records WHERE state_id = ?1 AND key = ?2",
                 params![state_id, key],
                 |row| row.get(0),
             )
@@ -311,7 +311,7 @@ impl Database {
     fn peek(&self, state_id: &str) -> Result<StoredState, StoreError> {
         self.connection
             .query_row(
-                "SELECT revision, payload FROM nanocodex_durable_states WHERE state_id = ?1",
+                "SELECT revision, payload FROM nanocode_durable_states WHERE state_id = ?1",
                 [state_id],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
@@ -331,7 +331,7 @@ impl Database {
     fn list_states(&self, limit: usize) -> Result<Vec<String>, StoreError> {
         let mut statement = self
             .connection
-            .prepare("SELECT state_id FROM nanocodex_durable_states ORDER BY rowid DESC LIMIT ?1")
+            .prepare("SELECT state_id FROM nanocode_durable_states ORDER BY rowid DESC LIMIT ?1")
             .map_err(backend)?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         statement
@@ -422,7 +422,7 @@ impl StateStore for SqliteStore {
 
 fn validate_owner_schema(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection
-        .prepare("PRAGMA table_info('nanocodex_durable_owners')")
+        .prepare("PRAGMA table_info('nanocode_durable_owners')")
         .map_err(backend)?;
     let columns = statement
         .query_map([], |row| {
@@ -485,7 +485,7 @@ fn validate_owner_schema(connection: &Connection) -> Result<(), StoreError> {
 
 fn validate_state_schema(connection: &Connection) -> Result<(), StoreError> {
     let mut statement = connection
-        .prepare("PRAGMA table_info('nanocodex_durable_states')")
+        .prepare("PRAGMA table_info('nanocode_durable_states')")
         .map_err(backend)?;
     let columns = statement
         .query_map([], |row| {
@@ -533,20 +533,20 @@ fn validate_state_schema(connection: &Connection) -> Result<(), StoreError> {
 
 fn incompatible_owner_schema(detail: String) -> StoreError {
     StoreError::Backend(format!(
-        "incompatible SQLite `nanocodex_durable_owners` schema: {detail}; recreate the table with the current schema"
+        "incompatible SQLite `nanocode_durable_owners` schema: {detail}; recreate the table with the current schema"
     ))
 }
 
 fn incompatible_state_schema(detail: String) -> StoreError {
     StoreError::Backend(format!(
-        "incompatible SQLite `nanocodex_durable_states` schema: {detail}; recreate the table with the current schema"
+        "incompatible SQLite `nanocode_durable_states` schema: {detail}; recreate the table with the current schema"
     ))
 }
 
 fn load_state(connection: &Connection, state_id: &str) -> Result<StoredState, StoreError> {
     let retained = connection
         .query_row(
-            "SELECT revision, payload FROM nanocodex_durable_states WHERE state_id = ?1",
+            "SELECT revision, payload FROM nanocode_durable_states WHERE state_id = ?1",
             [state_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )

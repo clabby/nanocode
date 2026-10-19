@@ -19,7 +19,7 @@ impl App {
         thinking: Thinking,
         tier: ServiceTier,
     ) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "request_switch", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "request_switch", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         if self.session_started && model != self.model {
             self.flash(
                 "the model is fixed for this thread; use /new before choosing another model",
@@ -35,7 +35,7 @@ impl App {
     }
 
     pub(crate) fn switch(&mut self, model: ModelSelection, thinking: Thinking, tier: ServiceTier) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "switch", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "switch", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         if self.session_started && model != self.model {
             self.flash(
                 "the model is fixed for this thread; use /new before choosing another model",
@@ -290,7 +290,7 @@ impl App {
     }
 
     pub(crate) fn open_session_picker(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "open_session_picker", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "open_session_picker", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let Some(store) = self.host.config.store.clone() else {
             self.flash("sessions are not saved with --ephemeral");
             return;
@@ -316,7 +316,7 @@ impl App {
     }
 
     pub(crate) fn resume(&mut self, session_id: String) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "resume", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "resume", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         if !matches!(self.turn, TurnState::Idle) {
             self.flash("interrupt the running turn (esc) before resuming another session");
             return;
@@ -344,7 +344,7 @@ impl App {
     }
 
     pub(crate) fn new_session(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "new_session", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "new_session", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         if !matches!(self.turn, TurnState::Idle) {
             self.flash("interrupt the running turn (esc) before starting a new session");
             return;
@@ -387,7 +387,7 @@ impl App {
     }
 
     pub(crate) fn compact(&mut self) {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "compact", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "compact", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let Some(agent) = self.agent.clone() else {
             return;
         };

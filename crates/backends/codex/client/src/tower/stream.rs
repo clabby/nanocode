@@ -454,7 +454,7 @@ fn emit_display_delta<P: Serialize>(
         .display_delta_emit_duration_ns
         .saturating_add(elapsed_ns(emit_started_at));
     tracing::trace!(
-        target: "nanocodex_stream_timing",
+        target: "nanocode_stream_timing",
         stage = "api_delta_emitted",
         request.id = events.request_id(),
         event.seq = seq,

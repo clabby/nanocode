@@ -1,7 +1,7 @@
 # nanocode-mcp
 
 Portable Model Context Protocol client contracts used by Code Mode. It replaces
-the rmcp 3.0.0 SDK with only the client surface Nanocodex exercises, and builds
+the rmcp 3.0.0 SDK with only the client surface Nanocode exercises, and builds
 for native targets and `wasm32-unknown-unknown` without host dependencies.
 
 | Module | Contents |

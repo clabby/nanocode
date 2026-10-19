@@ -527,7 +527,7 @@ impl EmbeddedToolRuntimeControl {
         if let (Some(host), Some(session_id)) = (&self.host, &self.session_id)
             && let Err(error) = host.preempt_turn(session_id).await
         {
-            tracing::warn!(target: "nanocodex_tools", %error, "embedded Code Mode observation preemption failed");
+            tracing::warn!(target: "nanocode_tools", %error, "embedded Code Mode observation preemption failed");
         }
     }
 

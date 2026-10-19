@@ -1,5 +1,5 @@
 [package]
-name = "nanocodex"
+name = "nanocode-cli"
 autotests = false
 autobenches = false
 version.workspace = true
@@ -13,7 +13,7 @@ repository.workspace = true
 description = "Interactive terminal coding agent built on the Nanocode Rust crates"
 
 [[bin]]
-name = "nanocodex"
+name = "nanocode"
 path = "src/main.rs"
 test = false
 bench = false

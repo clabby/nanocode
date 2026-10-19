@@ -6,17 +6,17 @@ use nanocode_durability_core::{
     OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoredState,
 };
 
-const POSTGRES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS nanocodex_durable_records (
+const POSTGRES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS nanocode_durable_records (
        state_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
        PRIMARY KEY (state_id, key)
      );
-     CREATE TABLE IF NOT EXISTS nanocodex_durable_owners (
+     CREATE TABLE IF NOT EXISTS nanocode_durable_owners (
        state_id TEXT PRIMARY KEY,
        owner_id TEXT NOT NULL,
        fence NUMERIC(20, 0) NOT NULL
          CHECK (fence >= 1 AND fence <= 18446744073709551615)
      );
-     CREATE TABLE IF NOT EXISTS nanocodex_durable_states (
+     CREATE TABLE IF NOT EXISTS nanocode_durable_states (
        state_id TEXT PRIMARY KEY,
        revision NUMERIC(20, 0) NOT NULL
          CHECK (revision >= 1 AND revision <= 18446744073709551615),
@@ -59,7 +59,7 @@ impl StateStore for PostgresStore {
         Box::pin(async move {
             self.client
                 .query_opt(
-                    "SELECT value FROM nanocodex_durable_records WHERE state_id = $1 AND key = $2",
+                    "SELECT value FROM nanocode_durable_records WHERE state_id = $1 AND key = $2",
                     &[&state_id, &key],
                 )
                 .await
@@ -77,12 +77,12 @@ impl StateStore for PostgresStore {
             let transaction = self.client.transaction().await.map_err(backend)?;
             let row = transaction
                 .query_opt(
-                    "INSERT INTO nanocodex_durable_owners (state_id, owner_id, fence)
+                    "INSERT INTO nanocode_durable_owners (state_id, owner_id, fence)
                      VALUES ($1, $2, 1)
                      ON CONFLICT (state_id) DO UPDATE
                      SET owner_id = excluded.owner_id,
-                         fence = nanocodex_durable_owners.fence + 1
-                     WHERE nanocodex_durable_owners.fence < 18446744073709551615
+                         fence = nanocode_durable_owners.fence + 1
+                     WHERE nanocode_durable_owners.fence < 18446744073709551615
                      RETURNING fence::text",
                     &[&state_id, &owner_id.as_str()],
                 )
@@ -95,7 +95,7 @@ impl StateStore for PostgresStore {
             let state = transaction
                 .query_opt(
                     "SELECT revision::text, payload
-                     FROM nanocodex_durable_states WHERE state_id = $1",
+                     FROM nanocode_durable_states WHERE state_id = $1",
                     &[&state_id],
                 )
                 .await
@@ -126,7 +126,7 @@ impl StateStore for PostgresStore {
             let transaction = self.client.transaction().await.map_err(backend)?;
             let retained_owner = transaction
                 .query_opt(
-                    "SELECT owner_id, fence::text FROM nanocodex_durable_owners
+                    "SELECT owner_id, fence::text FROM nanocode_durable_owners
                      WHERE state_id = $1 FOR UPDATE",
                     &[&state_id],
                 )
@@ -145,7 +145,7 @@ impl StateStore for PostgresStore {
             }
             let actual = transaction
                 .query_opt(
-                    "SELECT revision::text FROM nanocodex_durable_states
+                    "SELECT revision::text FROM nanocode_durable_states
                      WHERE state_id = $1 FOR UPDATE",
                     &[&state_id],
                 )
@@ -162,11 +162,11 @@ impl StateStore for PostgresStore {
             }
             for record in records {
                 transaction.execute(
-                    "INSERT INTO nanocodex_durable_records (state_id, key, value) VALUES ($1, $2, $3)
+                    "INSERT INTO nanocode_durable_records (state_id, key, value) VALUES ($1, $2, $3)
                      ON CONFLICT (state_id, key) DO NOTHING", &[&state_id, &record.key, &record.value],
                 ).await.map_err(backend)?;
                 let retained: String = transaction.query_one(
-                    "SELECT value FROM nanocodex_durable_records WHERE state_id = $1 AND key = $2",
+                    "SELECT value FROM nanocode_durable_records WHERE state_id = $1 AND key = $2",
                     &[&state_id, &record.key],
                 ).await.map_err(backend)?.get(0);
                 if retained != record.value {
@@ -182,7 +182,7 @@ impl StateStore for PostgresStore {
             let revision_text = revision.to_string();
             transaction
                 .execute(
-                    "INSERT INTO nanocodex_durable_states (state_id, revision, payload)
+                    "INSERT INTO nanocode_durable_states (state_id, revision, payload)
                      VALUES ($1, $2::numeric, $3)
                      ON CONFLICT (state_id) DO UPDATE
                      SET revision = excluded.revision, payload = excluded.payload",
@@ -203,7 +203,7 @@ impl StateStore for PostgresStore {
             self.client
                 .query_opt(
                     "SELECT revision::text, payload
-                     FROM nanocodex_durable_states WHERE state_id = $1",
+                     FROM nanocode_durable_states WHERE state_id = $1",
                     &[&state_id],
                 )
                 .await
@@ -228,7 +228,7 @@ impl StateStore for PostgresStore {
             Ok(self
                 .client
                 .query(
-                    "SELECT state_id FROM nanocodex_durable_states ORDER BY state_id DESC LIMIT $1",
+                    "SELECT state_id FROM nanocode_durable_states ORDER BY state_id DESC LIMIT $1",
                     &[&limit],
                 )
                 .await
@@ -247,7 +247,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
                     numeric_precision, numeric_scale
              FROM information_schema.columns
              WHERE table_schema = current_schema()
-               AND table_name IN ('nanocodex_durable_owners', 'nanocodex_durable_states')
+               AND table_name IN ('nanocode_durable_owners', 'nanocode_durable_states')
              ORDER BY table_name, ordinal_position",
             &[],
         )
@@ -268,7 +268,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
         .collect::<Vec<_>>();
     let expected = vec![
         (
-            "nanocodex_durable_owners",
+            "nanocode_durable_owners",
             "state_id",
             "text",
             "NO",
@@ -276,7 +276,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
             None,
         ),
         (
-            "nanocodex_durable_owners",
+            "nanocode_durable_owners",
             "owner_id",
             "text",
             "NO",
@@ -284,7 +284,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
             None,
         ),
         (
-            "nanocodex_durable_owners",
+            "nanocode_durable_owners",
             "fence",
             "numeric",
             "NO",
@@ -292,7 +292,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
             Some(0),
         ),
         (
-            "nanocodex_durable_states",
+            "nanocode_durable_states",
             "state_id",
             "text",
             "NO",
@@ -300,7 +300,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
             None,
         ),
         (
-            "nanocodex_durable_states",
+            "nanocode_durable_states",
             "revision",
             "numeric",
             "NO",
@@ -308,7 +308,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
             Some(0),
         ),
         (
-            "nanocodex_durable_states",
+            "nanocode_durable_states",
             "payload",
             "text",
             "NO",
@@ -327,7 +327,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
         })
     {
         return Err(StoreError::Backend(
-            "incompatible Postgres durability schema; recreate the two nanocodex_durable_* tables"
+            "incompatible Postgres durability schema; recreate the two nanocode_durable_* tables"
                 .to_owned(),
         ));
     }
@@ -341,7 +341,7 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
               AND tc.constraint_name = kcu.constraint_name
              WHERE tc.table_schema = current_schema()
                AND tc.constraint_type = 'PRIMARY KEY'
-               AND tc.table_name IN ('nanocodex_durable_owners', 'nanocodex_durable_states')
+               AND tc.table_name IN ('nanocode_durable_owners', 'nanocode_durable_states')
              ORDER BY tc.table_name, kcu.ordinal_position",
             &[],
         )
@@ -358,8 +358,8 @@ async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Resul
         })
         .collect::<Vec<_>>();
     let expected_primary_keys = [
-        ("nanocodex_durable_owners", "state_id", 1),
-        ("nanocodex_durable_states", "state_id", 1),
+        ("nanocode_durable_owners", "state_id", 1),
+        ("nanocode_durable_states", "state_id", 1),
     ];
     if primary_keys.len() != expected_primary_keys.len()
         || primary_keys

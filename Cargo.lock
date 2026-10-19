@@ -1829,6 +1829,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-cli"
+version = "0.6.7"
+dependencies = [
+ "clap",
+ "futures-util",
+ "nanocode",
+ "nanocode-home",
+ "nanocode-observability",
+ "nanocode-store-jsonl",
+ "nanocode-tui",
+ "nix 0.31.3",
+ "opentelemetry",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "uuid",
+]
+
+[[package]]
 name = "nanocode-code-mode"
 version = "0.6.7"
 dependencies = [
@@ -2282,27 +2303,6 @@ dependencies = [
 [[package]]
 name = "nanocode-zstd"
 version = "0.6.7"
-
-[[package]]
-name = "nanocodex"
-version = "0.6.7"
-dependencies = [
- "clap",
- "futures-util",
- "nanocode",
- "nanocode-home",
- "nanocode-observability",
- "nanocode-store-jsonl",
- "nanocode-tui",
- "nix 0.31.3",
- "opentelemetry",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "uuid",
-]
 
 [[package]]
 name = "nix"

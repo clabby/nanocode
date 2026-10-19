@@ -8,7 +8,7 @@
 | `core/` | Shared types, tool contracts, macros, media, platform interfaces, TLS, and home configuration | Changes to shared contracts or infrastructure |
 | `integrations/` | Computer use, observability, and state stores | Integration-specific development |
 | `tui/` | Reusable terminal UI components (`nanocode-tui`): terminal session, composer, transcript, markdown, diff, pickers, queue, agent tree | Terminal presentation |
-| `../bin/nanocodex/` | The `nanocodex` / `nc` interactive agent built on `nanocode` and `nanocode-tui` | Application behavior |
+| `../bin/nanocode/` | The `nanocode` / `nc` interactive agent built on `nanocode` and `nanocode-tui` | Application behavior |
 
 Each backend is one crate containing its API definitions, tools, and durability
 adapter. `core/` depends on nothing above it; `runtime/` depends only on `core/`
@@ -106,7 +106,7 @@ streaming response body. WASM hosts also supply tool execution and persistent
 storage through the existing Rust contracts. Native terminal, filesystem,
 database, desktop-process, and telemetry exporters are native adapters, gated out
 on WASM. Their library targets compile without exposing native APIs on WASM;
-the `nc` and `nanocodex` executables run on native targets.
+the `nc` and `nanocode` executables run on native targets.
 `nanocode-schema` validates output contracts without JavaScript bindings or
 host randomness. The active WASM dependency graph contains no `wasm-bindgen`.
 Cargo.lock can still list optional JavaScript dependencies of native-only upstream

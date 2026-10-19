@@ -250,10 +250,10 @@ pub struct DurableCheckpoint {
 #[serde(deny_unknown_fields)]
 #[serde(bound(deserialize = "R: serde::Deserialize<'de>"))]
 pub struct RetainedCheckpoint<R> {
-    pub nanocodex_durable_state: DurableCheckpoint,
+    pub nanocode_durable_state: DurableCheckpoint,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nanocodex_session: Option<R>,
+    pub nanocode_session: Option<R>,
 }
 
 #[derive(serde::Serialize)]
@@ -265,9 +265,9 @@ struct DurableCheckpointRef<'a> {
 
 #[derive(serde::Serialize)]
 struct RetainedCheckpointRef<'a, R> {
-    nanocodex_durable_state: DurableCheckpointRef<'a>,
+    nanocode_durable_state: DurableCheckpointRef<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    nanocodex_session: Option<&'a R>,
+    nanocode_session: Option<&'a R>,
 }
 
 impl JournalState {
@@ -358,12 +358,12 @@ impl JournalState {
 
     pub fn checkpoint_payload<R: serde::Serialize>(&self, session: Option<&R>) -> Result<String> {
         serde_json::to_string(&RetainedCheckpointRef {
-            nanocodex_durable_state: DurableCheckpointRef {
+            nanocode_durable_state: DurableCheckpointRef {
                 format: STATE_FORMAT,
                 operations: &self.operations,
                 latest_checkpoint: self.latest_checkpoint(),
             },
-            nanocodex_session: session,
+            nanocode_session: session,
         })
         .map_err(Error::InvalidPayload)
     }

@@ -33,7 +33,7 @@ impl<S: StateStore> CheckpointBranch<S> {
             serde_json::from_str(&payload).map_err(Error::InvalidPayload)?;
         let state = DurableState::from_checkpoint(
             acquired.state.revision,
-            retained.nanocodex_durable_state,
+            retained.nanocode_durable_state,
         )?;
         if !state.pending_operations().is_empty() {
             return Err(Error::InvalidState(

@@ -57,14 +57,14 @@ fn load() -> io::Result<ClientConfig> {
             .with_platform_verifier()
             .map_err(io::Error::other)?
             .with_no_client_auth();
-        tracing::info!(target: "nanocodex_tls", stage = "tls.platform_verifier",
+        tracing::info!(target: "nanocode_tls", stage = "tls.platform_verifier",
             elapsed_ms = began.elapsed().as_secs_f64() * 1000.0);
         return Ok(config);
     }
     let loaded = rustls_native_certs::load_native_certs();
     let mut roots = RootCertStore::empty();
     let (added, rejected) = roots.add_parsable_certificates(loaded.certs);
-    tracing::info!(target: "nanocodex_tls", stage = "tls.native_roots", elapsed_ms = began.elapsed().as_secs_f64() * 1000.0,
+    tracing::info!(target: "nanocode_tls", stage = "tls.native_roots", elapsed_ms = began.elapsed().as_secs_f64() * 1000.0,
         certificates = added, rejected, load_errors = loaded.errors.len());
     if roots.is_empty() {
         return Err(io::Error::new(

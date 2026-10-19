@@ -126,7 +126,7 @@ impl Tool for RunnerManagement {
                     config = config.call_timeout(Duration::from_millis(ms));
                 }
                 let server = self.pool.listen(config).await?;
-                json!({"url":server.endpoint(), "token":server.token(), "instruction":"Give this endpoint and credential to the hand, for example `nanocodex hand URL` with NANOCODE_RUNNER_TOKEN set to the credential."})
+                json!({"url":server.endpoint(), "token":server.token(), "instruction":"Give this endpoint and credential to the hand, for example `nanocode hand URL` with NANOCODE_RUNNER_TOKEN set to the credential."})
             }
             Request::Select { name, names } => {
                 let executors = self.pool.code_mode_executors();

@@ -1949,14 +1949,14 @@ fn reduce(stored: StoredState) -> Result<DurableState> {
         ));
     }
     let RetainedCheckpoint {
-        nanocodex_durable_state,
-        nanocodex_session,
+        nanocode_durable_state,
+        nanocode_session,
     } = serde_json::from_str(&payload).map_err(|source| Error::Decode {
         revision: stored.revision,
         source,
     })?;
-    let mut state = DurableState::from_checkpoint(stored.revision, nanocodex_durable_state)?;
-    state.set_session(nanocodex_session);
+    let mut state = DurableState::from_checkpoint(stored.revision, nanocode_durable_state)?;
+    state.set_session(nanocode_session);
     Ok(state)
 }
 

@@ -56,7 +56,7 @@ pub fn input_span(event: &Event) -> Span {
         Event::FocusGained => "focus_gained",
         Event::FocusLost => "focus_lost",
     };
-    tracing::info_span!(target: "nanocodex", "nc.input", input.action = action, input.redraw = Empty, session.id = Empty)
+    tracing::info_span!(target: "nanocode", "nc.input", input.action = action, input.redraw = Empty, session.id = Empty)
 }
 
 #[derive(Default)]
@@ -73,7 +73,7 @@ impl TurnSpans {
     pub fn begin(&mut self, request_id: &str, session_id: Option<&str>) -> Span {
         self.finish(None);
         let span = tracing::info_span!(
-            target: "nanocodex",
+            target: "nanocode",
             "nc.turn",
             turn.request_id = request_id,
             session.id = session_id.unwrap_or_default(),
@@ -92,7 +92,7 @@ impl TurnSpans {
     pub fn event(&mut self, event: &AgentEvent, session_id: Option<&str>) {
         if self.turn.is_none() {
             if event.kind != AgentEventKind::RunStarted
-                || !tracing::enabled!(target: "nanocodex", tracing::Level::INFO)
+                || !tracing::enabled!(target: "nanocode", tracing::Level::INFO)
             {
                 return;
             }
@@ -108,7 +108,7 @@ impl TurnSpans {
             AgentEventKind::ModelCallStarted => {
                 let payload = payload(event);
                 let span = tracing::info_span!(
-                    target: "nanocodex",
+                    target: "nanocode",
                     parent: &turn,
                     "nc.model_call",
                     model = payload["model"].as_str().unwrap_or_default(),
@@ -158,7 +158,7 @@ impl TurnSpans {
                     .and_then(|parent| self.tools.get(parent))
                     .unwrap_or(&turn);
                 let span = tracing::info_span!(
-                    target: "nanocodex",
+                    target: "nanocode",
                     parent: parent,
                     "nc.tool_call",
                     tool.name = payload["tool"].as_str().unwrap_or_default(),
@@ -185,7 +185,7 @@ impl TurnSpans {
             }
             AgentEventKind::RunSteered => {
                 self.steers += 1;
-                tracing::info!(target: "nanocodex", parent: &turn, "steer delivered");
+                tracing::info!(target: "nanocode", parent: &turn, "steer delivered");
             }
             AgentEventKind::RunCompleted | AgentEventKind::RunFailed => {
                 let payload = payload(event);
@@ -269,7 +269,7 @@ impl FrameMetrics {
     }
 
     pub fn frame(&mut self, session: Option<&str>) -> Span {
-        let span = tracing::info_span!(target: "nanocodex", "nc.frame", session.id = session, frame.input = self.input.is_some(), frame.stream = self.stream.is_some(), frame.resize = self.resize.is_some(), otel.status_code = Empty);
+        let span = tracing::info_span!(target: "nanocode", "nc.frame", session.id = session, frame.input = self.input.is_some(), frame.stream = self.stream.is_some(), frame.resize = self.resize.is_some(), otel.status_code = Empty);
         if let Some(context) = self.input_context.take() {
             span.add_link(context.span().span_context().clone());
         }

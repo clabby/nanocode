@@ -26,7 +26,7 @@ use tracing_subscriber::{
 
 pub use cli::ObservabilityOutputArgs;
 
-pub const DEFAULT_FILTER: &str = "warn,nanocode=info,nanocode_backend_codex=info,nanocode_backend_claude=info,nanocodex_claude=info,nanocode_agent=info,nanocode_code_mode=info,nanocode_subagents=info,nanocode_durability=info,nanocode_store_jsonl=info,nanocodex=info";
+pub const DEFAULT_FILTER: &str = "warn,nanocode=info,nanocode_backend_codex=info,nanocode_backend_claude=info,nanocode_claude=info,nanocode_agent=info,nanocode_code_mode=info,nanocode_subagents=info,nanocode_durability=info,nanocode_store_jsonl=info,nanocode=info";
 pub const METRICS_TARGET: &str = "nc_metrics";
 
 const DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";

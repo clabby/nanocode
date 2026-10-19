@@ -20,7 +20,7 @@ const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const KEYCHAIN_COMMAND_LIMIT: usize = 4032;
-const LOCK_FILE: &str = ".nanocodex-oauth-refresh.lock";
+const LOCK_FILE: &str = ".nanocode-oauth-refresh.lock";
 
 #[derive(Clone)]
 struct ClaudeCodeLogin {
@@ -348,13 +348,13 @@ impl ClaudeCodeLogin {
         let mut login = Login::load().await?;
         if login.usable(rejected)? {
             drop(guard);
-            tracing::info!(target: "nanocodex_claude", "reused a Claude Code login refreshed by another process");
+            tracing::info!(target: "nanocode_claude", "reused a Claude Code login refreshed by another process");
             return login.token();
         }
         self.exchange(&mut login).await?;
         login.save().await?;
         drop(guard);
-        tracing::info!(target: "nanocodex_claude", "refreshed the Claude Code login");
+        tracing::info!(target: "nanocode_claude", "refreshed the Claude Code login");
         login.token()
     }
 
@@ -476,7 +476,7 @@ impl ClaudeTokenSource for ClaudeCodeLogin {
 }
 
 fn unavailable(reason: &str) -> ClaudeAuthUnavailable {
-    tracing::warn!(target: "nanocodex_claude", reason, "Claude Code login unavailable");
+    tracing::warn!(target: "nanocode_claude", reason, "Claude Code login unavailable");
     ClaudeAuthUnavailable::new(reason.to_owned())
 }
 

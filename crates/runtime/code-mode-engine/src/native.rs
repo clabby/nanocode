@@ -384,7 +384,7 @@ fn install_native_functions<'js>(
     let tool_state = Rc::clone(state);
     globals
         .set(
-            "__nanocodexTool",
+            "__nanocodeTool",
             Func::from(
                 move |ctx: Ctx<'js>,
                       name: String,
@@ -420,7 +420,7 @@ fn install_native_functions<'js>(
     let content_state = Rc::clone(state);
     globals
         .set(
-            "__nanocodexContent",
+            "__nanocodeContent",
             Func::from(
                 move |ctx: Ctx<'js>, content_json: String| -> rquickjs::Result<()> {
                     let content: ToolOutputContent = serde_json::from_str(&content_json).map_err(|error| {
@@ -453,7 +453,7 @@ fn install_native_functions<'js>(
     let notify_state = Rc::clone(state);
     globals
         .set(
-            "__nanocodexNotify",
+            "__nanocodeNotify",
             Func::from(move |text: String| {
                 let state = notify_state.borrow();
                 let _ = state.event_tx.send(RuntimeEvent::Notify {
@@ -468,7 +468,7 @@ fn install_native_functions<'js>(
     let yield_state = Rc::clone(state);
     globals
         .set(
-            "__nanocodexYield",
+            "__nanocodeYield",
             Func::from(move || {
                 let state = yield_state.borrow();
                 let _ = state.event_tx.send(RuntimeEvent::Yielded {
@@ -482,7 +482,7 @@ fn install_native_functions<'js>(
     let timeout_state = Rc::clone(state);
     globals
         .set(
-            "__nanocodexSetTimeout",
+            "__nanocodeSetTimeout",
             Func::from(
                 move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| -> rquickjs::Result<u64> {
                     let callback = args
@@ -519,7 +519,7 @@ fn install_native_functions<'js>(
     let clear_timeout_state = Rc::clone(state);
     globals
         .set(
-            "__nanocodexClearTimeout",
+            "__nanocodeClearTimeout",
             Func::from(
                 move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| -> rquickjs::Result<()> {
                     let Some(value) = args
@@ -556,12 +556,12 @@ fn install_native_functions<'js>(
 fn remove_native_globals(ctx: &Ctx<'_>) -> Result<(), String> {
     let globals = ctx.globals();
     for name in [
-        "__nanocodexTool",
-        "__nanocodexContent",
-        "__nanocodexNotify",
-        "__nanocodexYield",
-        "__nanocodexSetTimeout",
-        "__nanocodexClearTimeout",
+        "__nanocodeTool",
+        "__nanocodeContent",
+        "__nanocodeNotify",
+        "__nanocodeYield",
+        "__nanocodeSetTimeout",
+        "__nanocodeClearTimeout",
         "console",
         "Atomics",
         "SharedArrayBuffer",

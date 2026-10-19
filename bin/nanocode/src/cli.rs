@@ -4,10 +4,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "nanocodex",
+    name = "nanocode",
     version,
     about = "Interactive coding agent for Codex and Claude",
-    long_about = "Interactive coding agent for Codex and Claude. Run without a subcommand to open the terminal interface; 'nc' is an alias of 'nanocodex'."
+    long_about = "Interactive coding agent for Codex and Claude. Run without a subcommand to open the terminal interface; 'nc' is an alias of 'nanocode'."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -24,7 +24,7 @@ pub struct Cli {
 pub enum Command {
     #[command(
         visible_alias = "runner",
-        about = "Make this machine a hand that runs a nanocodex agent's exec cells: dial the brain's URL, or listen for the brain"
+        about = "Make this machine a hand that runs a nanocode agent's exec cells: dial the brain's URL, or listen for the brain"
     )]
     Hand(HandArgs),
     #[command(about = "List saved sessions (current workspace unless --all)")]
@@ -84,7 +84,7 @@ pub struct SessionArgs {
         short,
         long,
         env = "NANOCODE_MODEL",
-        help = "Model id or alias (see 'nanocodex models'); defaults to gpt-6.1-sol at xhigh thinking on the fast tier"
+        help = "Model id or alias (see 'nanocode models'); defaults to gpt-6.1-sol at xhigh thinking on the fast tier"
     )]
     pub model: Option<String>,
 
@@ -249,14 +249,14 @@ pub struct RemoteArgs {
         long,
         value_name = "WS_URL",
         conflicts_with = "runner_host",
-        help = "Connect to a runner started with 'nanocodex runner --listen'"
+        help = "Connect to a runner started with 'nanocode runner --listen'"
     )]
     pub runner_connect: Option<String>,
 
     #[arg(
         long,
         value_name = "ADDR",
-        help = "Listen for a runner started with 'nanocodex runner --connect'"
+        help = "Listen for a runner started with 'nanocode runner --connect'"
     )]
     pub runner_host: Option<SocketAddr>,
 

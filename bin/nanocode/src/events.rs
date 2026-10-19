@@ -186,7 +186,7 @@ impl EventMapper {
     }
 
     pub fn apply(&mut self, transcript: &mut Transcript, event: &AgentEvent) -> Mapped {
-        let _span = tracing::info_span!(target: "nanocodex", "nc.transcript.apply", event.kind = ?event.kind, event.bytes = event.payload.get().len(), cells = transcript.len()).entered();
+        let _span = tracing::info_span!(target: "nanocode", "nc.transcript.apply", event.kind = ?event.kind, event.bytes = event.payload.get().len(), cells = transcript.len()).entered();
         let mut mapped = Mapped { accepted: None };
         let Ok(payload) = serde_json::from_str::<Value>(event.payload.get()) else {
             transcript.push(CellKind::Notice(

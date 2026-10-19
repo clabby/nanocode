@@ -45,7 +45,7 @@ members = [
     "crates/integrations/store-sqlite",
     "crates/integrations/store-jsonl",
     "crates/tui",
-    "bin/nanocodex",
+    "bin/nanocode",
 ]
 default-members = ["crates/nanocode"]
 resolver = "2"
@@ -56,8 +56,8 @@ edition = "2024"
 rust-version = "1.97"
 authors = ["Nanocode Contributors"]
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/gakonst/nanocodex"
-repository = "https://github.com/gakonst/nanocodex"
+homepage = "https://github.com/gakonst/nanocode"
+repository = "https://github.com/gakonst/nanocode"
 keywords = ["ai", "agents", "openai", "sdk", "websocket"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 publish = true

@@ -58,7 +58,7 @@ end run"#;
 impl Split {
     pub fn detect() -> Result<Self, String> {
         let executable = env::current_exe()
-            .map_err(|error| format!("could not locate the nanocodex executable: {error}"))?;
+            .map_err(|error| format!("could not locate the nanocode executable: {error}"))?;
         Ok(Self {
             backend: detect()?,
             executable,

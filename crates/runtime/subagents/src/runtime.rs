@@ -2125,7 +2125,7 @@ impl Registry {
                 if let Some(cell) = &self.cell {
                     return Some((cell.origin_call_id.as_str(), cell.running));
                 }
-                let code = self.metadata.as_ref()?.get("_nanocodex_code")?;
+                let code = self.metadata.as_ref()?.get("_nanocode_code")?;
                 let origin = code.get("origin_call_id")?.as_str()?;
                 Some((
                     origin,
