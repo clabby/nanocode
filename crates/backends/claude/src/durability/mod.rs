@@ -932,10 +932,7 @@ fn owner_write(write: &JournalWrite) -> OwnerWrite {
     }
 }
 
-fn admitted_step(
-    begun: nanocode_durability::Result<BeginStep>,
-    kind: &str,
-) -> AgentResult<Step> {
+fn admitted_step(begun: nanocode_durability::Result<BeginStep>, kind: &str) -> AgentResult<Step> {
     match begun.map_err(agent_error)? {
         BeginStep::Execute => Ok(Step::Execute),
         BeginStep::Interrupted if kind == "tool" => Ok(Step::Interrupted),

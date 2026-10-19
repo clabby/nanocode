@@ -33,7 +33,9 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
             };
             let base = continuation.get("pending_base").and_then(Value::as_u64);
             if let (Some(pending), Some(conversation)) = (
-                continuation.get_mut("pending").and_then(Value::as_array_mut),
+                continuation
+                    .get_mut("pending")
+                    .and_then(Value::as_array_mut),
                 snapshot
                     .get_mut("conversation")
                     .and_then(Value::as_object_mut),

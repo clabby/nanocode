@@ -620,14 +620,18 @@ fn validate_cache_layout<'a>(
 }
 
 fn cache_tail<M: WireMessage>(messages: &[M]) -> Option<(usize, usize)> {
-    messages.iter().enumerate().rev().find_map(|(index, message)| {
-        message
-            .message()
-            .content
-            .iter()
-            .rposition(|block| block.cache_slot().1)
-            .map(|block| (index, block))
-    })
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            message
+                .message()
+                .content
+                .iter()
+                .rposition(|block| block.cache_slot().1)
+                .map(|block| (index, block))
+        })
 }
 
 fn mark_system_tail(system: Option<&mut Value>, marker: Value) {
@@ -1748,7 +1752,10 @@ fn api_body<M: WireMessage>(
         head.len()
             + tail.len()
             + "\"messages\":[],".len()
-            + encoded.iter().map(|message| message.len() + 1).sum::<usize>(),
+            + encoded
+                .iter()
+                .map(|message| message.len() + 1)
+                .sum::<usize>(),
     );
     body.push_str(&head[..head.len() - 1]);
     body.push_str(",\"messages\":[");

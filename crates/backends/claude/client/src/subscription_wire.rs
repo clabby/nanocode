@@ -360,11 +360,15 @@ pub(crate) fn wire<M: WireMessage>(
             stringify(value, out)
         }
     })?;
-    let at = at.ok_or_else(|| {
-        ClaudeError::Protocol("subscription wire request has no messages".into())
-    })?;
+    let at = at
+        .ok_or_else(|| ClaudeError::Protocol("subscription wire request has no messages".into()))?;
     let mut bytes = Vec::with_capacity(
-        head.len() + 2 + encoded.iter().map(|message| message.len() + 1).sum::<usize>(),
+        head.len()
+            + 2
+            + encoded
+                .iter()
+                .map(|message| message.len() + 1)
+                .sum::<usize>(),
     );
     bytes.extend_from_slice(&head[..at]);
     bytes.push(b'[');

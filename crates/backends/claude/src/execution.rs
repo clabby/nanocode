@@ -175,8 +175,8 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
                 match write {
                     JournalWrite::Advance(state) => self.advance_encoded(id.clone(), state).await?,
                     JournalWrite::Complete { step_id, output } => {
-                        let output =
-                            serde_json::from_str(output.get()).map_err(crate::agent::provider_error)?;
+                        let output = serde_json::from_str(output.get())
+                            .map_err(crate::agent::provider_error)?;
                         self.complete_step(id.clone(), step_id, output).await?;
                     }
                 }
@@ -216,8 +216,8 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
                 serde_json::from_str(checkpoint.get()).map_err(crate::agent::provider_error)?;
             match settlement {
                 Settlement::Complete(output) => {
-                    let output = serde_json::from_str(output.get())
-                        .map_err(crate::agent::provider_error)?;
+                    let output =
+                        serde_json::from_str(output.get()).map_err(crate::agent::provider_error)?;
                     self.complete(id, checkpoint, output).await
                 }
                 Settlement::Fail(error) => self.fail(id, checkpoint, error).await,

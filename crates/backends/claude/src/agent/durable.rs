@@ -66,25 +66,27 @@ impl Snapshot {
 
     pub(super) fn session_context(&self, workspace: String) -> AgentSessionContext {
         use nanocode_types::responses::{ContentItem, MessageRole, ResponseItem};
-        let mut history = self
-            .conversation
-            .packed_messages()
-            .into_iter()
-            .map(|message| {
-                ResponseItem::message(
-                    match message.role {
-                        Role::User => MessageRole::User,
-                        Role::Assistant => MessageRole::Assistant,
-                    },
-                    message.into_message().content.into_iter().filter_map(|block| match block {
-                        ContentBlock::Text { text, .. } => Some(ContentItem::InputText {
-                            text: text.into_boxed_str(),
-                        }),
-                        _ => None,
-                    }),
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut history =
+            self.conversation
+                .packed_messages()
+                .into_iter()
+                .map(|message| {
+                    ResponseItem::message(
+                        match message.role {
+                            Role::User => MessageRole::User,
+                            Role::Assistant => MessageRole::Assistant,
+                        },
+                        message.into_message().content.into_iter().filter_map(
+                            |block| match block {
+                                ContentBlock::Text { text, .. } => Some(ContentItem::InputText {
+                                    text: text.into_boxed_str(),
+                                }),
+                                _ => None,
+                            },
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
         history.extend(self.developer_notices.iter().map(|(_, text)| {
             ResponseItem::message(
                 MessageRole::Developer,
@@ -183,7 +185,12 @@ impl Effect<'_> {
     ) -> Result<Step> {
         let request = BeginRequest {
             step_id: self.step.clone(),
-            kind: if self.model_call { "model_call" } else { "model" }.to_owned(),
+            kind: if self.model_call {
+                "model_call"
+            } else {
+                "model"
+            }
+            .to_owned(),
             input: wire.durable_input().map_err(provider_error)?,
             wire: Some(wire),
         };
@@ -378,7 +385,9 @@ impl State {
                     .ok()
                     .and_then(|base| cursor.snapshot.conversation.messages.get(..base))
                     .ok_or_else(|| {
-                        recovery_error("Claude continuation pending prefix exceeds its conversation")
+                        recovery_error(
+                            "Claude continuation pending prefix exceeds its conversation",
+                        )
                     })?;
                 cursor.pending = prefix
                     .iter()
@@ -472,7 +481,8 @@ impl State {
         if self.policy.is_some() && self.task_board.is_some() {
             cursor.parallel = false;
         }
-        self.defer_cursor(&mut cursor, conversation, journal).await?;
+        self.defer_cursor(&mut cursor, conversation, journal)
+            .await?;
         Ok(cursor)
     }
 
