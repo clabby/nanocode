@@ -113,7 +113,15 @@ function homeDir(options) {
 }
 
 function openDb(file) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.closeSync(fs.openSync(file, 'a', 0o600));
+  for (const suffix of ['', '-wal', '-shm']) {
+    try {
+      fs.chmodSync(file + suffix, 0o600);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -262144;');
   const hasMeta = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").get();
@@ -1250,8 +1258,9 @@ svg text{font-size:11px;fill:#555}.grid{stroke:#e6e6e6}.swatch{display:inline-bl
 </style>
 <h1>nanocode telemetry</h1><p>Generated ${escapeHtml(fmtTime(Date.now() * 1000))} from ${escapeHtml(homeDir(options))}${since}. Hover points and lines for details; ids in brackets work with <code>node scripts/otel.mjs trace &lt;id&gt;</code>.</p>
 ${body}`;
-  fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, html);
+  fs.mkdirSync(path.dirname(out), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(out, html, { mode: 0o600 });
+  fs.chmodSync(out, 0o600);
   console.log(out);
 }
 
