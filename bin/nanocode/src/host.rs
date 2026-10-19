@@ -45,6 +45,38 @@ impl ModelClients {
     }
 
     #[must_use]
+    pub fn openai_endpoint(
+        self,
+        base_url: impl Into<String>,
+        layer: impl nanocode::http::Layer + Clone,
+    ) -> Self {
+        let base_url = base_url.into();
+        self.openai(move || {
+            OpenAi::builder(nanocode::codex::OpenAiAuth::gateway_managed())
+                .api_base_url(base_url.clone())
+                .transport(nanocode::codex::transport::ResponsesTransport::Https)
+                .http_layer(layer.clone())
+        })
+    }
+
+    #[must_use]
+    pub fn claude_endpoint(
+        self,
+        messages_url: impl Into<String>,
+        layer: impl nanocode::http::Layer + Clone,
+    ) -> Self {
+        let messages_url = messages_url.into();
+        self.claude(move || {
+            ClaudeClient::with_auth_headers(
+                Default::default(),
+                messages_url.clone(),
+                Default::default(),
+            )
+            .with_http_layer(layer.clone())
+        })
+    }
+
+    #[must_use]
     pub fn warm_up<F>(mut self, warm_up: impl Fn() -> F + Send + Sync + 'static) -> Self
     where
         F: std::future::Future<Output = ()> + Send + 'static,
