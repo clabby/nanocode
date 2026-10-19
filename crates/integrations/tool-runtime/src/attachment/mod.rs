@@ -6,7 +6,7 @@ mod pool;
 #[cfg(not(target_family = "wasm"))]
 pub use pool::{
     Runner, RunnerEvent, RunnerHandle, RunnerInfo, RunnerPool, RunnerProtocol, RunnerServer,
-    RunnerServerConfig, RunnerStatus,
+    RunnerServerConfig, RunnerSpec, RunnerStatus,
 };
 pub(crate) mod process_routes;
 mod protocol;

@@ -37,7 +37,24 @@ pub struct Runner {
     workspace: Option<PathBuf>,
 }
 
+pub struct RunnerSpec {
+    pub endpoint: String,
+    pub token: String,
+    pub name: Option<String>,
+    pub replace: bool,
+    pub call_timeout: Option<Duration>,
+}
+
 impl Runner {
+    pub fn spec(&self) -> RunnerSpec {
+        RunnerSpec {
+            endpoint: self.endpoint.clone(),
+            token: self.token.clone(),
+            name: self.named.then(|| self.name.clone()),
+            replace: self.mode == RemoteMode::Replace,
+            call_timeout: self.timeout,
+        }
+    }
     pub fn workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
         self.workspace = Some(workspace.into());
         self
@@ -232,6 +249,7 @@ struct PoolState {
     closed: bool,
 }
 struct ExecutorEntry {
+    config: Option<Runner>,
     endpoint: String,
     mode: RemoteMode,
     status: watch::Sender<RunnerStatus>,
@@ -483,7 +501,12 @@ impl RunnerPool {
                     validate_registration(&self.inner.state(), advertised, config.mode)?;
                     advertised.to_owned()
                 }
-                _ => config.name,
+                _ => config.name.clone(),
+            };
+            let redial = Runner {
+                name: name.clone(),
+                named: true,
+                ..config.clone()
             };
             return self.register_executor(
                 name,
@@ -492,6 +515,7 @@ impl RunnerPool {
                 config.workspace,
                 transport,
                 false,
+                Some(redial),
             );
         }
         let timeout = config.timeout;
@@ -510,6 +534,10 @@ impl RunnerPool {
         }
         Ok(handle)
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each executor registration supplies its own connection facts"
+    )]
     fn register_executor(
         &self,
         name: String,
@@ -518,6 +546,7 @@ impl RunnerPool {
         workspace: Option<PathBuf>,
         transport: SocketTransport,
         reconnect: bool,
+        config: Option<Runner>,
     ) -> Result<RunnerHandle, AttachmentError> {
         RemoteRunner::new(&name)?;
         let workspace = workspace.or_else(|| transport.workspace().map(PathBuf::from));
@@ -590,6 +619,7 @@ impl RunnerPool {
         state.executors.insert(
             name.clone(),
             ExecutorEntry {
+                config,
                 endpoint,
                 mode,
                 status,
@@ -613,6 +643,15 @@ impl RunnerPool {
         tracing::info!(target: "nanocode_code_mode::attachment", runner = name, "Code Mode executor registered");
         emit(&mut state, RunnerEvent::StatusChanged { info });
         Ok(handle)
+    }
+    pub fn connected_hands(&self) -> Vec<RunnerSpec> {
+        self.inner
+            .state()
+            .executors
+            .values()
+            .filter(|entry| *entry.status.borrow() == RunnerStatus::Ready)
+            .filter_map(|entry| entry.config.as_ref().map(Runner::spec))
+            .collect()
     }
     pub fn list(&self) -> Vec<RunnerInfo> {
         let state = self.inner.state();
@@ -1078,7 +1117,7 @@ async fn incoming_executor(
         inner: pool.upgrade().ok_or(AttachmentError::Closed)?,
         model_management: true,
     };
-    pool.register_executor(name, endpoint, mode, workspace, transport, true)?;
+    pool.register_executor(name, endpoint, mode, workspace, transport, true, None)?;
     Ok(())
 }
 fn monitor(

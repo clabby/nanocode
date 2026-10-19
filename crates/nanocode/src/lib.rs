@@ -28,7 +28,7 @@ pub use nanocode_backend_claude::{Claude, ClaudeClient};
 #[cfg(not(target_family = "wasm"))]
 pub use runners::{
     AttachmentError, Runner, RunnerEvent, RunnerHandle, RunnerInfo, RunnerPool, RunnerProtocol,
-    RunnerServer, RunnerServerConfig, RunnerStatus,
+    RunnerServer, RunnerServerConfig, RunnerSpec, RunnerStatus,
 };
 
 pub use nanocode_backend_codex::{Codex, client::OpenAi};

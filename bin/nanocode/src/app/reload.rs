@@ -1,6 +1,9 @@
 use std::{collections::HashMap, io, path::PathBuf};
 
-use nanocode::{ExecutorSelection, ModelSelection, ServiceTier, Thinking, agent::input::Prompt};
+use nanocode::{
+    ExecutorSelection, ModelSelection, Runner, RunnerSpec, ServiceTier, Thinking,
+    agent::input::Prompt,
+};
 use nanocode_tui::{
     queue::{QueueKind, QueueState, QueuedPrompt},
     theme::Theme,
@@ -30,6 +33,48 @@ pub(crate) struct State {
     focus: Option<nanocode::subagents::AgentId>,
     #[serde(default)]
     pub(super) executor: SavedExecutor,
+    #[serde(default)]
+    pub(super) hands: Vec<SavedHand>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct SavedHand {
+    endpoint: String,
+    token: String,
+    name: Option<String>,
+    replace: bool,
+    call_timeout_ms: Option<u64>,
+}
+
+impl From<RunnerSpec> for SavedHand {
+    fn from(spec: RunnerSpec) -> Self {
+        Self {
+            endpoint: spec.endpoint,
+            token: spec.token,
+            name: spec.name,
+            replace: spec.replace,
+            call_timeout_ms: spec
+                .call_timeout
+                .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
+impl SavedHand {
+    fn runner(self) -> Runner {
+        let mut runner = Runner::connect(self.endpoint).token(self.token);
+        if let Some(name) = self.name {
+            runner = runner.name(name);
+        }
+        if let Some(timeout) = self.call_timeout_ms {
+            runner = runner.call_timeout(std::time::Duration::from_millis(timeout));
+        }
+        if self.replace {
+            runner.replace()
+        } else {
+            runner.alongside()
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -138,6 +183,52 @@ impl App {
             side: self.panes.saved(),
             focus: self.focus,
             executor: self.reload_executor(),
+            hands: self.reload_hands(),
+        }
+    }
+
+    pub(super) fn reload_hands(&self) -> Vec<SavedHand> {
+        self.host
+            .runtime
+            .runner_pool()
+            .connected_hands()
+            .into_iter()
+            .map(SavedHand::from)
+            .collect()
+    }
+
+    fn reconnect_hands(&self, hands: Vec<SavedHand>) {
+        let registered = self
+            .host
+            .runtime
+            .list_runners()
+            .into_iter()
+            .map(|runner| runner.name)
+            .collect::<Vec<_>>();
+        for hand in hands {
+            if hand
+                .name
+                .as_ref()
+                .is_some_and(|name| registered.contains(name))
+            {
+                continue;
+            }
+            let runtime = self.host.runtime.clone();
+            let tx = self.tx.clone();
+            let runner = hand.runner();
+            tokio::spawn(async move {
+                let (level, message) = match runtime.connect_runner(runner).await {
+                    Ok(handle) => (
+                        NoticeLevel::Info,
+                        format!("reconnected hand {}", handle.info().name),
+                    ),
+                    Err(error) => (
+                        NoticeLevel::Error,
+                        format!("hand reconnection failed: {error}"),
+                    ),
+                };
+                drop(tx.send(AppEvent::Notice(level, message)));
+            });
         }
     }
 
@@ -158,6 +249,7 @@ impl App {
                 .code_mode_executors()
                 .select(session, Some(selection));
         }
+        self.reconnect_hands(state.hands);
         self.composer.set_text(state.draft);
         self.attachments = state.attachments;
         self.next_local = state.next_local;

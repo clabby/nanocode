@@ -427,6 +427,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
     let session = app.session_id();
     let moved = app.moved;
     let executor = app.reload.then(|| app.reload_executor());
+    let hands = app.reload.then(|| app.reload_hands());
     if app.reload_all
         && let Err(error) = instance.broadcast().await
     {
@@ -472,6 +473,9 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         let mut state = app.reload_state();
         if let Some(executor) = executor {
             state.executor = executor;
+        }
+        if let Some(hands) = hands {
+            state.hands = hands;
         }
         let state = instance.save(&state).await?;
         instance.close().await?;

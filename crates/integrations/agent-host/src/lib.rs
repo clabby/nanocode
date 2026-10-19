@@ -17,7 +17,7 @@ pub use nanocode_process::search;
 #[cfg(not(target_family = "wasm"))]
 pub use nanocode_tool_runtime::attachment::{
     AttachmentError, Runner, RunnerEvent, RunnerHandle, RunnerInfo, RunnerPool, RunnerProtocol,
-    RunnerServer, RunnerServerConfig, RunnerStatus,
+    RunnerServer, RunnerServerConfig, RunnerSpec, RunnerStatus,
 };
 mod computer;
 #[cfg(not(target_family = "wasm"))]
