@@ -18,7 +18,7 @@ use rquickjs::{
     promise::PromiseState,
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 use tokio::sync::mpsc;
 
 use nanocode_tool_contracts::ToolOutputContent;
@@ -43,12 +43,12 @@ pub enum RuntimeEvent {
     },
     Done {
         cell_id: u64,
-        stored: HashMap<String, Value>,
+        stored: HashMap<String, Arc<RawValue>>,
     },
     Error {
         cell_id: u64,
         message: String,
-        stored: HashMap<String, Value>,
+        stored: HashMap<String, Arc<RawValue>>,
     },
 }
 
@@ -94,12 +94,13 @@ struct StartExecution {
     execution_id: u64,
     source: String,
     tools: Vec<Value>,
-    stored: HashMap<String, Value>,
+    stored: HashMap<String, Arc<RawValue>>,
 }
 
 struct ExecutionState {
     execution_id: u64,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    stored: HashMap<String, Arc<RawValue>>,
     pending_tools: HashMap<u64, (SavedFunction, SavedFunction)>,
     pending_timeouts: HashMap<u64, PendingTimeout>,
     next_tool_id: u64,
@@ -118,17 +119,19 @@ enum CommandPoll {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ExecutionTerminal {
-    Done {
-        #[serde(default)]
-        stored: HashMap<String, Value>,
-    },
-    Error {
-        message: String,
-        #[serde(default)]
-        stored: HashMap<String, Value>,
-    },
+#[serde(rename_all = "snake_case")]
+enum TerminalKind {
+    Done,
+    Error,
+}
+
+#[derive(Deserialize)]
+struct ExecutionTerminal {
+    #[serde(rename = "type")]
+    kind: TerminalKind,
+    message: Option<String>,
+    #[serde(default)]
+    stored: HashMap<String, Box<RawValue>>,
 }
 
 impl EmbeddedHost {
@@ -159,7 +162,7 @@ impl EmbeddedHost {
         &self,
         execution_id: u64,
         source: &str,
-        stored: HashMap<String, Value>,
+        stored: HashMap<String, Arc<RawValue>>,
         tools: Vec<Value>,
     ) -> Result<(), String> {
         self.command_tx
@@ -295,6 +298,7 @@ fn run_execution_in_context<'js>(
     let state = Rc::new(RefCell::new(ExecutionState {
         execution_id,
         event_tx,
+        stored: start.stored,
         pending_tools: HashMap::new(),
         pending_timeouts: HashMap::new(),
         next_tool_id: 1,
@@ -335,10 +339,8 @@ fn run_execution_in_context<'js>(
         .map_err(|error| format!("failed to encode QuickJS tool metadata: {error}"))?;
     let schemas = serde_json::to_string(&schemas)
         .map_err(|error| format!("failed to encode QuickJS tool schemas: {error}"))?;
-    let stored = serde_json::to_string(&start.stored)
-        .map_err(|error| format!("failed to encode QuickJS stored values: {error}"))?;
     let promise = run_cell
-        .call::<_, Promise<'js>>((start.source, tools, schemas, stored))
+        .call::<_, Promise<'js>>((start.source, tools, schemas))
         .catch(ctx)
         .map_err(|error| format!("embedded QuickJS execution failed to start: {error}"))?;
     drain_jobs(ctx);
@@ -467,6 +469,26 @@ fn install_native_functions<'js>(
         .catch(ctx)
         .map_err(|error| format!("failed to install QuickJS content callback: {error}"))?;
 
+    let load_state = Rc::clone(state);
+    globals
+        .set(
+            "__nanocodeLoad",
+            Func::from(
+                move |ctx: Ctx<'js>,
+                      key: String|
+                      -> rquickjs::Result<Option<rquickjs::String<'js>>> {
+                    load_state
+                        .borrow()
+                        .stored
+                        .get(&key)
+                        .map(|value| rquickjs::String::from_str(ctx, value.get()))
+                        .transpose()
+                },
+            ),
+        )
+        .catch(ctx)
+        .map_err(|error| format!("failed to install QuickJS load callback: {error}"))?;
+
     let notify_state = Rc::clone(state);
     globals
         .set(
@@ -575,6 +597,7 @@ fn remove_native_globals(ctx: &Ctx<'_>) -> Result<(), String> {
     for name in [
         "__nanocodeTool",
         "__nanocodeContent",
+        "__nanocodeLoad",
         "__nanocodeNotify",
         "__nanocodeYield",
         "__nanocodeSetTimeout",
@@ -628,21 +651,30 @@ fn send_terminal(
     terminal: ExecutionTerminal,
 ) -> Result<(), String> {
     let state = state.borrow();
-    let event = match terminal {
-        ExecutionTerminal::Done { stored } => RuntimeEvent::Done {
-            cell_id: state.execution_id,
-            stored,
-        },
-        ExecutionTerminal::Error { message, stored } => RuntimeEvent::Error {
-            cell_id: state.execution_id,
+    let cell_id = state.execution_id;
+    let stored = shared_values(terminal.stored);
+    let event = match (terminal.kind, terminal.message) {
+        (TerminalKind::Done, _) => RuntimeEvent::Done { cell_id, stored },
+        (TerminalKind::Error, Some(message)) => RuntimeEvent::Error {
+            cell_id,
             message,
             stored,
         },
+        (TerminalKind::Error, None) => {
+            return Err("embedded QuickJS returned an error result without a message".to_owned());
+        }
     };
     state
         .event_tx
         .send(event)
         .map_err(|_| "embedded QuickJS execution observer closed".to_owned())
+}
+
+fn shared_values(stored: HashMap<String, Box<RawValue>>) -> HashMap<String, Arc<RawValue>> {
+    stored
+        .into_iter()
+        .map(|(key, value)| (key, Arc::from(value)))
+        .collect()
 }
 
 fn resolve_tool(

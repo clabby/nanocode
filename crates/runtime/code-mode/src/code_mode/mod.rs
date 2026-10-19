@@ -13,7 +13,7 @@ use std::{
 
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 
 use tokio::{
     sync::{Mutex, Notify, OwnedMutexGuard, mpsc, oneshot, watch},
@@ -49,7 +49,7 @@ pub struct CodeModeRuntime {
     admission_epoch: Arc<AtomicU64>,
 
     cells: Arc<Mutex<CellRegistry>>,
-    stored: Arc<Mutex<HashMap<String, Value>>>,
+    stored: Arc<Mutex<HashMap<String, Arc<RawValue>>>>,
     host: Arc<Mutex<SharedJsHost>>,
     current_turn: Arc<AtomicU64>,
     preempt: watch::Sender<(u64, u64)>,
@@ -259,11 +259,11 @@ impl Drop for PendingCallReceipts {
 
 enum CellTerminal {
     Completed {
-        stored: HashMap<String, Value>,
+        stored: HashMap<String, Arc<RawValue>>,
     },
     ScriptFailed {
         message: String,
-        stored: HashMap<String, Value>,
+        stored: HashMap<String, Arc<RawValue>>,
     },
     Terminated,
 }
@@ -823,8 +823,8 @@ impl LiveCell {
         source: String,
         tools: Arc<dyn CodeModeToolset>,
         context: OwnedToolContext,
-        stored: HashMap<String, Value>,
-        shared_stored: Arc<Mutex<HashMap<String, Value>>>,
+        stored: HashMap<String, Arc<RawValue>>,
+        shared_stored: Arc<Mutex<HashMap<String, Arc<RawValue>>>>,
         host: Arc<Mutex<SharedJsHost>>,
     ) -> Self {
         let (updates_tx, updates) = mpsc::unbounded_channel();
@@ -1493,8 +1493,8 @@ async fn run_cell_actor(
     source: String,
     tools: Arc<dyn CodeModeToolset>,
     context: OwnedToolContext,
-    stored: HashMap<String, Value>,
-    shared_stored: Arc<Mutex<HashMap<String, Value>>>,
+    stored: HashMap<String, Arc<RawValue>>,
+    shared_stored: Arc<Mutex<HashMap<String, Arc<RawValue>>>>,
     updates: mpsc::UnboundedSender<CellUpdate>,
     mut terminate: oneshot::Receiver<()>,
     lifecycle: Arc<CellLifecycle>,

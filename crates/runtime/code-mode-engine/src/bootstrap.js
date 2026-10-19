@@ -2,6 +2,7 @@
   const { stringify, storeSnapshot, normalizeImage, normalizeAudio, generatedImageItems } = valueHelpers;
   const nativeTool = __nanocodeTool;
   const nativeContent = __nanocodeContent;
+  const nativeLoad = __nanocodeLoad;
   const nativeNotify = __nanocodeNotify;
   const nativeYield = __nanocodeYield;
   const nativeSetTimeout = __nanocodeSetTimeout;
@@ -33,11 +34,10 @@
     }
   }
 
-  return async function runCell(source, definitionsJson, schemasJson, initialStoredJson) {
+  return async function runCell(source, definitionsJson, schemasJson) {
     const definitions = jsonParse(definitionsJson);
     let schemas;
-    const initialStored = jsonParse(initialStoredJson);
-    const stored = new Map(Object.entries(initialStored));
+    const stored = new Map();
     const storedWrites = new Map();
     const declaredTools = Object.create(null);
     const invokeTool = (name, input) => {
@@ -89,7 +89,9 @@
 
     function load(key) {
       const normalizedKey = storageKey(key, "load");
-      return stored.has(normalizedKey) ? cloneValue(stored.get(normalizedKey)) : undefined;
+      if (stored.has(normalizedKey)) return cloneValue(stored.get(normalizedKey));
+      const encoded = nativeLoad(normalizedKey);
+      return encoded === undefined ? undefined : jsonParse(encoded);
     }
 
     function yield_control() {
