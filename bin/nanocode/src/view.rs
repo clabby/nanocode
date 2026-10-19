@@ -18,18 +18,22 @@ use crate::app::{App, Overlay, TurnState};
 
 pub const STATUS_VISIBLE: Duration = Duration::from_secs(4);
 
-pub const BINDINGS: [Binding; 33] = [
+pub const BINDINGS: [Binding; 34] = [
     Binding {
         keys: "enter",
-        action: "send · queue while a turn runs",
-    },
-    Binding {
-        keys: "enter on empty prompt",
-        action: "steer the queued message into the running turn",
+        action: "send · steer into the running turn",
     },
     Binding {
         keys: "tab",
-        action: "queue a follow-up while a turn runs",
+        action: "queue a follow-up for after the running turn",
+    },
+    Binding {
+        keys: "tab on empty prompt",
+        action: "take back the latest queued or steer message to edit",
+    },
+    Binding {
+        keys: "enter on empty prompt",
+        action: "steer the latest queued message into the running turn",
     },
     Binding {
         keys: "shift+enter / ctrl+j",
@@ -45,7 +49,7 @@ pub const BINDINGS: [Binding; 33] = [
     },
     Binding {
         keys: "alt+u / alt+up",
-        action: "undo the latest queued or steer message",
+        action: "take back the latest queued or steer message",
     },
     Binding {
         keys: "@path",
@@ -105,7 +109,7 @@ pub const BINDINGS: [Binding; 33] = [
     },
     Binding {
         keys: "drag",
-        action: "select text · release copies it to the clipboard",
+        action: "select transcript lines (scrolls at the edges) · release copies the raw markdown",
     },
     Binding {
         keys: "ctrl+home / ctrl+end",
@@ -128,8 +132,8 @@ pub const BINDINGS: [Binding; 33] = [
         action: "side pane: a forked side thread beside the chat",
     },
     Binding {
-        keys: "tab / shift+tab · click",
-        action: "switch between the chat and the side pane",
+        keys: "shift+tab · tab · click",
+        action: "switch chat and side pane; tab takes back queued messages first",
     },
     Binding {
         keys: "/collapse /split /close /zoom",
@@ -268,11 +272,7 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
         Some(Overlay::Picker(_, picker)) => picker.render(area, frame.buffer_mut(), &theme),
         Some(Overlay::Help) => keybindings::render(&BINDINGS, area, frame.buffer_mut(), &theme),
         Some(Overlay::Dial { dial, .. }) => dial.render(area, frame.buffer_mut(), &theme),
-        None => {
-            frame.selectable(app.panes.main_area);
-            frame.selectable(app.panes.side_area);
-            frame.selectable(inner);
-        }
+        None => frame.selectable(inner),
     }
 }
 
@@ -573,7 +573,7 @@ fn status_line(app: &App, spinner: &str, now: Instant) -> Line<'static> {
             ),
             Span::styled(
                 format!(
-                    " ({} · {} · enter queues · enter on empty steers)",
+                    " ({} · {} · enter steers · tab queues)",
                     elapsed_label(now.duration_since(*since)),
                     if matches!(app.turn, TurnState::External(_)) {
                         "woken by a finished subagent · esc esc to interrupt"

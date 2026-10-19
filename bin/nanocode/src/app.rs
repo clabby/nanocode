@@ -21,7 +21,8 @@ use nanocode::{
 use nanocode_tui::{
     composer::{Composer, ComposerAction},
     crossterm::event::{
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     effort::{DialAction, EffortDial},
     history::History,
@@ -47,6 +48,7 @@ pub(crate) mod reload;
 pub const DISPLAY_FRAME: Duration = Duration::from_micros(16_667);
 pub const SPINNER_FRAME: Duration = Duration::from_millis(80);
 pub const QUIT_CONFIRMATION: Duration = Duration::from_secs(2);
+pub const AUTOSCROLL_STEP: Duration = Duration::from_millis(50);
 pub const TOOL_PREVIEW_LINES: usize = 6;
 pub const DIFF_PREVIEW_LINES: usize = 40;
 
@@ -289,6 +291,8 @@ pub struct App {
     quit_armed: Option<Instant>,
     esc_armed: Option<Instant>,
     stashed_draft: Option<String>,
+    dragging: Option<bool>,
+    autoscroll_at: Option<Instant>,
     pub(crate) btw: HashMap<u64, (Option<nanocode::subagents::AgentId>, usize)>,
     pub(crate) next_btw: u64,
     next_local: u64,
@@ -359,6 +363,8 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         quit_armed: None,
         esc_armed: None,
         stashed_draft: None,
+        dragging: None,
+        autoscroll_at: None,
         btw: HashMap::new(),
         next_btw: 0,
         next_local: 0,
@@ -671,6 +677,12 @@ impl App {
             }
             metrics.wakeup();
             let now = Instant::now();
+            if self.autoscroll_at.is_some_and(|at| at <= now) {
+                self.autoscroll_at = None;
+                if self.autoscroll() {
+                    scheduler.request_immediate(now);
+                }
+            }
             if scheduler.is_due(now) {
                 let span = metrics.frame(self.agent.as_ref().map(|agent| agent.session_id()));
                 let _frame = span.enter();
@@ -690,6 +702,12 @@ impl App {
                         scheduler.request_at(expiry);
                     }
                 }
+            }
+            if self.autoscroll_at.is_none() && self.autoscrolling() {
+                self.autoscroll_at = Some(Instant::now() + AUTOSCROLL_STEP);
+            }
+            if let Some(at) = self.autoscroll_at {
+                scheduler.request_at(at);
             }
             let deadline = scheduler.deadline().map(tokio::time::Instant::from_std);
             tokio::select! {
@@ -1285,6 +1303,11 @@ impl App {
 
     fn restore_prompt(&mut self, error: &str, text: Option<String>, steers: Vec<QueuedPrompt>) {
         self.notice(NoticeLevel::Error, format!("prompt failed: {error}"));
+        for steer in &steers {
+            if let Some(attachments) = self.attachments_by_id.remove(&steer.id) {
+                self.attachments.extend(attachments);
+            }
+        }
         if text.is_none() {
             self.hold_after_failed_resume();
         }
@@ -1535,6 +1558,18 @@ impl App {
         id
     }
 
+    fn enqueue_steer(&mut self, text: String) -> String {
+        let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "enqueue_steer", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let id = self.local_id("steer");
+        self.queue.push(QueuedPrompt {
+            id: id.clone(),
+            kind: QueueKind::Steer,
+            state: QueueState::Pending,
+            text,
+        });
+        id
+    }
+
     fn flush_pending_steers(&mut self) {
         let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "flush_pending_steers", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         if self.quit {
@@ -1699,6 +1734,9 @@ impl App {
                 }
             }
             self.queue.remove(&id);
+            if let Some(attachments) = self.attachments_by_id.remove(&id) {
+                self.attachments.extend(attachments);
+            }
         }
         if !restored.is_empty() {
             let mut text = restored.join("\n\n");
@@ -1750,6 +1788,9 @@ impl App {
                 true
             }
             Event::Mouse(mouse) => {
+                if let Some(changed) = self.transcript_mouse(mouse, terminal) {
+                    return changed;
+                }
                 let selected = match terminal.select(mouse) {
                     SelectionEvent::Ignored => false,
                     SelectionEvent::Changed => true,
@@ -1781,6 +1822,64 @@ impl App {
             Event::Resize(..) => true,
             _ => false,
         }
+    }
+
+    fn transcript_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        terminal: &mut TerminalSession,
+    ) -> Option<bool> {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if self.overlay.is_none() => {
+                let side = self.pane_at(mouse.column, mouse.row)?;
+                if let Some(previous) = self.dragging.take() {
+                    self.pane_transcript(previous).select_cancel();
+                }
+                self.click_pane(mouse.column, mouse.row);
+                if self
+                    .pane_transcript(side)
+                    .select_start(mouse.column, mouse.row)
+                {
+                    self.dragging = Some(side);
+                }
+                Some(true)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let side = self.dragging?;
+                Some(self.pane_transcript(side).select_to(mouse.row))
+            }
+            MouseEventKind::Up(_) => {
+                let side = self.dragging.take()?;
+                self.autoscroll_at = None;
+                if let Some(text) = self.pane_transcript(side).select_end() {
+                    match terminal.copy(&text) {
+                        Ok(()) => self.flash(format!(
+                            "copied {} raw transcript lines",
+                            text.lines().count()
+                        )),
+                        Err(error) => self.flash(format!("copy failed: {error}")),
+                    }
+                }
+                Some(true)
+            }
+            MouseEventKind::Moved => {
+                let side = self.dragging.take()?;
+                self.autoscroll_at = None;
+                self.pane_transcript(side).select_cancel();
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    fn autoscroll(&mut self) -> bool {
+        self.dragging
+            .is_some_and(|side| self.pane_transcript(side).autoscroll())
+    }
+
+    fn autoscrolling(&mut self) -> bool {
+        self.dragging
+            .is_some_and(|side| self.pane_transcript(side).autoscrolling())
     }
 
     fn handle_key(&mut self, key: KeyEvent, terminal: &mut TerminalSession) {
@@ -1900,6 +1999,14 @@ impl App {
             KeyCode::F(2) => self.cycle_focus(),
             KeyCode::Up if alt => self.recall_queued(),
             KeyCode::Char('u') if alt => self.recall_queued(),
+            KeyCode::Tab
+                if self.composer.is_empty()
+                    && !self.panes.side_active()
+                    && self.focus.is_none()
+                    && self.recallable().is_some() =>
+            {
+                self.recall_queued();
+            }
             KeyCode::Tab if self.panes.side.is_some() && self.composer.is_empty() => {
                 self.toggle_pane();
             }
@@ -1916,11 +2023,11 @@ impl App {
                 }
             }
             KeyCode::Tab if self.complete_agent_argument() => {}
-            KeyCode::Tab if !self.composer.is_empty() && busy => {
+            KeyCode::Tab if busy && !self.composer.text().trim().is_empty() => {
                 let text = self.composer.take();
                 self.composer.history_mut().push(text.clone());
-                self.append_history(&text);
-                self.enqueue_follow_up(text);
+                self.quit_armed = None;
+                self.submit(text, true);
             }
             KeyCode::Enter if busy && self.composer.is_empty() && key.modifiers.is_empty() => {
                 self.promote_follow_up();
@@ -1929,7 +2036,7 @@ impl App {
                 ComposerAction::Submit(text) => {
                     self.quit_armed = None;
                     self.finder = None;
-                    self.submit(text);
+                    self.submit(text, false);
                 }
                 ComposerAction::Edited | ComposerAction::Moved => self.update_finder(),
                 ComposerAction::Ignored => {}
@@ -2037,16 +2144,22 @@ impl App {
         drop(std::fs::remove_file(&path));
     }
 
+    fn recallable(&self) -> Option<&QueuedPrompt> {
+        self.queue.items().iter().rev().find(|item| {
+            !(item.kind == QueueKind::FollowUp && item.state == QueueState::Sent)
+                && !self
+                    .resumes
+                    .get(&item.id)
+                    .is_some_and(|(_, durable)| *durable)
+        })
+    }
+
     fn recall_queued(&mut self) {
         let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "recall_queued", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
-        let Some(item) = self.queue.items().last().cloned() else {
+        let Some(item) = self.recallable().cloned() else {
             self.flash("nothing queued");
             return;
         };
-        if item.kind == QueueKind::FollowUp && item.state == QueueState::Sent {
-            self.flash("prompt already sent");
-            return;
-        }
         if item.kind == QueueKind::Steer
             && item.state == QueueState::Sent
             && let Some(control) = control_of(&self.turn)
@@ -2069,6 +2182,10 @@ impl App {
             });
         }
         self.queue.remove(&item.id);
+        self.resumes.remove(&item.id);
+        if let Some(attachments) = self.attachments_by_id.remove(&item.id) {
+            self.attachments.extend(attachments);
+        }
         let text = if self.composer.is_empty() {
             item.text
         } else {
@@ -2077,7 +2194,7 @@ impl App {
         self.composer.set_text(text);
     }
 
-    fn submit(&mut self, text: String) {
+    fn submit(&mut self, text: String, queue: bool) {
         let _span = tracing::info_span!(target: "nanocode", "nc.action", action.name = "submit", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         self.append_history(&text);
         self.stashed_draft = None;
@@ -2113,9 +2230,17 @@ impl App {
         let attachments = std::mem::take(&mut self.attachments);
         match self.turn {
             TurnState::Running { .. } | TurnState::Starting(_) | TurnState::External(_) => {
-                let id = self.enqueue_follow_up(text);
+                let id = if queue {
+                    self.enqueue_follow_up(text)
+                } else {
+                    self.enqueue_steer(text)
+                };
                 self.attachments_by_id.insert(id, attachments);
-                self.flash("queued · enter on an empty prompt steers it into the running turn");
+                if queue {
+                    self.flash("queued for after this turn · tab on an empty prompt takes it back");
+                } else {
+                    self.flush_pending_steers();
+                }
             }
             TurnState::Idle
                 if self.agent.is_none() || self.pending_switch.is_some() || self.starting =>
@@ -2152,13 +2277,7 @@ impl App {
             }
             TurnState::Idle => self.start_turn(text),
             _ => {
-                let id = self.local_id("steer");
-                self.queue.push(QueuedPrompt {
-                    id,
-                    kind: QueueKind::Steer,
-                    state: QueueState::Pending,
-                    text,
-                });
+                self.enqueue_steer(text);
                 self.flush_pending_steers();
             }
         }

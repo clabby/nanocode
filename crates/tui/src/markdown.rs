@@ -4,7 +4,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 use syntect::{easy::HighlightLines, highlighting::HighlightState, parsing::ParseState};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 pub struct Layout {
     pub lines: Vec<Line<'static>>,
     pub links: Vec<Vec<LinkSpan>>,
+    pub sources: Vec<Option<Range<usize>>>,
 }
 
 #[derive(Clone)]
@@ -101,6 +102,7 @@ pub(crate) fn render_with(
         return Layout {
             lines: Vec::new(),
             links: Vec::new(),
+            sources: Vec::new(),
         };
     }
     let options = Options::ENABLE_TABLES
@@ -109,19 +111,22 @@ pub(crate) fn render_with(
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_SMART_PUNCTUATION
         | Options::ENABLE_GFM;
-    let mut renderer = Renderer::new(width, theme, highlights);
-    let mut events = Parser::new_ext(markdown, options).peekable();
-    while let Some(event) = events.next() {
+    let mut renderer = Renderer::new(markdown, width, theme, highlights);
+    let mut events = Parser::new_ext(markdown, options).into_offset_iter();
+    while let Some((event, range)) = events.next() {
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
                 renderer.flush();
-                renderer.code_block(kind, &mut events);
+                renderer.code_block(kind, range, &mut events);
             }
             Event::Start(Tag::Table(_)) => {
                 renderer.flush();
-                renderer.table(&mut events);
+                renderer.table(range, &mut events);
             }
-            event => renderer.event(event),
+            event => {
+                renderer.range = range;
+                renderer.event(event);
+            }
         }
     }
     span.record("code.blocks", renderer.block);
@@ -147,34 +152,53 @@ fn wrap_plain_with_whitespace(
     style: Style,
     preserve_whitespace: bool,
 ) -> Vec<Line<'static>> {
+    wrap_plain_rows(text, width, style, preserve_whitespace)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect()
+}
+
+pub(crate) fn wrap_plain_rows(
+    text: &str,
+    width: u16,
+    style: Style,
+    preserve_whitespace: bool,
+) -> Vec<(Line<'static>, usize)> {
     if width == 0 {
-        return vec![Line::default()];
+        return vec![(Line::default(), 0)];
     }
     let logical = sanitize_terminal_text(text);
-    if let Some(lines) = wrap_ascii_spans(
+    if let Some(rows) = wrap_ascii_spans(
         std::iter::once((logical.as_ref(), style, None)),
         width,
         true,
         preserve_whitespace,
     ) {
-        return if lines.is_empty() {
-            vec![Line::default()]
-        } else {
-            lines.into_iter().map(|(line, _)| line).collect()
-        };
+        if rows.is_empty() {
+            return vec![(Line::default(), 0)];
+        }
+        let (mut index, mut counted) = (0, 0);
+        return rows
+            .into_iter()
+            .map(|(line, _, range)| {
+                index +=
+                    memchr::memchr_iter(b'\n', &logical.as_bytes()[counted..range.start]).count();
+                counted = range.start;
+                (line, index)
+            })
+            .collect();
     }
     let mut lines = Vec::new();
-    for line in logical.split('\n') {
+    for (index, line) in logical.split('\n').enumerate() {
         let spans = vec![Span::styled(line, style)];
-        lines.extend(wrap_spans_with_whitespace(
-            &spans,
-            width,
-            true,
-            preserve_whitespace,
-        ));
+        lines.extend(
+            wrap_spans_with_whitespace(&spans, width, true, preserve_whitespace)
+                .into_iter()
+                .map(|wrapped| (wrapped, index)),
+        );
     }
     if lines.is_empty() {
-        lines.push(Line::default());
+        lines.push((Line::default(), 0));
     }
     lines
 }
@@ -184,9 +208,12 @@ pub fn sanitize(text: &str) -> String {
 }
 
 struct Renderer<'a> {
+    markdown: &'a str,
+    range: Range<usize>,
     width: u16,
     theme: &'a Theme,
     lines: Vec<Line<'static>>,
+    sources: Vec<Option<Range<usize>>>,
     current: Vec<TaggedSpan>,
     styles: Vec<Style>,
     lists: Vec<ListState>,
@@ -211,14 +238,23 @@ struct LinkState {
 struct TaggedSpan {
     span: Span<'static>,
     link: Option<Arc<str>>,
+    source: Option<Range<usize>>,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(width: u16, theme: &'a Theme, highlights: &'a mut Highlights) -> Self {
+    fn new(
+        markdown: &'a str,
+        width: u16,
+        theme: &'a Theme,
+        highlights: &'a mut Highlights,
+    ) -> Self {
         Self {
+            markdown,
+            range: 0..0,
             width,
             theme,
             lines: Vec::new(),
+            sources: Vec::new(),
             current: Vec::new(),
             styles: vec![Style::default().fg(theme.text())],
             lists: Vec::new(),
@@ -267,10 +303,13 @@ impl<'a> Renderer<'a> {
             Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.flush();
-                self.lines.push(Line::from(Span::styled(
-                    "─".repeat(usize::from(self.width)),
-                    Style::default().fg(self.theme.muted()),
-                )));
+                self.push_line(
+                    Line::from(Span::styled(
+                        "─".repeat(usize::from(self.width)),
+                        Style::default().fg(self.theme.muted()),
+                    )),
+                    Some(self.range.clone()),
+                );
                 self.blank();
             }
             Event::TaskListMarker(checked) => self.span(
@@ -466,18 +505,20 @@ impl<'a> Renderer<'a> {
         self.push_current(Span::styled(text, self.style().patch(style)));
     }
 
-    fn code_block(
+    fn code_block<'e>(
         &mut self,
         kind: CodeBlockKind<'_>,
-        events: &mut std::iter::Peekable<Parser<'_>>,
+        range: Range<usize>,
+        events: &mut impl Iterator<Item = (Event<'e>, Range<usize>)>,
     ) {
+        let fenced = matches!(kind, CodeBlockKind::Fenced(_));
         let language = match kind {
             CodeBlockKind::Indented => None,
             CodeBlockKind::Fenced(language) if language.is_empty() => None,
             CodeBlockKind::Fenced(language) => Some(sanitize(&language)),
         };
         let mut code = String::new();
-        for event in events.by_ref() {
+        for (event, _) in events.by_ref() {
             match event {
                 Event::End(TagEnd::CodeBlock) => break,
                 Event::Text(text) | Event::Code(text) => code.push_str(&sanitize(&text)),
@@ -487,24 +528,34 @@ impl<'a> Renderer<'a> {
         }
         let is_diff = language.as_deref().is_some_and(is_diff_language);
         if is_diff {
-            self.lines
-                .extend(super::diff::render(&code, self.width, self.theme));
+            for line in super::diff::render(&code, self.width, self.theme) {
+                self.push_line(line, Some(range.clone()));
+            }
             self.blank();
             return;
         }
+        let rows = source_lines(self.markdown, range);
+        let content = code.split_terminator('\n').count();
+        let first = usize::from(fenced);
+        let line_source = |line: usize| {
+            (line < content)
+                .then(|| rows.get(first + line).cloned())
+                .flatten()
+        };
+        let fence = fenced.then(|| rows.first().cloned()).flatten();
+        let closing = fenced.then(|| rows.get(first + content).cloned()).flatten();
         let block = self.highlight(code, language.as_deref());
         if self.width < 6 {
-            self.narrow_code_block(block);
+            self.narrow_code_block(block, &line_source);
             self.blank();
             return;
         }
 
         let border = Style::default().fg(self.theme.border());
-        self.lines.push(code_block_header(
-            language.as_deref(),
-            self.width,
-            self.theme,
-        ));
+        self.push_line(
+            code_block_header(language.as_deref(), self.width, self.theme),
+            fence,
+        );
         let content_width = self.width.saturating_sub(4).max(1);
         let highlighted = &self.highlights.blocks[block];
         let mut source = Vec::new();
@@ -529,15 +580,19 @@ impl<'a> Renderer<'a> {
                 body.push(Span::raw(" ".repeat(padding)));
                 body.push(Span::styled(" │", border));
                 self.lines.push(Line::from(body));
+                self.sources.push(line_source(line));
             }
         }
-        self.lines.push(Line::from(Span::styled(
-            format!(
-                "╰{}╯",
-                "─".repeat(usize::from(self.width.saturating_sub(2)))
-            ),
-            border,
-        )));
+        self.push_line(
+            Line::from(Span::styled(
+                format!(
+                    "╰{}╯",
+                    "─".repeat(usize::from(self.width.saturating_sub(2)))
+                ),
+                border,
+            )),
+            closing,
+        );
         self.blank();
     }
 
@@ -623,7 +678,11 @@ impl<'a> Renderer<'a> {
         block
     }
 
-    fn narrow_code_block(&mut self, block: usize) {
+    fn narrow_code_block(
+        &mut self,
+        block: usize,
+        line_source: &impl Fn(usize) -> Option<Range<usize>>,
+    ) {
         let gutter = Style::default().fg(self.theme.border());
         let content_width = self.width.saturating_sub(2).max(1);
         let highlighted = &self.highlights.blocks[block];
@@ -631,21 +690,26 @@ impl<'a> Renderer<'a> {
         for line in 0..highlighted.lines.len() {
             highlighted.spans(line, &mut source);
             for spans in super::highlight::wrap_spans(&source, content_width) {
-                let mut line = vec![Span::styled("┃ ", gutter)];
-                line.extend(spans);
-                self.lines.push(Line::from(line));
+                let mut row = vec![Span::styled("┃ ", gutter)];
+                row.extend(spans);
+                self.lines.push(Line::from(row));
+                self.sources.push(line_source(line));
             }
         }
     }
 
-    fn table(&mut self, events: &mut std::iter::Peekable<Parser<'_>>) {
+    fn table<'e>(
+        &mut self,
+        range: Range<usize>,
+        events: &mut impl Iterator<Item = (Event<'e>, Range<usize>)>,
+    ) {
         let mut rows = Vec::<Vec<String>>::new();
         let mut row = Vec::<String>::new();
         let mut cell = String::new();
         let mut in_cell = false;
         let mut header_rows = 0_usize;
         let mut in_header = false;
-        for event in events.by_ref() {
+        for (event, _) in events.by_ref() {
             match event {
                 Event::Start(Tag::TableHead) => in_header = true,
                 Event::End(TagEnd::TableHead) => {
@@ -677,8 +741,9 @@ impl<'a> Renderer<'a> {
                 _ => {}
             }
         }
-        self.lines
-            .extend(render_table(&rows, header_rows, self.width, self.theme));
+        for line in render_table(&rows, header_rows, self.width, self.theme) {
+            self.push_line(line, Some(range.clone()));
+        }
         self.blank();
     }
 
@@ -711,18 +776,32 @@ impl<'a> Renderer<'a> {
 
     fn push_current(&mut self, span: Span<'static>) {
         let link = self.links.last().map(|link| Arc::clone(&link.destination));
-        self.current.push(TaggedSpan { span, link });
+        self.current.push(TaggedSpan {
+            span,
+            link,
+            source: Some(self.range.clone()),
+        });
     }
 
     fn push_unlinked(&mut self, span: Span<'static>) {
-        self.current.push(TaggedSpan { span, link: None });
+        self.current.push(TaggedSpan {
+            span,
+            link: None,
+            source: None,
+        });
     }
 
     fn push_linked(&mut self, span: Span<'static>, destination: Arc<str>) {
         self.current.push(TaggedSpan {
             span,
             link: Some(destination),
+            source: Some(self.range.clone()),
         });
+    }
+
+    fn push_line(&mut self, line: Line<'static>, source: Option<Range<usize>>) {
+        self.lines.push(line);
+        self.sources.push(source);
     }
 
     fn render_image_link(&mut self, image: LinkState) {
@@ -760,11 +839,16 @@ impl<'a> Renderer<'a> {
             return;
         }
         let first_line = self.lines.len();
+        let source = self
+            .current
+            .iter()
+            .filter_map(|tagged| tagged.source.clone())
+            .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end));
         for (offset, (line, links)) in wrap_tagged_spans(&self.current, self.width, true)
             .into_iter()
             .enumerate()
         {
-            self.lines.push(line);
+            self.push_line(line, source.clone());
             self.rendered_links.extend(
                 links
                     .into_iter()
@@ -778,7 +862,7 @@ impl<'a> Renderer<'a> {
         if self.lines.last().is_some_and(|line| line.width() == 0) {
             return;
         }
-        self.lines.push(Line::default());
+        self.push_line(Line::default(), None);
     }
 
     fn finish(mut self) -> Layout {
@@ -786,6 +870,7 @@ impl<'a> Renderer<'a> {
         self.highlights.blocks.truncate(self.block);
         while self.lines.last().is_some_and(|line| line.width() == 0) {
             self.lines.pop();
+            self.sources.pop();
         }
         let mut links = vec![Vec::new(); self.lines.len()];
         for (line, link) in self.rendered_links {
@@ -796,8 +881,22 @@ impl<'a> Renderer<'a> {
         Layout {
             lines: self.lines,
             links,
+            sources: self.sources,
         }
     }
+}
+
+fn source_lines(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
+    let mut start = text[..range.start].rfind('\n').map_or(0, |index| index + 1);
+    let end = range.end.min(text.len());
+    let mut lines = Vec::new();
+    while start < end {
+        let line_end = memchr::memchr(b'\n', &text.as_bytes()[start..end])
+            .map_or(end, |offset| start + offset);
+        lines.push(start..line_end);
+        start = line_end + 1;
+    }
+    lines
 }
 
 fn is_diff_language(language: &str) -> bool {
@@ -838,7 +937,7 @@ fn wrap_spans_with_whitespace(
         prefer_words,
         preserve_whitespace,
     ) {
-        return lines.into_iter().map(|(line, _)| line).collect();
+        return lines.into_iter().map(|(line, _, _)| line).collect();
     }
     let graphemes = spans
         .iter()
@@ -882,7 +981,10 @@ fn wrap_tagged_spans(
         prefer_words,
         false,
     ) {
-        return lines;
+        return lines
+            .into_iter()
+            .map(|(line, links, _)| (line, links))
+            .collect();
     }
     let graphemes = spans
         .iter()
@@ -1084,12 +1186,14 @@ fn graphemes_to_line(
     (Line::from(spans), links)
 }
 
+type AsciiRow = (Line<'static>, Vec<LinkSpan>, Range<usize>);
+
 fn wrap_ascii_spans<'a>(
     spans: impl Iterator<Item = (&'a str, Style, Option<&'a Arc<str>>)>,
     width: u16,
     prefer_words: bool,
     preserve_whitespace: bool,
-) -> Option<Vec<(Line<'static>, Vec<LinkSpan>)>> {
+) -> Option<Vec<AsciiRow>> {
     if width == 0 {
         return Some(Vec::new());
     }
@@ -1153,7 +1257,7 @@ fn wrap_ascii_spans<'a>(
                 index += 1;
             }
         }
-        lines.push((Line::from(rendered), links));
+        lines.push((Line::from(rendered), links, range));
     }
     Some(lines)
 }

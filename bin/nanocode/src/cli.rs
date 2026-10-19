@@ -84,7 +84,7 @@ pub struct SessionArgs {
         short,
         long,
         env = "NANOCODE_MODEL",
-        help = "Model id or alias (see 'nanocode models'); defaults to gpt-6.1-sol at xhigh thinking on the fast tier"
+        help = "Model id or alias (see 'nanocode models'); defaults to claude-opus-5-5 at xhigh thinking"
     )]
     pub model: Option<String>,
 

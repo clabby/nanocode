@@ -22,14 +22,22 @@ pub fn normalize_line_endings(text: &str) -> Cow<'_, str> {
 }
 
 pub fn sanitize_terminal_text(text: &str) -> Cow<'_, str> {
-    sanitize_terminal_text_with_break(text, '\n')
+    sanitize_terminal_text_with_break(text, '\n', "    ")
 }
 
 pub fn sanitize_terminal_text_inline(text: &str) -> Cow<'_, str> {
-    sanitize_terminal_text_with_break(text, ' ')
+    sanitize_terminal_text_with_break(text, ' ', "    ")
 }
 
-fn sanitize_terminal_text_with_break(text: &str, line_break: char) -> Cow<'_, str> {
+pub fn strip_terminal_controls(text: &str) -> Cow<'_, str> {
+    sanitize_terminal_text_with_break(text, '\n', "\t")
+}
+
+fn sanitize_terminal_text_with_break<'a>(
+    text: &'a str,
+    line_break: char,
+    tab: &str,
+) -> Cow<'a, str> {
     let mut offset = 0;
     while offset < text.len() {
         offset += crate::text::control_prefix(&text[offset..], line_break == '\n');
@@ -65,7 +73,7 @@ fn sanitize_terminal_text_with_break(text: &str, line_break: char) -> Cow<'_, st
                 sanitized.push(line_break);
             }
             '\n' => sanitized.push(line_break),
-            '\t' => sanitized.push_str("    "),
+            '\t' => sanitized.push_str(tab),
             character if character.is_control() => sanitized.push('�'),
             character => sanitized.push(character),
         }

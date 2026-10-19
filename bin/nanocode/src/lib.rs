@@ -163,7 +163,7 @@ async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Pre
             model
         }
         (None, Some(harness)) => family(harness).default_model(),
-        (None, None) => nanocode::HarnessFamily::Codex.default_model(),
+        (None, None) => nanocode::HarnessFamily::Claude.default_model(),
     };
     if let Some(gateway) = &gateway {
         gateway.check(&model)?;
@@ -180,12 +180,6 @@ async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Pre
         .check_thinking(thinking)?;
     let tier = match &args.tier {
         Some(value) => host::parse_tier(value)?,
-        None if defaulted
-            && gateway.is_none()
-            && capabilities.supports_service_tier(ServiceTier::Fast) =>
-        {
-            ServiceTier::Fast
-        }
         None => ServiceTier::Standard,
     };
     model

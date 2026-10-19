@@ -234,13 +234,19 @@ impl App {
         self.pane_transcript(side)
     }
 
-    pub(crate) const fn click_pane(&mut self, column: u16, row: u16) -> bool {
+    pub(crate) const fn pane_at(&self, column: u16, row: u16) -> Option<bool> {
         let position = Position::new(column, row);
-        let side = if self.panes.side_area.contains(position) {
-            true
+        if self.panes.side_area.contains(position) {
+            Some(true)
         } else if self.panes.main_area.contains(position) {
-            false
+            Some(false)
         } else {
+            None
+        }
+    }
+
+    pub(crate) const fn click_pane(&mut self, column: u16, row: u16) -> bool {
+        let Some(side) = self.pane_at(column, row) else {
             return false;
         };
         let changed = self.panes.active != side;

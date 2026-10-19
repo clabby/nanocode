@@ -6,28 +6,22 @@ use ratatui::{
     style::Modifier,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(crate) struct Selection {
     region: Rect,
     anchor: Position,
     pointer: Option<Position>,
+    screen: Buffer,
 }
 
 impl Selection {
-    pub(crate) fn begin(regions: &[Rect], anchor: Position) -> Option<Self> {
+    pub(crate) fn begin(regions: &[Rect], anchor: Position, screen: Buffer) -> Option<Self> {
         region_at(regions, anchor).map(|region| Self {
             region,
             anchor,
             pointer: None,
+            screen,
         })
-    }
-
-    pub(crate) fn rebind(&mut self, regions: &[Rect]) -> bool {
-        let Some(region) = region_at(regions, self.anchor) else {
-            return false;
-        };
-        self.region = region;
-        true
     }
 
     pub(crate) fn extend(&mut self, pointer: Position) -> bool {
@@ -40,6 +34,18 @@ impl Selection {
         self.pointer.is_some()
     }
 
+    pub(crate) fn paint(&self, buffer: &mut Buffer) {
+        if !self.active() {
+            return;
+        }
+        for y in self.region.top()..self.region.bottom() {
+            for x in self.region.left()..self.region.right() {
+                buffer[(x, y)].clone_from(&self.screen[(x, y)]);
+            }
+        }
+        self.highlight(buffer);
+    }
+
     pub(crate) fn highlight(&self, buffer: &mut Buffer) {
         for (y, from, to) in self.rows() {
             for x in columns(buffer, self.region, y, from, to) {
@@ -48,7 +54,8 @@ impl Selection {
         }
     }
 
-    pub(crate) fn text(&self, buffer: &Buffer) -> String {
+    pub(crate) fn text(&self) -> String {
+        let buffer = &self.screen;
         let mut text = String::new();
         for (index, (y, from, to)) in self.rows().enumerate() {
             if index > 0 {

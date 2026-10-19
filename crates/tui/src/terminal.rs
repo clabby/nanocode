@@ -167,12 +167,8 @@ impl TerminalSession {
         };
         render(&mut canvas);
         let cursor = canvas.cursor.filter(|position| area.contains(*position));
-        if let Some(selection) = &mut self.selection
-            && selection.rebind(&self.regions)
-        {
-            selection.highlight(&mut self.current);
-        } else {
-            self.selection = None;
+        if let Some(selection) = &self.selection {
+            selection.paint(&mut self.current);
         }
         if self.monochrome {
             monochrome(&mut self.current);
@@ -285,8 +281,12 @@ impl TerminalSession {
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let visible = self.selection.is_some_and(|selection| selection.active());
-                self.selection = Selection::begin(&self.regions, position);
+                let visible = self.selection.as_ref().is_some_and(Selection::active);
+                let mut screen = self.previous.clone();
+                if let Some(selection) = &self.selection {
+                    selection.highlight(&mut screen);
+                }
+                self.selection = Selection::begin(&self.regions, position, screen);
                 if visible {
                     SelectionEvent::Changed
                 } else {
@@ -303,7 +303,7 @@ impl TerminalSession {
             }
             MouseEventKind::Up(_) => match self.selection.take() {
                 Some(selection) if selection.active() => {
-                    let text = selection.text(&self.previous);
+                    let text = selection.text();
                     if text.is_empty() {
                         return SelectionEvent::Changed;
                     }

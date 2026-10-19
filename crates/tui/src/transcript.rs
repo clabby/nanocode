@@ -1,8 +1,8 @@
-use std::{borrow::Cow, rc::Rc, time::Duration};
+use std::{borrow::Cow, ops::Range, rc::Rc, time::Duration};
 
 use ratatui::{
     buffer::{Buffer, CellWidth},
-    layout::{Alignment, Rect},
+    layout::{Alignment, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
@@ -14,7 +14,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::{
     beautify::beautify,
     diff,
-    format::{format_duration, sanitize_terminal_text, sanitize_terminal_text_inline},
+    format::{
+        format_duration, sanitize_terminal_text, sanitize_terminal_text_inline,
+        strip_terminal_controls,
+    },
     highlight, markdown,
     theme::Theme,
 };
@@ -184,7 +187,28 @@ struct Layout {
 #[derive(Clone)]
 struct Rows {
     lines: Rc<Vec<Line<'static>>>,
+    sources: Rc<[Option<Source>]>,
     spinners: Rc<[(usize, usize)]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Point {
+    cell: usize,
+    row: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Selection {
+    anchor: (Point, Point),
+    head: Option<(Point, Point)>,
+    pointer: Option<u16>,
+}
+
+impl Selection {
+    fn bounds(&self) -> Option<(Point, Point)> {
+        self.head
+            .map(|(start, end)| (start.min(self.anchor.0), end.max(self.anchor.1)))
+    }
 }
 
 impl Rows {
@@ -217,6 +241,9 @@ pub struct Transcript {
     last_width: u16,
     theme: Option<Theme>,
     anchor: Option<(usize, usize)>,
+    area: Rect,
+    screen: Vec<Point>,
+    selection: Option<Selection>,
 }
 
 impl Transcript {
@@ -236,6 +263,9 @@ impl Transcript {
             last_width: 0,
             theme: None,
             anchor: None,
+            area: Rect::ZERO,
+            screen: Vec::new(),
+            selection: None,
         }
     }
 
@@ -256,6 +286,8 @@ impl Transcript {
         self.scroll = 0;
         self.last_total = None;
         self.anchor = None;
+        self.screen.clear();
+        self.selection = None;
     }
 
     pub fn push(&mut self, kind: CellKind) -> usize {
@@ -441,6 +473,136 @@ impl Transcript {
         }
     }
 
+    pub fn select_start(&mut self, column: u16, row: u16) -> bool {
+        if !self.area.contains(Position::new(column, row)) {
+            return false;
+        }
+        let Some(point) = self.point_at(row) else {
+            return false;
+        };
+        let anchor = self.segment(point);
+        self.selection = Some(Selection {
+            anchor,
+            head: None,
+            pointer: None,
+        });
+        true
+    }
+
+    pub fn select_to(&mut self, row: u16) -> bool {
+        let Some(mut selection) = self.selection else {
+            return false;
+        };
+        let previous = selection.bounds();
+        selection.pointer = Some(row);
+        selection.head = self.point_at(row).map(|point| self.segment(point));
+        self.selection = Some(selection);
+        selection.bounds() != previous
+    }
+
+    pub fn autoscroll(&mut self) -> bool {
+        let Some(row) = self.selection.and_then(|selection| selection.pointer) else {
+            return false;
+        };
+        let previous = self.scroll;
+        let (top, bottom) = (self.area.top(), self.area.bottom().saturating_sub(1));
+        if row <= top {
+            self.scroll_up(usize::from(top - row) + 1);
+        } else if row >= bottom {
+            self.scroll_down(usize::from(row - bottom) + 1);
+        }
+        self.scroll != previous
+    }
+
+    #[must_use]
+    pub fn autoscrolling(&self) -> bool {
+        self.selection
+            .and_then(|selection| selection.pointer)
+            .is_some_and(|row| row <= self.area.top() || row + 1 >= self.area.bottom())
+    }
+
+    pub fn select_end(&mut self) -> Option<String> {
+        let (start, end) = self.selection.take()?.bounds()?;
+        let mut cells = Vec::new();
+        for index in start.cell..=end.cell {
+            let Some(rows) = self.cell_rows(index) else {
+                continue;
+            };
+            let first = if index == start.cell { start.row } else { 0 };
+            let last = if index == end.cell {
+                end.row
+            } else {
+                rows.sources.len().saturating_sub(1)
+            };
+            let text = raw_rows(
+                &self.cells[index].kind,
+                self.mode,
+                rows.sources.get(first..=last).unwrap_or_default(),
+            );
+            if !text.is_empty() {
+                cells.push(text);
+            }
+        }
+        let text = cells.join("\n\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    pub const fn select_cancel(&mut self) {
+        self.selection = None;
+    }
+
+    fn point_at(&self, row: u16) -> Option<Point> {
+        let offset = usize::from(row.saturating_sub(self.area.top()));
+        self.screen.get(offset).or(self.screen.last()).copied()
+    }
+
+    fn cell_rows(&mut self, index: usize) -> Option<Rows> {
+        if index >= self.cells.len() {
+            return None;
+        }
+        let theme = self.theme.take()?;
+        let rows = self.layout(index, self.last_width, &theme);
+        self.theme = Some(theme);
+        Some(rows)
+    }
+
+    fn segment(&mut self, point: Point) -> (Point, Point) {
+        let Some(rows) = self.cell_rows(point.cell) else {
+            return (point, point);
+        };
+        let sources = &rows.sources;
+        let Some(Some(source)) = sources.get(point.row) else {
+            return (point, point);
+        };
+        let same = |other: &Option<Source>| {
+            other.as_ref().is_some_and(|other| {
+                if source.extent == Extent::Whole {
+                    other.part == source.part
+                } else {
+                    other == source
+                }
+            })
+        };
+        let mut start = point.row;
+        while start > 0 && same(&sources[start - 1]) {
+            start -= 1;
+        }
+        let mut end = point.row;
+        while end + 1 < sources.len() && same(&sources[end + 1]) {
+            end += 1;
+        }
+        (
+            Point {
+                cell: point.cell,
+                row: start,
+            },
+            Point {
+                cell: point.cell,
+                row: end,
+            },
+        )
+    }
+
     fn key(&self, index: usize, width: u16) -> CacheKey {
         CacheKey {
             width,
@@ -495,9 +657,9 @@ impl Transcript {
             self.resident.push(index);
         }
         let mut highlights = previous.map(|layout| layout.highlights).unwrap_or_default();
-        let mut lines = Vec::new();
+        let mut out = Output::default();
         if index > 0 {
-            lines.push(Line::default());
+            out.push(Line::default(), None);
         }
         let context = RenderContext {
             width,
@@ -507,8 +669,9 @@ impl Transcript {
             preview: self.policy.collapsed_preview_lines,
             diff_preview: self.policy.collapsed_diff_lines,
         };
-        context.render(&cell.kind, &mut lines, &mut highlights);
-        let spinners = lines
+        context.render(&cell.kind, &mut out, &mut highlights);
+        let spinners = out
+            .lines
             .iter()
             .enumerate()
             .flat_map(|(row, line)| {
@@ -520,7 +683,8 @@ impl Transcript {
             })
             .collect::<Rc<[_]>>();
         let rows = Rows {
-            lines: Rc::new(lines),
+            lines: Rc::new(out.lines),
+            sources: out.sources.into(),
             spinners,
         };
         span.record("layout.lines", rows.lines.len());
@@ -571,14 +735,18 @@ impl Transcript {
         }
         let width = area.width;
         let height = usize::from(area.height);
+        if width != self.last_width {
+            self.selection = None;
+        }
         self.last_width = width;
         if self.theme.as_ref() != Some(theme) {
             self.invalidate();
             self.theme = Some(theme.clone());
         }
         let count = self.cells.len();
+        let pinned = self.scroll > 0 || self.selection.is_some();
         let floor = match self.anchor {
-            Some((first, _)) if self.scroll > 0 => first.min(count),
+            Some((first, _)) if pinned => first.min(count),
             _ => count,
         };
         let mut layouts = Vec::new();
@@ -591,7 +759,7 @@ impl Transcript {
             width,
             theme,
         );
-        if self.scroll > 0
+        if pinned
             && let Some((first, lines)) = self.anchor
             && first <= count
             && count - first <= layouts.len()
@@ -645,6 +813,9 @@ impl Transcript {
             }
             keep
         });
+        self.area = area.intersection(buffer.area);
+        self.screen.clear();
+        let mut drawn = Vec::new();
         'layouts: for (index, offset) in visible {
             let layout = self.layout(index, width, theme);
             let count = layout.lines.len();
@@ -658,6 +829,22 @@ impl Transcript {
                     render_line(&layout.line(row, spinner), row_area, buffer);
                 } else {
                     render_line(&layout.lines[row], row_area, buffer);
+                }
+                self.screen.push(Point { cell: index, row });
+                drawn.push(row_area);
+            }
+        }
+        if let Some(mut selection) = self.selection {
+            if let Some(pointer) = selection.pointer {
+                selection.head = self.point_at(pointer).map(|point| self.segment(point));
+                self.selection = Some(selection);
+            }
+            if let Some((first, last)) = selection.bounds() {
+                for (point, row_area) in self.screen.iter().zip(drawn) {
+                    if (first..=last).contains(point) {
+                        buffer
+                            .set_style(row_area, Style::default().add_modifier(Modifier::REVERSED));
+                    }
                 }
             }
         }
@@ -693,6 +880,96 @@ struct Gutter {
     style: Style,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Part {
+    Text,
+    Question,
+    Header(usize),
+    Input(usize),
+    Output(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Extent {
+    Whole,
+    Bytes(Range<usize>),
+    Line(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Source {
+    part: Part,
+    extent: Extent,
+}
+
+type Row = (Line<'static>, Option<Source>);
+
+const fn whole(part: Part) -> Option<Source> {
+    Some(Source {
+        part,
+        extent: Extent::Whole,
+    })
+}
+
+#[derive(Default)]
+struct Output {
+    lines: Vec<Line<'static>>,
+    sources: Vec<Option<Source>>,
+}
+
+impl Output {
+    fn push(&mut self, line: Line<'static>, source: Option<Source>) {
+        self.lines.push(line);
+        self.sources.push(source);
+    }
+
+    fn prefixed(&mut self, body: Vec<Row>, first: Span<'static>, rest: Span<'static>) {
+        for (index, (line, source)) in body.into_iter().enumerate() {
+            let prefix = if index == 0 {
+                first.clone()
+            } else {
+                rest.clone()
+            };
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(prefix);
+            spans.extend(line.spans);
+            self.push(Line::from(spans).style(line.style), source);
+        }
+    }
+}
+
+fn plain(text: &str, width: u16, style: Style, preserve_whitespace: bool, part: &Part) -> Vec<Row> {
+    markdown::wrap_plain_rows(text, width, style, preserve_whitespace)
+        .into_iter()
+        .map(|(line, index)| {
+            (
+                line,
+                Some(Source {
+                    part: part.clone(),
+                    extent: Extent::Line(index),
+                }),
+            )
+        })
+        .collect()
+}
+
+fn rendered(layout: markdown::Layout, part: &Part) -> Vec<Row> {
+    layout
+        .lines
+        .into_iter()
+        .zip(layout.sources)
+        .map(|(line, range)| {
+            (
+                line,
+                range.map(|range| Source {
+                    part: part.clone(),
+                    extent: Extent::Bytes(range),
+                }),
+            )
+        })
+        .collect()
+}
+
 struct RenderContext<'a> {
     width: u16,
     theme: &'a Theme,
@@ -703,24 +980,20 @@ struct RenderContext<'a> {
 }
 
 impl RenderContext<'_> {
-    fn render(
-        &self,
-        kind: &CellKind,
-        lines: &mut Vec<Line<'static>>,
-        highlights: &mut markdown::Highlights,
-    ) {
+    fn render(&self, kind: &CellKind, out: &mut Output, highlights: &mut markdown::Highlights) {
         let theme = self.theme;
         match kind {
             CellKind::User(text) => {
-                let body = markdown::wrap_plain_preserving_whitespace(
-                    &sanitize_terminal_text(text),
+                let body = plain(
+                    text,
                     self.width.saturating_sub(2),
                     Style::default()
                         .fg(theme.text())
                         .add_modifier(Modifier::BOLD),
+                    true,
+                    &Part::Text,
                 );
-                prefixed(
-                    lines,
+                out.prefixed(
                     body,
                     Span::styled(
                         "› ",
@@ -732,11 +1005,11 @@ impl RenderContext<'_> {
                 );
             }
             CellKind::Assistant(text) => {
-                let body =
-                    markdown::render_with(text, self.width.saturating_sub(2), theme, highlights)
-                        .lines;
-                prefixed(
-                    lines,
+                let body = rendered(
+                    markdown::render_with(text, self.width.saturating_sub(2), theme, highlights),
+                    &Part::Text,
+                );
+                out.prefixed(
                     body,
                     Span::styled("● ", Style::default().fg(theme.text())),
                     Span::raw("  "),
@@ -747,12 +1020,14 @@ impl RenderContext<'_> {
                     .fg(theme.muted())
                     .add_modifier(Modifier::ITALIC);
                 if self.reasoning {
-                    let body = markdown::wrap_plain(
-                        &sanitize_terminal_text(text.trim()),
+                    let body = plain(
+                        text.trim(),
                         self.width.saturating_sub(2),
                         style,
+                        false,
+                        &Part::Text,
                     );
-                    prefixed(lines, body, Span::styled("∴ ", style), Span::raw("  "));
+                    out.prefixed(body, Span::styled("∴ ", style), Span::raw("  "));
                 } else {
                     let summary = sanitize_terminal_text_inline(
                         text.trim().lines().next().unwrap_or_default(),
@@ -768,27 +1043,29 @@ impl RenderContext<'_> {
                         Style::default().fg(theme.border()),
                     ));
                     let line = Line::from(collapsed);
-                    lines.extend(
-                        markdown::wrap_spans(&line.spans, self.width, true)
-                            .into_iter()
-                            .take(1),
-                    );
+                    for line in markdown::wrap_spans(&line.spans, self.width, true)
+                        .into_iter()
+                        .take(1)
+                    {
+                        out.push(line, whole(Part::Text));
+                    }
                 }
             }
-            CellKind::Tool(tool) => self.tool(tool, tool.depth, false, lines),
+            CellKind::Tool(tool) => self.tool(tool, tool.depth, false, out, &mut 0),
             CellKind::Notice(level, text) => {
                 let (icon, color) = match level {
                     NoticeLevel::Info => ("ℹ ", theme.muted()),
                     NoticeLevel::Warning => ("⚠ ", theme.thinking_high()),
                     NoticeLevel::Error => ("✗ ", theme.thinking_max()),
                 };
-                let body = markdown::wrap_plain(
-                    &sanitize_terminal_text(text),
+                let body = plain(
+                    text,
                     self.width.saturating_sub(2),
                     Style::default().fg(color),
+                    false,
+                    &Part::Text,
                 );
-                prefixed(
-                    lines,
+                out.prefixed(
                     body,
                     Span::styled(icon, Style::default().fg(color)),
                     Span::raw("  "),
@@ -812,36 +1089,45 @@ impl RenderContext<'_> {
                     format!("  {}", sanitize_terminal_text_inline(question)),
                     Style::default().fg(theme.muted()),
                 ));
-                lines.push(Line::from(header));
+                out.push(Line::from(header), whole(Part::Question));
                 if !answer.is_empty() {
-                    let body = markdown::render_with(
-                        answer,
-                        self.width.saturating_sub(2),
-                        theme,
-                        highlights,
-                    )
-                    .lines;
-                    prefixed(
-                        lines,
-                        body,
-                        Span::styled("┃ ", bar),
-                        Span::styled("┃ ", bar),
+                    let body = rendered(
+                        markdown::render_with(
+                            answer,
+                            self.width.saturating_sub(2),
+                            theme,
+                            highlights,
+                        ),
+                        &Part::Text,
                     );
+                    out.prefixed(body, Span::styled("┃ ", bar), Span::styled("┃ ", bar));
                 }
             }
             CellKind::Summary(text) => {
                 let label = format!(" {} ", sanitize_terminal_text_inline(text));
                 let fill = usize::from(self.width).saturating_sub(label.chars().count() + 2);
-                lines.push(Line::from(vec![
-                    Span::styled("──", Style::default().fg(theme.border())),
-                    Span::styled(label, Style::default().fg(theme.muted())),
-                    Span::styled("─".repeat(fill), Style::default().fg(theme.border())),
-                ]));
+                out.push(
+                    Line::from(vec![
+                        Span::styled("──", Style::default().fg(theme.border())),
+                        Span::styled(label, Style::default().fg(theme.muted())),
+                        Span::styled("─".repeat(fill), Style::default().fg(theme.border())),
+                    ]),
+                    whole(Part::Text),
+                );
             }
         }
     }
 
-    fn tool(&self, tool: &ToolCell, depth: usize, nested: bool, lines: &mut Vec<Line<'static>>) {
+    fn tool(
+        &self,
+        tool: &ToolCell,
+        depth: usize,
+        nested: bool,
+        out: &mut Output,
+        ordinal: &mut usize,
+    ) {
+        let id = *ordinal;
+        *ordinal += 1;
         let theme = self.theme;
         let indent = "  ".repeat(depth);
         let (icon, color) = match tool.status {
@@ -891,7 +1177,7 @@ impl RenderContext<'_> {
                 muted,
             ));
         }
-        lines.push(Line::from(header));
+        out.push(Line::from(header), whole(Part::Header(id)));
         let collapsed = self.mode == DisplayMode::Collapsed;
         let inner = self
             .width
@@ -907,16 +1193,34 @@ impl RenderContext<'_> {
                 }
                 _ => Cow::Borrowed(tool.input.as_str()),
             };
-            let body = self.body(&input, tool.input_body, &tool.language, inner);
+            let mut body = self.body(
+                &input,
+                tool.input_body,
+                &tool.language,
+                inner,
+                &Part::Input(id),
+            );
+            if matches!(input, Cow::Owned(_)) {
+                for (_, source) in &mut body {
+                    *source = whole(Part::Input(id));
+                }
+            }
             let gutter = Gutter {
                 first: format!("{indent}  │ "),
                 rest: format!("{indent}  │ "),
                 style: gutter,
             };
-            self.preview(lines, body, self.limit(tool.input_body), &gutter, false);
+            self.preview(
+                out,
+                body,
+                Part::Input(id),
+                self.limit(tool.input_body),
+                &gutter,
+                false,
+            );
         }
         for child in &tool.children {
-            self.tool(child, depth + 1, true, lines);
+            self.tool(child, depth + 1, true, out, ordinal);
         }
         let output = match self.mode {
             DisplayMode::Raw if !tool.raw_output.is_empty() => tool.raw_output.as_str(),
@@ -925,20 +1229,40 @@ impl RenderContext<'_> {
         let show_output = !nested || !collapsed || tool.unsuccessful();
         if show_output && !output.trim().is_empty() {
             let body = if self.mode == DisplayMode::Raw {
-                self.body(output, ToolBody::Text, "", inner)
+                self.body(output, ToolBody::Text, "", inner, &Part::Output(id))
             } else {
-                self.body(output, tool.output_body, &tool.language, inner)
+                self.body(
+                    output,
+                    tool.output_body,
+                    &tool.language,
+                    inner,
+                    &Part::Output(id),
+                )
             };
             let gutter = Gutter {
                 first: format!("{indent}  └ "),
                 rest: format!("{indent}    "),
                 style: gutter,
             };
-            self.preview(lines, body, self.limit(tool.output_body), &gutter, true);
+            self.preview(
+                out,
+                body,
+                Part::Output(id),
+                self.limit(tool.output_body),
+                &gutter,
+                true,
+            );
         }
     }
 
-    fn body(&self, text: &str, body: ToolBody, language: &str, width: u16) -> Vec<Line<'static>> {
+    fn body(
+        &self,
+        text: &str,
+        body: ToolBody,
+        language: &str,
+        width: u16,
+        part: &Part,
+    ) -> Vec<Row> {
         let _span = tracing::info_span!(
             "tui.tool.format",
             text.bytes = text.len(),
@@ -949,12 +1273,28 @@ impl RenderContext<'_> {
         .entered();
         let text = sanitize_terminal_text(text.trim_end());
         match body {
-            ToolBody::Diff => diff::render(&text, width, self.theme),
-            ToolBody::Code => code_lines(&text, language, width),
-            ToolBody::Text => markdown::wrap_plain_preserving_whitespace(
+            ToolBody::Diff => diff::render(&text, width, self.theme)
+                .into_iter()
+                .map(|line| (line, whole(part.clone())))
+                .collect(),
+            ToolBody::Code => code_lines(&text, language, width)
+                .into_iter()
+                .map(|(line, index)| {
+                    (
+                        line,
+                        Some(Source {
+                            part: part.clone(),
+                            extent: Extent::Line(index),
+                        }),
+                    )
+                })
+                .collect(),
+            ToolBody::Text => plain(
                 &text,
                 width,
                 Style::default().fg(self.theme.muted()),
+                true,
+                part,
             ),
         }
     }
@@ -968,8 +1308,9 @@ impl RenderContext<'_> {
 
     fn preview(
         &self,
-        lines: &mut Vec<Line<'static>>,
-        body: Vec<Line<'static>>,
+        out: &mut Output,
+        body: Vec<Row>,
+        part: Part,
         preview: usize,
         gutter: &Gutter,
         tail: bool,
@@ -981,17 +1322,20 @@ impl RenderContext<'_> {
             total
         };
         let hidden = total - limit;
-        let mut shown: Vec<Line<'static>> = if tail {
+        let mut shown: Vec<Row> = if tail {
             body.into_iter().skip(hidden).collect()
         } else {
             body.into_iter().take(limit).collect()
         };
         if hidden > 0 {
-            let hint = Line::styled(
-                format!("… {hidden} more lines (ctrl+o to expand)"),
-                Style::default()
-                    .fg(self.theme.muted())
-                    .add_modifier(Modifier::ITALIC),
+            let hint = (
+                Line::styled(
+                    format!("… {hidden} more lines (ctrl+o to expand)"),
+                    Style::default()
+                        .fg(self.theme.muted())
+                        .add_modifier(Modifier::ITALIC),
+                ),
+                whole(part),
             );
             if tail {
                 shown.insert(0, hint);
@@ -999,8 +1343,7 @@ impl RenderContext<'_> {
                 shown.push(hint);
             }
         }
-        prefixed(
-            lines,
+        out.prefixed(
             shown,
             Span::styled(gutter.first.clone(), gutter.style),
             Span::styled(gutter.rest.clone(), gutter.style),
@@ -1008,7 +1351,7 @@ impl RenderContext<'_> {
     }
 }
 
-fn code_lines(text: &str, language: &str, width: u16) -> Vec<Line<'static>> {
+fn code_lines(text: &str, language: &str, width: u16) -> Vec<(Line<'static>, usize)> {
     let _span = tracing::info_span!(
         "tui.code.highlight",
         text.bytes = text.len(),
@@ -1020,13 +1363,14 @@ fn code_lines(text: &str, language: &str, width: u16) -> Vec<Line<'static>> {
     let syntax = highlight::syntax_for_token(&assets.syntaxes, language);
     let mut highlighter = HighlightLines::new(syntax, highlight::theme());
     text.lines()
-        .flat_map(|line| {
+        .enumerate()
+        .flat_map(|(index, line)| {
             highlight::wrap(
                 highlight::line(&mut highlighter, line, &assets.syntaxes),
                 width,
             )
             .into_iter()
-            .map(Line::from)
+            .map(move |spans| (Line::from(spans), index))
         })
         .collect()
 }
@@ -1074,21 +1418,134 @@ fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer) {
     }
 }
 
-fn prefixed(
-    lines: &mut Vec<Line<'static>>,
-    body: Vec<Line<'static>>,
-    first: Span<'static>,
-    rest: Span<'static>,
-) {
-    for (index, line) in body.into_iter().enumerate() {
-        let prefix = if index == 0 {
-            first.clone()
-        } else {
-            rest.clone()
+struct Selected<'a> {
+    part: &'a Part,
+    whole: bool,
+    bytes: Option<Range<usize>>,
+    lines: Option<(usize, usize)>,
+}
+
+fn raw_rows(kind: &CellKind, mode: DisplayMode, sources: &[Option<Source>]) -> String {
+    let mut selected = Vec::<Selected<'_>>::new();
+    for source in sources.iter().flatten() {
+        if selected
+            .last()
+            .is_none_or(|selected| *selected.part != source.part)
+        {
+            selected.push(Selected {
+                part: &source.part,
+                whole: false,
+                bytes: None,
+                lines: None,
+            });
+        }
+        let Some(current) = selected.last_mut() else {
+            continue;
         };
-        let mut spans = Vec::with_capacity(line.spans.len() + 1);
-        spans.push(prefix);
-        spans.extend(line.spans);
-        lines.push(Line::from(spans).style(line.style));
+        match &source.extent {
+            Extent::Whole => current.whole = true,
+            Extent::Bytes(range) => {
+                current.bytes = Some(current.bytes.as_ref().map_or(range.clone(), |bytes| {
+                    bytes.start.min(range.start)..bytes.end.max(range.end)
+                }));
+            }
+            Extent::Line(line) => {
+                current.lines = Some(current.lines.map_or((*line, *line), |(first, last)| {
+                    (first.min(*line), last.max(*line))
+                }));
+            }
+        }
     }
+    selected
+        .into_iter()
+        .filter_map(|selected| {
+            let text = part_text(kind, selected.part, mode)?;
+            if selected.whole {
+                return Some(strip_terminal_controls(text.trim_end()).into_owned());
+            }
+            let range = [
+                selected.bytes.map(|bytes| lines_around(&text, bytes)),
+                selected.lines.and_then(|(first, last)| {
+                    Some(line_range(&text, first)?.start..line_range(&text, last)?.end)
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))?;
+            Some(strip_terminal_controls(&text[range]).into_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn part_text<'a>(kind: &'a CellKind, part: &Part, mode: DisplayMode) -> Option<Cow<'a, str>> {
+    match (kind, part) {
+        (
+            CellKind::User(text)
+            | CellKind::Assistant(text)
+            | CellKind::Notice(_, text)
+            | CellKind::Summary(text)
+            | CellKind::Btw { answer: text, .. },
+            Part::Text,
+        ) => Some(Cow::Borrowed(text)),
+        (CellKind::Reasoning(text), Part::Text) => Some(Cow::Borrowed(text.trim())),
+        (CellKind::Btw { question, .. }, Part::Question) => Some(Cow::Borrowed(question)),
+        (CellKind::Tool(tool), Part::Header(index)) => nth_tool(tool, *index).map(|tool| {
+            if tool.title.is_empty() {
+                Cow::Borrowed(tool.name.as_str())
+            } else {
+                Cow::Owned(format!("{} {}", tool.name, tool.title))
+            }
+        }),
+        (CellKind::Tool(tool), Part::Input(index)) => {
+            nth_tool(tool, *index).map(|tool| Cow::Borrowed(tool.input.as_str()))
+        }
+        (CellKind::Tool(tool), Part::Output(index)) => nth_tool(tool, *index).map(|tool| {
+            Cow::Borrowed(if mode == DisplayMode::Raw && !tool.raw_output.is_empty() {
+                tool.raw_output.as_str()
+            } else {
+                tool.output.as_str()
+            })
+        }),
+        _ => None,
+    }
+}
+
+fn nth_tool(tool: &ToolCell, index: usize) -> Option<&ToolCell> {
+    fn walk<'a>(tool: &'a ToolCell, remaining: &mut usize) -> Option<&'a ToolCell> {
+        if *remaining == 0 {
+            return Some(tool);
+        }
+        *remaining -= 1;
+        tool.children
+            .iter()
+            .find_map(|child| walk(child, remaining))
+    }
+    walk(tool, &mut { index })
+}
+
+fn lines_around(text: &str, range: Range<usize>) -> Range<usize> {
+    let bytes = text.as_bytes();
+    let mut end = range.end.min(text.len());
+    let start = range.start.min(end);
+    while end > start && matches!(bytes[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    let first = memchr::memrchr2(b'\n', b'\r', &bytes[..start]).map_or(0, |index| index + 1);
+    let last = memchr::memchr2(b'\n', b'\r', &bytes[end..]).map_or(text.len(), |index| end + index);
+    first..last
+}
+
+fn line_range(text: &str, line: usize) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    for _ in 0..line {
+        start += memchr::memchr2(b'\n', b'\r', &bytes[start..])? + 1;
+        if bytes[start - 1] == b'\r' && bytes.get(start) == Some(&b'\n') {
+            start += 1;
+        }
+    }
+    let end =
+        memchr::memchr2(b'\n', b'\r', &bytes[start..]).map_or(text.len(), |index| start + index);
+    Some(start..end)
 }
