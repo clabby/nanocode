@@ -22,11 +22,9 @@ pub use web::{
 pub use workspace_files::ClaudeWorkspaceFiles;
 
 #[cfg(not(target_family = "wasm"))]
-pub mod context;
+mod context;
 #[cfg(not(target_family = "wasm"))]
 pub mod skills;
-#[cfg(not(target_family = "wasm"))]
-pub use context::{ClaudeProjectContext, ContextExcerpt, ProjectContext};
 #[cfg(not(target_family = "wasm"))]
 pub use skills::{ClaudeSkills, SkillCatalog, SkillDefinition, SkillExpansion, SkillInvocation};
 

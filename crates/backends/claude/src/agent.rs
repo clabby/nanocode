@@ -1011,7 +1011,7 @@ impl ClaudeBuilder {
                     let session = invocation.session_environment();
                     host_reply(
                         files
-                            .execute_output_in_session(&name, input, true, Some(session))
+                            .execute_output_in_session(&name, input, Some(session))
                             .await?,
                     )
                 }
@@ -1529,6 +1529,7 @@ impl ClaudeBuilder {
             round_boundary: std::sync::RwLock::new(round_boundary),
             side_view: std::sync::RwLock::new(None),
             environment: std::sync::OnceLock::new(),
+            project_instructions: std::sync::OnceLock::new(),
             boundary_stale: AtomicBool::new(false),
             policy: self.policy,
             admission: Mutex::new(()),
@@ -2721,6 +2722,7 @@ struct State {
     side_view: std::sync::RwLock<Option<Arc<Vec<Message>>>>,
 
     environment: std::sync::OnceLock<String>,
+    project_instructions: std::sync::OnceLock<Option<String>>,
 
     boundary_stale: AtomicBool,
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
@@ -3662,21 +3664,30 @@ impl State {
         let environment = self
             .environment
             .get_or_init(|| crate::environment::environment_section(&self.workspace()));
-        if let Some(resolve) = &self.system_resolver {
-            return Some(json!(format!(
-                "{}\n\n{environment}",
-                resolve(&self.session_id)
-            )));
-        }
-        if let Some(blocks) = &self.system_blocks {
+        let instructions = self
+            .project_instructions
+            .get_or_init(|| crate::environment::project_instructions(&self.workspace()));
+        if let Some(blocks) = &self.system_blocks
+            && self.system_resolver.is_none()
+        {
             let mut blocks = blocks.clone();
             blocks.push(json!({"type": "text", "text": environment}));
+            if let Some(instructions) = instructions {
+                blocks.push(json!({"type": "text", "text": instructions}));
+            }
             return Some(json!(blocks));
         }
+        let context = match instructions {
+            Some(instructions) => format!("{environment}\n\n{instructions}"),
+            None => environment.clone(),
+        };
+        if let Some(resolve) = &self.system_resolver {
+            return Some(json!(format!("{}\n\n{context}", resolve(&self.session_id))));
+        }
         Some(json!(if self.system.is_empty() {
-            environment.clone()
+            context
         } else {
-            format!("{}\n\n{environment}", self.system)
+            format!("{}\n\n{context}", self.system)
         }))
     }
 

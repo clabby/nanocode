@@ -16,6 +16,41 @@ pub(crate) fn environment_section(workspace: &str) -> String {
 }
 
 #[cfg(not(target_family = "wasm"))]
+pub(crate) fn project_instructions(workspace: &str) -> Option<String> {
+    if workspace.is_empty() {
+        return None;
+    }
+    let global = nanocode_home::AgentHome::from_env()
+        .ok()
+        .map(|home| home.global_instructions());
+    let project = nanocode_home::ProjectHome::discover(workspace).read_instructions();
+    for diagnostic in global
+        .iter()
+        .flat_map(|global| &global.diagnostics)
+        .chain(&project.diagnostics)
+        .filter(|diagnostic| matches!(diagnostic.level, nanocode_home::Level::Warning))
+    {
+        tracing::warn!(
+            path = %diagnostic.path.display(),
+            message = %diagnostic.message,
+            "instruction file skipped"
+        );
+    }
+    let text = nanocode_home::combine_instructions(
+        global.and_then(|global| global.combined()).as_deref(),
+        project.combined().as_deref(),
+    )?;
+    Some(format!(
+        "# AGENTS.md instructions for {workspace}\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>"
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) const fn project_instructions(_workspace: &str) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn is_git_repository(workspace: &str) -> bool {
     std::path::Path::new(workspace)
         .ancestors()

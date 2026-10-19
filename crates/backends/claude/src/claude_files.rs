@@ -59,7 +59,7 @@ impl Tool for ClaudeFileTool {
             .as_ref()
             .clone()
             .with_read_token_budget(context.output_token_budget())
-            .execute_output_in_session(&self.name, input, true, self.session.clone())
+            .execute_output_in_session(&self.name, input, self.session.clone())
             .await
         {
             Ok(output) => output,

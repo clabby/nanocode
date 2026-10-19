@@ -3,8 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use super::agents_md::{combine_instructions, load_global_instructions, load_instructions};
+use super::agents_md::{load_global_instructions, load_instructions};
 use crate::{NanocodeError, Result};
+use nanocode_home::combine_instructions;
 
 #[derive(Clone, Default)]
 pub(crate) struct ContextSourceConfig {

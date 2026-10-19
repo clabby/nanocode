@@ -20,6 +20,7 @@ pub use agents::{
 };
 pub use instructions::{
     GlobalInstructions, InstructionKind, InstructionSource, MAX_INSTRUCTION_FILE_BYTES,
+    PROJECT_DOC_SEPARATOR, combine_instructions,
 };
 pub use project::{InstructionFile, ProjectHome, ProjectInstructions};
 pub use session_environment::SessionEnvironment;

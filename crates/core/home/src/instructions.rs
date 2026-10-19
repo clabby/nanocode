@@ -61,6 +61,17 @@ impl GlobalInstructions {
     }
 }
 
+pub const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
+
+#[must_use]
+pub fn combine_instructions(global: Option<&str>, project: Option<&str>) -> Option<String> {
+    match (global, project) {
+        (Some(global), Some(project)) => Some(format!("{global}{PROJECT_DOC_SEPARATOR}{project}")),
+        (Some(text), None) | (None, Some(text)) => Some(text.to_owned()),
+        (None, None) => None,
+    }
+}
+
 pub(crate) fn combine(sources: &[InstructionSource]) -> Option<String> {
     (!sources.is_empty()).then(|| {
         sources

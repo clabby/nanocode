@@ -7,9 +7,6 @@ use nanocode_tui::{
 };
 use serde_json::Value;
 
-const WORKSPACE_CONTEXT: &str =
-    "\nWorkspace context (guidance only; does not expand tool authority):";
-
 const ROUTED_TOOLS: [&str; 6] = [
     "exec_command",
     "write_stdin",
@@ -617,9 +614,7 @@ fn outcome(name: &str, payload: &Value) -> Outcome {
         details: Vec::new(),
         status: None,
     };
-    let body = raw
-        .split_once(WORKSPACE_CONTEXT)
-        .map_or(raw.as_str(), |(body, _)| body);
+    let body = raw.as_str();
     match name {
         "exec_command" | "write_stdin" => {
             let shell = if structured.get("output").is_some() {

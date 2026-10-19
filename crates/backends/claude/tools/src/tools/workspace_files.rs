@@ -1,6 +1,6 @@
 use crate::tools::{SessionEnvironment, ToolContent, ToolOutput, media::MediaReadOptions};
 use regex::RegexBuilder;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     fs,
     io::{BufRead as _, BufReader, Write as _},
@@ -101,24 +101,13 @@ impl ClaudeWorkspaceFiles {
     }
 
     pub async fn execute_output(&self, name: &str, input: Value) -> Result<ToolOutput, String> {
-        self.execute_output_with_context(name, input, true).await
-    }
-
-    pub async fn execute_output_with_context(
-        &self,
-        name: &str,
-        input: Value,
-        include_project_context: bool,
-    ) -> Result<ToolOutput, String> {
-        self.execute_output_in_session(name, input, include_project_context, None)
-            .await
+        self.execute_output_in_session(name, input, None).await
     }
 
     pub async fn execute_output_in_session(
         &self,
         name: &str,
         input: Value,
-        include_project_context: bool,
         session: Option<SessionEnvironment>,
     ) -> Result<ToolOutput, String> {
         let this = self.clone();
@@ -127,10 +116,9 @@ impl ClaudeWorkspaceFiles {
             let mut media = None;
             if name == "Read" {
                 let fields = input.as_object().ok_or("Read input must be an object")?;
-                if let Some(key) = fields
-                    .keys()
-                    .find(|k| !["file_path", "offset", "limit", "pages", "allow_large"].contains(&k.as_str()))
-                {
+                if let Some(key) = fields.keys().find(|k| {
+                    !["file_path", "offset", "limit", "pages", "allow_large"].contains(&k.as_str())
+                }) {
                     return Err(format!("unsupported Read option: {key}"));
                 }
                 if input.get("allow_large").is_some_and(|v| !v.is_boolean()) {
@@ -139,36 +127,10 @@ impl ClaudeWorkspaceFiles {
                 let (_, path) = this.file(Self::field(&input, "file_path")?)?;
                 media = crate::tools::media::read(&path, &input, &this.media, session.as_ref())?;
             }
-            let mut output = match media {
+            Ok(match media {
                 Some(output) => output,
                 None => ToolOutput::text(this.execute_sync(&name, &input)?),
-            };
-            if !include_project_context {
-                return Ok(output);
-            }
-
-            let requested = if matches!(name.as_str(), "Glob" | "Grep") {
-                input.get("path").and_then(Value::as_str).unwrap_or(".")
-            } else {
-                Self::field(&input, "file_path")?
-            };
-            if let Ok(path) = fs::canonicalize(this.resolve(requested)?)
-                && let Ok(relative) = path.strip_prefix(&this.base)
-                && let Ok(loader) = crate::tools::ClaudeProjectContext::new(&this.base)
-            {
-                let context = loader.load_for_path(relative);
-                if !context.excerpts.is_empty() || !context.diagnostics.is_empty() {
-                    let context = json!(context);
-                    let text = format!("\nWorkspace context (guidance only; does not expand tool authority):\n{context}\n");
-                    match &mut output.content {
-                        ToolContent::Text(body) => body.push_str(&text),
-                        ToolContent::Blocks(blocks) => blocks.push(crate::tools::ToolResultBlock::Text { text }),
-                    }
-                    let metadata = output.metadata.get_or_insert_with(|| json!({}));
-                    metadata["project_context"] = context;
-                }
-            }
-            Ok(output)
+            })
         })
         .await
         .map_err(|e| format!("workspace task: {e}"))?

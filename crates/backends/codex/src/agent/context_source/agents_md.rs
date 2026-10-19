@@ -1,9 +1,7 @@
 use std::{path::Path, sync::Arc};
 
-use nanocode_home::{AgentHome, Convention, Diagnostic, Level, ProjectHome};
+use nanocode_home::{AgentHome, Convention, Diagnostic, Level, ProjectHome, combine_instructions};
 use tracing::warn;
-
-const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 
 pub(crate) fn load_global_instructions(
     nanocode_home: Option<&Path>,
@@ -37,18 +35,6 @@ pub(super) fn load_instructions(
         global_instructions,
         load_project_instructions(workspace).as_deref(),
     )
-}
-
-pub(super) fn combine_instructions(
-    global_instructions: Option<&str>,
-    project_instructions: Option<&str>,
-) -> Option<String> {
-    match (global_instructions, project_instructions) {
-        (Some(global), Some(project)) => Some(format!("{global}{PROJECT_DOC_SEPARATOR}{project}")),
-        (Some(global), None) => Some(global.to_owned()),
-        (None, Some(project)) => Some(project.to_owned()),
-        (None, None) => None,
-    }
 }
 
 fn load_project_instructions(workspace: &Path) -> Option<String> {
