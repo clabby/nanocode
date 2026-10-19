@@ -577,7 +577,7 @@ impl ClaudeBuilder {
             automatic_cache: true,
             cache_one_hour: false,
             adaptive_thinking: false,
-            keep_thinking: false,
+            keep_thinking: true,
             fast_mode: false,
             message_diagnostics: false,
             context_window_tokens,
@@ -774,7 +774,7 @@ impl ClaudeBuilder {
         self.thinking_disabled = stored.thinking_disabled;
         self.automatic_cache |= stored.automatic_cache;
         self.cache_one_hour |= stored.cache_one_hour;
-        self.keep_thinking = stored.keep_thinking;
+        self.keep_thinking |= stored.keep_thinking;
         self.fast_mode = stored.fast_mode;
         self.message_diagnostics = stored.message_diagnostics;
         self.context_window_tokens = stored.context_window_tokens;
@@ -3900,6 +3900,10 @@ impl State {
         .then(|| json!({"type":"adaptive","display":"summarized"}))
     }
     fn request_template(&self, speed: Option<crate::Speed>) -> MessagesRequest {
+        let thinking = self.thinking_config();
+        let thinks = thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking["type"] != "disabled");
         let mut request = MessagesRequest {
             model: self.model(),
             max_tokens: self.max_tokens.unwrap_or_else(|| {
@@ -3914,9 +3918,8 @@ impl State {
             output_config: self.effort().map(|effort| crate::OutputConfig { effort }),
             speed,
             tool_choice: None,
-            thinking: self.thinking_config(),
-            context_management: self
-                .keep_thinking
+            thinking,
+            context_management: (self.keep_thinking && thinks)
                 .then(|| json!({"edits":[{"type":"clear_thinking_20251015","keep":"all"}]})),
             diagnostics: self
                 .message_diagnostics
