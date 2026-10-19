@@ -266,6 +266,7 @@ pub struct App {
     pub overlay: Option<Overlay>,
     pub tree: AgentTree,
     pub show_tree: bool,
+    pub show_panel: bool,
     pub theme: Theme,
     pub status: Option<(String, Instant)>,
     pub starting: bool,
@@ -339,6 +340,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         overlay: None,
         tree: AgentTree::default(),
         show_tree: true,
+        show_panel: true,
         theme: Theme::default(),
         status: None,
         starting: true,
@@ -2101,7 +2103,10 @@ impl App {
             KeyCode::Tab
                 if self.composer.text().starts_with('/') && !self.composer.text().contains(' ') =>
             {
-                if let Some(command) = crate::commands::complete(self.composer.text()) {
+                if let Some(command) = crate::commands::complete(
+                    self.composer.text(),
+                    self.host.config.clients.panel_command(),
+                ) {
                     self.composer.set_text(format!("{command} "));
                 }
             }
@@ -2434,6 +2439,15 @@ impl App {
             "resume" | "sessions" => self.open_session_picker(),
             "new" | "clear" => self.new_session(),
             "agents" => self.agents_command(argument),
+            name if self
+                .host
+                .config
+                .clients
+                .panel_command()
+                .is_some_and(|(command, _)| command.strip_prefix('/') == Some(name)) =>
+            {
+                self.show_panel = !self.show_panel;
+            }
             "stop" | "stop-agent" => self.stop_command(argument),
             "compact" => self.compact(),
             "runner" => self.runner_command(argument),

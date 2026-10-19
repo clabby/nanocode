@@ -23,6 +23,50 @@ pub struct ModelClients {
     warm_up: Option<std::sync::Arc<dyn Fn() -> WarmUp + Send + Sync>>,
     status: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     notices: Option<std::sync::Arc<dyn Fn() -> Notices + Send + Sync>>,
+    panel: Option<PanelSource>,
+}
+
+#[derive(Clone)]
+struct PanelSource {
+    command: &'static str,
+    about: &'static str,
+    panel: std::sync::Arc<dyn Fn() -> Option<Panel> + Send + Sync>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Panel {
+    pub title: String,
+    pub rows: Vec<Vec<String>>,
+}
+
+impl Panel {
+    pub(crate) fn widths(&self) -> Vec<usize> {
+        let mut widths = Vec::new();
+        for row in &self.rows {
+            widths.resize(widths.len().max(row.len()), 0);
+            for (width, cell) in widths.iter_mut().zip(row) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+        widths
+    }
+
+    pub(crate) fn aligned(&self) -> Vec<Vec<String>> {
+        let widths = self.widths();
+        self.rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .zip(&widths)
+                    .enumerate()
+                    .map(|(column, (cell, width))| match column {
+                        0 => format!("{cell:<width$}"),
+                        _ => format!("{cell:>width$}"),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
 }
 
 impl ModelClients {
@@ -100,6 +144,31 @@ impl ModelClients {
     {
         self.notices = Some(std::sync::Arc::new(move || Box::pin(notices()) as Notices));
         self
+    }
+
+    #[must_use]
+    pub fn panel(
+        mut self,
+        command: &'static str,
+        about: &'static str,
+        panel: impl Fn() -> Option<Panel> + Send + Sync + 'static,
+    ) -> Self {
+        self.panel = Some(PanelSource {
+            command,
+            about,
+            panel: std::sync::Arc::new(panel),
+        });
+        self
+    }
+
+    pub(crate) fn panel_command(&self) -> Option<(&'static str, &'static str)> {
+        self.panel
+            .as_ref()
+            .map(|source| (source.command, source.about))
+    }
+
+    pub(crate) fn render_panel(&self) -> Option<Panel> {
+        self.panel.as_ref().and_then(|source| (source.panel)())
     }
 
     pub(crate) fn notifying(&self) -> Option<Notices> {

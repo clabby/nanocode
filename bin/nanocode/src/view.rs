@@ -241,14 +241,29 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
     } else {
         u16::try_from(tree_lines.len() + 1).unwrap_or(u16::MAX)
     };
+    let panel_lines = app
+        .show_panel
+        .then(|| app.host.config.clients.render_panel())
+        .flatten()
+        .map(|panel| panel_lines(app, &panel, &theme))
+        .unwrap_or_default();
+    let panel_height = u16::try_from(panel_lines.len()).unwrap_or(u16::MAX);
     let queue_height = u16::try_from(queue_lines.len()).unwrap_or(u16::MAX);
-    let fixed = [tree_height, queue_height, 1, composer_height, 1]
-        .into_iter()
-        .try_fold(0_u16, u16::checked_add)
-        .filter(|fixed| *fixed < area.height);
+    let fixed = [
+        tree_height,
+        panel_height,
+        queue_height,
+        1,
+        composer_height,
+        1,
+    ]
+    .into_iter()
+    .try_fold(0_u16, u16::checked_add)
+    .filter(|fixed| *fixed < area.height);
     let [
         transcript_area,
         tree_area,
+        panel_area,
         queue_area,
         status_area,
         composer_area,
@@ -259,6 +274,7 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
             [
                 area.height - fixed,
                 tree_height,
+                panel_height,
                 queue_height,
                 1,
                 composer_height,
@@ -268,6 +284,7 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
         None => Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(tree_height),
+            Constraint::Length(panel_height),
             Constraint::Length(queue_height),
             Constraint::Length(1),
             Constraint::Length(composer_height),
@@ -314,6 +331,7 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
         );
         Paragraph::new(lines).render(tree_area, buffer);
     }
+    Paragraph::new(panel_lines).render(panel_area, buffer);
     Paragraph::new(queue_lines).render(queue_area, buffer);
     let status = status_line(app, now, &mut animation);
     animation
@@ -355,6 +373,36 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
         frame.spinner(position);
     }
     app.clock_deadline = animation.until;
+}
+
+fn panel_lines(app: &App, panel: &crate::host::Panel, theme: &Theme) -> Vec<Line<'static>> {
+    let hide = app
+        .host
+        .config
+        .clients
+        .panel_command()
+        .map_or_else(String::new, |(command, _)| format!(" · {command} to hide"));
+    let mut lines = vec![Line::styled(
+        format!("{}{hide}", panel.title),
+        Style::default()
+            .fg(theme.muted())
+            .add_modifier(Modifier::BOLD),
+    )];
+    lines.extend(panel.aligned().into_iter().map(|row| {
+        let mut spans = vec![Span::raw("  ")];
+        for (column, cell) in row.into_iter().enumerate() {
+            if column > 0 {
+                spans.push(Span::raw("  "));
+            }
+            let color = match column {
+                0 => theme.text(),
+                _ => theme.muted(),
+            };
+            spans.push(Span::styled(cell, Style::default().fg(color)));
+        }
+        Line::from(spans)
+    }));
+    lines
 }
 
 fn stack<const N: usize>(area: Rect, heights: [u16; N]) -> [Rect; N] {
@@ -533,7 +581,7 @@ fn command_popup(app: &App, composer_area: Rect, transcript_area: Rect, frame: &
     let matches = if text.contains(' ') {
         app.agent_argument_candidates(text).unwrap_or_default()
     } else {
-        crate::commands::matching(text)
+        crate::commands::matching(text, app.host.config.clients.panel_command())
             .map(|(command, description)| (command.to_owned(), description.to_owned()))
             .collect::<Vec<_>>()
     };

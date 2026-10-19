@@ -106,13 +106,17 @@ pub enum RunnerAction {
     StopListening,
 }
 
-pub fn matching(prefix: &str) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+pub fn matching<'a>(
+    prefix: &'a str,
+    extra: Option<(&'static str, &'static str)>,
+) -> impl Iterator<Item = (&'static str, &'static str)> + 'a {
     COMMANDS
         .iter()
         .copied()
+        .chain(extra)
         .filter(move |(command, _)| command.starts_with(prefix))
 }
 
-pub fn complete(prefix: &str) -> Option<&'static str> {
-    matching(prefix).next().map(|(command, _)| command)
+pub fn complete(prefix: &str, extra: Option<(&'static str, &'static str)>) -> Option<&'static str> {
+    matching(prefix, extra).next().map(|(command, _)| command)
 }

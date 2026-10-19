@@ -33,7 +33,7 @@ use crate::{
     host::{Host, HostConfig, Result},
 };
 
-pub use host::ModelClients;
+pub use host::{ModelClients, Panel};
 
 const TELEMETRY_SHUTDOWN: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -424,6 +424,12 @@ async fn exec(args: SessionArgs, clients: ModelClients) -> Result<()> {
     let mut stderr = std::io::stderr();
     if let Some(status) = host.config.clients.describe() {
         drop(writeln!(stderr, "{status}"));
+    }
+    if let Some(panel) = host.config.clients.render_panel() {
+        drop(writeln!(stderr, "{}", panel.title));
+        for row in panel.aligned() {
+            drop(writeln!(stderr, "  {}", row.join("  ").trim_end()));
+        }
     }
     drop(writeln!(stderr, "session {}", agent.session_id()));
     let flushed = agent.flush().await;
