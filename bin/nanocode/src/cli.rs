@@ -347,4 +347,7 @@ pub struct SessionsArgs {
 
     #[arg(long, help = "Include sessions from every workspace")]
     pub all: bool,
+
+    #[arg(help = "Print this session's user and assistant messages instead of listing sessions")]
+    pub session: Option<String>,
 }

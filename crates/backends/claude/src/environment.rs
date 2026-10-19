@@ -101,7 +101,7 @@ fn session_store_line() -> Option<String> {
     let store = home.nanocode_home();
     store.join("sessions.jsonl").is_file().then(|| {
         format!(
-            "Nanocode sessions: {} (find one by ID with `nc sessions --all`; sessions.jsonl is too large to search directly)",
+            "Nanocode sessions: {} (list them with `nc sessions --all`; print one's conversation with `nc sessions <ID>`)",
             store.display()
         )
     })

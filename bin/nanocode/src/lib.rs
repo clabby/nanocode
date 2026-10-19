@@ -26,7 +26,7 @@ use std::{
 
 use clap::Parser;
 use futures_util::StreamExt;
-use nanocode::{ModelSelection, ServiceTier, Thinking};
+use nanocode::{ModelSelection, ServiceTier, Thinking, durability::TranscriptItem};
 
 use crate::{
     cli::{Cli, Command, HandArgs, HarnessArg, SessionArgs, SessionsArgs},
@@ -406,6 +406,17 @@ async fn stream_turn(mut turn: nanocode::agent::Turn, answers: impl Write) -> Re
 async fn list_sessions(args: SessionsArgs) -> Result<()> {
     let home = host::home_dir(args.home.as_deref())?;
     let store = host::open_store(&home).await?;
+    if let Some(id) = &args.session {
+        for item in store.load(id).await?.transcript {
+            match item {
+                TranscriptItem::User(text) => println!("## user\n{text}\n"),
+                TranscriptItem::Assistant(text) => println!("## assistant\n{text}\n"),
+                _ => {}
+            }
+        }
+        store.flush().await?;
+        return Ok(());
+    }
     let workspace = std::env::current_dir()?;
     for session in store.list().await? {
         let record = &session.record;
