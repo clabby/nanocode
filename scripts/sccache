@@ -20,19 +20,14 @@ if [ -z "${SCCACHE_SERVER_PORT:-}${SCCACHE_SERVER_UDS:-}" ]; then
   export SCCACHE_SERVER_UDS
 fi
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || ulimit -n "$(sysctl -n kern.maxfilesperproc)" 2>/dev/null
-cached() {
-  exec env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS "$sccache" "$@"
-}
-case $1 in
-  *rustc) ;;
-  *) cached "$@" ;;
-esac
-unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR
 if command -v shasum >/dev/null 2>&1; then
   sum="shasum -a 256"
 else
   sum=sha256sum
 fi
+cached() {
+  exec env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS "$sccache" "$@"
+}
 publish() {
   ln -sn "$1" "$2" 2>/dev/null || rm -rf "$1"
 }
@@ -41,6 +36,87 @@ relocate() {
   to=$(printf '%s' "$2" | sed 's/[\&#]/\\&/g')
   sed "s#$from#$to#g"
 }
+preprocess() {
+  skip=
+  for arg do
+    shift
+    if [ -n "$skip" ]; then
+      skip=
+      continue
+    fi
+    case $arg in
+      -o) skip=1 && continue ;;
+      -c) arg=-E ;;
+    esac
+    set -- "$@" "$arg"
+  done
+  "$@"
+}
+compile_c() {
+  object= source= compile= previous= optimize=-O0
+  for arg do
+    case $previous in
+      -o) object=$arg ;;
+      -c) source=$arg ;;
+    esac
+    case $arg in
+      -E | -M* | -o?* | @* | -) return ;;
+      -c) compile=1 ;;
+      -O*) optimize=$arg ;;
+    esac
+    previous=$arg
+  done
+  [ "$optimize" = -O0 ] && exec "$@"
+  case $source in
+    "" | -*) return ;;
+  esac
+  [ -n "$compile" ] && [ -n "$object" ] || return
+  expanded=$(mktemp "${TMPDIR:-/tmp}/cc-expanded.XXXXXX")
+  if ! preprocess "$@" > "$expanded" 2>/dev/null; then
+    rm -f "$expanded"
+    return
+  fi
+  key=$( {
+    echo nanocode-c-cache-1 "-ffile-prefix-map=<out>=."
+    "$1" --version 2>&1
+    pwd
+    printf '%s\n' "$@" | grep -vxF -e -o -e "$object" | relocate "$OUT_DIR" "<out>"
+    env | LC_ALL=C sort | grep -E '^(MACOSX_DEPLOYMENT_TARGET|SDKROOT|CPATH|C_INCLUDE_PATH|CPLUS_INCLUDE_PATH|OBJC_INCLUDE_PATH)='
+    relocate "$OUT_DIR" "<out>" < "$expanded"
+  } | $sum)
+  rm -f "$expanded"
+  entry=$cache/c/${key%% *}
+  if [ -f "$entry.o" ]; then
+    rm -f "$object"
+    cp -c "$entry.o" "$object" 2>/dev/null || cp "$entry.o" "$object" || exit 1
+    touch "$object"
+    cat "$entry.err" >&2 2>/dev/null
+    exit 0
+  fi
+  errors=$(mktemp "${TMPDIR:-/tmp}/cc-stderr.XXXXXX")
+  "$@" "-ffile-prefix-map=$OUT_DIR=." 2> "$errors"
+  status=$?
+  cat "$errors" >&2
+  if [ $status -eq 0 ]; then
+    mkdir -p "$cache/c"
+    staging=$(mktemp "$cache/c/.staging.XXXXXX")
+    if cp "$errors" "$entry.err" && cp "$object" "$staging"; then
+      mv -f "$staging" "$entry.o"
+    else
+      rm -f "$staging"
+    fi
+  fi
+  rm -f "$errors"
+  exit $status
+}
+case $1 in
+  *rustc) ;;
+  *)
+    [ -n "${OUT_DIR:-}" ] && compile_c "$@"
+    cached "$@"
+    ;;
+esac
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR
 stable() {
   stable_dir=
   listing=$(cd "$1" && find . | LC_ALL=C sort && find . -type f -exec $sum {} + | LC_ALL=C sort) || return
