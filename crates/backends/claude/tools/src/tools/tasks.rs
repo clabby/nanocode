@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
+
+use nanocode_sync::Atom;
 
 const MAX_TASKS: usize = 256;
 const MAX_TODOS: usize = 256;
@@ -26,7 +28,7 @@ struct Task {
     blocked_by: BTreeSet<String>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
     next_id: u64,
@@ -43,7 +45,7 @@ struct Checkpoint {
 
 #[derive(Clone, Default, Debug)]
 pub struct ClaudeTasks {
-    state: Arc<Mutex<State>>,
+    state: Arc<Atom<State>>,
 }
 
 impl ClaudeTasks {
@@ -53,8 +55,7 @@ impl ClaudeTasks {
     }
 
     pub fn snapshot(&self) -> Result<Value, String> {
-        let state = self.state.lock().map_err(|_| "task board lock poisoned")?;
-        Ok(json!({"version":1,"state":&*state}))
+        Ok(json!({"version":1,"state":&*self.state.get()}))
     }
 
     pub fn restore(&self, checkpoint: Value) -> Result<(), String> {
@@ -64,7 +65,7 @@ impl ClaudeTasks {
             return Err("unsupported task checkpoint version".into());
         }
         validate_state(&checkpoint.state)?;
-        *self.state.lock().map_err(|_| "task board lock poisoned")? = checkpoint.state;
+        self.state.set(checkpoint.state);
         Ok(())
     }
 
@@ -130,46 +131,43 @@ impl ClaudeTasks {
         let description = required_text(fields, "description")?.to_owned();
         let active_form = optional_text(fields, "activeForm")?.map(str::to_owned);
         let metadata = metadata(fields)?.unwrap_or_default();
-        let mut state = self.state.lock().map_err(|_| "task board lock poisoned")?;
-        if state.tasks.len() >= MAX_TASKS {
-            return Err("session task limit reached".into());
-        }
-        let next_id = state
-            .next_id
-            .checked_add(1)
-            .ok_or("task ID limit reached")?;
-        let id = next_id.to_string();
-        let task = Task {
-            id: id.clone(),
-            subject: subject.clone(),
-            description,
-            active_form,
-            status: "pending".into(),
-            owner: None,
-            metadata,
-            blocks: BTreeSet::new(),
-            blocked_by: BTreeSet::new(),
-        };
+        self.state.modify(|state| {
+            if state.tasks.len() >= MAX_TASKS {
+                return Err("session task limit reached".into());
+            }
+            let next_id = state
+                .next_id
+                .checked_add(1)
+                .ok_or("task ID limit reached")?;
+            let id = next_id.to_string();
+            let task = Task {
+                id: id.clone(),
+                subject: subject.clone(),
+                description: description.clone(),
+                active_form: active_form.clone(),
+                status: "pending".into(),
+                owner: None,
+                metadata: metadata.clone(),
+                blocks: BTreeSet::new(),
+                blocked_by: BTreeSet::new(),
+            };
 
-        let result = json!({"task":{"id":id,"subject":subject}});
-        ensure_output(&result)?;
-        let mut tasks = state.tasks.clone();
-        tasks.insert(id, task);
-        ensure_readable(&tasks)?;
-        state.tasks = tasks;
-        state.next_id = next_id;
-        Ok(result)
+            let result = json!({"task":{"id":id,"subject":subject}});
+            ensure_output(&result)?;
+            state.tasks.insert(id, task);
+            ensure_readable(&state.tasks)?;
+            state.next_id = next_id;
+            Ok(result)
+        })
     }
 
     fn get(&self, fields: &Map<String, Value>) -> Result<Value, String> {
         let id = required_text(fields, "taskId")?;
-        let state = self.state.lock().map_err(|_| "task board lock poisoned")?;
-        Ok(task_result(state.tasks.get(id)))
+        Ok(self.state.read(|state| task_result(state.tasks.get(id))))
     }
 
     fn list(&self) -> Result<Value, String> {
-        let state = self.state.lock().map_err(|_| "task board lock poisoned")?;
-        Ok(list_result(&state.tasks))
+        Ok(self.state.read(|state| list_result(&state.tasks)))
     }
 
     fn update(&self, fields: &Map<String, Value>) -> Result<Value, String> {
@@ -187,124 +185,125 @@ impl ClaudeTasks {
         let blocks = id_list(fields, "addBlocks")?;
         let blocked_by = id_list(fields, "addBlockedBy")?;
         let changes = metadata(fields)?;
-        let mut state = self.state.lock().map_err(|_| "task board lock poisoned")?;
-        let original = state.tasks.get(&id).ok_or("task not found")?;
-        let old_status = original.status.clone();
-        if status == Some("deleted") {
-            if fields.keys().any(|key| key != "taskId" && key != "status") {
-                return Err("deleted status cannot be combined with other changes".into());
+        self.state.modify(|state| {
+            let original = state.tasks.get(&id).ok_or("task not found")?;
+            let old_status = original.status.clone();
+            if status == Some("deleted") {
+                if fields.keys().any(|key| key != "taskId" && key != "status") {
+                    return Err("deleted status cannot be combined with other changes".into());
+                }
+                let result = json!({"success":true,"taskId":id,"updatedFields":["status"],"statusChange":{"from":old_status,"to":"deleted"}});
+                ensure_output(&result)?;
+                state.tasks.remove(&id);
+                for task in state.tasks.values_mut() {
+                    task.blocks.remove(&id);
+                    task.blocked_by.remove(&id);
+                }
+                return Ok(result);
             }
-            let result = json!({"success":true,"taskId":id,"updatedFields":["status"],"statusChange":{"from":old_status,"to":"deleted"}});
-            ensure_output(&result)?;
-            state.tasks.remove(&id);
-            for task in state.tasks.values_mut() {
-                task.blocks.remove(&id);
-                task.blocked_by.remove(&id);
-            }
-            return Ok(result);
-        }
 
-        let mut candidate = original.clone();
-        let mut updated_fields = Vec::new();
-        for (key, value) in [
-            ("subject", subject),
-            ("description", description),
-            ("activeForm", active_form),
-            ("owner", owner),
-        ] {
-            if let Some(value) = value {
-                match key {
-                    "subject" => candidate.subject = value.to_owned(),
-                    "description" => candidate.description = value.to_owned(),
-                    "activeForm" => candidate.active_form = Some(value.to_owned()),
-                    "owner" => candidate.owner = Some(value.to_owned()),
-                    _ => unreachable!(),
-                }
-                updated_fields.push(key);
-            }
-        }
-        if let Some(status) = status {
-            candidate.status = status.into();
-            updated_fields.push("status");
-        }
-        if let Some(changes) = changes {
-            for (key, value) in changes {
-                if value.is_null() {
-                    candidate.metadata.remove(&key);
-                } else {
-                    candidate.metadata.insert(key, value);
+            let mut candidate = original.clone();
+            let mut updated_fields = Vec::new();
+            for (key, value) in [
+                ("subject", subject),
+                ("description", description),
+                ("activeForm", active_form),
+                ("owner", owner),
+            ] {
+                if let Some(value) = value {
+                    match key {
+                        "subject" => candidate.subject = value.to_owned(),
+                        "description" => candidate.description = value.to_owned(),
+                        "activeForm" => candidate.active_form = Some(value.to_owned()),
+                        "owner" => candidate.owner = Some(value.to_owned()),
+                        _ => unreachable!(),
+                    }
+                    updated_fields.push(key);
                 }
             }
-            if serde_json::to_vec(&candidate.metadata)
-                .map_err(|e| e.to_string())?
-                .len()
-                > MAX_METADATA
+            if let Some(status) = status {
+                candidate.status = status.into();
+                updated_fields.push("status");
+            }
+            if let Some(changes) = &changes {
+                for (key, value) in changes {
+                    if value.is_null() {
+                        candidate.metadata.remove(key);
+                    } else {
+                        candidate.metadata.insert(key.clone(), value.clone());
+                    }
+                }
+                if serde_json::to_vec(&candidate.metadata)
+                    .map_err(|e| e.to_string())?
+                    .len()
+                    > MAX_METADATA
+                {
+                    return Err("task metadata exceeds 16 KiB".into());
+                }
+                updated_fields.push("metadata");
+            }
+            let mut edges = Vec::new();
+            if fields.contains_key("addBlocks") {
+                updated_fields.push("addBlocks");
+            }
+            if fields.contains_key("addBlockedBy") {
+                updated_fields.push("addBlockedBy");
+            }
+            for target in &blocks {
+                edges.push((id.clone(), target.clone()));
+            }
+            for source in &blocked_by {
+                edges.push((source.clone(), id.clone()));
+            }
+            for (source, target) in &edges {
+                if source == target {
+                    return Err("task cannot depend on itself".into());
+                }
+                if !state.tasks.contains_key(source) || !state.tasks.contains_key(target) {
+                    return Err("dependency task not found".into());
+                }
+            }
+
+            let mut adjacency: BTreeMap<String, BTreeSet<String>> = state
+                .tasks
+                .iter()
+                .map(|(id, task)| (id.clone(), task.blocks.clone()))
+                .collect();
+            for (source, target) in &edges {
+                adjacency
+                    .get_mut(source)
+                    .expect("validated source")
+                    .insert(target.clone());
+            }
+            if has_cycle(&adjacency) {
+                return Err("dependency cycle".into());
+            }
+            let mut result = json!({"success":true,"taskId":id,"updatedFields":updated_fields});
+            if let Some(status) = status
+                && status != old_status
             {
-                return Err("task metadata exceeds 16 KiB".into());
+                result["statusChange"] = json!({"from":old_status,"to":status});
             }
-            updated_fields.push("metadata");
-        }
-        let mut edges = Vec::new();
-        if fields.contains_key("addBlocks") {
-            updated_fields.push("addBlocks");
-        }
-        if fields.contains_key("addBlockedBy") {
-            updated_fields.push("addBlockedBy");
-        }
-        for target in blocks {
-            edges.push((id.clone(), target));
-        }
-        for source in blocked_by {
-            edges.push((source, id.clone()));
-        }
-        for (source, target) in &edges {
-            if source == target {
-                return Err("task cannot depend on itself".into());
+            ensure_output(&result)?;
+            state.tasks.insert(id.clone(), candidate);
+            for (source, target) in edges {
+                state
+                    .tasks
+                    .get_mut(&source)
+                    .expect("validated source")
+                    .blocks
+                    .insert(target.clone());
+                state
+                    .tasks
+                    .get_mut(&target)
+                    .expect("validated target")
+                    .blocked_by
+                    .insert(source);
             }
-            if !state.tasks.contains_key(source) || !state.tasks.contains_key(target) {
-                return Err("dependency task not found".into());
-            }
-        }
 
-        let mut adjacency: BTreeMap<String, BTreeSet<String>> = state
-            .tasks
-            .iter()
-            .map(|(id, task)| (id.clone(), task.blocks.clone()))
-            .collect();
-        for (source, target) in &edges {
-            adjacency
-                .get_mut(source)
-                .expect("validated source")
-                .insert(target.clone());
-        }
-        if has_cycle(&adjacency) {
-            return Err("dependency cycle".into());
-        }
-        let mut result = json!({"success":true,"taskId":id,"updatedFields":updated_fields});
-        if let Some(status) = status
-            && status != old_status
-        {
-            result["statusChange"] = json!({"from":old_status,"to":status});
-        }
-        ensure_output(&result)?;
-        let mut tasks = state.tasks.clone();
-        tasks.insert(id, candidate);
-        for (source, target) in edges {
-            tasks
-                .get_mut(&source)
-                .expect("validated source")
-                .blocks
-                .insert(target.clone());
-            tasks
-                .get_mut(&target)
-                .expect("validated target")
-                .blocked_by
-                .insert(source);
-        }
-
-        ensure_readable(&tasks)?;
-        state.tasks = tasks;
-        Ok(result)
+            ensure_readable(&state.tasks)?;
+            Ok(result)
+        })
     }
 
     fn todo_write(&self, fields: &Map<String, Value>) -> Result<Value, String> {
@@ -313,11 +312,12 @@ impl ClaudeTasks {
             .and_then(Value::as_array)
             .ok_or("missing or invalid todos")?;
         validate_todos(todos)?;
-        let mut state = self.state.lock().map_err(|_| "task board lock poisoned")?;
-        let result = json!({"oldTodos":state.todos,"newTodos":todos});
-        ensure_output(&result)?;
-        state.todos = todos.clone();
-        Ok(result)
+        self.state.modify(|state| {
+            let result = json!({"oldTodos":state.todos,"newTodos":todos});
+            ensure_output(&result)?;
+            state.todos.clone_from(todos);
+            Ok(result)
+        })
     }
 }
 

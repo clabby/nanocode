@@ -186,7 +186,7 @@ struct LazyClaudeExecution {
 
     initialized: std::sync::atomic::AtomicBool,
 
-    model: std::sync::Mutex<Option<nanocode_agent_core::ModelSelection>>,
+    model: nanocode_sync::Atom<Option<nanocode_agent_core::ModelSelection>>,
 
     initial: Option<InitialSettings>,
 
@@ -205,7 +205,7 @@ impl LazyClaudeExecution {
             ready: tokio::sync::OnceCell::new(),
             reopened: std::sync::atomic::AtomicBool::new(false),
             initialized: std::sync::atomic::AtomicBool::new(false),
-            model: std::sync::Mutex::new(None),
+            model: nanocode_sync::Atom::default(),
             initial: None,
             existing: None,
             attempted: AtomicBool::new(false),
@@ -241,7 +241,7 @@ impl LazyClaudeExecution {
             .ready
             .get_or_try_init(|| async {
                 let mut record = self.record.clone();
-                if let Some(model) = self.model.lock().ok().and_then(|model| model.clone()) {
+                if let Some(model) = Option::clone(&self.model.get()) {
                     record.model = model;
                 }
                 let state = DurableSession::prepare_shared_described(
@@ -499,9 +499,7 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
                     "the deferred durable acquisition already failed".to_owned(),
                 ));
             }
-            if let Ok(mut recorded) = self.model.lock() {
-                *recorded = Some(model);
-            }
+            self.model.set(Some(model));
 
             let prepared = self
                 .ready

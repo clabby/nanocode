@@ -137,7 +137,7 @@ impl State {
     }
 
     pub(super) fn publish_side_view(&self, messages: Option<Arc<[HistoryMessage]>>) {
-        *self.side_view.write().expect("side view lock poisoned") = messages;
+        self.side_view.set(messages);
     }
 
     pub(super) fn publish_side_request(
@@ -145,19 +145,12 @@ impl State {
         template: &MessagesRequest,
         wire_profile: Option<&FrozenWireProfile>,
     ) {
-        *self
-            .side_request
-            .write()
-            .expect("side request lock poisoned") =
-            Some(Arc::new((template.clone(), wire_profile.cloned())));
+        self.side_request
+            .set(Some(Arc::new((template.clone(), wire_profile.cloned()))));
     }
 
     fn side_template(&self) -> SideRequest {
-        let latest = self
-            .side_request
-            .read()
-            .expect("side request lock poisoned")
-            .clone();
+        let latest = Option::clone(&self.side_request.get());
         if let Some(latest) = latest {
             return SideRequest::clone(&latest);
         }
@@ -169,12 +162,11 @@ impl State {
     }
 
     async fn side_transcript(&self) -> Result<Vec<HistoryMessage>> {
-        let live = self.conversation.try_lock().is_err().then(|| {
-            self.side_view
-                .read()
-                .expect("side view lock poisoned")
-                .clone()
-        });
+        let live = self
+            .conversation
+            .try_acquire()
+            .is_none()
+            .then(|| Option::clone(&self.side_view.get()));
         if let Some(Some(messages)) = live {
             return Ok(messages.to_vec());
         }

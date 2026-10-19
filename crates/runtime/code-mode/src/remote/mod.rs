@@ -1,7 +1,9 @@
 mod client;
 mod executors;
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+
+use nanocode_sync::Atom;
 
 pub use client::{
     LOCAL_CLOSED, PEER_CLOSED, RemoteActivity, RemoteClient, RemoteDelivery, RemoteLink,
@@ -149,7 +151,7 @@ pub trait RemoteTransport: Send + Sync + 'static {
 pub struct RemoteCodeModeHost {
     transport: Arc<dyn RemoteTransport>,
     definitions: Vec<ToolDefinition>,
-    hand: Mutex<Option<String>>,
+    hand: Atom<Option<String>>,
 }
 
 impl RemoteCodeModeHost {
@@ -157,7 +159,7 @@ impl RemoteCodeModeHost {
         Self {
             transport: Arc::new(transport),
             definitions,
-            hand: Mutex::new(None),
+            hand: Atom::default(),
         }
     }
 
@@ -210,11 +212,7 @@ impl CodeModeHost for RemoteCodeModeHost {
             source: source.into(),
             context: RemoteContext::from_context(context),
             local_tools: tools.iter().map(|tool| tool.definition()).collect(),
-            hand: self
-                .hand
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone(),
+            hand: Option::clone(&self.hand.get()),
         };
         Box::pin(async move { self.run(operation, tools, observer).await })
     }
@@ -255,7 +253,7 @@ impl CodeModeHost for RemoteCodeModeHost {
         })
     }
     fn route_hands(&self, name: &str, hands: Arc<dyn HandCalls>) {
-        *self.hand.lock().unwrap_or_else(PoisonError::into_inner) = Some(name.into());
+        self.hand.set(Some(name.into()));
         self.transport.route_hands(hands);
     }
     fn begin_turn(&self, session_id: &str) {

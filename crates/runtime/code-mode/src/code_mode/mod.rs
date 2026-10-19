@@ -5,7 +5,7 @@ use crate::code_mode_spec as spec;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc,
         atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Instant,
@@ -15,9 +15,9 @@ use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnord
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 
+use nanocode_sync::{Atom, Leased, Owned, Sequencer, Signal, Slot, Turn};
 use tokio::{
-    sync::{Mutex, Notify, OwnedMutexGuard, mpsc, oneshot, watch},
-    task::JoinHandle,
+    sync::{Notify, mpsc, oneshot, watch},
     time::Duration,
 };
 use tracing::{Instrument, info_span};
@@ -45,12 +45,12 @@ const CELL_COMPLETION_CLAIMED: u8 = 2;
 const CELL_CLOSED: u8 = 3;
 
 pub struct CodeModeRuntime {
-    admission: Arc<Mutex<()>>,
+    admission: Sequencer,
     admission_epoch: Arc<AtomicU64>,
 
-    cells: Arc<Mutex<CellRegistry>>,
-    stored: Arc<Mutex<HashMap<String, Arc<RawValue>>>>,
-    host: Arc<Mutex<SharedJsHost>>,
+    cells: Arc<Atom<CellRegistry>>,
+    stored: Arc<Atom<HashMap<String, Arc<RawValue>>>>,
+    host: Arc<Slot<EmbeddedHost>>,
     current_turn: Arc<AtomicU64>,
     preempt: watch::Sender<(u64, u64)>,
     preempt_consumed: Arc<AtomicU64>,
@@ -61,40 +61,34 @@ pub struct CodeModeControl {
     current_turn: Arc<AtomicU64>,
     preempt: watch::Sender<(u64, u64)>,
     preempt_consumed: Arc<AtomicU64>,
-    admission: Arc<Mutex<()>>,
+    admission: Sequencer,
     admission_epoch: Arc<AtomicU64>,
 
-    cells: Arc<Mutex<CellRegistry>>,
-    host: Arc<Mutex<SharedJsHost>>,
+    cells: Arc<Atom<CellRegistry>>,
+    host: Arc<Slot<EmbeddedHost>>,
 }
 
 pub struct CodeModeQuiescence {
-    _admission: OwnedMutexGuard<()>,
-}
-
-struct SharedJsHost {
-    host: Option<EmbeddedHost>,
+    _admission: Turn,
 }
 
 struct EmbeddedHost {
     worker: ExecutionWorker,
 }
 
-impl SharedJsHost {
-    fn prewarmed() -> Self {
-        let host = match spawn_host() {
-            Ok(host) => Some(host),
-            Err(error) => {
-                tracing::warn!(
-                    target: "nanocode_code_mode",
-                    %error,
-                    "embedded QuickJS code mode prewarm failed; the first cell will retry"
-                );
-                None
-            }
-        };
-        Self { host }
-    }
+fn prewarmed_host() -> Slot<EmbeddedHost> {
+    let host = match spawn_host() {
+        Ok(host) => Some(host),
+        Err(error) => {
+            tracing::warn!(
+                target: "nanocode_code_mode",
+                %error,
+                "embedded QuickJS code mode prewarm failed; the first cell will retry"
+            );
+            None
+        }
+    };
+    Slot::new(host)
 }
 
 fn spawn_host() -> Result<EmbeddedHost, String> {
@@ -129,6 +123,7 @@ fn spawn_host() -> Result<EmbeddedHost, String> {
     result
 }
 
+#[derive(Clone)]
 struct CellRegistry {
     next_cell_id: u64,
     live_cells: HashMap<u64, Arc<LiveCell>>,
@@ -140,16 +135,24 @@ struct LiveCell {
     origin_call_id: String,
     session_id: String,
     turn_id: AtomicU64,
-    observation: Arc<Mutex<CellObservationState>>,
+    observation: Arc<Owned<CellObservationState>>,
     lifecycle: Arc<CellLifecycle>,
-    terminate: StdMutex<Option<oneshot::Sender<()>>>,
-    task: Mutex<Option<JoinHandle<()>>>,
-    relay: StdMutex<Option<CellRelay>>,
+    terminate: Slot<oneshot::Sender<()>>,
+    finished: Arc<Signal>,
+    relay: Slot<CellRelay>,
 }
 
 struct CellRelay {
     stop: Arc<Notify>,
-    task: JoinHandle<()>,
+    done: Arc<Signal>,
+}
+
+struct Finished(Arc<Signal>);
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.0.fire();
+    }
 }
 
 struct CellObservationState {
@@ -278,15 +281,15 @@ struct HostFailure {
 impl CodeModeRuntime {
     pub fn new_with_turn(current_turn: Arc<AtomicU64>) -> Self {
         Self {
-            admission: Arc::new(Mutex::new(())),
+            admission: Sequencer::new(),
             admission_epoch: Arc::new(AtomicU64::new(0)),
 
-            cells: Arc::new(Mutex::new(CellRegistry {
+            cells: Arc::new(Atom::new(CellRegistry {
                 next_cell_id: 1,
                 live_cells: HashMap::new(),
             })),
-            stored: Arc::new(Mutex::new(HashMap::new())),
-            host: Arc::new(Mutex::new(SharedJsHost::prewarmed())),
+            stored: Arc::default(),
+            host: Arc::new(prewarmed_host()),
             current_turn,
             preempt: watch::channel((0, 0)).0,
             preempt_consumed: Arc::new(AtomicU64::new(0)),
@@ -298,7 +301,7 @@ impl CodeModeRuntime {
             current_turn: Arc::clone(&self.current_turn),
             preempt: self.preempt.clone(),
             preempt_consumed: Arc::clone(&self.preempt_consumed),
-            admission: Arc::clone(&self.admission),
+            admission: self.admission.clone(),
             admission_epoch: Arc::clone(&self.admission_epoch),
 
             cells: Arc::clone(&self.cells),
@@ -374,7 +377,7 @@ impl CodeModeRuntime {
         tracing::Span::current().record("output.max_tokens", output_token_budget);
         let context = context.with_output_token_budget(output_token_budget);
 
-        let admission = self.admission.lock().await;
+        let admission = self.admission.enter().await;
         if self.admission_epoch.load(Ordering::Acquire) != admission_epoch {
             return observed_execution(
                 tools.as_ref(),
@@ -387,10 +390,9 @@ impl CodeModeRuntime {
                 Vec::new(),
             );
         }
-        let stored = self.stored.lock().await.clone();
+        let stored = HashMap::clone(&self.stored.get());
         let cell = {
-            let mut registry = self.cells.lock().await;
-            let cell_id = registry.allocate_cell_id();
+            let cell_id = self.cells.update(CellRegistry::allocate_cell_id);
             tracing::Span::current().record("cell.id", cell_id);
             let cell = Arc::new(LiveCell::spawn(
                 cell_id,
@@ -402,11 +404,13 @@ impl CodeModeRuntime {
                 Arc::clone(&self.stored),
                 Arc::clone(&self.host),
             ));
-            registry.live_cells.insert(cell_id, Arc::clone(&cell));
+            self.cells.update(|registry| {
+                registry.live_cells.insert(cell_id, Arc::clone(&cell));
+            });
             cell
         };
         drop(admission);
-        let observation = Arc::clone(&cell.observation).lock_owned().await;
+        let observation = Arc::clone(&cell.observation).acquire_owned().await;
         let yield_after = source
             .yield_time_ms
             .map_or(INITIAL_YIELD, Duration::from_millis);
@@ -506,7 +510,10 @@ impl CodeModeRuntime {
         span.record("cell.id", cell_id);
         span.record("wait.terminate", arguments.terminate);
         span.record("wait.yield_time_ms", arguments.yield_time_ms);
-        let Some(cell) = self.cells.lock().await.live_cells.get(&cell_id).cloned() else {
+        let Some(cell) = self
+            .cells
+            .read(|registry| registry.live_cells.get(&cell_id).cloned())
+        else {
             return failed_execution(
                 started_at,
                 &format!("exec cell {cell_id} not found"),
@@ -573,8 +580,7 @@ impl CodeModeRuntime {
     }
 
     async fn remove_and_join(&self, cell: &Arc<LiveCell>) {
-        {
-            let mut registry = self.cells.lock().await;
+        self.cells.update(|registry| {
             if registry
                 .live_cells
                 .get(&cell.id)
@@ -582,7 +588,7 @@ impl CodeModeRuntime {
             {
                 registry.live_cells.remove(&cell.id);
             }
-        }
+        });
         cell.join().await;
     }
 }
@@ -631,15 +637,14 @@ impl CodeModeControl {
         turn_id: u64,
         sink: &mut (dyn FnMut(&str) -> Box<dyn CodeModeObserver> + Send),
     ) {
-        let cells = self
-            .cells
-            .lock()
-            .await
-            .live_cells
-            .values()
-            .filter(|cell| cell.turn_id.load(Ordering::Acquire) == turn_id)
-            .cloned()
-            .collect::<Vec<_>>();
+        let cells = self.cells.read(|registry| {
+            registry
+                .live_cells
+                .values()
+                .filter(|cell| cell.turn_id.load(Ordering::Acquire) == turn_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
         for cell in cells {
             cell.detach(sink(&cell.origin_call_id));
         }
@@ -650,10 +655,9 @@ impl CodeModeControl {
         turn_id: u64,
         mut observer: Option<&mut dyn CodeModeObserver>,
     ) {
-        let _admission = self.admission.lock().await;
+        let _admission = self.admission.enter().await;
         self.admission_epoch.fetch_add(1, Ordering::AcqRel);
-        let cells = {
-            let mut registry = self.cells.lock().await;
+        let cells = self.cells.update(|registry| {
             let ids = registry
                 .live_cells
                 .iter()
@@ -664,7 +668,7 @@ impl CodeModeControl {
             ids.into_iter()
                 .filter_map(|id| registry.live_cells.remove(&id))
                 .collect::<Vec<_>>()
-        };
+        });
         for cell in &cells {
             cell.request_terminate();
         }
@@ -681,14 +685,13 @@ impl CodeModeControl {
         &self,
         mut observer: Option<&mut dyn CodeModeObserver>,
     ) -> CodeModeQuiescence {
-        let admission = Arc::clone(&self.admission).lock_owned().await;
+        let admission = self.admission.enter().await;
         self.admission_epoch.fetch_add(1, Ordering::AcqRel);
-        let cells = {
-            let mut registry = self.cells.lock().await;
-            std::mem::take(&mut registry.live_cells)
-                .into_values()
-                .collect::<Vec<_>>()
-        };
+        let cells = self
+            .cells
+            .update(|registry| std::mem::take(&mut registry.live_cells))
+            .into_values()
+            .collect::<Vec<_>>();
         for cell in &cells {
             cell.request_terminate();
         }
@@ -700,11 +703,9 @@ impl CodeModeControl {
             }
         }
 
-        let mut shared_host = self.host.lock().await;
-        if let Some(mut host) = shared_host.host.take() {
+        if let Some(mut host) = self.host.take() {
             host.worker.terminate().await;
         }
-        drop(shared_host);
         CodeModeQuiescence {
             _admission: admission,
         }
@@ -833,8 +834,8 @@ impl LiveCell {
         tools: Arc<dyn CodeModeToolset>,
         context: OwnedToolContext,
         stored: HashMap<String, Arc<RawValue>>,
-        shared_stored: Arc<Mutex<HashMap<String, Arc<RawValue>>>>,
-        host: Arc<Mutex<SharedJsHost>>,
+        shared_stored: Arc<Atom<HashMap<String, Arc<RawValue>>>>,
+        host: Arc<Slot<EmbeddedHost>>,
     ) -> Self {
         let (updates_tx, updates) = mpsc::unbounded_channel();
         let (terminate, terminate_rx) = oneshot::channel();
@@ -857,7 +858,9 @@ impl LiveCell {
         );
         let origin_call_id = context.call_id.clone();
         let session_id = context.session_id.clone();
-        let task = tokio::spawn(
+        let finished = Arc::new(Signal::new());
+        let guard = Finished(Arc::clone(&finished));
+        let actor = tokio::spawn(
             run_cell_actor(
                 host,
                 id,
@@ -870,61 +873,66 @@ impl LiveCell {
                 terminate_rx,
                 Arc::clone(&lifecycle),
             )
-            .instrument(actor_span),
+            .instrument(actor_span)
+            .map(move |()| drop(guard)),
         );
+        drop(actor);
         Self {
             tools,
             id,
             origin_call_id,
             session_id,
             turn_id: AtomicU64::new(turn_id),
-            observation: Arc::new(Mutex::new(CellObservationState {
+            observation: Arc::new(Owned::new(CellObservationState {
                 updates,
                 replay: VecDeque::new(),
                 buffered: ObservationBuffer::default(),
             })),
             lifecycle,
-            terminate: StdMutex::new(Some(terminate)),
-            task: Mutex::new(Some(task)),
-            relay: StdMutex::new(None),
+            terminate: Slot::new(Some(terminate)),
+            finished,
+            relay: Slot::default(),
         }
     }
 
     fn detach(&self, sink: Box<dyn CodeModeObserver>) {
-        let mut relay = self
-            .relay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if relay.is_some() {
+        if !self.relay.is_empty() {
             return;
         }
-        let Ok(observation) = Arc::clone(&self.observation).try_lock_owned() else {
+        let stop = Arc::new(Notify::new());
+        let done = Arc::new(Signal::new());
+        let finished = Finished(Arc::clone(&done));
+        if let Some(previous) = self.relay.put(CellRelay {
+            stop: Arc::clone(&stop),
+            done,
+        }) {
+            self.relay.put(previous);
+            return;
+        }
+        let Some(observation) = Arc::clone(&self.observation).try_acquire_owned() else {
+            self.relay.take();
             return;
         };
-        let stop = Arc::new(Notify::new());
-        let task = tokio::spawn(relay_cell_updates(observation, Arc::clone(&stop), sink));
-        *relay = Some(CellRelay { stop, task });
+        drop(tokio::spawn(async move {
+            let _finished = finished;
+            relay_cell_updates(observation, stop, sink).await;
+        }));
     }
 
     async fn finish_relay(&self, stop: bool) {
-        let relay = self
-            .relay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(relay) = relay {
+        if let Some(relay) = self.relay.take() {
             if stop {
                 relay.stop.notify_one();
             }
-            let _ = relay.task.await;
+            relay.done.wait().await;
         }
     }
 
-    async fn begin_observation(&self) -> Result<OwnedMutexGuard<CellObservationState>, CellError> {
+    async fn begin_observation(&self) -> Result<Leased<CellObservationState>, CellError> {
         self.finish_relay(true).await;
         Arc::clone(&self.observation)
-            .try_lock_owned()
-            .map_err(|_| CellError::Busy)
+            .try_acquire_owned()
+            .ok_or(CellError::Busy)
     }
 
     fn yielded(&self) {
@@ -935,15 +943,10 @@ impl LiveCell {
     }
 
     fn request_terminate(&self) {
-        if self.lifecycle.request_termination() {
-            let terminate = self
-                .terminate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(terminate) = terminate {
-                let _ = terminate.send(());
-            }
+        if self.lifecycle.request_termination()
+            && let Some(terminate) = self.terminate.take()
+        {
+            let _ = terminate.send(());
         }
     }
 
@@ -951,7 +954,7 @@ impl LiveCell {
         self.join_actor().await;
         self.finish_relay(true).await;
 
-        let observation = Arc::clone(&self.observation).lock_owned().await;
+        let observation = Arc::clone(&self.observation).acquire_owned().await;
         let _ = observe_cell(
             self,
             observation,
@@ -970,10 +973,7 @@ impl LiveCell {
     }
 
     async fn join_actor(&self) {
-        let mut task = self.task.lock().await;
-        if let Some(task) = task.take() {
-            let _ = task.await;
-        }
+        self.finished.wait().await;
     }
 }
 
@@ -1045,7 +1045,7 @@ enum ObservationMode {
 }
 
 async fn relay_cell_updates(
-    mut observation: OwnedMutexGuard<CellObservationState>,
+    mut observation: Leased<CellObservationState>,
     stop: Arc<Notify>,
     mut sink: Box<dyn CodeModeObserver>,
 ) {
@@ -1104,7 +1104,7 @@ async fn relay_cell_updates(
 #[allow(clippy::too_many_lines)]
 async fn observe_cell(
     cell: &LiveCell,
-    mut observation: OwnedMutexGuard<CellObservationState>,
+    mut observation: Leased<CellObservationState>,
     started_at: Instant,
     mode: ObservationMode,
     max_output_tokens: Option<usize>,
@@ -1522,13 +1522,13 @@ impl EmbeddedHost {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_cell_actor(
-    shared_host: Arc<Mutex<SharedJsHost>>,
+    shared_host: Arc<Slot<EmbeddedHost>>,
     cell_id: u64,
     source: String,
     tools: Arc<dyn CodeModeToolset>,
     context: OwnedToolContext,
     stored: HashMap<String, Arc<RawValue>>,
-    shared_stored: Arc<Mutex<HashMap<String, Arc<RawValue>>>>,
+    shared_stored: Arc<Atom<HashMap<String, Arc<RawValue>>>>,
     updates: mpsc::UnboundedSender<CellUpdate>,
     mut terminate: oneshot::Receiver<()>,
     lifecycle: Arc<CellLifecycle>,
@@ -1536,9 +1536,9 @@ async fn run_cell_actor(
     let started_at = Instant::now();
     let host_wait_started_at = Instant::now();
     let (mut host, reused) = {
-        let mut shared_host = shared_host.lock().await;
-        let reused = shared_host.host.is_some();
-        let host = match shared_host.host.take() {
+        let taken = shared_host.take();
+        let reused = taken.is_some();
+        let host = match taken {
             Some(host) => host,
             None => match spawn_host() {
                 Ok(host) => host,
@@ -1605,11 +1605,23 @@ async fn run_cell_actor(
     );
     match terminal {
         Ok(CellTerminal::Completed { stored }) => {
-            shared_stored.lock().await.extend(stored);
+            shared_stored.update(|shared| {
+                shared.extend(
+                    stored
+                        .iter()
+                        .map(|(key, value)| (key.clone(), Arc::clone(value))),
+                )
+            });
             let _ = updates.send(CellUpdate::Completed);
         }
         Ok(CellTerminal::ScriptFailed { message, stored }) => {
-            shared_stored.lock().await.extend(stored);
+            shared_stored.update(|shared| {
+                shared.extend(
+                    stored
+                        .iter()
+                        .map(|(key, value)| (key.clone(), Arc::clone(value))),
+                )
+            });
             let _ = updates.send(CellUpdate::ScriptFailed { message });
         }
         Ok(CellTerminal::Terminated) => {
@@ -1620,12 +1632,8 @@ async fn run_cell_actor(
         }
     }
     if host_healthy {
-        let mut shared_host = shared_host.lock().await;
-        if shared_host.host.is_none() {
-            shared_host.host = Some(host);
-        } else {
-            drop(shared_host);
-            host.worker.terminate().await;
+        if let Some(mut displaced) = shared_host.put(host) {
+            displaced.worker.terminate().await;
         }
     } else if !terminated {
         let termination_started_at = Instant::now();

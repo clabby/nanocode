@@ -325,8 +325,8 @@ impl State {
     pub(super) async fn snapshot(&self, conversation: &Conversation) -> Result<Snapshot> {
         Ok(Snapshot {
             conversation: conversation.clone(),
-            developer_notices: self.developer_notices.lock().await.clone(),
-            discovered: self.discovered.lock().await.clone(),
+            developer_notices: Vec::clone(&self.developer_notices.get()),
+            discovered: HashSet::clone(&self.discovered.get()),
             tasks: self.task_snapshot()?,
             model: Some(self.model()),
             workspace: Some(self.workspace()),
@@ -344,8 +344,8 @@ impl State {
         snapshot: Snapshot,
     ) -> Result<()> {
         self.restore_tasks(snapshot.tasks)?;
-        *self.discovered.lock().await = snapshot.discovered;
-        *self.developer_notices.lock().await = snapshot.developer_notices;
+        self.discovered.set(snapshot.discovered);
+        self.developer_notices.set(snapshot.developer_notices);
         *conversation = snapshot.conversation;
         Ok(())
     }
@@ -356,13 +356,16 @@ impl State {
         selected: &mut HashSet<String>,
     ) -> Result<()> {
         let notices = policy.developer_notices(operation.to_owned()).await?;
-        let mut queued = self.developer_notices.lock().await;
-        for notice in notices {
+        for notice in &notices {
             selected.remove(&notice.0);
-            if !queued.iter().any(|(id, _)| id == &notice.0) {
-                queued.push(notice);
-            }
         }
+        self.developer_notices.update(|queued| {
+            for notice in &notices {
+                if !queued.iter().any(|(id, _)| id == &notice.0) {
+                    queued.push(notice.clone());
+                }
+            }
+        });
         Ok(())
     }
 
@@ -375,7 +378,7 @@ impl State {
         mut developer_notice_ids: HashSet<String>,
         journal: &mut Journal,
     ) -> Result<Cursor> {
-        let update = self.persistence_update.lock().await;
+        let update = self.persistence_update.enter().await;
         if let (Some(policy), Some(operation)) = (&self.policy, operation)
             && let Some(value) = policy.continuation(operation.to_owned()).await?
         {
@@ -501,7 +504,7 @@ impl State {
         conversation: &mut Conversation,
         journal: &mut Journal,
     ) -> Result<()> {
-        let _update = self.persistence_update.lock().await;
+        let _update = self.persistence_update.enter().await;
         self.defer_cursor_locked(cursor, conversation, journal)
             .await
     }
@@ -564,7 +567,7 @@ impl State {
         request: &BackendPrompt,
         result: &Result<TurnResult>,
     ) -> Result<()> {
-        let _update = self.persistence_update.lock().await;
+        let _update = self.persistence_update.enter().await;
         let (Some(policy), Some(operation)) = (&self.policy, &request.request_id) else {
             return Ok(());
         };
@@ -581,7 +584,7 @@ impl State {
             && self.closing.load(Ordering::SeqCst)
         {
             let released = policy.release(operation.clone()).await;
-            if let Some(turn) = self.steering.lock().await.get_mut(&request.key) {
+            if let Some(turn) = self.steering.acquire().await.get_mut(&request.key) {
                 turn.operation = None;
             }
             self.persistence_ready.notify_waiters();
@@ -617,7 +620,7 @@ impl State {
         if settled.is_err() {
             self.stopped.store(true, Ordering::SeqCst);
         }
-        if let Some(turn) = self.steering.lock().await.get_mut(&request.key) {
+        if let Some(turn) = self.steering.acquire().await.get_mut(&request.key) {
             turn.operation = None;
         }
         self.persistence_ready.notify_waiters();
@@ -677,7 +680,8 @@ impl State {
                 ));
             }
             self.restore_tasks(receipt.tasks).map_err(recovery_error)?;
-            self.discovered.lock().await.extend(receipt.discovered);
+            self.discovered
+                .update(|discovered| discovered.extend(receipt.discovered.iter().cloned()));
             return Ok((receipt.result, None));
         }
         let unknown = || {
@@ -746,7 +750,7 @@ impl State {
             let completion = effect.completion(&Completed {
                 result: &result,
                 tasks: self.task_snapshot()?,
-                discovered: &*self.discovered.lock().await,
+                discovered: &self.discovered.get(),
             })?;
             if defer {
                 deferred = Some(completion);

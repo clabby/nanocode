@@ -34,6 +34,7 @@ use history::HistoryMessage;
 use nanocode_platform::Instant;
 #[cfg(target_family = "wasm")]
 use nanocode_platform::sleep;
+use nanocode_sync::{Atom, Owned, Sequencer};
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -45,7 +46,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Notify, oneshot};
 #[cfg(not(target_family = "wasm"))]
 use tokio::time::sleep;
 use tracing::Instrument as _;
@@ -1175,7 +1176,7 @@ impl ClaudeBuilder {
         recipe.subagent_type = Some("general-purpose".into());
         let native_factory = Arc::new(ClaudeNativeFactory {
             recipe,
-            state: std::sync::Mutex::new(Weak::new()),
+            state: Atom::new(Weak::new()),
         });
         let selected_model = ModelSelection::new(HarnessFamily::Claude, self.claude.model.clone());
         let mut handle = AgentHandle::new(
@@ -1258,7 +1259,7 @@ impl ClaudeBuilder {
             }
             definitions.push(definition);
         }
-        let discovered = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let discovered = Arc::new(Atom::new(HashSet::<String>::new()));
         if custom_tool_search && !handlers.contains_key("ToolSearch") {
             return Err(unsupported(
                 "custom_tool_search requires a ToolSearch handler",
@@ -1480,7 +1481,7 @@ impl ClaudeBuilder {
             .conversation_id
             .or_else(|| restored.conversation_id.clone())
             .unwrap_or_else(|| session_id.clone());
-        *discovered.try_lock().expect("new discovery lock") = restored.discovered.clone();
+        discovered.set(restored.discovered.clone());
         let mut round_boundary = restored.clone();
         round_boundary.lineage = Some(lineage.clone());
         round_boundary.conversation_id = Some(conversation_id.clone());
@@ -1499,11 +1500,11 @@ impl ClaudeBuilder {
         let state = Arc::new(State {
             subagent_type: self.subagent_type,
             subagent_type_resolver: self.subagent_type_resolver,
-            lifecycle_opened: Mutex::new(None),
+            lifecycle_opened: Atom::default(),
             client: self.claude.client.bind_subscription_session(&session_id),
             model: self.claude.model,
             max_tokens: self.max_tokens,
-            effort: std::sync::RwLock::new(self.effort),
+            effort: Atom::new(self.effort),
             automatic_cache: self.automatic_cache,
             cache_one_hour: self.cache_one_hour,
             adaptive_thinking: AtomicBool::new(self.adaptive_thinking),
@@ -1539,37 +1540,34 @@ impl ClaudeBuilder {
             code_only: self.code_only,
             parallel_tools: self.parallel_tools,
             parallel_safe_tools: self.parallel_safe_tools,
-            developer_notices: Mutex::new(restored.developer_notices),
-            persistence_update: Mutex::new(()),
+            developer_notices: Atom::new(restored.developer_notices),
+            persistence_update: Sequencer::new(),
             persistence_ready: Notify::new(),
-            conversation: Mutex::new(restored.conversation),
-            round_boundary: std::sync::RwLock::new(round_boundary),
-            side_view: std::sync::RwLock::new(None),
-            side_request: std::sync::RwLock::new(None),
+            conversation: Owned::new(restored.conversation),
+            round_boundary: Atom::new(round_boundary),
+            side_view: Atom::default(),
+            side_request: Atom::default(),
             environment,
             project_instructions,
             boundary_stale: AtomicBool::new(false),
             policy: self.policy,
-            admission: Mutex::new(()),
+            admission: Sequencer::new(),
             idle: Notify::new(),
             attempts: std::sync::atomic::AtomicUsize::new(0),
             admission_order: AtomicU64::new(0),
-            waiters: std::sync::Mutex::new(std::collections::BTreeSet::new()),
-            compaction_cancel: Mutex::new(None),
+            waiters: Atom::default(),
+            compaction_cancel: Atom::default(),
             #[cfg(not(target_family = "wasm"))]
             task_board: self.task_board,
-            cancellations: Mutex::new(HashMap::new()),
+            cancellations: Atom::default(),
             stopped: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             accepted_turns: AtomicU64::new(accepted_turns),
-            steering: Mutex::new(HashMap::new()),
-            live_nested_starts: std::sync::Mutex::new(LiveNestedStarts::default()),
-            code_call_summaries: std::sync::Mutex::new(HashMap::new()),
+            steering: Owned::default(),
+            live_nested_starts: Atom::default(),
+            code_call_summaries: Atom::default(),
         });
-        *native_factory
-            .state
-            .lock()
-            .expect("new native capability lock") = Arc::downgrade(&state);
+        native_factory.state.set(Arc::downgrade(&state));
         let driver = Driver { state, handle };
         Ok((runtime.bind(driver), events))
     }
@@ -2451,14 +2449,13 @@ struct NativeChildState {
 
 struct ClaudeNativeFactory {
     recipe: ClaudeBuilder,
-    state: std::sync::Mutex<Weak<State>>,
+    state: Atom<Weak<State>>,
 }
 impl ClaudeNativeFactory {
     fn owner(&self) -> Result<Arc<State>> {
         let state = self
             .state
-            .lock()
-            .map_err(|_| unsupported("Claude capability lock poisoned"))?
+            .get()
             .upgrade()
             .ok_or(NanocodeError::AgentStopped)?;
         if state.stopped.load(Ordering::SeqCst) {
@@ -2714,7 +2711,7 @@ struct State {
     code_turn_cleanup: Vec<CodeTurnCleanup>,
     code_turn_preempt: Vec<ToolCleanup>,
     code_turn_settle: Vec<ToolCleanup>,
-    lifecycle_opened: Mutex<Option<String>>,
+    lifecycle_opened: Atom<Option<String>>,
     subagent_type: Option<String>,
     subagent_type_resolver: Option<SubagentTypeResolver>,
     session_id: String,
@@ -2725,7 +2722,7 @@ struct State {
     client: ClaudeClient,
     model: String,
     max_tokens: Option<u32>,
-    effort: std::sync::RwLock<Option<crate::Effort>>,
+    effort: Atom<Option<crate::Effort>>,
     automatic_cache: bool,
     cache_one_hour: bool,
     adaptive_thinking: AtomicBool,
@@ -2747,52 +2744,52 @@ struct State {
     tool_hooks: Vec<Arc<dyn crate::ClaudeToolHooks>>,
     server_tools: Vec<ServerToolDefinition>,
     handlers: HashMap<String, Handler>,
-    discovered: Arc<Mutex<HashSet<String>>>,
+    discovered: Arc<Atom<HashSet<String>>>,
     client_tool_search: bool,
     code_only: bool,
     nested_tools: Option<NestedToolLookup>,
     parallel_tools: bool,
 
     parallel_safe_tools: HashSet<String>,
-    conversation: Mutex<Conversation>,
-    developer_notices: Mutex<Vec<(String, String)>>,
-    persistence_update: Mutex<()>,
+    conversation: Owned<Conversation>,
+    developer_notices: Atom<Vec<(String, String)>>,
+    persistence_update: Sequencer,
     persistence_ready: Notify,
 
-    round_boundary: std::sync::RwLock<Arc<Snapshot>>,
+    round_boundary: Atom<Arc<Snapshot>>,
 
-    side_view: std::sync::RwLock<Option<Arc<[HistoryMessage]>>>,
-    side_request: std::sync::RwLock<Option<Arc<side::SideRequest>>>,
+    side_view: Atom<Option<Arc<[HistoryMessage]>>>,
+    side_request: Atom<Option<Arc<side::SideRequest>>>,
 
     environment: std::sync::OnceLock<String>,
     project_instructions: std::sync::OnceLock<Option<String>>,
 
     boundary_stale: AtomicBool,
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
-    admission: Mutex<()>,
+    admission: Sequencer,
     idle: Notify,
 
     attempts: std::sync::atomic::AtomicUsize,
 
     admission_order: AtomicU64,
 
-    waiters: std::sync::Mutex<std::collections::BTreeSet<u64>>,
-    compaction_cancel: Mutex<Option<Arc<Cancellation>>>,
+    waiters: Atom<std::collections::BTreeSet<u64>>,
+    compaction_cancel: Atom<Option<Arc<Cancellation>>>,
     #[cfg(not(target_family = "wasm"))]
     task_board: Option<Arc<crate::tools::tasks::ClaudeTasks>>,
-    cancellations: Mutex<HashMap<BackendTurnKey, Arc<Cancellation>>>,
+    cancellations: Atom<HashMap<BackendTurnKey, Arc<Cancellation>>>,
     stopped: AtomicBool,
     closing: AtomicBool,
 
     accepted_turns: AtomicU64,
-    steering: Mutex<HashMap<BackendTurnKey, TurnSteering>>,
+    steering: Owned<HashMap<BackendTurnKey, TurnSteering>>,
 
-    live_nested_starts: std::sync::Mutex<LiveNestedStarts>,
+    live_nested_starts: Atom<LiveNestedStarts>,
 
-    code_call_summaries: std::sync::Mutex<HashMap<String, Vec<Value>>>,
+    code_call_summaries: Atom<HashMap<String, Vec<Value>>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LiveNestedStarts {
     open: HashSet<String>,
     order: std::collections::VecDeque<String>,
@@ -2851,9 +2848,7 @@ impl LiveNestedCalls<'_> {
                     || !self
                         .state
                         .live_nested_starts
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(&call_id)
+                        .update(|starts| starts.insert(&call_id))
                 {
                     return;
                 }
@@ -2973,10 +2968,7 @@ impl State {
             && (self.attempts.load(Ordering::SeqCst) > 0
                 || self
                     .waiters
-                    .lock()
-                    .expect("waiters lock")
-                    .first()
-                    .is_some_and(|first| *first < order))
+                    .read(|waiters| waiters.first().is_some_and(|first| *first < order)))
     }
 }
 
@@ -2991,7 +2983,7 @@ async fn fail_begun(
         return;
     }
     let checkpoint = {
-        let conversation = state.conversation.lock().await;
+        let conversation = state.conversation.acquire().await;
         state
             .snapshot(&conversation)
             .await
@@ -3056,7 +3048,7 @@ async fn start_turn(
     );
     let request_id = request.request_id.clone();
     let key = request.key;
-    state.steering.lock().await.insert(
+    state.steering.acquire().await.insert(
         key,
         TurnSteering {
             pending: std::collections::VecDeque::new(),
@@ -3064,11 +3056,7 @@ async fn start_turn(
             operation: request_id.clone(),
             developer_notice_ids: state
                 .developer_notices
-                .lock()
-                .await
-                .iter()
-                .map(|(id, _)| id.clone())
-                .collect(),
+                .read(|notices| notices.iter().map(|(id, _)| id.clone()).collect()),
             model_call_index: 1,
             next_index: 0,
             revision: request.prompt.instruction_revision(),
@@ -3077,11 +3065,9 @@ async fn start_turn(
             events: request.events.clone(),
         },
     );
-    state
-        .cancellations
-        .lock()
-        .await
-        .insert(key, cancellation.clone());
+    state.cancellations.update(|cancellations| {
+        cancellations.insert(key, cancellation.clone());
+    });
     let (sender, receiver) = oneshot::channel();
     let running = state.clone();
 
@@ -3098,12 +3084,12 @@ async fn start_turn(
         telemetry::finish_turn(&finished_span, &result);
         if panicked {
             running.stopped.store(true, Ordering::SeqCst);
-            for cancel in running.cancellations.lock().await.values() {
+            for cancel in running.cancellations.get().values() {
                 cancel.cancel();
             }
             let model_call_index = running
                 .steering
-                .lock()
+                .acquire()
                 .await
                 .get(&key)
                 .map_or(0, |turn| turn.model_call_index);
@@ -3115,8 +3101,10 @@ async fn start_turn(
             let ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             running.emit_run_finished(&events, &result, reasoning_mode, &effort, ns);
         }
-        running.steering.lock().await.remove(&key);
-        running.cancellations.lock().await.remove(&key);
+        running.steering.acquire().await.remove(&key);
+        running.cancellations.update(|cancellations| {
+            cancellations.remove(&key);
+        });
         drop(attempt);
         running.idle.notify_waiters();
         running.persistence_ready.notify_waiters();
@@ -3139,14 +3127,14 @@ async fn defer_turn(
     order: u64,
     automatic: bool,
 ) -> BackendTurn {
-    state.waiters.lock().expect("waiters lock").insert(order);
+    state.waiters.update(|waiters| {
+        waiters.insert(order);
+    });
     let key = request.key;
     let cancellation = Arc::new(Cancellation::default());
-    state
-        .cancellations
-        .lock()
-        .await
-        .insert(key, cancellation.clone());
+    state.cancellations.update(|cancellations| {
+        cancellations.insert(key, cancellation.clone());
+    });
     let events = request.events.clone();
     let request_id = Some(id.clone());
     let (sender, receiver) = oneshot::channel();
@@ -3159,7 +3147,7 @@ async fn defer_turn(
             }
 
             let admission = tokio::select! {
-                admission = state.admission.lock() => admission,
+                admission = state.admission.enter() => admission,
                 () = cancellation.cancelled() => break Err((NanocodeError::TurnCancelled, false)),
             };
             if state.stopped.load(Ordering::SeqCst) {
@@ -3168,7 +3156,9 @@ async fn defer_turn(
             match policy.begin_attempt(id.clone()).await {
                 Ok(()) => {
                     let attempt = AttemptGuard::begin(state.clone());
-                    state.waiters.lock().expect("waiters lock").remove(&order);
+                    state.waiters.update(|waiters| {
+                        waiters.remove(&order);
+                    });
                     let frozen = crate::prompt::freeze_admitted(
                         request.prompt,
                         policy.as_ref(),
@@ -3242,7 +3232,9 @@ async fn abandon_deferred(
     begun: bool,
     automatic: bool,
 ) -> NanocodeError {
-    state.waiters.lock().expect("waiters lock").remove(&order);
+    state.waiters.update(|waiters| {
+        waiters.remove(&order);
+    });
     let cancelled = matches!(error, NanocodeError::TurnCancelled);
     if !begun {
         if automatic || cancelled {
@@ -3251,7 +3243,9 @@ async fn abandon_deferred(
             let _ = policy.release(id).await;
         }
     }
-    state.cancellations.lock().await.remove(&key);
+    state.cancellations.update(|cancellations| {
+        cancellations.remove(&key);
+    });
     if !cancelled {
         state.emit(
             events,
@@ -3406,7 +3400,7 @@ impl State {
 
     fn publish_boundary(&self, snapshot: Snapshot) -> Arc<Snapshot> {
         let snapshot = Arc::new(snapshot);
-        *self.round_boundary.write().expect("round boundary lock") = Arc::clone(&snapshot);
+        self.round_boundary.set(Arc::clone(&snapshot));
         self.boundary_stale.store(false, Ordering::SeqCst);
         snapshot
     }
@@ -3427,7 +3421,7 @@ impl State {
     }
 
     async fn latest_boundary(&self) -> Result<Snapshot> {
-        if let Ok(conversation) = self.conversation.try_lock() {
+        if let Some(conversation) = self.conversation.try_acquire() {
             if self.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
@@ -3438,18 +3432,13 @@ impl State {
                 "Claude committed boundary is stale after a failed snapshot",
             ));
         }
-        let boundary: Arc<Snapshot> = Arc::clone(
-            &*self
-                .round_boundary
-                .read()
-                .map_err(|_| unsupported("Claude boundary lock poisoned"))?,
-        );
+        let boundary: Arc<Snapshot> = self.round_boundary.read(Arc::clone);
         let mut snapshot = Snapshot::clone(&boundary);
         if self.stopped.load(Ordering::SeqCst) {
             return Err(NanocodeError::AgentStopped);
         }
 
-        snapshot.developer_notices = self.developer_notices.lock().await.clone();
+        snapshot.developer_notices = Vec::clone(&self.developer_notices.get());
         snapshot.conversation.pending_continuation = false;
         snapshot.conversation.previous_message_id = None;
         snapshot.conversation.container = None;
@@ -3606,11 +3595,11 @@ impl State {
         prefix: Option<&str>,
     ) -> Result<Option<Snapshot>> {
         loop {
-            let admission = self.admission.lock().await;
+            let admission = self.admission.enter().await;
             let notified = self.persistence_ready.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let update = self.persistence_update.lock().await;
+            let update = self.persistence_update.enter().await;
             if self.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
@@ -3627,7 +3616,7 @@ impl State {
             if let Some(policy) = &self.policy {
                 let operation = self
                     .steering
-                    .lock()
+                    .acquire()
                     .await
                     .iter()
                     .filter_map(|(key, turn)| turn.operation.as_ref().map(|id| (key.0, id.clone())))
@@ -3664,7 +3653,8 @@ impl State {
                     return Err(error);
                 }
             }
-            *self.developer_notices.lock().await = snapshot.developer_notices.clone();
+            self.developer_notices
+                .set(snapshot.developer_notices.clone());
             return Ok(Some(snapshot));
         }
     }
@@ -3787,9 +3777,7 @@ impl State {
         };
         let started = self
             .live_nested_starts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(call_id);
+            .update(|starts| starts.remove(call_id));
         if !started {
             self.emit(
                 events,
@@ -3839,7 +3827,7 @@ impl State {
         self.model.clone()
     }
     fn effort(&self) -> Option<crate::Effort> {
-        *self.effort.read().expect("Claude effort lock poisoned")
+        *self.effort.get()
     }
 
     fn speed(&self) -> Option<crate::Speed> {
@@ -4544,10 +4532,10 @@ impl State {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(NanocodeError::TurnCancelled),
-                conversation = self.conversation.lock() => conversation,
+                conversation = self.conversation.acquire() => conversation,
             }
         } else {
-            self.conversation.lock().await
+            self.conversation.acquire().await
         };
         let events = &request.events;
         let (reasoning_mode, effort) = self.emit_run_started(&request);
@@ -4559,7 +4547,7 @@ impl State {
         let mut result = execution.await;
 
         let mut model_call_index = 0;
-        if let Some(turn) = self.steering.lock().await.get_mut(&request.key) {
+        if let Some(turn) = self.steering.acquire().await.get_mut(&request.key) {
             turn.accepting = false;
             model_call_index = turn.model_call_index;
         }
@@ -4889,10 +4877,10 @@ impl State {
             return Err(provider_error("compaction returned empty summary"));
         }
 
-        let mut discovered = self.discovered.lock().await;
         if cursor.tool_search {
             let references = client_discovered_tools(&retained);
-            discovered.retain(|name| references.contains(name.as_str()));
+            self.discovered
+                .update(|discovered| discovered.retain(|name| references.contains(name.as_str())));
         }
 
         context.messages = retained;
@@ -4916,7 +4904,6 @@ impl State {
             CompactionMode::Manual => 0,
         };
         context.rounds_since_compaction = 0;
-        drop(discovered);
         let outcome = self
             .lifecycle(
                 cursor,
@@ -4941,9 +4928,7 @@ impl State {
         }
         let references = client_discovered_tools(messages);
         self.discovered
-            .lock()
-            .await
-            .retain(|name| references.contains(name.as_str()));
+            .update(|discovered| discovered.retain(|name| references.contains(name.as_str())));
         true
     }
 
@@ -5079,7 +5064,7 @@ impl State {
         pending: &mut Vec<HistoryMessage>,
         replaying_boundary: bool,
     ) -> Result<bool> {
-        let mut turns = self.steering.lock().await;
+        let mut turns = self.steering.acquire().await;
         let Some(turn) = turns.get_mut(&request.key) else {
             return Ok(false);
         };
@@ -5253,10 +5238,9 @@ impl State {
                 .unwrap_or_default();
             calls.append(&mut live.unknown);
             if !calls.is_empty() {
-                self.code_call_summaries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id.to_owned(), calls);
+                self.code_call_summaries.update(|summaries| {
+                    summaries.insert(id.to_owned(), calls.clone());
+                });
             }
         }
         let mut payload =
@@ -5355,7 +5339,7 @@ impl State {
         let mut prompt = prompt_messages(&request.prompt)?;
         let developer_notice_ids = self
             .steering
-            .lock()
+            .acquire()
             .await
             .get(&request.key)
             .ok_or(NanocodeError::TurnStopped)?
@@ -5372,7 +5356,7 @@ impl State {
             )
             .await?;
         if let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) {
-            let mut turns = self.steering.lock().await;
+            let mut turns = self.steering.acquire().await;
             let turn = turns
                 .get_mut(&request.key)
                 .ok_or(NanocodeError::TurnStopped)?;
@@ -5403,12 +5387,12 @@ impl State {
             turn.model_call_index = cursor.index.max(1);
         }
         if cursor.prepared && conversation.lifecycle_started {
-            *self.lifecycle_opened.lock().await = Some(
+            self.lifecycle_opened.set(Some(
                 cursor
                     .operation
                     .clone()
                     .unwrap_or_else(|| cursor.lifecycle_turn_id.clone()),
-            );
+            ));
         }
         let mut usage = cursor.usage.clone();
         let mut pending = cursor.pending.clone();
@@ -5423,7 +5407,7 @@ impl State {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if self.lifecycle_opened.lock().await.is_none() {
+            if self.lifecycle_opened.read(Option::is_none) {
                 let event = match self
                     .subagent_type_resolver
                     .as_ref()
@@ -5455,12 +5439,12 @@ impl State {
                     prompt.insert(0, Message::text(Role::User, context));
                 }
                 conversation.lifecycle_started = true;
-                *self.lifecycle_opened.lock().await = Some(
+                self.lifecycle_opened.set(Some(
                     cursor
                         .operation
                         .clone()
                         .unwrap_or_else(|| cursor.lifecycle_turn_id.clone()),
-                );
+                ));
             }
             let event = crate::ClaudeLifecycleEvent::UserPromptSubmit { prompt: submitted };
             self.flush_for_lifecycle(&event, journal).await?;
@@ -5514,19 +5498,20 @@ impl State {
                 );
                 self.emit_compacted(&request.events, 0, compaction_started);
             }
-            let _update = self.persistence_update.lock().await;
+            let _update = self.persistence_update.enter().await;
             let notices = {
-                let mut queued = self.developer_notices.lock().await;
-                let mut notices = Vec::new();
-                queued.retain(|(id, text)| {
-                    if cursor.developer_notice_ids.contains(id) {
-                        notices.push(text.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                notices
+                self.developer_notices.update(|queued| {
+                    let mut notices = Vec::new();
+                    queued.retain(|(id, text)| {
+                        if cursor.developer_notice_ids.contains(id) {
+                            notices.push(text.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    notices
+                })
             };
             prompt.splice(
                 0..0,
@@ -5594,8 +5579,8 @@ impl State {
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<HashSet<_>>();
-            *self.discovered.lock().await = discovered.clone();
-            if let Some(turn) = self.steering.lock().await.get_mut(&request.key) {
+            self.discovered.set(discovered.clone());
+            if let Some(turn) = self.steering.acquire().await.get_mut(&request.key) {
                 turn.model_call_index = index.saturating_add(cursor.model_step_offset).max(1);
             }
             self.publish_side_view(Some(pending.as_slice().into()));
@@ -5976,16 +5961,14 @@ impl State {
                 pending.push(Message::tool_results(results).into());
 
                 conversation.messages = pending.clone();
-                {
-                    let mut summaries = self
-                        .code_call_summaries
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for id in &code_call_ids {
-                        if let Some(calls) = summaries.remove(id) {
-                            conversation.retain_code_calls(id, calls);
-                        }
-                    }
+                let retained = self.code_call_summaries.update(|summaries| {
+                    code_call_ids
+                        .iter()
+                        .filter_map(|id| summaries.remove(id).map(|calls| (id.clone(), calls)))
+                        .collect::<Vec<_>>()
+                });
+                for (id, calls) in retained {
+                    conversation.retain_code_calls(&id, calls);
                 }
                 conversation.previous_message_id = previous_message_id.clone();
                 conversation.summary.clear();
@@ -6194,7 +6177,7 @@ impl State {
             }
 
             let more_instructions = {
-                let mut turns = self.steering.lock().await;
+                let mut turns = self.steering.acquire().await;
                 if let Some(turn) = turns.get_mut(&request.key) {
                     if turn.pending.is_empty() {
                         turn.accepting = false;
@@ -6324,7 +6307,7 @@ impl Driver {
             if state.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
-            let mut turns = state.steering.lock().await;
+            let mut turns = state.steering.acquire().await;
             let turn = turns.get_mut(&key).ok_or(NanocodeError::TurnNotSteerable)?;
             state.accept_steer(turn, id, prompt).await
         })
@@ -6397,7 +6380,7 @@ impl LifecycleBackend for Driver {
     fn set_harness_model(&self, model: ModelSelection) -> BackendFuture<Result<()>> {
         let state = self.state.clone();
         Box::pin(async move {
-            let _admission = state.admission.lock().await;
+            let _admission = state.admission.enter().await;
             if state.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
@@ -6420,7 +6403,7 @@ impl LifecycleBackend for Driver {
             let (accepted, receipt) = oneshot::channel();
             let task = async move {
                 let result = async move {
-                    let _admission = state.admission.lock().await;
+                    let _admission = state.admission.enter().await;
                     if state.stopped.load(Ordering::SeqCst) {
                         return Err(NanocodeError::AgentStopped);
                     }
@@ -6562,7 +6545,7 @@ impl LifecycleBackend for Driver {
                 return Err(NanocodeError::AgentStopped);
             }
             {
-                let mut turns = state.steering.lock().await;
+                let mut turns = state.steering.acquire().await;
                 if let (Some(policy), Some(id)) = (&state.policy, &request_id)
                     && policy
                         .identified_steer_accepted(
@@ -6599,7 +6582,7 @@ impl LifecycleBackend for Driver {
     fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
         let state = self.state.clone();
         Box::pin(async move {
-            let mut turns = state.steering.lock().await;
+            let mut turns = state.steering.acquire().await;
             let Some(turn) = turns.get_mut(&key) else {
                 return Ok(false);
             };
@@ -6626,13 +6609,13 @@ impl LifecycleBackend for Driver {
         let state = self.state.clone();
         Box::pin(async move {
             {
-                let cancels = state.cancellations.lock().await;
+                let cancels = state.cancellations.get();
                 cancels
                     .get(&key)
                     .ok_or(NanocodeError::TurnNotCancellable)?
                     .cancel();
             }
-            if let Some(turn) = state.steering.lock().await.get_mut(&key) {
+            if let Some(turn) = state.steering.acquire().await.get_mut(&key) {
                 turn.accepting = false;
             }
             if state.policy.is_some() {
@@ -6640,7 +6623,7 @@ impl LifecycleBackend for Driver {
                     let notified = state.idle.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
-                    if !state.cancellations.lock().await.contains_key(&key) {
+                    if !state.cancellations.get().contains_key(&key) {
                         break;
                     }
                     notified.await;
@@ -6658,8 +6641,7 @@ impl LifecycleBackend for Driver {
             let key = driver
                 .state
                 .cancellations
-                .lock()
-                .await
+                .get()
                 .keys()
                 .min_by_key(|key| key.0)
                 .copied()
@@ -6670,7 +6652,7 @@ impl LifecycleBackend for Driver {
     fn set_thinking(&self, thinking: Thinking) -> BackendFuture<Result<()>> {
         let state = self.state.clone();
         Box::pin(async move {
-            let _admission = state.admission.lock().await;
+            let _admission = state.admission.enter().await;
             if state.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
@@ -6679,11 +6661,7 @@ impl LifecycleBackend for Driver {
             model
                 .capabilities(ModelTransport::Native)
                 .check_thinking(thinking)?;
-            *state
-                .effort
-                .write()
-                .map_err(|_| unsupported("Claude effort lock poisoned"))? =
-                thinking_effort(thinking);
+            state.effort.set(thinking_effort(thinking));
             state
                 .adaptive_thinking
                 .store(thinking != Thinking::None, Ordering::SeqCst);
@@ -6696,7 +6674,7 @@ impl LifecycleBackend for Driver {
     fn set_fast_mode(&self, enabled: bool) -> BackendFuture<Result<()>> {
         let state = self.state.clone();
         Box::pin(async move {
-            let _admission = state.admission.lock().await;
+            let _admission = state.admission.enter().await;
             if state.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
@@ -6718,25 +6696,25 @@ impl LifecycleBackend for Driver {
                 let cancellation = Arc::new(Cancellation::default());
                 let cleanup_cancellation = cancellation.clone();
                 let result = async move {
-                    let _admission = state.admission.lock().await;
-                    *state.compaction_cancel.lock().await = Some(cancellation.clone());
+                    let _admission = state.admission.enter().await;
+                    state.compaction_cancel.set(Some(cancellation.clone()));
                     if state.stopped.load(Ordering::SeqCst) {
                         return Err(NanocodeError::AgentStopped);
                     }
 
-                    for cancel in state.cancellations.lock().await.values() {
+                    for cancel in state.cancellations.get().values() {
                         cancel.cancel();
                     }
                     loop {
                         let notified = state.idle.notified();
                         tokio::pin!(notified);
                         notified.as_mut().enable();
-                        if state.cancellations.lock().await.is_empty() {
+                        if state.cancellations.get().is_empty() {
                             break;
                         }
                         notified.await;
                     }
-                    let mut context = state.conversation.lock().await;
+                    let mut context = state.conversation.acquire().await;
                     let mut operation = None;
                     let mut _compaction_attempt = None;
                     if let Some(policy) = &state.policy {
@@ -6825,14 +6803,14 @@ impl LifecycleBackend for Driver {
                         })
                 }
                 .await;
-                let mut registered = cleanup.compaction_cancel.lock().await;
-                if registered
-                    .as_ref()
-                    .is_some_and(|token| Arc::ptr_eq(token, &cleanup_cancellation))
-                {
-                    *registered = None;
-                }
-                drop(registered);
+                cleanup.compaction_cancel.update(|registered| {
+                    if registered
+                        .as_ref()
+                        .is_some_and(|token| Arc::ptr_eq(token, &cleanup_cancellation))
+                    {
+                        *registered = None;
+                    }
+                });
                 if result
                     .as_ref()
                     .err()
@@ -6912,7 +6890,7 @@ impl LifecycleBackend for Driver {
         let state = self.state.clone();
         Box::pin(async move {
             {
-                let _admission = state.admission.lock().await;
+                let _admission = state.admission.enter().await;
                 if state.stopped.swap(true, Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -6931,18 +6909,18 @@ impl LifecycleBackend for Driver {
         Box::pin(async move {
             state.closing.store(true, Ordering::SeqCst);
             let first_shutdown = !state.stopped.swap(true, Ordering::SeqCst);
-            if let Some(cancel) = state.compaction_cancel.lock().await.as_ref() {
+            if let Some(cancel) = state.compaction_cancel.get().as_ref() {
                 cancel.cancel();
             }
-            for cancel in state.cancellations.lock().await.values() {
+            for cancel in state.cancellations.get().values() {
                 cancel.cancel();
             }
-            let _admission = state.admission.lock().await;
+            let _admission = state.admission.enter().await;
             loop {
                 let notified = state.idle.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                let cancels = state.cancellations.lock().await;
+                let cancels = state.cancellations.get();
                 if cancels.is_empty() {
                     break;
                 }
@@ -6961,8 +6939,8 @@ impl LifecycleBackend for Driver {
                     .iter()
                     .any(|hook| hook.handles_lifecycle(&end_event))
             {
-                let mut context = state.conversation.lock().await;
-                if let Some(opened) = state.lifecycle_opened.lock().await.clone() {
+                let mut context = state.conversation.acquire().await;
+                if let Some(opened) = Option::clone(&state.lifecycle_opened.get()) {
                     let mut operation = None;
                     let mut deliver = true;
                     if let Some(policy) = &state.policy {
@@ -7024,7 +7002,7 @@ impl State {
             let notified = self.idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.cancellations.lock().await.is_empty() {
+            if self.cancellations.get().is_empty() {
                 break;
             }
             notified.await;

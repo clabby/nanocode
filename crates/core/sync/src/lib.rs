@@ -87,13 +87,17 @@ impl<T: Clone> Atom<T> {
     }
 
     pub fn try_update<R>(&self, mut change: impl FnMut(&mut T) -> Option<R>) -> Option<R> {
+        self.modify(|value| change(value).ok_or(())).ok()
+    }
+
+    pub fn modify<R, E>(&self, mut change: impl FnMut(&mut T) -> Result<R, E>) -> Result<R, E> {
         let mut current = self.0.load_full();
         loop {
             let mut next = T::clone(&current);
             let output = change(&mut next)?;
             let previous = self.0.compare_and_swap(&current, Arc::new(next));
             if Arc::ptr_eq(&previous, &current) {
-                return Some(output);
+                return Ok(output);
             }
             current = arc_swap::Guard::into_inner(previous);
         }
@@ -280,6 +284,212 @@ impl<T: Clone> SingleFlight<T> {
     }
 }
 
+#[derive(Clone, Default)]
+struct Queue {
+    holder: Option<u64>,
+    waiting: std::collections::VecDeque<(u64, Arc<Signal>)>,
+}
+
+#[derive(Default)]
+struct Line {
+    queue: Atom<Queue>,
+    tickets: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone, Default)]
+pub struct Sequencer(Arc<Line>);
+
+pub struct Turn {
+    line: Arc<Line>,
+    ticket: u64,
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        let next = self.line.queue.update(|queue| {
+            queue.waiting.retain(|(ticket, _)| *ticket != self.ticket);
+            if queue.holder != Some(self.ticket) {
+                return None;
+            }
+            let next = queue.waiting.pop_front();
+            queue.holder = next.as_ref().map(|(ticket, _)| *ticket);
+            next.map(|(_, admitted)| admitted)
+        });
+        if let Some(next) = next {
+            next.fire();
+        }
+    }
+}
+
+impl Sequencer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn ticket(&self) -> Turn {
+        Turn {
+            line: Arc::clone(&self.0),
+            ticket: self
+                .0
+                .tickets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    pub async fn enter(&self) -> Turn {
+        let turn = self.ticket();
+        let admitted = Arc::new(Signal::new());
+        let immediate = self.0.queue.update(|queue| {
+            if queue.holder.is_none() && queue.waiting.is_empty() {
+                queue.holder = Some(turn.ticket);
+                true
+            } else {
+                queue
+                    .waiting
+                    .push_back((turn.ticket, Arc::clone(&admitted)));
+                false
+            }
+        });
+        if !immediate {
+            admitted.wait().await;
+        }
+        turn
+    }
+
+    #[must_use]
+    pub fn try_enter(&self) -> Option<Turn> {
+        let turn = self.ticket();
+        self.0
+            .queue
+            .try_update(|queue| {
+                (queue.holder.is_none() && queue.waiting.is_empty())
+                    .then(|| queue.holder = Some(turn.ticket))
+            })
+            .map(|()| turn)
+    }
+}
+
+pub struct Owned<T> {
+    sequencer: Sequencer,
+    value: Slot<T>,
+}
+
+impl<T: Default> Default for Owned<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+pub struct Held<'owner, T> {
+    owner: &'owner Owned<T>,
+    value: Option<T>,
+    _turn: Turn,
+}
+
+impl<T> std::ops::Deref for Held<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("a held value stays present until release")
+    }
+}
+
+impl<T> std::ops::DerefMut for Held<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.value
+            .as_mut()
+            .expect("a held value stays present until release")
+    }
+}
+
+impl<T> Drop for Held<'_, T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            self.owner.value.put(value);
+        }
+    }
+}
+
+pub struct Leased<T> {
+    owner: Arc<Owned<T>>,
+    value: Option<T>,
+    _turn: Turn,
+}
+
+impl<T> std::ops::Deref for Leased<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("a leased value stays present until release")
+    }
+}
+
+impl<T> std::ops::DerefMut for Leased<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.value
+            .as_mut()
+            .expect("a leased value stays present until release")
+    }
+}
+
+impl<T> Drop for Leased<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            self.owner.value.put(value);
+        }
+    }
+}
+
+impl<T> Owned<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            sequencer: Sequencer::new(),
+            value: Slot::new(Some(value)),
+        }
+    }
+
+    fn held(&self, turn: Turn) -> Held<'_, T> {
+        Held {
+            owner: self,
+            value: self.value.take(),
+            _turn: turn,
+        }
+    }
+
+    pub async fn acquire(&self) -> Held<'_, T> {
+        let turn = self.sequencer.enter().await;
+        self.held(turn)
+    }
+
+    pub fn try_acquire(&self) -> Option<Held<'_, T>> {
+        self.sequencer.try_enter().map(|turn| self.held(turn))
+    }
+
+    fn leased(self: Arc<Self>, turn: Turn) -> Leased<T> {
+        let value = self.value.take();
+        Leased {
+            owner: self,
+            value,
+            _turn: turn,
+        }
+    }
+
+    pub async fn acquire_owned(self: Arc<Self>) -> Leased<T> {
+        let turn = self.sequencer.enter().await;
+        self.leased(turn)
+    }
+
+    pub fn try_acquire_owned(self: Arc<Self>) -> Option<Leased<T>> {
+        let turn = self.sequencer.try_enter()?;
+        Some(self.leased(turn))
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 type Job<S> =
     Box<dyn for<'a> FnOnce(&'a mut S) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send>;
@@ -349,6 +559,9 @@ impl<S: 'static> Actor<S> {
         let (mut sender, receiver) = oneshot::channel();
         let job: Job<S> = Box::new(move |state| {
             Box::pin(async move {
+                if sender.is_closed() {
+                    return;
+                }
                 let work = job(state);
                 let output = {
                     let abandoned = Box::pin(sender.closed());
@@ -380,6 +593,9 @@ impl<S: 'static> Actor<S> {
         let (mut sender, receiver) = oneshot::channel();
         let job: Job<S> = Box::new(move |state| {
             Box::pin(async move {
+                if sender.is_closed() {
+                    return;
+                }
                 let work = job(state);
                 let output = {
                     let abandoned = Box::pin(sender.closed());

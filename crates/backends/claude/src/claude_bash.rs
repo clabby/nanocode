@@ -1,5 +1,6 @@
 use crate::tools::{BashExecution, BashExecutor, BashRequest, BashResult, ClaudeBash};
 use async_trait::async_trait;
+use nanocode_sync::{Atom, Signal};
 use nanocode_tool_host::{
     SessionEnvironment, Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult,
     ToolsBuilder,
@@ -9,21 +10,24 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::{
-    sync::{Mutex as AsyncMutex, watch},
-    task::JoinHandle,
-};
+use tokio::sync::watch;
 
 type Outcome = Result<BashResult, String>;
 struct Job {
     result: watch::Receiver<Option<Outcome>>,
-    task: AsyncMutex<Option<JoinHandle<()>>>,
+    finished: Arc<Signal>,
     abort: tokio::task::AbortHandle,
+}
+struct Finished(Arc<Signal>);
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.0.fire();
+    }
 }
 impl Drop for Job {
     fn drop(&mut self) {
@@ -33,26 +37,18 @@ impl Drop for Job {
 #[derive(Default)]
 pub(super) struct Jobs {
     next: AtomicU64,
-    entries: Mutex<BTreeMap<String, Arc<Job>>>,
+    entries: Atom<BTreeMap<String, Arc<Job>>>,
 }
 impl Jobs {
     pub(super) async fn shutdown(&self) {
         let jobs = self
             .entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+            .read(|entries| entries.values().cloned().collect::<Vec<_>>());
         for job in &jobs {
             job.abort.abort();
         }
         for job in jobs {
-            let mut task = job.task.lock().await;
-            if let Some(handle) = task.as_mut() {
-                let _ = handle.await;
-            }
-            *task = None;
+            job.finished.wait().await;
         }
     }
 }
@@ -118,23 +114,23 @@ impl BashExecutor for LocalBash {
         );
         let (sender, receiver) = watch::channel(None);
         let job = {
-            let mut entries = self
-                .jobs
-                .entries
-                .lock()
-                .map_err(|_| "Bash job store poisoned")?;
             let workspace = self.workspace.clone();
             let executor = self.executor.clone();
+            let finished = Arc::new(Signal::new());
+            let guard = Finished(Arc::clone(&finished));
             let task = tokio::spawn(async move {
+                let _finished = guard;
                 let result = run(executor.as_ref(), workspace, request, hard_timeout).await;
                 let _ = sender.send(Some(result));
             });
             let job = Arc::new(Job {
                 abort: task.abort_handle(),
-                task: AsyncMutex::new(Some(task)),
+                finished,
                 result: receiver,
             });
-            entries.insert(id.clone(), job.clone());
+            self.jobs.entries.update(|entries| {
+                entries.insert(id.clone(), Arc::clone(&job));
+            });
             job
         };
 
@@ -149,11 +145,9 @@ impl BashExecutor for LocalBash {
         let mut admission = Admission(Some(job.abort.clone()));
         if !background {
             if let Ok(result) = tokio::time::timeout(foreground_timeout, completion(&job)).await {
-                self.jobs
-                    .entries
-                    .lock()
-                    .map_err(|_| "Bash job store poisoned")?
-                    .remove(&id);
+                self.jobs.entries.update(|entries| {
+                    entries.remove(&id);
+                });
                 return result.map(BashExecution::Completed);
             }
         }
@@ -290,18 +284,11 @@ impl TaskTool {
         let job = self
             .jobs
             .entries
-            .lock()
-            .map_err(|_| "Bash job store poisoned")?
-            .get(id)
-            .cloned()
+            .read(|entries| entries.get(id).cloned())
             .ok_or("unknown task_id in this session")?;
         if self.name == "TaskStop" {
             job.abort.abort();
-            let mut task = job.task.lock().await;
-            if let Some(handle) = task.as_mut() {
-                let _ = handle.await;
-            }
-            *task = None;
+            job.finished.wait().await;
             return Ok(
                 json!({"task_id":id,"status":if job.result.borrow().is_some() {"completed"} else {"stopped"}}),
             );

@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{Arc, Weak},
 };
+
+use nanocode_sync::Atom;
 
 use serde_json::{Value, json};
 
@@ -33,10 +35,10 @@ pub enum Placement {
 
 #[derive(Clone, Default)]
 pub struct CodeModeExecutors {
-    state: Arc<Mutex<State>>,
+    state: Arc<Atom<State>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     executors: BTreeMap<Arc<str>, Arc<dyn CodeModeHost>>,
     selections: HashMap<Box<str>, ExecutorSelection>,
@@ -45,7 +47,7 @@ struct State {
     sessions: HashMap<Box<str>, SessionPlaces>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SessionPlaces {
     touched: Vec<Arc<str>>,
     cells: Vec<(Box<str>, Option<Arc<str>>)>,
@@ -108,7 +110,7 @@ pub const PLACEMENT_INSTRUCTIONS: &str = "Code Mode scripts run on one machine: 
 
 const HANDS_DESCRIPTION: &str = "List the hands attached to this session: whole machines, each with its own files, processes and tools. `here` names the hand this script runs on, or is null on the brain's own machine. Inside exec, any tool call runs on another hand when its arguments include `hand: \"<name>\"`, for example `await Promise.all(names.map(hand => tools.exec_command({ cmd: \"uptime\", hand })))`; a freeform tool takes `{ input, hand }`. Calls without `hand` run where the script runs. Naming a hand that is not attached fails without running anything, and a hand lost mid-call leaves that call's outcome unknown.";
 
-struct ExecutorCalls(Weak<Mutex<State>>);
+struct ExecutorCalls(Weak<Atom<State>>);
 
 impl HandCalls for ExecutorCalls {
     fn here(&self, _hand: &str) -> bool {
@@ -181,10 +183,6 @@ impl CodeModeExecutors {
         Self::default()
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     pub fn insert(
         &self,
         name: impl Into<Arc<str>>,
@@ -192,40 +190,43 @@ impl CodeModeExecutors {
     ) -> Option<Arc<dyn CodeModeHost>> {
         let name = name.into();
         host.route_hands(&name, self.calls());
-        let mut state = self.state();
-        let previous = state.executors.insert(Arc::clone(&name), host);
-        if previous.is_some() {
-            state.forget_executor(&name);
-        }
-        previous
+        self.state.update(|state| {
+            let previous = state.executors.insert(Arc::clone(&name), Arc::clone(&host));
+            if previous.is_some() {
+                state.forget_executor(&name);
+            }
+            previous
+        })
     }
 
     pub fn remove(&self, name: &str) -> Option<Arc<dyn CodeModeHost>> {
-        let mut state = self.state();
-        let removed = state.executors.remove(name);
-        if removed.is_some() {
-            state.forget_executor(name);
-        }
-        removed
+        self.state.update(|state| {
+            let removed = state.executors.remove(name);
+            if removed.is_some() {
+                state.forget_executor(name);
+            }
+            removed
+        })
     }
 
     pub fn remove_host(&self, name: &str, host: &Arc<dyn CodeModeHost>) -> bool {
-        let mut state = self.state();
-        if !state
-            .executors
-            .get(name)
-            .is_some_and(|current| Arc::ptr_eq(current, host))
-        {
-            return false;
-        }
-        state.executors.remove(name);
-        state.forget_executor(name);
-        true
+        self.state
+            .try_update(|state| {
+                state
+                    .executors
+                    .get(name)
+                    .is_some_and(|current| Arc::ptr_eq(current, host))
+                    .then(|| {
+                        state.executors.remove(name);
+                        state.forget_executor(name);
+                    })
+            })
+            .is_some()
     }
 
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<dyn CodeModeHost>> {
-        self.state().executors.get(name).cloned()
+        self.state.read(|state| state.executors.get(name).cloned())
     }
 
     pub fn connected(&self, name: &str) -> Result<Arc<dyn CodeModeHost>, CodeModeHostError> {
@@ -234,7 +235,8 @@ impl CodeModeExecutors {
 
     #[must_use]
     pub fn names(&self) -> Vec<Arc<str>> {
-        self.state().executors.keys().cloned().collect()
+        self.state
+            .read(|state| state.executors.keys().cloned().collect())
     }
 
     #[must_use]
@@ -254,26 +256,28 @@ impl CodeModeExecutors {
         input: Value,
         context: ToolContext<'_>,
     ) -> ToolOutput {
-        let host = {
-            let mut state = self.state();
+        let session_id = context.session_id();
+        let host = self.state.modify(|state| {
             let Some((hand, host)) = state
                 .executors
                 .get_key_value(hand)
                 .map(|(hand, host)| (Arc::clone(hand), Arc::clone(host)))
             else {
-                return ToolOutput::error(format!(
-                    "hand `{hand}` is not attached ({}); nothing was dispatched",
-                    state.attached()
-                ));
+                return Err(state.attached());
             };
-            let places = state
-                .sessions
-                .entry(context.session_id().into())
-                .or_default();
+            let places = state.sessions.entry(session_id.into()).or_default();
             if !places.touched.contains(&hand) {
                 places.touched.push(hand);
             }
-            host
+            Ok(host)
+        });
+        let host = match host {
+            Ok(host) => host,
+            Err(attached) => {
+                return ToolOutput::error(format!(
+                    "hand `{hand}` is not attached ({attached}); nothing was dispatched"
+                ));
+            }
         };
         match host.call(name, input, context).await {
             Ok(output) => output,
@@ -282,81 +286,87 @@ impl CodeModeExecutors {
     }
 
     pub fn select(&self, session_id: &str, selection: Option<ExecutorSelection>) {
-        let mut state = self.state();
-        match selection {
+        self.state.update(|state| match &selection {
             Some(selection) => {
-                state.selections.insert(session_id.into(), selection);
+                state
+                    .selections
+                    .insert(session_id.into(), selection.clone());
             }
             None => {
                 state.selections.remove(session_id);
             }
-        }
+        });
     }
 
     pub fn select_prompt_hand(&self, session_id: &str, sender: Option<&str>) {
-        let mut state = self.state();
-        let hand = sender.map(Arc::from).or_else(|| {
-            if state.default.is_none() && state.executors.len() == 1 {
-                state.executors.keys().next().cloned()
-            } else {
-                None
+        self.state.update(|state| {
+            let hand = sender.map(Arc::from).or_else(|| {
+                if state.default.is_none() && state.executors.len() == 1 {
+                    state.executors.keys().next().cloned()
+                } else {
+                    None
+                }
+            });
+            match hand {
+                Some(hand) => {
+                    state
+                        .selections
+                        .insert(session_id.into(), ExecutorSelection::Executor(hand));
+                }
+                None => {
+                    state.selections.remove(session_id);
+                }
             }
         });
-        match hand {
-            Some(hand) => {
-                state
-                    .selections
-                    .insert(session_id.into(), ExecutorSelection::Executor(hand));
-            }
-            None => {
-                state.selections.remove(session_id);
-            }
-        }
     }
 
     #[must_use]
     pub fn selection(&self, session_id: &str) -> ExecutorSelection {
-        self.state().resolve(session_id)
+        self.state.read(|state| state.resolve(session_id))
     }
 
     #[must_use]
     pub fn placement(&self, session_id: &str) -> Placement {
-        self.state().placement(session_id)
+        self.state.read(|state| state.placement(session_id))
     }
 
     pub fn set_default(&self, name: Option<Arc<str>>) {
-        self.state().default = name;
+        self.state.update(|state| state.default.clone_from(&name));
     }
 
     #[must_use]
     pub fn default_executor(&self) -> Option<Arc<str>> {
-        self.state().default.clone()
+        self.state.read(|state| state.default.clone())
     }
 
     pub fn clear_selections(&self, name: &str) {
-        let mut state = self.state();
-        state.selections.retain(|_, selection| match selection {
-            ExecutorSelection::Executor(selected) => &**selected != name,
-            ExecutorSelection::Local => true,
+        self.state.update(|state| {
+            state.selections.retain(|_, selection| match selection {
+                ExecutorSelection::Executor(selected) => &**selected != name,
+                ExecutorSelection::Local => true,
+            });
+            if state.default.as_deref() == Some(name) {
+                state.default = None;
+            }
         });
-        if state.default.as_deref() == Some(name) {
-            state.default = None;
-        }
     }
 
     pub fn link(&self, session_id: &str, root_session_id: &str) {
         if session_id != root_session_id {
-            self.state()
-                .roots
-                .insert(session_id.into(), root_session_id.into());
+            self.state.update(|state| {
+                state
+                    .roots
+                    .insert(session_id.into(), root_session_id.into());
+            });
         }
     }
 
     pub fn forget(&self, session_id: &str) {
-        let mut state = self.state();
-        state.selections.remove(session_id);
-        state.roots.remove(session_id);
-        state.sessions.remove(session_id);
+        self.state.update(|state| {
+            state.selections.remove(session_id);
+            state.roots.remove(session_id);
+            state.sessions.remove(session_id);
+        });
     }
 
     pub fn record(
@@ -365,28 +375,29 @@ impl CodeModeExecutors {
         executor: Option<&Arc<str>>,
         execution: &CodeModeExecution,
     ) {
-        let mut state = self.state();
-        let places = state.sessions.entry(session_id.into()).or_default();
-        if let Some(name) = executor
-            && !places.touched.contains(name)
-        {
-            places.touched.push(Arc::clone(name));
-        }
-        if let Some(cell) = &execution.cell {
-            places.cells.retain(|(origin, place)| {
-                **origin != *cell.origin_call_id || place.as_ref() != executor
-            });
-            if cell.running {
-                places
-                    .cells
-                    .push((cell.origin_call_id.as_str().into(), executor.cloned()));
+        self.state.update(|state| {
+            let places = state.sessions.entry(session_id.into()).or_default();
+            if let Some(name) = executor
+                && !places.touched.contains(name)
+            {
+                places.touched.push(Arc::clone(name));
             }
-        }
+            if let Some(cell) = &execution.cell {
+                places.cells.retain(|(origin, place)| {
+                    **origin != *cell.origin_call_id || place.as_ref() != executor
+                });
+                if cell.running {
+                    places
+                        .cells
+                        .push((cell.origin_call_id.as_str().into(), executor.cloned()));
+                }
+            }
+        });
     }
 
     #[must_use]
     pub fn wait_route(&self, session_id: &str) -> Vec<Option<Arc<str>>> {
-        let state = self.state();
+        let state = self.state.get();
         let mut places = Vec::new();
         if let Some(session) = state.sessions.get(session_id) {
             for (_, place) in session.cells.iter().rev() {
@@ -424,13 +435,13 @@ impl CodeModeExecutors {
     fn unselected(&self) -> CodeModeHostError {
         CodeModeHostError::new(format!(
             "no hand is selected to run this session's scripts ({}); nothing was dispatched",
-            self.state().attached()
+            self.state.read(State::attached)
         ))
     }
 
     #[must_use]
     pub fn touched(&self, session_id: &str) -> Vec<Arc<dyn CodeModeHost>> {
-        let state = self.state();
+        let state = self.state.get();
         state
             .sessions
             .get(session_id)
@@ -445,9 +456,11 @@ impl CodeModeExecutors {
     }
 
     pub fn settle_cells(&self, session_id: &str) {
-        if let Some(session) = self.state().sessions.get_mut(session_id) {
-            session.cells.clear();
-        }
+        self.state.update(|state| {
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                session.cells.clear();
+            }
+        });
     }
 
     pub async fn execute_on(
