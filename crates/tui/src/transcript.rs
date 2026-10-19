@@ -193,6 +193,9 @@ struct Stable {
     body: usize,
     bytes: usize,
     blocks: usize,
+    continuation: markdown::Continuation,
+    open: Option<(usize, usize)>,
+    fallback: (usize, usize, usize, usize),
 }
 
 #[derive(Clone)]
@@ -200,6 +203,7 @@ struct Rows {
     head: Rc<Output>,
     tail: Rc<Output>,
     spinners: Rc<[(usize, usize)]>,
+    group: Option<(Range<usize>, Option<Source>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -241,12 +245,17 @@ impl Rows {
     }
 
     fn source(&self, row: usize) -> Option<&Option<Source>> {
+        if let Some((rows, source)) = &self.group
+            && rows.contains(&row)
+        {
+            return Some(source);
+        }
         let (part, row) = self.part(row);
         part.sources.get(row)
     }
 
     fn sources(&self) -> impl Iterator<Item = &Option<Source>> {
-        self.head.sources.iter().chain(&self.tail.sources)
+        (0..self.len()).filter_map(|row| self.source(row))
     }
 
     fn animated(&self, row: usize, spinner: &str) -> Line<'static> {
@@ -759,6 +768,7 @@ impl Transcript {
                     head: Rc::default(),
                     spinners: spinners(&out.lines, 0).collect(),
                     tail: Rc::new(out),
+                    group: None,
                 };
                 (rows, None)
             });
@@ -949,6 +959,21 @@ impl Transcript {
     }
 }
 
+impl Stable {
+    fn rewind(&mut self) {
+        let (lines, body, bytes, blocks) = self.fallback;
+        let head = Rc::make_mut(&mut self.rows);
+        head.lines.truncate(lines);
+        head.sources.truncate(lines);
+        self.spinners.retain(|&(row, _)| row < lines);
+        self.body = body;
+        self.bytes = bytes;
+        self.blocks = blocks;
+        self.continuation = markdown::Continuation::Block;
+        self.open = None;
+    }
+}
+
 impl Layout {
     fn release(&mut self, live: bool) -> bool {
         if !live {
@@ -1082,6 +1107,13 @@ fn spinners(lines: &[Line<'_>], offset: usize) -> impl Iterator<Item = (usize, u
     })
 }
 
+const fn text_source(bytes: Range<usize>) -> Option<Source> {
+    Some(Source {
+        part: Part::Text,
+        extent: Extent::Bytes(bytes),
+    })
+}
+
 fn plain(text: &str, width: u16, style: Style, preserve_whitespace: bool, part: &Part) -> Vec<Row> {
     plain_from(text, width, style, preserve_whitespace, part, 0)
 }
@@ -1172,17 +1204,32 @@ impl RenderContext<'_> {
             .filter(contained)
             .unwrap_or_else(|| self.frame(kind, index, text));
         let commit = width > 0 && contained(&stable);
+        let mut group = None;
+        let mut block = None;
         let (body, boundary) = match plain {
             None => {
-                let (layout, boundary) = markdown::render_from(
-                    text,
-                    stable.bytes,
-                    stable.blocks,
-                    width,
-                    theme,
-                    highlights,
-                );
-                (rendered(layout, &Part::Text), boundary.filter(|_| commit))
+                let render = |stable: &Stable, highlights: &mut markdown::Highlights| {
+                    markdown::render_from(
+                        text,
+                        stable.bytes,
+                        stable.blocks,
+                        stable.continuation,
+                        width,
+                        theme,
+                        highlights,
+                    )
+                };
+                let mut rendered_text = render(&stable, highlights);
+                if !rendered_text.resumed {
+                    stable.rewind();
+                    rendered_text = render(&stable, highlights);
+                }
+                group = rendered_text.group;
+                block = rendered_text.block;
+                (
+                    rendered(rendered_text.layout, &Part::Text),
+                    rendered_text.boundary.filter(|_| commit),
+                )
             }
             Some(style) => {
                 let tail = text[stable.bytes..].trim_end();
@@ -1204,6 +1251,8 @@ impl RenderContext<'_> {
                             bytes: stable.bytes + end + 1,
                             lines: rows.len(),
                             blocks: stable.blocks + lines,
+                            continuation: markdown::Continuation::Block,
+                            group: None,
                         };
                         rows.extend(plain_from(
                             &tail[end + 1..],
@@ -1231,18 +1280,45 @@ impl RenderContext<'_> {
             };
             (prefixed(line, prefix), source)
         });
+        let open = stable.open;
+        let mut committed = 0;
         if let Some(boundary) = boundary {
             let head = Rc::make_mut(&mut stable.rows);
             let before = head.lines.len();
             for (line, source) in body.by_ref().take(boundary.lines) {
                 head.push(line, source);
             }
+            if let (Some((row, start)), Some((rows, end))) = (stable.open, group)
+                && boundary.lines >= rows
+            {
+                head.sources[row..before + rows].fill(text_source(start..end));
+                stable.open = None;
+            }
+            stable.open = match boundary.group {
+                Some((0, _)) if stable.open.is_some() => stable.open,
+                Some((line, source)) => Some((before + line, source)),
+                None => None,
+            };
             stable
                 .spinners
                 .extend(spinners(&head.lines[before..], before));
             stable.body += boundary.lines;
             stable.bytes = boundary.bytes;
             stable.blocks = boundary.blocks;
+            stable.continuation = boundary.continuation;
+            committed = boundary.lines;
+            let rewind = match boundary.continuation {
+                markdown::Continuation::Block => Some(boundary),
+                _ => block.filter(|block| block.lines <= boundary.lines),
+            };
+            if let Some(rewind) = rewind {
+                stable.fallback = (
+                    before + rewind.lines,
+                    stable.body - boundary.lines + rewind.lines,
+                    rewind.bytes,
+                    rewind.blocks,
+                );
+            }
         }
         let mut tail = Output::default();
         for (line, source) in body {
@@ -1258,6 +1334,11 @@ impl RenderContext<'_> {
                 .chain(spinners(&tail.lines, offset))
                 .collect(),
             tail: Rc::new(tail),
+            group: stable.open.filter(|_| stable.open == open).zip(group).map(
+                |((row, start), (rows, end))| {
+                    (row..offset + rows - committed, text_source(start..end))
+                },
+            ),
         };
         Some((rows, (stable.body > 0).then_some(stable)))
     }
@@ -1274,12 +1355,16 @@ impl RenderContext<'_> {
             CellKind::Reasoning(_) => text.len() - text.trim_start().len(),
             _ => 0,
         };
+        let lines = rows.lines.len();
         Stable {
             spinners: spinners(&rows.lines, 0).collect(),
             rows: Rc::new(rows),
             body: 0,
             bytes,
             blocks: 0,
+            continuation: markdown::Continuation::Block,
+            open: None,
+            fallback: (lines, 0, bytes, 0),
         }
     }
 

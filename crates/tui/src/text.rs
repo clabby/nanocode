@@ -101,7 +101,7 @@ pub(crate) fn ascii_rows(
     width: usize,
     prefer_words: bool,
     preserve_whitespace: bool,
-) -> Vec<(Range<usize>, usize)> {
+) -> Vec<(Range<usize>, usize, usize)> {
     let bytes = text.as_bytes();
     let mut rows = Vec::new();
     let mut line_start = 0;
@@ -110,7 +110,7 @@ pub(crate) fn ascii_rows(
         .enumerate()
     {
         if line_start == line_end {
-            rows.push((line_start..line_end, line));
+            rows.push((line_start..line_end, line, line_end));
         }
         let mut start = line_start;
         while start < line_end {
@@ -149,7 +149,7 @@ pub(crate) fn ascii_rows(
             } else {
                 start + bytes[start..split].trim_ascii_end().len()
             };
-            rows.push((start..rendered, line));
+            rows.push((start..rendered, line, end));
             start = split;
         }
         line_start = line_end + 1;

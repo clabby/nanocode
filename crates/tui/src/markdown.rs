@@ -4,7 +4,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use std::{ops::Range, sync::Arc};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 use syntect::{easy::HighlightLines, highlighting::HighlightState, parsing::ParseState};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -90,7 +90,16 @@ pub(crate) fn render_with(
     theme: &Theme,
     highlights: &mut Highlights,
 ) -> Layout {
-    render_from(markdown, 0, 0, width, theme, highlights).0
+    render_from(
+        markdown,
+        0,
+        0,
+        Continuation::Block,
+        width,
+        theme,
+        highlights,
+    )
+    .layout
 }
 
 #[derive(Clone, Copy)]
@@ -98,16 +107,49 @@ pub(crate) struct Checkpoint {
     pub(crate) bytes: usize,
     pub(crate) lines: usize,
     pub(crate) blocks: usize,
+    pub(crate) continuation: Continuation,
+    pub(crate) group: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) enum Continuation {
+    #[default]
+    Block,
+    Item {
+        next: Option<u64>,
+        loose: bool,
+    },
+    Text,
+}
+
+pub(crate) struct Rendered {
+    pub(crate) layout: Layout,
+    pub(crate) boundary: Option<Checkpoint>,
+    pub(crate) block: Option<Checkpoint>,
+    pub(crate) resumed: bool,
+    pub(crate) group: Option<(usize, usize)>,
+}
+
+enum Trailing {
+    Text { clean: bool, quoted: bool },
+    List(Items),
+}
+
+#[derive(Default)]
+struct Items {
+    starts: Vec<(Option<Checkpoint>, Option<u64>, bool)>,
+    loose: Option<bool>,
 }
 
 pub(crate) fn render_from(
     markdown: &str,
     start: usize,
     blocks: usize,
+    continuation: Continuation,
     width: u16,
     theme: &Theme,
     highlights: &mut Highlights,
-) -> (Layout, Option<Checkpoint>) {
+) -> Rendered {
     let text = &markdown[start..];
     let span = tracing::info_span!(
         "tui.markdown.render",
@@ -118,13 +160,19 @@ pub(crate) fn render_from(
         code.highlighted = tracing::field::Empty
     );
     let _entered = span.enter();
-    if width == 0 {
-        let layout = Layout {
+    let skipped = |resumed| Rendered {
+        layout: Layout {
             lines: Vec::new(),
             links: Vec::new(),
             sources: Vec::new(),
-        };
-        return (layout, None);
+        },
+        boundary: None,
+        block: None,
+        resumed,
+        group: None,
+    };
+    if width == 0 {
+        return skipped(true);
     }
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
@@ -137,17 +185,105 @@ pub(crate) fn render_from(
     renderer.continued = start > 0;
     let mut depth = 0_usize;
     let mut boundary = None;
+    let mut trailing = None;
+    let mut opened = 0_usize;
+    let mut observed = None;
     let mut events = Parser::new_ext(text, options).into_offset_iter();
     while let Some((event, range)) = events.next() {
-        if depth == 0
-            && matches!(event, Event::Start(_) | Event::Rule)
-            && memchr::memchr(b'\n', &text.as_bytes()[range.start..]).is_some()
-        {
-            boundary = Some(Checkpoint {
-                bytes: start + text[..range.start].rfind('\n').map_or(0, |index| index + 1),
-                lines: renderer.lines.len(),
-                blocks: renderer.block,
-            });
+        let (lines, blocks) = (renderer.lines.len(), renderer.block);
+        let at = range.start;
+        let checkpoint = move || {
+            let line = text[..at].rfind('\n').map_or(0, |index| index + 1);
+            let complete = memchr::memchr(b'\n', &text.as_bytes()[at..]).is_some();
+            let checkpoint = Checkpoint {
+                bytes: start + line,
+                lines,
+                blocks,
+                continuation: Continuation::Block,
+                group: None,
+            };
+            (checkpoint, complete, line)
+        };
+        let event = if depth == 0 && matches!(event, Event::Start(_) | Event::Rule) {
+            let (checkpoint, complete, _) = checkpoint();
+            if complete && (opened > 0 || matches!(continuation, Continuation::Block)) {
+                boundary = Some(checkpoint);
+            }
+            if let Some(Trailing::List(items)) = trailing.take()
+                && opened == 1
+            {
+                observed = items.loose;
+            }
+            opened += 1;
+            renderer.cut = None;
+            trailing = match event {
+                Event::Start(Tag::Paragraph) => Some(Trailing::Text {
+                    clean: true,
+                    quoted: false,
+                }),
+                Event::Start(Tag::List(_)) => Some(Trailing::List(Items::default())),
+                _ => None,
+            };
+            match (opened, continuation, event) {
+                (1, Continuation::Item { next, .. }, Event::Start(Tag::List(_))) => {
+                    Event::Start(Tag::List(next))
+                }
+                (1, Continuation::Text, event @ Event::Start(Tag::Paragraph)) => event,
+                (1, Continuation::Item { .. } | Continuation::Text, _) => return skipped(false),
+                (_, _, event) => event,
+            }
+        } else {
+            event
+        };
+        match (&mut trailing, &event) {
+            (Some(Trailing::Text { clean, quoted }), Event::Text(content)) => {
+                let source = &text[range.clone()];
+                let unsettled = unsettled(text, range.clone());
+                renderer.anchor = *clean
+                    && !*quoted
+                    && !unsettled
+                    && depth == 1
+                    && content.as_ref() == source
+                    && matches!(sanitize_terminal_text(source), Cow::Borrowed(_));
+                if source == "\"" {
+                    *quoted = content.as_ref() == "\u{201c}";
+                } else if unsettled {
+                    *clean = false;
+                }
+            }
+            (Some(Trailing::List(items)), Event::Start(Tag::Item)) if depth == 1 => {
+                let (checkpoint, complete, line) = checkpoint();
+                let next = renderer.lists.last().and_then(|list| list.next);
+                let gap = line > 0
+                    && text[..line - 1]
+                        .rsplit('\n')
+                        .next()
+                        .is_some_and(|previous| previous.trim().is_empty());
+                items
+                    .starts
+                    .push((complete.then_some(checkpoint), next, gap));
+            }
+            (Some(Trailing::List(items)), Event::Start(Tag::Paragraph)) if depth == 2 => {
+                items.loose = Some(true);
+            }
+            (
+                Some(Trailing::List(items)),
+                Event::Text(_)
+                | Event::Code(_)
+                | Event::InlineHtml(_)
+                | Event::SoftBreak
+                | Event::HardBreak
+                | Event::Start(
+                    Tag::Emphasis
+                    | Tag::Strong
+                    | Tag::Strikethrough
+                    | Tag::Link { .. }
+                    | Tag::Image { .. },
+                ),
+            ) if depth == 2 => {
+                items.loose.get_or_insert(false);
+            }
+            _ => {}
         }
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -166,19 +302,80 @@ pub(crate) fn render_from(
                 }
                 renderer.range = range;
                 renderer.event(event);
+                renderer.anchor = false;
             }
         }
     }
+    if let Some(Trailing::List(items)) = &trailing
+        && opened == 1
+    {
+        observed = items.loose;
+    }
+    let resumed = match continuation {
+        Continuation::Block => true,
+        Continuation::Item { loose, .. } => {
+            opened > 0 && observed.is_none_or(|observed| observed == loose)
+        }
+        Continuation::Text => opened > 0,
+    };
+    if !resumed {
+        return skipped(false);
+    }
     span.record("code.blocks", renderer.block);
     span.record("code.highlighted", renderer.highlighted);
+    let inner = match &trailing {
+        Some(Trailing::Text { .. }) => renderer.cut.map(|cut| Checkpoint {
+            bytes: start + cut.bytes,
+            lines: cut.line,
+            blocks: renderer.block,
+            continuation: Continuation::Text,
+            group: Some((cut.group, start + cut.source)),
+        }),
+        Some(Trailing::List(items)) => items.loose.and_then(|loose| {
+            (1..items.starts.len()).rev().find_map(|index| {
+                let (checkpoint, next, _) = items.starts[index];
+                let settled = !loose || items.starts.get(index + 1).is_some_and(|(_, _, gap)| *gap);
+                checkpoint.filter(|_| settled).map(|checkpoint| Checkpoint {
+                    continuation: Continuation::Item { next, loose },
+                    ..checkpoint
+                })
+            })
+        }),
+        None => None,
+    };
+    let group = renderer.group.map(|(rows, end)| (rows, start + end));
     let mut layout = renderer.finish();
     for range in layout.sources.iter_mut().flatten() {
         range.start += start;
         range.end += start;
     }
-    let boundary =
-        boundary.filter(|boundary| boundary.lines > 0 && boundary.lines < layout.lines.len());
-    (layout, boundary)
+    let block = boundary;
+    let boundary = [inner, boundary]
+        .into_iter()
+        .flatten()
+        .find(|boundary| boundary.lines > 0 && boundary.lines < layout.lines.len());
+    Rendered {
+        layout,
+        boundary,
+        block,
+        resumed,
+        group: matches!(continuation, Continuation::Text)
+            .then_some(group)
+            .flatten(),
+    }
+}
+
+fn unsettled(text: &str, range: Range<usize>) -> bool {
+    text[range.clone()]
+        .char_indices()
+        .any(|(index, character)| match character {
+            '*' | '~' | '[' | ']' | '`' | '<' | '|' | '"' => true,
+            '_' | '\'' => !text[..range.start + index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric),
+            _ => false,
+        })
 }
 
 pub(crate) fn self_contained(markdown: &str) -> bool {
@@ -236,7 +433,7 @@ pub(crate) fn wrap_plain_rows<T>(
         }
         return rows
             .into_iter()
-            .map(|(line, _, index)| row(line, index))
+            .map(|(line, _, index, _)| row(line, index))
             .collect();
     }
     let mut lines = Vec::new();
@@ -276,6 +473,17 @@ struct Renderer<'a> {
     block: usize,
     highlighted: usize,
     continued: bool,
+    anchor: bool,
+    cut: Option<Cut>,
+    group: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct Cut {
+    line: usize,
+    bytes: usize,
+    group: usize,
+    source: usize,
 }
 
 struct ListState {
@@ -291,6 +499,7 @@ struct TaggedSpan {
     span: Span<'static>,
     link: Option<Arc<str>>,
     source: Option<Range<usize>>,
+    anchor: bool,
 }
 
 impl<'a> Renderer<'a> {
@@ -318,6 +527,9 @@ impl<'a> Renderer<'a> {
             block: 0,
             highlighted: 0,
             continued: false,
+            anchor: false,
+            cut: None,
+            group: None,
         }
     }
 
@@ -833,6 +1045,7 @@ impl<'a> Renderer<'a> {
             span,
             link,
             source: Some(self.range.clone()),
+            anchor: self.anchor,
         });
     }
 
@@ -841,6 +1054,7 @@ impl<'a> Renderer<'a> {
             span,
             link: None,
             source: None,
+            anchor: false,
         });
     }
 
@@ -849,6 +1063,7 @@ impl<'a> Renderer<'a> {
             span,
             link: Some(destination),
             source: Some(self.range.clone()),
+            anchor: false,
         });
     }
 
@@ -897,10 +1112,20 @@ impl<'a> Renderer<'a> {
             .iter()
             .filter_map(|tagged| tagged.source.clone())
             .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end));
-        for (offset, (line, links)) in wrap_tagged_spans(&self.current, self.width, true)
-            .into_iter()
-            .enumerate()
+        let rows = wrap_tagged_spans(&self.current, self.width, true);
+        if let Some(source) = &source
+            && let Some((row, bytes)) = cut(&self.current, &rows)
         {
+            self.cut = Some(Cut {
+                line: first_line + row,
+                bytes,
+                group: first_line,
+                source: source.start,
+            });
+        }
+        self.group
+            .get_or_insert((rows.len(), source.as_ref().map_or(0, |source| source.end)));
+        for (offset, (line, links, _)) in rows.into_iter().enumerate() {
             self.push_line(line, source.clone());
             self.rendered_links.extend(
                 links
@@ -994,72 +1219,114 @@ fn wrap_spans_with_whitespace(
         prefer_words,
         preserve_whitespace,
     ) {
-        return lines.into_iter().map(|(line, _, _)| line).collect();
+        return lines.into_iter().map(|(line, ..)| line).collect();
     }
-    let graphemes = spans
-        .iter()
-        .flat_map(|span| {
-            graphemes(&span.content).map(|text| StyledGrapheme {
-                text,
-                style: span.style,
-                link: None,
-                width: if matches!(text.as_bytes(), [b' '..=b'~']) {
-                    1
-                } else {
-                    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
-                },
-                whitespace: text.chars().all(char::is_whitespace),
-            })
-        })
-        .collect::<Vec<_>>();
+    let graphemes = styled_graphemes(
+        spans
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style, None)),
+    );
     wrap_graphemes(&graphemes, width, prefer_words, preserve_whitespace)
         .into_iter()
-        .map(|(line, _)| line)
+        .map(|(line, ..)| line)
         .collect()
 }
 
-fn wrap_tagged_spans(
-    spans: &[TaggedSpan],
-    width: u16,
-    prefer_words: bool,
-) -> Vec<(Line<'static>, Vec<LinkSpan>)> {
+type WrappedRow = (Line<'static>, Vec<LinkSpan>, Range<usize>);
+
+fn wrap_tagged_spans(spans: &[TaggedSpan], width: u16, prefer_words: bool) -> Vec<WrappedRow> {
     if width == 0 {
         return Vec::new();
     }
-    if let Some(lines) = wrap_ascii_spans(
+    let pieces = || {
         spans.iter().map(|tagged| {
             (
                 tagged.span.content.as_ref(),
                 tagged.span.style,
                 tagged.link.as_ref(),
             )
-        }),
-        width,
-        prefer_words,
-        false,
-    ) {
+        })
+    };
+    if let Some(lines) = wrap_ascii_spans(pieces(), width, prefer_words, false) {
         return lines
             .into_iter()
-            .map(|(line, links, _)| (line, links))
+            .map(|(line, links, _, range)| (line, links, range))
             .collect();
     }
-    let graphemes = spans
-        .iter()
-        .flat_map(|tagged| {
-            graphemes(&tagged.span.content).map(|text| StyledGrapheme {
+    wrap_graphemes(&styled_graphemes(pieces()), width, prefer_words, false)
+}
+
+fn styled_graphemes<'a>(
+    spans: impl Iterator<Item = (&'a str, Style, Option<&'a Arc<str>>)>,
+) -> Vec<StyledGrapheme<'a>> {
+    let mut offset = 0;
+    spans
+        .flat_map(|(content, style, link)| graphemes(content).map(move |text| (text, style, link)))
+        .map(|(text, style, link)| {
+            let grapheme = StyledGrapheme {
                 text,
-                style: tagged.span.style,
-                link: tagged.link.as_ref(),
+                style,
+                link,
                 width: if matches!(text.as_bytes(), [b' '..=b'~']) {
                     1
                 } else {
                     u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
                 },
                 whitespace: text.chars().all(char::is_whitespace),
-            })
+                offset,
+            };
+            offset += text.len();
+            grapheme
+        })
+        .collect()
+}
+
+fn cut(spans: &[TaggedSpan], rows: &[WrappedRow]) -> Option<(usize, usize)> {
+    if !spans.iter().any(|tagged| tagged.anchor) {
+        return None;
+    }
+    let mut starts = Vec::with_capacity(spans.len());
+    let mut joined = 0;
+    for tagged in spans {
+        starts.push(joined);
+        joined += tagged.span.content.len();
+    }
+    let reach = rows
+        .iter()
+        .scan(0, |reach, row| {
+            *reach = row.2.end.max(*reach);
+            Some(*reach)
         })
         .collect::<Vec<_>>();
-    wrap_graphemes(&graphemes, width, prefer_words, false)
+    (1..rows.len()).rev().find_map(|row| {
+        let position = rows[row].2.start;
+        let index = starts
+            .partition_point(|&start| start <= position)
+            .checked_sub(1)?;
+        let tagged = &spans[index];
+        let content = tagged.span.content.as_ref();
+        let offset = position - starts[index];
+        let settled = if index + 1 < spans.len() {
+            content.len()
+        } else {
+            let trimmed = content.trim_end();
+            trimmed.rfind(char::is_whitespace).map_or(0, |space| {
+                space + trimmed[space..].chars().next().map_or(0, char::len_utf8)
+            })
+        };
+        (tagged.anchor
+            && content
+                .get(offset..)
+                .is_some_and(|rest| rest.starts_with(char::is_alphabetic))
+            && reach[row - 1] <= starts[index] + settled)
+            .then(|| {
+                tagged
+                    .source
+                    .as_ref()
+                    .map(|source| (row, source.start + offset))
+            })
+            .flatten()
+    })
 }
 
 fn graphemes(text: &str) -> impl Iterator<Item = &str> {
@@ -1098,9 +1365,9 @@ fn wrap_graphemes(
     width: u16,
     prefer_words: bool,
     preserve_whitespace: bool,
-) -> Vec<(Line<'static>, Vec<LinkSpan>)> {
+) -> Vec<WrappedRow> {
     if graphemes.is_empty() {
-        return vec![(Line::default(), Vec::new())];
+        return vec![(Line::default(), Vec::new(), 0..0)];
     }
     let mut lines = Vec::new();
     let mut start = 0;
@@ -1135,10 +1402,10 @@ fn wrap_visual_line(
     width: u16,
     prefer_words: bool,
     preserve_whitespace: bool,
-) -> Vec<(Line<'static>, Vec<LinkSpan>)> {
-    if graphemes.is_empty() {
-        return vec![(Line::default(), Vec::new())];
-    }
+) -> Vec<WrappedRow> {
+    let Some(last) = graphemes.last() else {
+        return vec![(Line::default(), Vec::new(), 0..0)];
+    };
 
     let mut lines = Vec::new();
     let mut start = 0_usize;
@@ -1180,9 +1447,12 @@ fn wrap_visual_line(
         } else {
             end
         };
-        lines.push(graphemes_to_line(
-            &graphemes[start..split],
-            preserve_whitespace,
+        let (line, links) = graphemes_to_line(&graphemes[start..split], preserve_whitespace);
+        let examined = graphemes.get(end).unwrap_or(last);
+        lines.push((
+            line,
+            links,
+            graphemes[start].offset..examined.offset + examined.text.len(),
         ));
         start = split.max(start + 1);
     }
@@ -1195,6 +1465,7 @@ struct StyledGrapheme<'a> {
     link: Option<&'a Arc<str>>,
     width: u16,
     whitespace: bool,
+    offset: usize,
 }
 
 fn graphemes_to_line(
@@ -1243,7 +1514,7 @@ fn graphemes_to_line(
     (Line::from(spans), links)
 }
 
-type AsciiRow = (Line<'static>, Vec<LinkSpan>, usize);
+type AsciiRow = (Line<'static>, Vec<LinkSpan>, usize, Range<usize>);
 
 fn wrap_ascii_spans<'a>(
     spans: impl Iterator<Item = (&'a str, Style, Option<&'a Arc<str>>)>,
@@ -1271,7 +1542,7 @@ fn wrap_ascii_spans<'a>(
     let mut index = 0;
     let mut offset = 0;
     let mut lines = Vec::new();
-    for (range, line) in
+    for (range, line, window) in
         crate::text::ascii_rows(&text, usize::from(width), prefer_words, preserve_whitespace)
     {
         while index < spans.len() && offset + spans[index].0.len() <= range.start {
@@ -1314,7 +1585,12 @@ fn wrap_ascii_spans<'a>(
                 index += 1;
             }
         }
-        lines.push((Line::from(rendered), links, line));
+        lines.push((
+            Line::from(rendered),
+            links,
+            line,
+            range.start..(window + 1).min(text.len()),
+        ));
     }
     Some(lines)
 }
