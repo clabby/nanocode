@@ -129,6 +129,12 @@ impl ResponseEventSource for ResponsesHttpStream {
     async fn next_text(&mut self) -> Result<crate::client::socket::ReceivedText, ResponsesError> {
         Self::next_text(self).await
     }
+
+    fn try_next_text(
+        &mut self,
+    ) -> Result<Option<crate::client::socket::ReceivedText>, ResponsesError> {
+        Self::try_next_text(self)
+    }
 }
 
 async fn send_with_auth_recovery(

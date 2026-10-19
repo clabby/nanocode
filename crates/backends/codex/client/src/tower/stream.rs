@@ -1,18 +1,18 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use crate::client::{
-    AgentEventKind, ContentItem, EventSink, MessagePhase, MessageRole, ResponseItem,
-    ResponseItemId, monotonic_now_ns,
-    responses::{ServerEvent, Usage},
+    AgentEventKind, ContentItem, EventSink, MessagePhase, MessageRole, ResponseEvent, ResponseItem,
+    ResponseItemId, events::TextDeltaRef, monotonic_now_ns, responses::Usage,
 };
 use nanocode_platform::Instant;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use crate::client::{
     ResponsesError,
     attempt::ResponsesObserver,
     service_error::ResponsesServiceError,
-    socket::{ResponsesSocket, decode_event},
+    socket::{ReceivedText, ResponsesSocket},
     telemetry::{ApiEvent, ApiEventData, elapsed_ns},
     transport::error::Credentials,
 };
@@ -146,25 +146,13 @@ pub enum CodeCallKind {
 }
 
 #[derive(Serialize)]
-struct AssistantTextDelta<'a> {
-    model_call_index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    item_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    phase: Option<MessagePhase>,
-    text: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_elapsed_ns: Option<u64>,
-}
-
-#[derive(Serialize)]
 struct AssistantMessage<'a> {
     model_call_index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     item_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<MessagePhase>,
-    text: String,
+    text: Cow<'a, str>,
 }
 
 struct AssistantStreamItem {
@@ -172,17 +160,10 @@ struct AssistantStreamItem {
     phase: Option<MessagePhase>,
 }
 
-#[derive(Serialize)]
-struct TextDelta<'a> {
-    model_call_index: u32,
-    text: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_elapsed_ns: Option<u64>,
-}
-
 struct StreamTiming {
     started_at: Instant,
     model_started_at: Option<Instant>,
+    model_started_ns: Option<u64>,
     first_event_ns: Option<u64>,
     first_output_ns: Option<u64>,
     first_event_model_ns: Option<u64>,
@@ -192,10 +173,12 @@ struct StreamTiming {
 }
 
 impl StreamTiming {
-    const fn new(started_at: Instant, model_started_at: Option<Instant>) -> Self {
+    fn new(started_at: Instant, model_started_at: Option<Instant>) -> Self {
         Self {
             started_at,
             model_started_at,
+            model_started_ns: model_started_at
+                .map(|started_at| monotonic_now_ns().saturating_sub(elapsed_ns(started_at))),
             first_event_ns: None,
             first_output_ns: None,
             first_event_model_ns: None,
@@ -254,23 +237,382 @@ impl StreamTiming {
         }
         self.last_display_delta_received_ns = Some(received_ns);
     }
-}
 
-struct ReceivedServerEvent {
-    event: ServerEvent,
-    received_ns: u64,
-    api_event_seq: u64,
-    model_elapsed_ns: Option<u64>,
+    fn record_first_output(&mut self) {
+        if self.first_output_ns.is_none() {
+            self.first_output_ns = Some(elapsed_ns(self.started_at));
+            self.first_output_model_ns = self.model_elapsed_ns();
+        }
+    }
 }
 
 pub(crate) trait ResponseEventSource {
-    async fn next_text(&mut self) -> Result<crate::client::socket::ReceivedText, ResponsesError>;
+    async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError>;
+
+    fn try_next_text(&mut self) -> Result<Option<ReceivedText>, ResponsesError>;
 }
 
 impl ResponseEventSource for ResponsesSocket {
-    async fn next_text(&mut self) -> Result<crate::client::socket::ReceivedText, ResponsesError> {
+    async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError> {
         Self::next_text(self).await
     }
+
+    fn try_next_text(&mut self) -> Result<Option<ReceivedText>, ResponsesError> {
+        Self::try_next_text(self)
+    }
+}
+
+#[derive(Deserialize)]
+struct WireEvent<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Cow<'a, str>,
+    #[serde(borrow)]
+    output_index: Option<&'a RawValue>,
+    #[serde(borrow)]
+    delta: Option<&'a RawValue>,
+    #[serde(borrow)]
+    item: Option<&'a RawValue>,
+    #[serde(borrow)]
+    response: Option<&'a RawValue>,
+    #[serde(borrow)]
+    item_id: Option<&'a RawValue>,
+    #[serde(borrow)]
+    call_id: Option<&'a RawValue>,
+    #[serde(borrow)]
+    text: Option<&'a RawValue>,
+    #[serde(borrow)]
+    summary_index: Option<&'a RawValue>,
+    #[serde(borrow)]
+    content_index: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct Text<'a>(#[serde(borrow)] Cow<'a, str>);
+
+#[derive(Deserialize)]
+struct CompletedResponse<'a> {
+    id: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default = "completed_status")]
+    status: String,
+    #[serde(default)]
+    end_turn: Option<bool>,
+    #[serde(default, borrow)]
+    output: Option<&'a RawValue>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct OutputItemHeader<'a> {
+    #[serde(default, borrow)]
+    id: Option<Cow<'a, str>>,
+}
+
+fn completed_status() -> String {
+    "completed".to_owned()
+}
+
+enum StreamEvent<'a> {
+    ItemAdded {
+        output_index: Option<u32>,
+        item: ResponseItem,
+    },
+    TextDelta {
+        output_index: Option<u32>,
+        delta: Cow<'a, str>,
+    },
+    ReasoningDelta {
+        delta: Cow<'a, str>,
+    },
+    ItemDone {
+        output_index: Option<u32>,
+        item: ResponseItem,
+    },
+    Completed(CompletedResponse<'a>),
+    Failure,
+    Other,
+}
+
+impl StreamEvent<'_> {
+    const fn is_output(&self) -> bool {
+        matches!(
+            self,
+            Self::TextDelta { .. }
+                | Self::ReasoningDelta { .. }
+                | Self::ItemAdded { .. }
+                | Self::ItemDone { .. }
+        )
+    }
+}
+
+type DecodedEvent<'a> = (StreamEvent<'a>, Option<ResponseEvent>);
+
+fn required<'a, T: Deserialize<'a>>(
+    value: Option<&'a RawValue>,
+    field: &'static str,
+) -> Result<T, serde_json::Error> {
+    let value =
+        value.ok_or_else(|| <serde_json::Error as serde::de::Error>::missing_field(field))?;
+    serde_json::from_str(value.get())
+}
+
+fn optional<'a, T: Deserialize<'a>>(
+    value: Option<&'a RawValue>,
+) -> Result<Option<T>, serde_json::Error> {
+    value
+        .map(|value| serde_json::from_str(value.get()))
+        .transpose()
+}
+
+fn decode_wire_event(raw: &str, responses: bool) -> Result<DecodedEvent<'_>, serde_json::Error> {
+    let event = serde_json::from_str::<WireEvent<'_>>(raw)?;
+    Ok(match event.kind.as_ref() {
+        "response.output_text.delta" => {
+            let delta = required::<Text<'_>>(event.delta, "delta")?.0;
+            let response =
+                responses.then(|| ResponseEvent::OutputTextDelta(delta.clone().into_owned()));
+            (
+                StreamEvent::TextDelta {
+                    output_index: optional(event.output_index)?,
+                    delta,
+                },
+                response,
+            )
+        }
+        "response.reasoning_summary_text.delta" => {
+            let delta = required::<Text<'_>>(event.delta, "delta")?.0;
+            let summary_index = required(event.summary_index, "summary_index")?;
+            let response = responses.then(|| ResponseEvent::ReasoningSummaryDelta {
+                delta: delta.clone().into_owned(),
+                summary_index,
+            });
+            (StreamEvent::ReasoningDelta { delta }, response)
+        }
+        "response.reasoning_summary.delta" => {
+            let delta = required::<Text<'_>>(event.delta, "delta")?.0;
+            let summary_index = optional(event.summary_index)?;
+            let response = summary_index.filter(|_| responses).map(|summary_index| {
+                ResponseEvent::ReasoningSummaryDelta {
+                    delta: delta.clone().into_owned(),
+                    summary_index,
+                }
+            });
+            (StreamEvent::ReasoningDelta { delta }, response)
+        }
+        "response.reasoning_text.delta" => {
+            let delta = required::<Text<'_>>(event.delta, "delta")?.0;
+            let content_index = required(event.content_index, "content_index")?;
+            let response = responses.then(|| ResponseEvent::ReasoningContentDelta {
+                delta: delta.clone().into_owned(),
+                content_index,
+            });
+            (StreamEvent::ReasoningDelta { delta }, response)
+        }
+        "response.output_item.added" => {
+            let item = required::<ResponseItem>(event.item, "item")?;
+            let response = responses.then(|| ResponseEvent::OutputItemAdded(item.clone()));
+            (
+                StreamEvent::ItemAdded {
+                    output_index: optional(event.output_index)?,
+                    item,
+                },
+                response,
+            )
+        }
+        "response.output_item.done" => {
+            let item = required::<ResponseItem>(event.item, "item")?;
+            let response = responses.then(|| ResponseEvent::OutputItemDone(item.clone()));
+            (
+                StreamEvent::ItemDone {
+                    output_index: optional(event.output_index)?,
+                    item,
+                },
+                response,
+            )
+        }
+        "response.completed" => {
+            let completed = required::<CompletedResponse<'_>>(event.response, "response")?;
+            let response = responses.then(|| ResponseEvent::Completed {
+                usage: completed.usage.clone(),
+                end_turn: completed.end_turn,
+            });
+            (StreamEvent::Completed(completed), response)
+        }
+        "response.custom_tool_call_input.delta" => {
+            let delta = required::<Text<'_>>(event.delta, "delta")?.0;
+            let item_id = optional::<String>(event.item_id)?;
+            let call_id = optional::<String>(event.call_id)?;
+            let response = responses
+                .then(|| {
+                    Some(ResponseEvent::ToolCallInputDelta {
+                        item_id: item_id.or_else(|| call_id.clone())?,
+                        call_id,
+                        delta: delta.into_owned(),
+                    })
+                })
+                .flatten();
+            (StreamEvent::Other, response)
+        }
+        "response.reasoning_summary_text.done" => {
+            let item_id = required::<String>(event.item_id, "item_id")?;
+            let text = required::<Text<'_>>(event.text, "text")?.0;
+            let summary_index = required(event.summary_index, "summary_index")?;
+            let response = responses.then(|| ResponseEvent::ReasoningSummaryDone {
+                item_id,
+                text: text.into_owned(),
+                summary_index,
+            });
+            (StreamEvent::Other, response)
+        }
+        "response.reasoning_summary_part.added" => {
+            let summary_index = required(event.summary_index, "summary_index")?;
+            let response =
+                responses.then_some(ResponseEvent::ReasoningSummaryPartAdded { summary_index });
+            (StreamEvent::Other, response)
+        }
+        "response.created" => (
+            StreamEvent::Other,
+            responses.then_some(ResponseEvent::Created),
+        ),
+        "response.failed" | "response.incomplete" | "error" => (StreamEvent::Failure, None),
+        _ => (StreamEvent::Other, None),
+    })
+}
+
+struct ReceivedEvent<'a> {
+    raw: &'a str,
+    decoded: Result<DecodedEvent<'a>, ResponsesError>,
+    decoded_ns: u64,
+}
+
+fn decode_received<'a>(
+    received: &'a ReceivedText,
+    started_ns: u64,
+    timing: &mut StreamTiming,
+    responses: bool,
+) -> Result<ReceivedEvent<'a>, ResponsesError> {
+    let text = received.text.as_str();
+    timing.pipeline.event_count = timing.pipeline.event_count.saturating_add(1);
+    timing.pipeline.socket_queue_duration_ns = timing
+        .pipeline
+        .socket_queue_duration_ns
+        .saturating_add(started_ns.saturating_sub(received.received_ns));
+    timing.pipeline.event_bytes = timing
+        .pipeline
+        .event_bytes
+        .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+    let raw = text.trim_matches([' ', '\t', '\n', '\r']);
+    let decoded = match decode_wire_event(raw, responses) {
+        Ok(decoded) => Ok(decoded),
+        Err(source) if source.is_syntax() || source.is_eof() => {
+            return Err(ResponsesError::InvalidJson(source));
+        }
+        Err(source) => Err(ResponsesError::InvalidPayload {
+            source,
+            event: raw.to_owned(),
+        }),
+    };
+    let decoded_ns = monotonic_now_ns();
+    timing.pipeline.decode_duration_ns = timing
+        .pipeline
+        .decode_duration_ns
+        .saturating_add(decoded_ns.saturating_sub(started_ns));
+    if timing.first_event_ns.is_none() {
+        timing.first_event_ns = Some(elapsed_ns(timing.started_at));
+        timing.first_event_model_ns = timing.model_elapsed_ns();
+    }
+    Ok(ReceivedEvent {
+        raw,
+        decoded,
+        decoded_ns,
+    })
+}
+
+struct EventContext<'a> {
+    transport: &'static str,
+    observer: &'a ResponsesObserver,
+    credentials: &'a Credentials,
+    phase: &'static str,
+    call_index: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Published {
+    api_event_seq: u64,
+    ready_ns: u64,
+}
+
+async fn publish_received<'a>(
+    context: &EventContext<'_>,
+    received: &ReceivedText,
+    event: ReceivedEvent<'a>,
+    timing: &mut StreamTiming,
+) -> Result<(StreamEvent<'a>, Published), ResponsesServiceError> {
+    let failure = matches!(&event.decoded, Ok((StreamEvent::Failure, _)));
+    let traced = tracing::enabled!(target: "nanocode_codex", tracing::Level::TRACE);
+    let raw_event = if failure || traced || context.observer.raw_api_events {
+        context.credentials.redact(event.raw)
+    } else {
+        Cow::Borrowed(event.raw)
+    };
+    if traced {
+        tracing::trace!(
+            target: "nanocode_codex",
+            direction = "inbound",
+            transport = context.transport,
+            phase = context.phase,
+            model.call_index = context.call_index,
+            api.event = %raw_event,
+            "OpenAI Responses API event"
+        );
+    }
+    let api_event_seq = context.observer.events.emit_with_source_sequence(
+        AgentEventKind::ApiEvent,
+        ApiEvent {
+            direction: "inbound",
+            transport: context.transport,
+            phase: context.phase,
+            model_call_index: Some(context.call_index),
+            event: ApiEventData::Received(&raw_event),
+        },
+        Some(received.received_ns),
+    )?;
+    let emitted_ns = monotonic_now_ns();
+    timing.pipeline.emit_duration_ns = timing
+        .pipeline
+        .emit_duration_ns
+        .saturating_add(emitted_ns.saturating_sub(event.decoded_ns));
+    let (stream_event, response) = event.decoded?;
+    if failure {
+        return Err(
+            ResponsesServiceError::from(ResponsesError::api_event_received(
+                raw_event.into_owned(),
+                received.retry_receipt,
+            ))
+            .with_connection_renewal(timing.pipeline.event_count == 1),
+        );
+    }
+    let mut ready_ns = emitted_ns;
+    if let Some(response) = response {
+        context.observer.emit_response(response).await;
+        ready_ns = monotonic_now_ns();
+        timing.pipeline.response_forward_duration_ns = timing
+            .pipeline
+            .response_forward_duration_ns
+            .saturating_add(ready_ns.saturating_sub(emitted_ns));
+    }
+    if stream_event.is_output() {
+        timing.record_first_output();
+    }
+    Ok((
+        stream_event,
+        Published {
+            api_event_seq,
+            ready_ns,
+        },
+    ))
 }
 
 pub(crate) async fn receive<S>(
@@ -289,20 +631,52 @@ where
     let mut assistant_items = HashMap::new();
     let item_namespace = nanocode_platform::uuid_v4();
     let mut timing = StreamTiming::new(started_at, model_started_at);
+    let context = EventContext {
+        transport,
+        observer,
+        credentials,
+        phase: "generation",
+        call_index,
+    };
+    let responses = observer.wants_responses();
+    let events = &observer.events;
 
     loop {
-        let received = next_event(
-            source,
-            transport,
-            observer,
-            credentials,
-            "generation",
-            call_index,
-            &mut timing,
-        )
-        .await?;
-        match received.event {
-            ServerEvent::OutputItemAdded {
+        let (received, started_ns) = match source.try_next_text() {
+            Ok(Some(received)) => (received, monotonic_now_ns()),
+            Ok(None) => {
+                flush_display_deltas(events, &mut timing)?;
+                let wait_started_ns = monotonic_now_ns();
+                let received = source.next_text().await?;
+                let started_ns = monotonic_now_ns();
+                timing.pipeline.receive_wait_duration_ns = timing
+                    .pipeline
+                    .receive_wait_duration_ns
+                    .saturating_add(started_ns.saturating_sub(wait_started_ns));
+                (received, started_ns)
+            }
+            Err(error) => {
+                flush_display_deltas(events, &mut timing)?;
+                return Err(error.into());
+            }
+        };
+        let event = match decode_received(&received, started_ns, &mut timing, responses) {
+            Ok(event) => event,
+            Err(error) => {
+                flush_display_deltas(events, &mut timing)?;
+                return Err(error.into());
+            }
+        };
+        let (event, published) =
+            match publish_received(&context, &received, event, &mut timing).await {
+                Ok(published) => published,
+                Err(error) => {
+                    flush_display_deltas(events, &mut timing)?;
+                    return Err(error);
+                }
+            };
+        match event {
+            StreamEvent::ItemAdded {
                 output_index,
                 mut item,
             } => {
@@ -326,7 +700,7 @@ where
                 };
                 assistant_items.insert(output_index, AssistantStreamItem { item_id: id, phase });
             }
-            ServerEvent::OutputTextDelta {
+            StreamEvent::TextDelta {
                 output_index,
                 delta,
             } => {
@@ -340,43 +714,38 @@ where
                         )),
                         phase: None,
                     });
-                let model_elapsed_ns = timing.model_elapsed_ns();
                 emit_display_delta(
-                    &observer.events,
+                    events,
                     &mut timing,
                     AgentEventKind::AssistantDelta,
-                    AssistantTextDelta {
+                    TextDeltaRef {
                         model_call_index: call_index,
-                        item_id: item.item_id.as_deref(),
+                        item_id: item.item_id.as_deref().map(Cow::Borrowed),
                         phase: item.phase,
-                        text: &delta,
-                        model_elapsed_ns,
+                        text: delta,
+                        model_elapsed_ns: None,
                     },
-                    received.received_ns,
-                    received.api_event_seq,
-                    delta.len(),
+                    &received,
+                    published,
                 )?;
             }
-
-            ServerEvent::ReasoningSummaryTextDelta { delta, .. }
-            | ServerEvent::ReasoningSummaryDelta { delta, .. }
-            | ServerEvent::ReasoningContentDelta { delta, .. } => {
-                let model_elapsed_ns = timing.model_elapsed_ns();
+            StreamEvent::ReasoningDelta { delta } => {
                 emit_display_delta(
-                    &observer.events,
+                    events,
                     &mut timing,
                     AgentEventKind::ReasoningSummaryDelta,
-                    TextDelta {
+                    TextDeltaRef {
                         model_call_index: call_index,
-                        text: &delta,
-                        model_elapsed_ns,
+                        item_id: None,
+                        phase: None,
+                        text: delta,
+                        model_elapsed_ns: None,
                     },
-                    received.received_ns,
-                    received.api_event_seq,
-                    delta.len(),
+                    &received,
+                    published,
                 )?;
             }
-            ServerEvent::OutputItemDone {
+            StreamEvent::ItemDone {
                 output_index,
                 mut item,
             } => {
@@ -386,19 +755,15 @@ where
                     &item_namespace,
                     &mut assistant_items,
                 );
-                emit_assistant_message(&observer.events, call_index, &item)?;
+                emit_assistant_message(events, call_index, &item)?;
                 done_items.push(item);
             }
-            ServerEvent::Completed { mut response } => {
+            StreamEvent::Completed(response) => {
                 let emitted_ids = done_items
                     .iter()
                     .filter_map(|item| item.id().cloned())
                     .collect::<std::collections::HashSet<_>>();
-                let mut output_items = if response.output.is_empty() {
-                    done_items
-                } else {
-                    std::mem::take(&mut response.output)
-                };
+                let mut output_items = completed_output(response.output, done_items)?;
                 for (index, item) in output_items.iter_mut().enumerate() {
                     normalize_stream_item(
                         item,
@@ -407,7 +772,7 @@ where
                         &mut assistant_items,
                     );
                     if item.id().is_some_and(|id| !emitted_ids.contains(id)) {
-                        emit_assistant_message(&observer.events, call_index, item)?;
+                        emit_assistant_message(events, call_index, item)?;
                     }
                 }
                 let code_calls = code_calls(&output_items);
@@ -427,43 +792,84 @@ where
                     timing: ResponseTiming {
                         first_event_ns: timing.first_event_model_ns,
                         first_output_ns: timing.first_output_model_ns,
-                        response_completed_ns: received.model_elapsed_ns,
+                        response_completed_ns: timing.model_elapsed_ns(),
                         ..ResponseTiming::default()
                     },
                 });
             }
-            _ => {}
+            StreamEvent::Failure | StreamEvent::Other => {}
         }
     }
 }
 
-fn emit_display_delta<P: Serialize>(
+fn completed_output(
+    output: Option<&RawValue>,
+    done_items: Vec<ResponseItem>,
+) -> Result<Vec<ResponseItem>, ResponsesError> {
+    let Some(output) = output else {
+        return Ok(done_items);
+    };
+    let invalid = |source| ResponsesError::InvalidPayload {
+        source,
+        event: output.get().to_owned(),
+    };
+    let headers =
+        serde_json::from_str::<Vec<OutputItemHeader<'_>>>(output.get()).map_err(invalid)?;
+    let streamed = headers.len() == done_items.len()
+        && headers.iter().zip(&done_items).all(|(header, item)| {
+            header
+                .id
+                .as_deref()
+                .is_some_and(|id| item.id().is_some_and(|item_id| item_id.as_str() == id))
+        });
+    if headers.is_empty() || streamed {
+        return Ok(done_items);
+    }
+    serde_json::from_str(output.get()).map_err(invalid)
+}
+
+fn emit_display_delta(
     events: &EventSink,
     timing: &mut StreamTiming,
     kind: AgentEventKind,
-    payload: P,
-    received_ns: u64,
-    api_event_seq: u64,
-    payload_bytes: usize,
+    mut delta: TextDeltaRef<'_>,
+    received: &ReceivedText,
+    published: Published,
 ) -> Result<(), ResponsesServiceError> {
-    timing.record_display_delta(received_ns, payload_bytes);
-    let emit_started_at = Instant::now();
-    let seq = events.emit_with_source_sequence(kind, payload, Some(received_ns))?;
+    let payload_bytes = delta.text.len();
+    timing.record_display_delta(received.received_ns, payload_bytes);
+    delta.model_elapsed_ns = timing
+        .model_started_ns
+        .map(|started_ns| published.ready_ns.saturating_sub(started_ns));
+    events.emit_text_delta(kind, delta, Some(received.received_ns))?;
+    let emitted_ns = monotonic_now_ns();
     timing.pipeline.display_delta_emit_duration_ns = timing
         .pipeline
         .display_delta_emit_duration_ns
-        .saturating_add(elapsed_ns(emit_started_at));
+        .saturating_add(emitted_ns.saturating_sub(published.ready_ns));
     tracing::trace!(
         target: "nanocode_stream_timing",
         stage = "api_delta_emitted",
         request.id = events.request_id(),
-        event.seq = seq,
         event.kind = ?kind,
-        source.api.event.seq = api_event_seq,
+        source.api.event.seq = published.api_event_seq,
         payload.bytes = payload_bytes,
-        socket_to_agent_emit_ns = monotonic_now_ns().saturating_sub(received_ns),
+        socket_to_agent_emit_ns = emitted_ns.saturating_sub(received.received_ns),
         "Responses display delta entered the agent event stream"
     );
+    Ok(())
+}
+
+fn flush_display_deltas(
+    events: &EventSink,
+    timing: &mut StreamTiming,
+) -> Result<(), ResponsesServiceError> {
+    let started_ns = monotonic_now_ns();
+    events.flush_deltas()?;
+    timing.pipeline.display_delta_emit_duration_ns = timing
+        .pipeline
+        .display_delta_emit_duration_ns
+        .saturating_add(monotonic_now_ns().saturating_sub(started_ns));
     Ok(())
 }
 
@@ -538,21 +944,30 @@ where
 {
     let mut done_items = Vec::with_capacity(2);
     let mut timing = StreamTiming::new(started_at, None);
+    let context = EventContext {
+        transport,
+        observer,
+        credentials,
+        phase: "compaction",
+        call_index,
+    };
+    let responses = observer.wants_responses();
 
     loop {
-        let received = next_event(
-            source,
-            transport,
-            observer,
-            credentials,
-            "compaction",
-            call_index,
-            &mut timing,
-        )
-        .await?;
-        match received.event {
-            ServerEvent::OutputItemDone { item, .. } => done_items.push(item),
-            ServerEvent::Completed { response } => {
+        let wait_started_ns = monotonic_now_ns();
+        let received = source.next_text().await?;
+        let started_ns = monotonic_now_ns();
+        timing.pipeline.receive_wait_duration_ns = timing
+            .pipeline
+            .receive_wait_duration_ns
+            .saturating_add(started_ns.saturating_sub(wait_started_ns));
+        let event = decode_received(&received, started_ns, &mut timing, responses)?;
+        match publish_received(&context, &received, event, &mut timing)
+            .await?
+            .0
+        {
+            StreamEvent::ItemDone { item, .. } => done_items.push(item),
+            StreamEvent::Completed(response) => {
                 let mut compactions = done_items
                     .into_iter()
                     .filter(|item| matches!(item, ResponseItem::Compaction { .. }));
@@ -577,121 +992,6 @@ where
             _ => {}
         }
     }
-}
-
-async fn next_event<S>(
-    source: &mut S,
-    transport: &'static str,
-    observer: &ResponsesObserver,
-    credentials: &Credentials,
-    phase: &'static str,
-    call_index: u32,
-    timing: &mut StreamTiming,
-) -> Result<ReceivedServerEvent, ResponsesServiceError>
-where
-    S: ResponseEventSource,
-{
-    let receive_started_at = Instant::now();
-    let received = source.next_text().await?;
-    timing.pipeline.receive_wait_duration_ns = timing
-        .pipeline
-        .receive_wait_duration_ns
-        .saturating_add(elapsed_ns(receive_started_at));
-    timing.pipeline.event_count = timing.pipeline.event_count.saturating_add(1);
-    timing.pipeline.socket_queue_duration_ns = timing
-        .pipeline
-        .socket_queue_duration_ns
-        .saturating_add(monotonic_now_ns().saturating_sub(received.received_ns));
-    timing.pipeline.event_bytes = timing
-        .pipeline
-        .event_bytes
-        .saturating_add(u64::try_from(received.text.len()).unwrap_or(u64::MAX));
-
-    let decode_started_at = Instant::now();
-    let parsed = decode_event::<ServerEvent>(received.text.as_str())?;
-    let initial_decode_duration_ns = elapsed_ns(decode_started_at);
-    let raw_event = credentials.redact(parsed.raw);
-    let raw_event = raw_event.as_ref();
-    let decoded = parsed.decoded;
-    let elapsed = elapsed_ns(timing.started_at);
-    let model_elapsed_ns = timing.model_elapsed_ns();
-    timing.first_event_ns.get_or_insert(elapsed);
-    if timing.first_event_model_ns.is_none() {
-        timing.first_event_model_ns = model_elapsed_ns;
-    }
-
-    tracing::trace!(
-        target: "nanocode_codex",
-        direction = "inbound",
-        transport,
-        phase,
-        model.call_index = call_index,
-        api.event = %raw_event,
-        "OpenAI Responses API event"
-    );
-
-    let failure = matches!(
-        &decoded,
-        Ok(ServerEvent::Error | ServerEvent::Failed | ServerEvent::Incomplete)
-    )
-    .then(|| ResponsesError::api_event_received(raw_event.to_owned(), received.retry_receipt));
-    let emit_started_at = Instant::now();
-    let api_event_seq = observer.events.emit_with_source_sequence(
-        AgentEventKind::ApiEvent,
-        ApiEvent {
-            direction: "inbound",
-            transport,
-            phase,
-            model_call_index: Some(call_index),
-            event: ApiEventData::Received(raw_event),
-        },
-        Some(received.received_ns),
-    )?;
-    timing.pipeline.emit_duration_ns = timing
-        .pipeline
-        .emit_duration_ns
-        .saturating_add(elapsed_ns(emit_started_at));
-
-    let decode_started_at = Instant::now();
-    let event = decoded?;
-    let normalized = event.normalized();
-    timing.pipeline.decode_duration_ns = timing
-        .pipeline
-        .decode_duration_ns
-        .saturating_add(initial_decode_duration_ns)
-        .saturating_add(elapsed_ns(decode_started_at));
-    if let Some(normalized) = normalized {
-        let forward_started_at = Instant::now();
-        observer.emit_response(normalized).await;
-        timing.pipeline.response_forward_duration_ns = timing
-            .pipeline
-            .response_forward_duration_ns
-            .saturating_add(elapsed_ns(forward_started_at));
-    }
-    if matches!(
-        event,
-        ServerEvent::OutputTextDelta { .. }
-            | ServerEvent::ReasoningSummaryTextDelta { .. }
-            | ServerEvent::ReasoningSummaryDelta { .. }
-            | ServerEvent::ReasoningContentDelta { .. }
-            | ServerEvent::OutputItemAdded { .. }
-            | ServerEvent::OutputItemDone { .. }
-    ) {
-        timing.first_output_ns.get_or_insert(elapsed);
-        if timing.first_output_model_ns.is_none() {
-            timing.first_output_model_ns = model_elapsed_ns;
-        }
-    }
-    if let Some(failure) = failure {
-        return Err(ResponsesServiceError::from(failure)
-            .with_connection_renewal(timing.pipeline.event_count == 1));
-    }
-    Ok(ReceivedServerEvent {
-        event,
-        received_ns: received.received_ns,
-        api_event_seq,
-        model_elapsed_ns,
-    })
 }
 
 fn code_calls(items: &[ResponseItem]) -> Vec<CodeCall> {
@@ -758,19 +1058,28 @@ fn final_message(items: &[ResponseItem]) -> Option<String> {
         else {
             return None;
         };
-        Some(output_text(content))
+        Some(output_text(content).into_owned())
     })
 }
 
-fn output_text(content: &[ContentItem]) -> String {
-    content
-        .iter()
-        .filter_map(|part| match part {
-            ContentItem::OutputText { text, .. } => Some(text.as_ref()),
-            ContentItem::InputText { .. }
-            | ContentItem::InputImage { .. }
-            | ContentItem::InputImageFile { .. }
-            | ContentItem::InputAudio { .. } => None,
-        })
-        .collect()
+fn output_text(content: &[ContentItem]) -> Cow<'_, str> {
+    let mut parts = content.iter().filter_map(|part| match part {
+        ContentItem::OutputText { text, .. } => Some(text.as_ref()),
+        ContentItem::InputText { .. }
+        | ContentItem::InputImage { .. }
+        | ContentItem::InputImageFile { .. }
+        | ContentItem::InputAudio { .. } => None,
+    });
+    let Some(first) = parts.next() else {
+        return Cow::Borrowed("");
+    };
+    match parts.next() {
+        None => Cow::Borrowed(first),
+        Some(second) => {
+            let mut text = String::from(first);
+            text.push_str(second);
+            text.extend(parts);
+            Cow::Owned(text)
+        }
+    }
 }

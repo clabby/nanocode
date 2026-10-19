@@ -159,18 +159,8 @@ impl ResponsesHttpStream {
             return chat.next_text().await;
         }
         loop {
-            if let Some(text) = self.decoder.next()? {
-                return Ok(ReceivedText {
-                    #[cfg(not(target_family = "wasm"))]
-                    text: text.into(),
-                    #[cfg(target_family = "wasm")]
-                    text,
-                    received_ns: monotonic_now_ns(),
-                    retry_receipt: self
-                        .decoder
-                        .retry_receipt
-                        .unwrap_or_else(super::RetryReceipt::now),
-                });
+            if let Some(text) = self.buffered_text()? {
+                return Ok(text);
             }
             if self.ended {
                 return Err(ResponsesError::UnexpectedEnd);
@@ -190,6 +180,32 @@ impl ResponsesHttpStream {
             }
         }
     }
+
+    pub(crate) fn try_next_text(&mut self) -> Result<Option<ReceivedText>, ResponsesError> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(chat) = self.chat.as_mut() {
+            return Ok(chat.try_next_text());
+        }
+        self.buffered_text()
+    }
+
+    fn buffered_text(&mut self) -> Result<Option<ReceivedText>, ResponsesError> {
+        let Some(text) = self.decoder.next()? else {
+            return Ok(None);
+        };
+        let (received_ns, retry_receipt) = self
+            .decoder
+            .received
+            .unwrap_or_else(|| (monotonic_now_ns(), super::RetryReceipt::now()));
+        Ok(Some(ReceivedText {
+            #[cfg(not(target_family = "wasm"))]
+            text: text.into(),
+            #[cfg(target_family = "wasm")]
+            text,
+            received_ns,
+            retry_receipt,
+        }))
+    }
 }
 
 #[derive(Default)]
@@ -199,12 +215,12 @@ pub(crate) struct SseDecoder {
     scan_start: usize,
     data: Vec<String>,
     finished: bool,
-    retry_receipt: Option<super::RetryReceipt>,
+    received: Option<(u64, super::RetryReceipt)>,
 }
 
 impl SseDecoder {
     pub(crate) fn push(&mut self, chunk: &[u8]) {
-        self.retry_receipt = Some(super::RetryReceipt::now());
+        self.received = Some((monotonic_now_ns(), super::RetryReceipt::now()));
         self.compact();
         self.bytes.extend_from_slice(chunk);
     }

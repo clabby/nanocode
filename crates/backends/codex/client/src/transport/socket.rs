@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -30,7 +30,7 @@ pub(crate) use crate::client::transport::wire::decode_event;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
-const SOCKET_MESSAGE_CAPACITY: usize = 32;
+const SOCKET_BATCH_CAPACITY: usize = 32;
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
@@ -58,9 +58,22 @@ pub(crate) struct ReceivedText {
 
 struct SocketPump {
     commands: mpsc::Sender<SocketCommand>,
-    messages: mpsc::Receiver<PumpMessage>,
+    messages: mpsc::Receiver<PumpBatch>,
+    batch: Option<ReceivedBatch>,
     task: tokio::task::JoinHandle<()>,
     stopped: Arc<AtomicBool>,
+}
+
+struct PumpBatch {
+    messages: Vec<std::result::Result<Message, WebSocketError>>,
+    received_ns: u64,
+    retry_receipt: super::RetryReceipt,
+}
+
+struct ReceivedBatch {
+    messages: std::vec::IntoIter<std::result::Result<Message, WebSocketError>>,
+    received_ns: u64,
+    retry_receipt: super::RetryReceipt,
 }
 
 struct PumpMessage {
@@ -197,26 +210,42 @@ impl ResponsesSocket {
                 .next()
                 .await
                 .ok_or(ResponsesError::UnexpectedEnd)?;
-            let message = received.message.map_err(map_receive_error)?;
+            if let Some(text) = self.received_text(received)? {
+                return Ok(text);
+            }
+        }
+    }
 
-            match message {
-                Message::Text(text) => {
-                    self.capture_turn_state(text.as_str());
-                    return Ok(ReceivedText {
-                        text,
-                        received_ns: received.received_ns,
-                        retry_receipt: received.retry_receipt,
-                    });
-                }
-                Message::Binary(_) => return Err(ResponsesError::UnexpectedBinary),
-                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
-                Message::Close(frame) => {
-                    let detail = frame.map_or_else(
-                        || "without a reason".to_owned(),
-                        |frame| format!("with code {}: {}", frame.code, frame.reason),
-                    );
-                    return Err(ResponsesError::Closed { detail });
-                }
+    pub(crate) fn try_next_text(&mut self) -> Result<Option<ReceivedText>, ResponsesError> {
+        while let Some(received) = self.pump.try_next() {
+            if let Some(text) = self.received_text(received)? {
+                return Ok(Some(text));
+            }
+        }
+        Ok(None)
+    }
+
+    fn received_text(
+        &mut self,
+        received: PumpMessage,
+    ) -> Result<Option<ReceivedText>, ResponsesError> {
+        match received.message.map_err(map_receive_error)? {
+            Message::Text(text) => {
+                self.capture_turn_state(text.as_str());
+                Ok(Some(ReceivedText {
+                    text,
+                    received_ns: received.received_ns,
+                    retry_receipt: received.retry_receipt,
+                }))
+            }
+            Message::Binary(_) => Err(ResponsesError::UnexpectedBinary),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
+            Message::Close(frame) => {
+                let detail = frame.map_or_else(
+                    || "without a reason".to_owned(),
+                    |frame| format!("with code {}: {}", frame.code, frame.reason),
+                );
+                Err(ResponsesError::Closed { detail })
             }
         }
     }
@@ -241,7 +270,7 @@ impl ResponsesSocket {
 impl SocketPump {
     fn new(mut socket: Socket) -> Self {
         let (commands, mut command_receiver) = mpsc::channel(32);
-        let (message_sender, messages) = mpsc::channel(SOCKET_MESSAGE_CAPACITY);
+        let (message_sender, messages) = mpsc::channel(SOCKET_BATCH_CAPACITY);
         let stopped = Arc::new(AtomicBool::new(false));
         let completion = Arc::clone(&stopped);
         let task = tokio::spawn(async move {
@@ -271,36 +300,51 @@ impl SocketPump {
                         let Some(message) = message else {
                             break;
                         };
-                        match message {
-                            Ok(Message::Ping(payload)) => {
-                                if let Err(error) = socket.send(Message::Pong(payload)).await {
-                                    drop(message_sender.send(PumpMessage {
-                                        message: Err(error),
-                                        received_ns: monotonic_now_ns(),
-                                    retry_receipt: super::RetryReceipt::now(),
-                                    }).await);
+                        let received_ns = monotonic_now_ns();
+                        let retry_receipt = super::RetryReceipt::now();
+                        let mut messages = Vec::new();
+                        let mut next = Some(message);
+                        let mut should_stop = false;
+                        while let Some(message) = next.take() {
+                            match message {
+                                Ok(Message::Ping(payload)) => {
+                                    if let Err(error) = socket.send(Message::Pong(payload)).await {
+                                        messages.push(Err(error));
+                                        should_stop = true;
+                                        break;
+                                    }
+                                }
+                                Ok(Message::Pong(_)) => {}
+                                Ok(message) => {
+                                    should_stop = matches!(message, Message::Close(_));
+                                    messages.push(Ok(message));
+                                    if should_stop {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    messages.push(Err(error));
+                                    should_stop = true;
                                     break;
                                 }
                             }
-                            Ok(Message::Pong(_)) => {}
-                            Ok(message) => {
-                                let should_stop = matches!(message, Message::Close(_));
-                                if message_sender.send(PumpMessage {
-                                    message: Ok(message),
-                                    received_ns: monotonic_now_ns(),
-                                    retry_receipt: super::RetryReceipt::now(),
-                                }).await.is_err() || should_stop {
-                                    break;
-                                }
+                            match socket.next().now_or_never() {
+                                Some(Some(message)) => next = Some(message),
+                                Some(None) => should_stop = true,
+                                None => {}
                             }
-                            Err(error) => {
-                                drop(message_sender.send(PumpMessage {
-                                    message: Err(error),
-                                    received_ns: monotonic_now_ns(),
-                                    retry_receipt: super::RetryReceipt::now(),
-                                }).await);
-                                break;
-                            }
+                        }
+                        let sent = messages.is_empty()
+                            || message_sender
+                                .send(PumpBatch {
+                                    messages,
+                                    received_ns,
+                                    retry_receipt,
+                                })
+                                .await
+                                .is_ok();
+                        if !sent || should_stop {
+                            break;
                         }
                     }
                 }
@@ -310,6 +354,7 @@ impl SocketPump {
         Self {
             commands,
             messages,
+            batch: None,
             task,
             stopped,
         }
@@ -333,7 +378,39 @@ impl SocketPump {
     }
 
     async fn next(&mut self) -> Option<PumpMessage> {
-        self.messages.recv().await
+        if let Some(message) = self.buffered() {
+            return Some(message);
+        }
+        let batch = self.messages.recv().await?;
+        self.install(batch);
+        self.buffered()
+    }
+
+    fn try_next(&mut self) -> Option<PumpMessage> {
+        if let Some(message) = self.buffered() {
+            return Some(message);
+        }
+        let batch = self.messages.try_recv().ok()?;
+        self.install(batch);
+        self.buffered()
+    }
+
+    fn install(&mut self, batch: PumpBatch) {
+        self.batch = Some(ReceivedBatch {
+            messages: batch.messages.into_iter(),
+            received_ns: batch.received_ns,
+            retry_receipt: batch.retry_receipt,
+        });
+    }
+
+    fn buffered(&mut self) -> Option<PumpMessage> {
+        let batch = self.batch.as_mut()?;
+        let message = batch.messages.next()?;
+        Some(PumpMessage {
+            message,
+            received_ns: batch.received_ns,
+            retry_receipt: batch.retry_receipt,
+        })
     }
 }
 

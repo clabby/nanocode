@@ -1654,6 +1654,15 @@ impl ChatStream {
         Ok(())
     }
 
+    pub(crate) fn try_next_text(&mut self) -> Option<ReceivedText> {
+        let text = self.queue.pop_front()?;
+        Some(ReceivedText {
+            text: text.into(),
+            received_ns: monotonic_now_ns(),
+            retry_receipt: super::RetryReceipt::now(),
+        })
+    }
+
     pub(crate) async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError> {
         loop {
             if let Some(text) = self.queue.pop_front() {

@@ -51,6 +51,7 @@ impl ResponsesAttemptKind {
 #[derive(Clone)]
 pub(crate) struct ResponsesObserver {
     pub(crate) events: EventSink,
+    pub(crate) raw_api_events: bool,
     pub(crate) stats: Arc<TransportStats>,
     response_events: Option<mpsc::Sender<ResponseEvent>>,
 }
@@ -62,6 +63,10 @@ impl ResponsesObserver {
         payload: P,
     ) -> Result<(), EventError> {
         self.events.emit(kind, payload)
+    }
+
+    pub(crate) const fn wants_responses(&self) -> bool {
+        self.response_events.is_some()
     }
 
     pub(crate) async fn emit_response(&self, event: ResponseEvent) {
@@ -480,6 +485,7 @@ impl ResponsesAttemptFactory {
             profile: Arc::new(profile),
             observer: ResponsesObserver {
                 events,
+                raw_api_events: true,
                 stats,
                 response_events: None,
             },

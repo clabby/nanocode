@@ -122,6 +122,10 @@ impl ResponsesSocket {
         }
     }
 
+    pub(crate) const fn try_next_text(&mut self) -> Result<Option<ReceivedText>, ResponsesError> {
+        Ok(None)
+    }
+
     pub(crate) fn turn_state(&self) -> Option<&str> {
         self.turn_state.as_deref()
     }
