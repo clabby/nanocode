@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    hash::Hasher,
     env,
     ffi::{OsStr, OsString},
     fs,
@@ -14,11 +15,18 @@ use std::{
     time::SystemTime,
 };
 
-const RUST_KEY: &str = "nanocode-rustc-cache-4";
+const RUST_KEY: &str = "nanocode-rustc-cache-5";
+const WORKSPACE_KEY: &str = "nanocode-workspace-cache-1";
 const C_KEY: &str = "nanocode-c-cache-3 -ffile-prefix-map=<out>=. -MD";
 const MEMO: &str = ".nanocode-sha256";
 
 type Environment = BTreeMap<OsString, OsString>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Registry,
+    Workspace,
+}
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
@@ -27,13 +35,19 @@ fn main() -> ExitCode {
     };
     let cache = cache_dir();
     let environment: Environment = env::vars_os().collect();
-    if tool.as_bytes().ends_with(b"rustc") {
-        rust(&cache, args, environment)
+    if is_rustc(tool) {
+        rust(&cache, args, environment, 1)
+    } else if args.get(1).is_some_and(|compiler| is_rustc(compiler)) {
+        rust(&cache, args, environment, 2)
     } else if environment.contains_key(OsStr::new("OUT_DIR")) {
         c(&cache, &args, environment)
     } else {
         exec(&args, &environment)
     }
+}
+
+fn is_rustc(path: &OsStr) -> bool {
+    path.as_bytes().ends_with(b"rustc")
 }
 
 fn cache_dir() -> PathBuf {
@@ -57,7 +71,7 @@ fn exit_code(status: std::process::ExitStatus) -> ExitCode {
     ExitCode::from(status.code().map_or(1, |code| code as u8))
 }
 
-fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> ExitCode {
+fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment, compiler: usize) -> ExitCode {
     for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"] {
         environment.remove(OsStr::new(name));
     }
@@ -78,9 +92,15 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> 
             }),
     )
     .join("registry/src/");
+    let Ok(cwd) = env::current_dir() else {
+        return exec(&args, &environment);
+    };
+    let mut workspace_root = cwd.as_os_str().as_bytes().to_vec();
+    workspace_root.push(b'/');
     let mut keyed: Vec<Vec<u8>> = Vec::with_capacity(args.len());
-    let (mut out_dir, mut suffix, mut source, mut eligible) = (None, None, false, true);
-    for index in 1..args.len() {
+    let mut externs: Vec<Vec<u8>> = Vec::new();
+    let (mut out_dir, mut suffix, mut kind, mut eligible) = (None, None, None, true);
+    for index in compiler..args.len() {
         let previous = args[index - 1].as_bytes().to_vec();
         let arg = args[index].clone();
         let bytes = arg.as_bytes();
@@ -88,13 +108,13 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> 
         match previous.as_slice() {
             b"-L" => {
                 if let Some(at) = bytes.iter().position(|byte| *byte == b'=') {
-                    let (kind, path) = (&bytes[..at], &bytes[at + 1..]);
-                    if kind == b"dependency" {
+                    let (prefix, path) = (&bytes[..at], &bytes[at + 1..]);
+                    if prefix == b"dependency" {
                         key = b"dependency=".to_vec();
                     } else if is_build_out(path) && Path::new(OsStr::from_bytes(path)).is_dir()
                         && let Some(stable) = stable(cache, Path::new(OsStr::from_bytes(path)))
                     {
-                        let mut rewritten = kind.to_vec();
+                        let mut rewritten = prefix.to_vec();
                         rewritten.push(b'=');
                         rewritten.extend_from_slice(stable.as_os_str().as_bytes());
                         key.clone_from(&rewritten);
@@ -109,13 +129,15 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> 
             b"--extern" => {
                 if let Some(at) = bytes.iter().position(|byte| *byte == b'=') {
                     let path = Path::new(OsStr::from_bytes(&bytes[at + 1..]));
+                    key = bytes[..at].to_vec();
+                    key.push(b'=');
+                    key.extend_from_slice(path.file_name().map_or(b"" as &[u8], OsStrExt::as_bytes));
                     match identity(path) {
                         Some(identity) => {
-                            key = bytes[..at].to_vec();
-                            key.push(b'=');
-                            key.extend_from_slice(path.file_name().map_or(b"" as &[u8], OsStrExt::as_bytes));
-                            key.push(b' ');
-                            key.extend_from_slice(identity.as_bytes());
+                            let mut line = key.clone();
+                            line.push(b' ');
+                            line.extend_from_slice(identity.as_bytes());
+                            externs.push(line);
                         }
                         None => eligible = false,
                     }
@@ -124,6 +146,8 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> 
             b"-C" => {
                 if let Some(value) = bytes.strip_prefix(b"extra-filename=") {
                     suffix = Some(value.to_vec());
+                } else if bytes.starts_with(b"incremental=") {
+                    key = b"incremental=".to_vec();
                 }
             }
             _ => {}
@@ -131,29 +155,50 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> 
         if bytes.starts_with(b"@") {
             eligible = false;
         }
-        if bytes.ends_with(b".rs") && bytes.starts_with(registry.as_os_str().as_bytes()) {
-            source = true;
+        if bytes.ends_with(b".rs") {
+            if bytes.starts_with(registry.as_os_str().as_bytes()) {
+                kind = Some(Kind::Registry);
+            } else if !bytes.starts_with(b"/") || bytes.starts_with(&workspace_root) {
+                kind = Some(Kind::Workspace);
+            }
         }
         keyed.push(key);
     }
-    let (Some(out_dir), Some(suffix), true, true) = (out_dir, suffix, source, eligible) else {
+    let (Some(out_dir), Some(suffix), Some(kind), true) = (out_dir, suffix, kind, eligible) else {
         return exec(&args, &environment);
     };
-    let Some(version) = rustc_version(cache, Path::new(&args[0])) else {
+    let Some(version) = rustc_version(cache, Path::new(&args[compiler - 1])) else {
         return exec(&args, &environment);
     };
     let mut hasher = Sha256::new();
-    hasher.update(RUST_KEY.as_bytes());
+    hasher.update(if kind == Kind::Registry { RUST_KEY } else { WORKSPACE_KEY }.as_bytes());
     hasher.update(b"\n");
     hasher.update(version.as_bytes());
     hasher.update(b"\n");
+    for wrapper in &args[..compiler - 1] {
+        let Ok(digest) = digest_file(Path::new(wrapper)) else {
+            return exec(&args, &environment);
+        };
+        hasher.update(digest.as_bytes());
+        hasher.update(b"\n");
+    }
+    if kind == Kind::Workspace {
+        hasher.update(&workspace_root);
+        hasher.update(b"\n");
+    }
     for key in &keyed {
         hasher.update(key);
         hasher.update(b"\n");
     }
+    if kind == Kind::Registry {
+        for line in &externs {
+            hasher.update(line);
+            hasher.update(b"\n");
+        }
+    }
     for (name, value) in &environment {
         let name = name.as_bytes();
-        let relevant = (name.starts_with(b"CARGO_") && name != b"CARGO_MAKEFLAGS")
+        let relevant = (name.starts_with(b"CARGO_") && !matches!(name, b"CARGO_MAKEFLAGS" | b"CARGO_PRIMARY_PACKAGE"))
             || matches!(name, b"OUT_DIR" | b"RUSTC_BOOTSTRAP" | b"MACOSX_DEPLOYMENT_TARGET" | b"SDKROOT");
         if relevant {
             hasher.update(name);
@@ -163,8 +208,35 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> 
         }
     }
     let key = hasher.finish();
-    let entry = cache.join("units").join(&key);
-    if restore(&entry, &out_dir, &environment).is_ok() {
+    let inputs = match kind {
+        Kind::Registry => Vec::new(),
+        Kind::Workspace => {
+            let manifest = environment
+                .get(OsStr::new("CARGO_MANIFEST_PATH"))
+                .map(PathBuf::from)
+                .or_else(|| environment.get(OsStr::new("CARGO_MANIFEST_DIR")).map(|dir| Path::new(dir).join("Cargo.toml")));
+            let mut inputs = Vec::new();
+            for line in &externs {
+                inputs.extend_from_slice(line);
+                inputs.push(b'\n');
+            }
+            for path in manifest.iter().map(PathBuf::as_path).chain([cwd.join("Cargo.toml").as_path()]) {
+                let Ok(digest) = digest_file(path) else {
+                    return exec(&args, &environment);
+                };
+                inputs.extend_from_slice(digest.as_bytes());
+                inputs.push(b' ');
+                inputs.extend_from_slice(path.as_os_str().as_bytes());
+                inputs.push(b'\n');
+            }
+            inputs
+        }
+    };
+    let entry = match kind {
+        Kind::Registry => cache.join("units").join(&key),
+        Kind::Workspace => cache.join("workspace").join(&key),
+    };
+    if restore(&entry, &out_dir, &environment, kind, &inputs).is_ok() {
         return ExitCode::SUCCESS;
     }
     let mut child = match Command::new(&args[0])
@@ -180,22 +252,38 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> 
             return ExitCode::from(1);
         }
     };
+    let mut marker = Marker {
+        kind,
+        key: &key,
+        metadata: None,
+    };
     let mut captured = Vec::new();
     if let Some(mut pipe) = child.stderr.take() {
         let mut buffer = [0; 65536];
+        let mut pending = Vec::new();
         let mut stderr = io::stderr();
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    let _ = stderr.write_all(&buffer[..read]);
-                    let _ = stderr.flush();
-                    captured.extend_from_slice(&buffer[..read]);
+                    pending.extend_from_slice(&buffer[..read]);
+                    while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=end).collect();
+                        if let Some((path, emit)) = artifact(&line) {
+                            marker.mark(&path, &emit);
+                        }
+                        let _ = stderr.write_all(&line);
+                        let _ = stderr.flush();
+                        captured.extend_from_slice(&line);
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
+        let _ = stderr.write_all(&pending);
+        let _ = stderr.flush();
+        captured.extend_from_slice(&pending);
     }
     let status = match child.wait() {
         Ok(status) => status,
@@ -205,21 +293,154 @@ fn rust(cache: &Path, mut args: Vec<OsString>, mut environment: Environment) -> 
         return exit_code(status);
     }
     let outputs = outputs(&out_dir, &suffix);
-    let mut digests = Vec::new();
+    let mut identities = Vec::new();
     for output in &outputs {
         let name = output.file_name().map_or(b"" as &[u8], OsStrExt::as_bytes);
-        let linked = name.ends_with(b".rmeta")
-            || (name.starts_with(b"lib") && (name.ends_with(b".dylib") || name.ends_with(b".so")));
-        if linked && let Ok(digest) = digest_file(output) {
-            write_memo(output, &digest);
-            digests.extend_from_slice(name);
-            digests.push(b' ');
-            digests.extend_from_slice(digest.as_bytes());
-            digests.push(b'\n');
+        if name.ends_with(b".d") {
+            continue;
+        }
+        if fresh_memo(output).is_none() {
+            marker.mark(output, if name.ends_with(b".rmeta") { b"metadata" } else { b"link" });
+        }
+        if let Some(identity) = fresh_memo(output) {
+            identities.extend_from_slice(name);
+            identities.push(b' ');
+            identities.extend_from_slice(identity.as_bytes());
+            identities.push(b'\n');
         }
     }
-    let _ = store(cache, &entry, &out_dir, &registry, &outputs, &digests, &captured, &environment);
+    let Some(depinfo) = outputs
+        .iter()
+        .find(|path| path.extension() == Some(OsStr::new("d")))
+        .and_then(|path| fs::read(path).ok())
+    else {
+        return ExitCode::SUCCESS;
+    };
+    let (dependencies, names) = dependencies(&depinfo);
+    let stable_root = cache.join("out");
+    let inside = |path: &[u8]| {
+        path.starts_with(registry.as_os_str().as_bytes()) || path.starts_with(stable_root.as_os_str().as_bytes())
+    };
+    let (identity, sources) = match kind {
+        Kind::Registry => {
+            if !dependencies.iter().all(|path| inside(path)) {
+                return ExitCode::SUCCESS;
+            }
+            (key.clone(), Vec::new())
+        }
+        Kind::Workspace => {
+            let mut sources = Vec::new();
+            for path in &dependencies {
+                let local = !path.starts_with(b"/") || path.starts_with(&workspace_root);
+                if !local && !inside(path) {
+                    return ExitCode::SUCCESS;
+                }
+                let Ok(digest) = digest_file(Path::new(OsStr::from_bytes(path))) else {
+                    return ExitCode::SUCCESS;
+                };
+                sources.extend_from_slice(digest.as_bytes());
+                sources.push(b' ');
+                sources.extend_from_slice(path);
+                sources.push(b'\n');
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(key.as_bytes());
+            hasher.update(b"\n");
+            hasher.update(&inputs);
+            hasher.update(b"\n");
+            hasher.update(&sources);
+            (hasher.finish(), sources)
+        }
+    };
+    let Some(recorded) = recorded_environment(&names, &environment) else {
+        return ExitCode::SUCCESS;
+    };
+    let unit = Unit {
+        out_dir: &out_dir,
+        outputs: &outputs,
+        captured: &captured,
+        recorded: &recorded,
+        inputs: &inputs,
+        sources: &sources,
+        identities: &identities,
+        identity: &identity,
+    };
+    let _ = match kind {
+        Kind::Registry => store(cache, &entry, &unit),
+        Kind::Workspace => store_workspace(cache, &entry, &unit),
+    };
     ExitCode::SUCCESS
+}
+
+struct Unit<'a> {
+    out_dir: &'a Path,
+    outputs: &'a [PathBuf],
+    captured: &'a [u8],
+    recorded: &'a [u8],
+    inputs: &'a [u8],
+    sources: &'a [u8],
+    identities: &'a [u8],
+    identity: &'a str,
+}
+
+struct Marker<'a> {
+    kind: Kind,
+    key: &'a str,
+    metadata: Option<String>,
+}
+
+impl Marker<'_> {
+    fn mark(&mut self, path: &Path, emit: &[u8]) {
+        let name = path.file_name().map_or(b"" as &[u8], OsStrExt::as_bytes);
+        let identity = match (self.kind, emit) {
+            (_, b"dep-info") => return,
+            (Kind::Registry, _) => self.key.to_owned(),
+            (Kind::Workspace, b"metadata") => {
+                let Ok(digest) = digest_file(path) else {
+                    return;
+                };
+                self.metadata = Some(digest.clone());
+                digest
+            }
+            (Kind::Workspace, _) if name.ends_with(b".rlib") && self.metadata.is_some() => {
+                self.metadata.clone().unwrap_or_default()
+            }
+            (Kind::Workspace, _) if name.starts_with(b"lib") => {
+                let Ok(digest) = digest_file(path) else {
+                    return;
+                };
+                digest
+            }
+            (Kind::Workspace, _) => return,
+        };
+        write_memo(path, &identity);
+    }
+}
+
+fn artifact(line: &[u8]) -> Option<(PathBuf, Vec<u8>)> {
+    if !line.windows(29).any(|window| window == br#""$message_type":"artifact""#) {
+        return None;
+    }
+    let path = json_string(line, br#""artifact":""#)?;
+    let emit = json_string(line, br#""emit":""#)?;
+    Some((PathBuf::from(OsString::from_vec(path)), emit))
+}
+
+fn json_string(line: &[u8], field: &[u8]) -> Option<Vec<u8>> {
+    let start = line.windows(field.len()).position(|window| window == field)? + field.len();
+    let mut value = Vec::new();
+    let mut bytes = line[start..].iter();
+    while let Some(&byte) = bytes.next() {
+        match byte {
+            b'"' => return Some(value),
+            b'\\' => match bytes.next()? {
+                escaped @ (b'"' | b'\\' | b'/') => value.push(*escaped),
+                _ => return None,
+            },
+            _ => value.push(byte),
+        }
+    }
+    None
 }
 
 fn is_build_out(path: &[u8]) -> bool {
@@ -244,6 +465,39 @@ fn outputs(out_dir: &Path, suffix: &[u8]) -> Vec<PathBuf> {
     outputs
 }
 
+fn dependencies(depinfo: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let (mut paths, mut names) = (Vec::new(), Vec::new());
+    for line in depinfo.split(|byte| *byte == b'\n') {
+        if let Some(name) = line.strip_prefix(b"# env-dep:") {
+            let end = name.iter().position(|byte| *byte == b'=').unwrap_or(name.len());
+            names.push(name[..end].to_vec());
+        } else if !line.starts_with(b"#") && line.ends_with(b":") && !line.ends_with(b"\\:") {
+            paths.push(relocate(&line[..line.len() - 1], b"\\ ", b" "));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    names.sort();
+    names.dedup();
+    (paths, names)
+}
+
+fn recorded_environment(names: &[Vec<u8>], environment: &Environment) -> Option<Vec<u8>> {
+    let mut recorded = Vec::new();
+    for name in names {
+        recorded.extend_from_slice(name);
+        if let Some(value) = environment.get(OsStr::from_bytes(name)) {
+            if value.as_bytes().contains(&b'\n') {
+                return None;
+            }
+            recorded.push(b'=');
+            recorded.extend_from_slice(value.as_bytes());
+        }
+        recorded.push(b'\n');
+    }
+    Some(recorded)
+}
+
 fn memo_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(MEMO);
@@ -254,15 +508,17 @@ fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|metadata| metadata.modified()).ok()
 }
 
-fn identity(path: &Path) -> Option<String> {
+fn fresh_memo(path: &Path) -> Option<String> {
     let memo = memo_path(path);
-    if let (Some(file), Some(memo_time)) = (modified(path), modified(&memo))
-        && file <= memo_time
-        && let Ok(text) = fs::read_to_string(&memo)
-        && let Some(line) = text.lines().next()
-        && line.len() == 64
-    {
-        return Some(line.to_owned());
+    let (file, memo_time) = (modified(path)?, modified(&memo)?);
+    let text = fs::read_to_string(&memo).ok()?;
+    let line = text.lines().next()?;
+    (file <= memo_time && line.len() == 64).then(|| line.to_owned())
+}
+
+fn identity(path: &Path) -> Option<String> {
+    if let Some(identity) = fresh_memo(path) {
+        return Some(identity);
     }
     let digest = digest_file(path).ok()?;
     write_memo(path, &digest);
@@ -332,13 +588,35 @@ fn rustc_version(cache: &Path, rustc: &Path) -> Option<String> {
 fn stable(cache: &Path, directory: &Path) -> Option<PathBuf> {
     let mut entries = Vec::new();
     walk(directory, Path::new(""), &mut entries).ok()?;
-    entries.sort();
+    let renames = object_renames(directory, &entries);
+    let mut canonical = Vec::with_capacity(entries.len());
+    for (relative, is_file) in entries {
+        let name = renames.iter().find(|(from, _)| *from == relative).map_or_else(|| relative.clone(), |(_, to)| to.clone());
+        let content = if is_file && !renames.is_empty() && relative.extension() == Some(OsStr::new("a")) {
+            Some(rename_members(&fs::read(directory.join(&relative)).ok()?, &renames)?)
+        } else {
+            None
+        };
+        canonical.push((name, relative, is_file, content));
+    }
+    canonical.sort_by(|left, right| left.0.cmp(&right.0));
+    if canonical.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return None;
+    }
     let mut hasher = Sha256::new();
-    for (relative, is_file) in &entries {
-        hasher.update(relative.as_os_str().as_bytes());
+    for (name, relative, is_file, content) in &canonical {
+        hasher.update(name.as_os_str().as_bytes());
         if *is_file {
+            let digest = match content {
+                Some(content) => {
+                    let mut digest = Sha256::new();
+                    digest.update(content);
+                    digest.finish()
+                }
+                None => digest_file(&directory.join(relative)).ok()?,
+            };
             hasher.update(b" ");
-            hasher.update(digest_file(&directory.join(relative)).ok()?.as_bytes());
+            hasher.update(digest.as_bytes());
         }
         hasher.update(b"\n");
     }
@@ -348,11 +626,11 @@ fn stable(cache: &Path, directory: &Path) -> Option<PathBuf> {
         let staging = cache.join("out").join(format!(".data.{}.{}", std::process::id(), unique()));
         let copied = (|| -> io::Result<()> {
             fs::create_dir(&staging)?;
-            for (relative, is_file) in &entries {
-                if *is_file {
-                    clone(&directory.join(relative), &staging.join(relative))?;
-                } else {
-                    fs::create_dir_all(staging.join(relative))?;
+            for (name, relative, is_file, content) in &canonical {
+                match (is_file, content) {
+                    (false, _) => fs::create_dir_all(staging.join(name))?,
+                    (true, Some(content)) => fs::write(staging.join(name), content)?,
+                    (true, None) => clone(&directory.join(relative), &staging.join(name))?,
                 }
             }
             Ok(())
@@ -362,6 +640,71 @@ fn stable(cache: &Path, directory: &Path) -> Option<PathBuf> {
         }
     }
     stable.exists().then_some(stable)
+}
+
+fn object_renames(directory: &Path, entries: &[(PathBuf, bool)]) -> Vec<(PathBuf, PathBuf)> {
+    const EXTENSIONS: [&str; 10] = ["c", "cc", "cpp", "cxx", "C", "s", "S", "asm", "m", "mm"];
+    let prefix_of = |dirname: &str, extension: &str| {
+        let mut hasher = std::hash::DefaultHasher::new();
+        hasher.write(dirname.as_bytes());
+        hasher.write(extension.as_bytes());
+        format!("{:016x}", hasher.finish())
+    };
+    let mut renames = Vec::new();
+    for (relative, is_file) in entries {
+        let Some(name) = relative.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let (prefix, rest) = name.split_at(name.len().min(16));
+        if !is_file || !name.ends_with(".o") || !rest.starts_with('-') || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let parent = relative.parent().unwrap_or(Path::new(""));
+        let absolute = if parent.as_os_str().is_empty() { directory.to_path_buf() } else { directory.join(parent) };
+        let (Some(absolute), Some(local)) = (absolute.to_str(), parent.to_str()) else {
+            continue;
+        };
+        if let Some(extension) = EXTENSIONS.iter().find(|extension| prefix_of(absolute, extension) == prefix) {
+            renames.push((relative.clone(), parent.join(format!("{}{rest}", prefix_of(local, extension)))));
+        }
+    }
+    renames
+}
+
+fn rename_members(archive: &[u8], renames: &[(PathBuf, PathBuf)]) -> Option<Vec<u8>> {
+    let mut archive = archive.to_vec();
+    if !archive.starts_with(b"!<arch>\n") {
+        return None;
+    }
+    let mut offset = 8;
+    while offset + 60 <= archive.len() {
+        let header = &archive[offset..offset + 60];
+        let size: usize = std::str::from_utf8(&header[48..58]).ok()?.trim().parse().ok()?;
+        let data = offset + 60;
+        if data + size > archive.len() {
+            return None;
+        }
+        if let Some(length) = header.strip_prefix(b"#1/") {
+            let length: usize = std::str::from_utf8(&length[..13]).ok()?.trim().parse().ok()?;
+            let stored = &archive[data..data + length.min(size)];
+            let name = stored[..stored.iter().position(|byte| *byte == 0).unwrap_or(stored.len())].to_vec();
+            if let Some((_, to)) = renames.iter().find(|(from, _)| from.file_name().map(OsStrExt::as_bytes) == Some(name.as_slice())) {
+                let to = to.file_name()?.as_bytes();
+                if to.len() != name.len() {
+                    return None;
+                }
+                archive[data..data + name.len()].copy_from_slice(to);
+            }
+        } else if header.starts_with(b"//") {
+            for (from, to) in renames {
+                let (from, to) = (from.file_name()?.as_bytes(), to.file_name()?.as_bytes());
+                let region = relocate(&archive[data..data + size], from, to);
+                archive[data..data + size].copy_from_slice(&region);
+            }
+        }
+        offset = data + size + size % 2;
+    }
+    Some(archive)
 }
 
 fn unique() -> u128 {
@@ -429,9 +772,30 @@ fn same_environment(entry: &Path, environment: &Environment) -> bool {
     })
 }
 
-fn restore(entry: &Path, out_dir: &Path, environment: &Environment) -> io::Result<()> {
+fn sources_match(sources: &[u8]) -> bool {
+    sources.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).all(|line| {
+        line.iter().position(|byte| *byte == b' ').is_some_and(|at| {
+            digest_file(Path::new(OsStr::from_bytes(&line[at + 1..])))
+                .is_ok_and(|digest| digest.as_bytes() == &line[..at])
+        })
+    })
+}
+
+fn restore(
+    entry: &Path,
+    out_dir: &Path,
+    environment: &Environment,
+    kind: Kind,
+    inputs: &[u8],
+) -> io::Result<()> {
     let cached_out = fs::read(entry.join("out-dir"))?;
     let cached_out = cached_out.strip_suffix(b"\n").unwrap_or(&cached_out).to_vec();
+    if kind == Kind::Workspace
+        && (fs::read(entry.join("inputs"))? != inputs || !sources_match(&fs::read(entry.join("sources"))?))
+    {
+        return Err(io::Error::other("inputs changed"));
+    }
+    let identities = fs::read(entry.join("identities"))?;
     if !same_environment(entry, environment) {
         return Err(io::Error::other("environment changed"));
     }
@@ -448,12 +812,9 @@ fn restore(entry: &Path, out_dir: &Path, environment: &Environment) -> io::Resul
             touch(&destination)?;
         }
     }
-    if let Ok(digests) = fs::read(entry.join("digests")) {
-        for line in digests.split(|byte| *byte == b'\n') {
-            if let Some(at) = line.iter().position(|byte| *byte == b' ') {
-                let digest = String::from_utf8_lossy(&line[at + 1..]);
-                write_memo(&out_dir.join(OsStr::from_bytes(&line[..at])), &digest);
-            }
+    for line in identities.split(|byte| *byte == b'\n') {
+        if let Some(at) = line.iter().position(|byte| *byte == b' ') {
+            write_memo(&out_dir.join(OsStr::from_bytes(&line[..at])), &String::from_utf8_lossy(&line[at + 1..]));
         }
     }
     let stderr = fs::read(entry.join("stderr"))?;
@@ -462,71 +823,70 @@ fn restore(entry: &Path, out_dir: &Path, environment: &Environment) -> io::Resul
     output.flush()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn store(
-    cache: &Path,
-    entry: &Path,
-    out_dir: &Path,
-    registry: &Path,
-    outputs: &[PathBuf],
-    digests: &[u8],
-    captured: &[u8],
-    environment: &Environment,
-) -> io::Result<()> {
-    let Some(depinfo) = outputs.iter().find(|path| path.extension() == Some(OsStr::new("d"))) else {
-        return Ok(());
-    };
-    let depinfo = fs::read(depinfo)?;
-    let stable_root = cache.join("out");
-    let mut names = Vec::new();
-    for line in depinfo.split(|byte| *byte == b'\n') {
-        if let Some(name) = line.strip_prefix(b"# env-dep:") {
-            let end = name.iter().position(|byte| *byte == b'=').unwrap_or(name.len());
-            names.push(name[..end].to_vec());
-        } else if !line.starts_with(b"#") && line.ends_with(b":") {
-            let path = &line[..line.len() - 1];
-            let inside = path.starts_with(registry.as_os_str().as_bytes())
-                || path.starts_with(stable_root.as_os_str().as_bytes());
-            if !inside {
-                return Ok(());
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
-    let mut recorded = Vec::new();
-    for name in &names {
-        recorded.extend_from_slice(name);
-        if let Some(value) = environment.get(OsStr::from_bytes(name)) {
-            if value.as_bytes().contains(&b'\n') {
-                return Ok(());
-            }
-            recorded.push(b'=');
-            recorded.extend_from_slice(value.as_bytes());
-        }
-        recorded.push(b'\n');
-    }
-    fs::create_dir_all(cache.join("units"))?;
-    let staging = cache.join("units").join(format!(".data.{}.{}", std::process::id(), unique()));
+fn stage(cache: &Path, directory: &str, unit: &Unit<'_>) -> io::Result<PathBuf> {
+    fs::create_dir_all(cache.join(directory))?;
+    let staging = cache.join(directory).join(format!(".data.{}.{}", std::process::id(), unique()));
     let result = (|| -> io::Result<()> {
         fs::create_dir_all(staging.join("files"))?;
-        for output in outputs {
+        for output in unit.outputs {
             if let Some(name) = output.file_name() {
                 clone(output, &staging.join("files").join(name))?;
             }
         }
-        fs::write(staging.join("env"), &recorded)?;
-        fs::write(staging.join("digests"), digests)?;
-        fs::write(staging.join("stderr"), captured)?;
-        let mut out = out_dir.as_os_str().as_bytes().to_vec();
+        fs::write(staging.join("env"), unit.recorded)?;
+        fs::write(staging.join("stderr"), unit.captured)?;
+        fs::write(staging.join("inputs"), unit.inputs)?;
+        fs::write(staging.join("sources"), unit.sources)?;
+        fs::write(staging.join("identities"), unit.identities)?;
+        let mut out = unit.out_dir.as_os_str().as_bytes().to_vec();
         out.push(b'\n');
-        fs::write(staging.join("out-dir"), out)?;
-        symlink(&staging, entry)
+        fs::write(staging.join("out-dir"), out)
     })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&staging);
+    match result {
+        Ok(()) => Ok(staging),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error)
+        }
     }
-    result
+}
+
+fn store(cache: &Path, entry: &Path, unit: &Unit<'_>) -> io::Result<()> {
+    let staging = stage(cache, "units", unit)?;
+    symlink(&staging, entry).inspect_err(|_| {
+        let _ = fs::remove_dir_all(&staging);
+    })
+}
+
+fn store_workspace(cache: &Path, entry: &Path, unit: &Unit<'_>) -> io::Result<()> {
+    let (Some(directory), Some(slot)) = (entry.parent(), entry.file_name()) else {
+        return Ok(());
+    };
+    let mut prefix = slot.as_bytes().to_vec();
+    prefix.push(b'.');
+    let mut version = prefix.clone();
+    version.extend_from_slice(unit.identity.as_bytes());
+    let version = directory.join(OsStr::from_bytes(&version));
+    if !version.exists() {
+        let staging = stage(cache, "workspace", unit)?;
+        if fs::rename(&staging, &version).is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+    }
+    let link = directory.join(format!(".link.{}.{}", std::process::id(), unique()));
+    symlink(&version, &link)?;
+    if let Err(error) = fs::rename(&link, entry) {
+        let _ = fs::remove_file(&link);
+        return Err(error);
+    }
+    let current = fs::read_link(entry).ok();
+    for sibling in fs::read_dir(directory)?.flatten() {
+        let path = sibling.path();
+        if sibling.file_name().as_bytes().starts_with(&prefix) && current.as_deref() != Some(path.as_path()) {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+    Ok(())
 }
 
 fn c(cache: &Path, args: &[OsString], environment: Environment) -> ExitCode {
@@ -765,13 +1125,22 @@ impl Sha256 {
             self.compress(&block);
             self.filled = 0;
         }
-        let mut chunks = data.chunks_exact(64);
-        for block in &mut chunks {
-            self.compress(block.try_into().expect("64-byte block"));
-        }
-        let rest = chunks.remainder();
+        let whole = data.len() - data.len() % 64;
+        self.blocks(&data[..whole]);
+        let rest = &data[whole..];
         self.buffer[..rest.len()].copy_from_slice(rest);
         self.filled = rest.len();
+    }
+
+    fn blocks(&mut self, data: &[u8]) {
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("sha2") {
+            unsafe { compress_sha2(&mut self.state, data) };
+            return;
+        }
+        for block in data.chunks_exact(64) {
+            self.compress(block.try_into().expect("64-byte block"));
+        }
     }
 
     fn compress(&mut self, block: &[u8; 64]) {
@@ -824,5 +1193,39 @@ impl Sha256 {
         self.update(&padding);
         self.length = length;
         self.state.iter().map(|word| format!("{word:08x}")).collect()
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha2")]
+unsafe fn compress_sha2(state: &mut [u32; 8], data: &[u8]) {
+    use std::arch::aarch64::{
+        vaddq_u32, vld1q_u32, vld1q_u8, vreinterpretq_u32_u8, vrev32q_u8, vsha256h2q_u32, vsha256hq_u32,
+        vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
+    };
+    unsafe {
+        let mut abcd = vld1q_u32(state.as_ptr());
+        let mut efgh = vld1q_u32(state.as_ptr().add(4));
+        for block in data.chunks_exact(64) {
+            let (saved_abcd, saved_efgh) = (abcd, efgh);
+            let mut schedule = [
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr()))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(16)))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(32)))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(48)))),
+            ];
+            for group in 0..16 {
+                let words = vaddq_u32(schedule[0], vld1q_u32(ROUND.as_ptr().add(group * 4)));
+                let previous = abcd;
+                abcd = vsha256hq_u32(abcd, efgh, words);
+                efgh = vsha256h2q_u32(efgh, previous, words);
+                let next = vsha256su1q_u32(vsha256su0q_u32(schedule[0], schedule[1]), schedule[2], schedule[3]);
+                schedule = [schedule[1], schedule[2], schedule[3], next];
+            }
+            abcd = vaddq_u32(abcd, saved_abcd);
+            efgh = vaddq_u32(efgh, saved_efgh);
+        }
+        vst1q_u32(state.as_mut_ptr(), abcd);
+        vst1q_u32(state.as_mut_ptr().add(4), efgh);
     }
 }

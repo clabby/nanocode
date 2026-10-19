@@ -1,6 +1,6 @@
 #!/bin/sh
 case $1 in
-  */rustc-parallel-frontend | */clippy-driver | clippy-driver) exec "$@" ;;
+  */clippy-driver | clippy-driver) exec "$@" ;;
 esac
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/nanocode/build
 source=${0%/*}/buildcache.rs
