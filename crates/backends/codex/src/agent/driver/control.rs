@@ -1,6 +1,6 @@
 use super::*;
 
-type SharedShutdownResult = std::result::Result<(), Arc<NanocodexError>>;
+type SharedShutdownResult = std::result::Result<(), Arc<NanocodeError>>;
 
 #[derive(Default)]
 enum ShutdownPhase {
@@ -74,7 +74,7 @@ impl DriverShutdown {
         }
     }
 
-    pub(in crate::agent) async fn stopped_error(&self) -> NanocodexError {
+    pub(in crate::agent) async fn stopped_error(&self) -> NanocodeError {
         let receiver = {
             let (result, receiver) = oneshot::channel();
             let mut state = match self.state.lock() {
@@ -98,16 +98,16 @@ impl DriverShutdown {
                     Some(crate::ExecutionPolicyDisposition::Reopen)
                 ) =>
             {
-                NanocodexError::Shutdown(error)
+                NanocodeError::Shutdown(error)
             }
-            Ok(Ok(()) | Err(_)) | Err(_) => NanocodexError::AgentStopped,
+            Ok(Ok(()) | Err(_)) | Err(_) => NanocodeError::AgentStopped,
         };
-        if matches!(error, NanocodexError::AgentStopped)
+        if matches!(error, NanocodeError::AgentStopped)
             && self
                 .execution_policy_owned
                 .load(std::sync::atomic::Ordering::Acquire)
         {
-            NanocodexError::ExecutionPolicyOwnerStopped
+            NanocodeError::ExecutionPolicyOwnerStopped
         } else {
             error
         }
@@ -254,7 +254,7 @@ pub(super) async fn begin_shutdown(
                 result,
                 ..
             } => {
-                drop(accepted.send(Err(NanocodexError::AgentStopped)));
+                drop(accepted.send(Err(NanocodeError::AgentStopped)));
                 drop(result);
             }
             Command::Prompt {
@@ -286,32 +286,32 @@ pub(super) async fn begin_shutdown(
                 turn_result,
                 ..
             } => {
-                drop(route_result.send(Err(NanocodexError::AgentStopped)));
+                drop(route_result.send(Err(NanocodeError::AgentStopped)));
                 drop(turn_result);
             }
             Command::ChildSnapshot { result } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
+                drop(result.send(Err(NanocodeError::AgentStopped)));
             }
             Command::Fork { result, .. } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
+                drop(result.send(Err(NanocodeError::AgentStopped)));
             }
             Command::Spawn { result, .. } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
+                drop(result.send(Err(NanocodeError::AgentStopped)));
             }
             Command::SpawnBatch { result, .. } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
+                drop(result.send(Err(NanocodeError::AgentStopped)));
             }
             Command::AppendDeveloperMessage { result, .. } => {
-                result.fail(NanocodexError::AgentStopped);
+                result.fail(NanocodeError::AgentStopped);
             }
             Command::Context { result } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
+                drop(result.send(Err(NanocodeError::AgentStopped)));
             }
             Command::SideQuestion { result, .. } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
+                drop(result.send(Err(NanocodeError::AgentStopped)));
             }
             Command::WithdrawSteer { result, .. } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
+                drop(result.send(Err(NanocodeError::AgentStopped)));
             }
             Command::SteerWithId { result, .. }
             | Command::Steer { result, .. }
@@ -321,7 +321,7 @@ pub(super) async fn begin_shutdown(
             | Command::SetThinking { result, .. }
             | Command::SetServiceTier { result, .. }
             | Command::Compact { result, .. } => {
-                drop(result.send(Err(NanocodexError::AgentStopped)));
+                drop(result.send(Err(NanocodeError::AgentStopped)));
             }
             Command::Shutdown => {}
         }
@@ -338,7 +338,7 @@ fn spawn_side_question(
     result: oneshot::Sender<Result<nanocode_agent_core::SideAnswer>>,
 ) {
     let Some(latest) = latest.map(Arc::clone) else {
-        drop(result.send(Err(NanocodexError::InvalidRequest(
+        drop(result.send(Err(NanocodeError::InvalidRequest(
             "a side question requires a completed turn".to_owned(),
         ))));
         return;
@@ -431,7 +431,7 @@ pub(super) fn handle_idle_command(
                         .selected_family()
                         .is_some_and(|family| family != crate::HarnessFamily::Codex)
                     {
-                        return Err(NanocodexError::InvalidRequest(
+                        return Err(NanocodeError::InvalidRequest(
                             "selected harness requires a configured child factory".into(),
                         ));
                     }
@@ -444,7 +444,7 @@ pub(super) fn handle_idle_command(
                         .selected_harness_model()
                         .and_then(|model| model.as_codex())
                     else {
-                        return Err(NanocodexError::InvalidRequest(
+                        return Err(NanocodeError::InvalidRequest(
                             "selected harness requires a configured child factory".into(),
                         ));
                     };
@@ -505,18 +505,18 @@ pub(super) fn handle_idle_command(
             drop(result.send(Ok(false)));
         }
         Command::SteerWithId { result, .. } | Command::Steer { result, .. } => {
-            drop(result.send(Err(NanocodexError::TurnNotSteerable)));
+            drop(result.send(Err(NanocodeError::TurnNotSteerable)));
         }
         Command::RoutePrompt {
             route_result,
             turn_result,
             ..
         } => {
-            drop(route_result.send(Err(NanocodexError::AgentStopped)));
+            drop(route_result.send(Err(NanocodeError::AgentStopped)));
             drop(turn_result);
         }
         Command::Cancel { result, .. } | Command::CancelActive { result } => {
-            drop(result.send(Err(NanocodexError::TurnNotCancellable)));
+            drop(result.send(Err(NanocodeError::TurnNotCancellable)));
         }
         Command::SetThinking { result, .. } | Command::SetServiceTier { result, .. } => {
             drop(result.send(Ok(())));
@@ -526,10 +526,10 @@ pub(super) fn handle_idle_command(
         }
         Command::Shutdown => {}
         Command::Compact { result, .. } => {
-            drop(result.send(Err(NanocodexError::AgentStopped)));
+            drop(result.send(Err(NanocodeError::AgentStopped)));
         }
         Command::AppendDeveloperMessage { result, .. } => {
-            result.fail(NanocodexError::AgentStopped);
+            result.fail(NanocodeError::AgentStopped);
         }
         Command::Context { result } => {
             drop(result.send(super::agent_session_context(
@@ -542,8 +542,8 @@ pub(super) fn handle_idle_command(
     }
 }
 
-pub(super) fn model_change_locked() -> NanocodexError {
-    NanocodexError::InvalidRequest(
+pub(super) fn model_change_locked() -> NanocodeError {
+    NanocodeError::InvalidRequest(
         "the model is fixed for this thread; start a new thread to use another model".to_owned(),
     )
 }

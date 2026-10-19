@@ -241,7 +241,7 @@ fn admit_options(
 }
 
 async fn child_settings(
-    child: &nanocode_agent_core::Nanocodex,
+    child: &nanocode_agent_core::Agent,
     policy: Option<(&Registry, &SpawnParent)>,
 ) -> std::io::Result<(Option<ModelSelection>, Option<Thinking>, ReasoningMode)> {
     match child.checkpoint().await {
@@ -380,10 +380,8 @@ pub async fn start_agents_observed(
             )?;
             routes.push((route, options));
         }
-        let mut children: Vec<(
-            nanocode_agent_core::Nanocodex,
-            nanocode_agent_core::AgentEvents,
-        )> = Vec::with_capacity(routes.len());
+        let mut children: Vec<(nanocode_agent_core::Agent, nanocode_agent_core::AgentEvents)> =
+            Vec::with_capacity(routes.len());
         for (route, options) in routes {
             let options = match admit_options(&registry.spawn_policy(), &policy_parent, options) {
                 Ok(options) => options,

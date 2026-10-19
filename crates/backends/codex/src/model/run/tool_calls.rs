@@ -56,7 +56,7 @@ pub(super) struct NestedToolEventObserver<'a> {
     pub(super) progress: &'a Mutex<ActiveToolProgress>,
     fallback_call_index: u32,
     parent_call_id: &'a str,
-    error: Option<NanocodexError>,
+    error: Option<NanocodeError>,
 }
 
 impl CodeModeObserver for NestedToolEventObserver<'_> {
@@ -274,8 +274,8 @@ async fn execute_code_call(
     }
 }
 
-fn interrupted_tool_host(error: nanocode_code_mode::embedded::CodeModeHostError) -> NanocodexError {
-    NanocodexError::execution_policy_with_disposition(
+fn interrupted_tool_host(error: nanocode_code_mode::embedded::CodeModeHostError) -> NanocodeError {
+    NanocodeError::execution_policy_with_disposition(
         "tool host interrupted",
         crate::ExecutionPolicyDisposition::Reopen,
         error,
@@ -403,7 +403,7 @@ impl ModelRun {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
             else {
-                return Err(NanocodexError::InvalidAttemptState {
+                return Err(NanocodeError::InvalidAttemptState {
                     detail: "completed tool call did not retain its output",
                 });
             };
@@ -412,7 +412,7 @@ impl ModelRun {
                 .iter()
                 .position(|candidate| Arc::ptr_eq(&candidate.completion, &active.completion))
             else {
-                return Err(NanocodexError::InvalidAttemptState {
+                return Err(NanocodeError::InvalidAttemptState {
                     detail: "completed tool call was not active",
                 });
             };

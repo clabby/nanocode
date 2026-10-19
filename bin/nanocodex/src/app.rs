@@ -604,7 +604,7 @@ fn listener_notice(server: &RunnerServer) -> String {
     )
 }
 
-fn forward_runners(runtime: &nanocode::Nanocodex, tx: UnboundedSender<AppEvent>) {
+fn forward_runners(runtime: &nanocode::Nanocode, tx: UnboundedSender<AppEvent>) {
     let mut events = runtime.runner_events();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
@@ -1632,7 +1632,7 @@ impl App {
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 match agent.cancel_active_turn().await {
-                    Ok(()) | Err(nanocode::NanocodexError::TurnNotCancellable) => {}
+                    Ok(()) | Err(nanocode::NanocodeError::TurnNotCancellable) => {}
                     Err(error) => drop(tx.send(AppEvent::Notice(
                         NoticeLevel::Error,
                         format!("interrupt failed: {error}"),
@@ -2740,35 +2740,35 @@ const OWNER_MOVED: &str = "this session was opened in another nc window, which n
 fn report_owner_moved(
     tx: &UnboundedSender<AppEvent>,
     generation: u64,
-    error: &nanocode::NanocodexError,
+    error: &nanocode::NanocodeError,
 ) {
     if owner_moved(error) {
         drop(tx.send(AppEvent::OwnerMoved { generation }));
     }
 }
 
-fn owner_moved(error: &nanocode::NanocodexError) -> bool {
+fn owner_moved(error: &nanocode::NanocodeError) -> bool {
     use nanocode::durability::{Error, StoreError};
     match error {
-        nanocode::NanocodexError::ExecutionPolicy { source, .. } => {
+        nanocode::NanocodeError::ExecutionPolicy { source, .. } => {
             source.downcast_ref::<Error>().is_some_and(|error| {
                 matches!(
                     error,
                     Error::ModelOwnerFenced | Error::Store(StoreError::Fenced)
                 )
             }) || source
-                .downcast_ref::<nanocode::NanocodexError>()
+                .downcast_ref::<nanocode::NanocodeError>()
                 .is_some_and(owner_moved)
         }
-        nanocode::NanocodexError::Shutdown(inner) => owner_moved(inner),
+        nanocode::NanocodeError::Shutdown(inner) => owner_moved(inner),
         _ => false,
     }
 }
 
-fn operation_active(error: &nanocode::NanocodexError) -> bool {
+fn operation_active(error: &nanocode::NanocodeError) -> bool {
     matches!(
         error,
-        nanocode::NanocodexError::ExecutionPolicy { source, .. }
+        nanocode::NanocodeError::ExecutionPolicy { source, .. }
             if matches!(
                 source.downcast_ref::<nanocode::durability::Error>(),
                 Some(nanocode::durability::Error::OperationActive { .. })

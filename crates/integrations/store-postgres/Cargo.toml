@@ -10,7 +10,7 @@ authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Postgres state store for Nanocodex durability"
+description = "Postgres state store for Nanocode durability"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 nanocode-durability-core.workspace = true

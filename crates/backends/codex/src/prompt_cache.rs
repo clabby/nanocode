@@ -5,7 +5,7 @@ use crate::model::run::ModelCheckpoint;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OnceCell};
 
-use crate::{NanocodexError, Result};
+use crate::{NanocodeError, Result};
 
 type PrefixFingerprint = [u8; 32];
 type WarmupEntry = Arc<OnceCell<()>>;
@@ -68,6 +68,6 @@ impl SharedPromptCache {
 
 fn prefix_fingerprint(model: Model, profile: &RequestProfile) -> Result<PrefixFingerprint> {
     let encoded = serde_json::to_vec(&(model, profile.prompt_cache_key(), profile.prefix()))
-        .map_err(NanocodexError::SerializePromptPrefix)?;
+        .map_err(NanocodeError::SerializePromptPrefix)?;
     Ok(Sha256::digest(encoded).into())
 }

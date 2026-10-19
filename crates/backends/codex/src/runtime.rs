@@ -1,13 +1,13 @@
-use crate::{NanocodexBuilder, OpenAi};
+use crate::{CodexBuilder, OpenAi};
 use nanocode_agent_config::configuration::{
     AgentResult, AgentTools, RuntimeBackend, RuntimeRequest, Settings,
 };
 use nanocode_agent_core::{
-    AgentHandle, BackendId, HarnessFamily, ModelSelection, ModelTransport, NanocodexError, Result,
+    AgentHandle, BackendId, HarnessFamily, ModelSelection, ModelTransport, NanocodeError, Result,
     backend::BackendFuture,
 };
 use std::sync::Arc;
-type Hook = Arc<dyn Fn(NanocodexBuilder) -> Result<NanocodexBuilder> + Send + Sync>;
+type Hook = Arc<dyn Fn(CodexBuilder) -> Result<CodexBuilder> + Send + Sync>;
 #[derive(Clone)]
 pub struct CodexHarness {
     client: OpenAi,
@@ -55,7 +55,7 @@ impl CodexHarness {
     #[must_use]
     pub fn configure<F>(mut self, configure: F) -> Self
     where
-        F: Fn(NanocodexBuilder) -> Result<NanocodexBuilder> + Send + Sync + 'static,
+        F: Fn(CodexBuilder) -> Result<CodexBuilder> + Send + Sync + 'static,
     {
         self.configure = Some(Arc::new(configure));
         self
@@ -115,11 +115,11 @@ impl RuntimeBackend for CodexHarness {
             let host = services.clone();
             let shared = services.shared_tools(remote).await?;
             let Some(model) = spec.model.as_codex() else {
-                return Err(NanocodexError::InvalidRequest(
+                return Err(NanocodeError::InvalidRequest(
                     "the Codex harness requires a Codex model".into(),
                 ));
             };
-            let mut builder = crate::Nanocodex::builder(client)
+            let mut builder = crate::Agent::builder(client)
                 .model(model)
                 .thinking(spec.thinking)
                 .spawn_factory(spec.spawn_factory)
@@ -191,7 +191,7 @@ impl RuntimeBackend for CodexHarness {
             if let Some(state) = spec.durable_state {
                 use nanocode_durability::DurableAgentExt as _;
                 let session_id = state.state_id().parse().map_err(|error| {
-                    NanocodexError::InvalidRequest(format!(
+                    NanocodeError::InvalidRequest(format!(
                         "invalid durable Codex session identity: {error}"
                     ))
                 })?;
@@ -211,7 +211,7 @@ impl RuntimeBackend for CodexHarness {
                         .deferred_durability(&state, record, text.clone());
                     let built =
                         tracing::info_span!("codex.session.build").in_scope(|| deferred.build());
-                    match nanocode_agent_core::Nanocodex::persist_created(built).await {
+                    match nanocode_agent_core::Agent::persist_created(built).await {
                         Ok((agent, events)) => {
                             host.initial_notice_committed(&agent, text);
                             return Ok((agent, events));

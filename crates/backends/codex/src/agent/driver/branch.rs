@@ -102,12 +102,12 @@ impl BranchSpawner {
         origin: crate::Origin,
         session_id: SessionId,
         branch_policy: Option<Arc<dyn execution::ExecutionPolicy>>,
-    ) -> Result<(Nanocodex, AgentEvents)> {
+    ) -> Result<(Agent, AgentEvents)> {
         let mut spawner = self.for_new_thread("fork", branch_policy)?;
         spawner.context_source = spawner.context_config.build();
         let (workspace, initial) = match point {
             ForkFrom::Latest => {
-                let checkpoint = latest.ok_or(NanocodexError::ForkBeforeCompletedTurn)?;
+                let checkpoint = latest.ok_or(NanocodeError::ForkBeforeCompletedTurn)?;
                 (
                     Arc::<str>::from(checkpoint.model().workspace()),
                     InitialResume::Exact(Box::new(checkpoint.model().clone())),
@@ -124,7 +124,7 @@ impl BranchSpawner {
                     .context_source
                     .resolve_workspace(Some(&resume.workspace))?;
                 if resolved != resume.workspace {
-                    return Err(NanocodexError::InvalidCheckpoint(
+                    return Err(NanocodeError::InvalidCheckpoint(
                         "fork workspace no longer resolves to the stored location".into(),
                     ));
                 }
@@ -165,7 +165,7 @@ impl BranchSpawner {
         stateless_http: bool,
         host_context: Option<Arc<str>>,
         parent: &execution::Execution,
-    ) -> Result<(Nanocodex, AgentEvents)> {
+    ) -> Result<(Agent, AgentEvents)> {
         let session_id = SessionId::new();
         let session_id_text = session_id.to_string();
         let lineage = Lineage::child_of(&self.lineage, parent_session_id, crate::Origin::Subagent);
@@ -234,10 +234,10 @@ impl BranchSpawner {
         parent_session_id: &str,
         host_context: Option<Arc<str>>,
         parent: &execution::Execution,
-    ) -> Result<(Nanocodex, AgentEvents)> {
+    ) -> Result<(Agent, AgentEvents)> {
         snapshot.validate()?;
         let session_id = snapshot.session_id.parse::<SessionId>().map_err(|error| {
-            NanocodexError::InvalidCheckpoint(format!("invalid child session ID: {error}"))
+            NanocodeError::InvalidCheckpoint(format!("invalid child session ID: {error}"))
         })?;
 
         let origin = match snapshot.lineage.origin {
@@ -282,7 +282,7 @@ impl BranchSpawner {
         if let Some(workspace) = &workspace {
             let resolved = spawner.context_source.resolve_workspace(Some(workspace))?;
             if resolved != workspace.as_ref() {
-                return Err(NanocodexError::InvalidCheckpoint(
+                return Err(NanocodeError::InvalidCheckpoint(
                     "child workspace no longer resolves to the stored location".into(),
                 ));
             }
@@ -317,7 +317,7 @@ impl BranchSpawner {
         observer: Option<&SpawnObserver>,
         host_context: Option<Arc<str>>,
         parent: &execution::Execution,
-    ) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+    ) -> Result<Vec<(Agent, AgentEvents)>> {
         let mut children = Vec::with_capacity(count);
         for _ in 0..count {
             let child = self.spawn_clean(

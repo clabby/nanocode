@@ -41,14 +41,14 @@ pub use crate::client::{Model, ReasoningMode, Thinking, events::AgentEvents};
 
 pub use crate::client::{OpenAi, ResponseError, ResponseErrorKind};
 pub use agent::{
-    AgentHandle, AgentSessionContext, BuilderBackend, Nanocodex, PromptRequest, PromptRoute,
+    Agent, AgentHandle, AgentSessionContext, BuilderBackend, PromptRequest, PromptRoute,
     SpawnOptions, Turn, TurnControl, TurnResult, WeakAgent,
 };
 
-pub use agent::{ExecutionEnvironment, NanocodexBuilder};
+pub use agent::{CodexBuilder, ExecutionEnvironment};
 
 pub use error::CompactionRecovery;
-pub use error::{ExecutionPolicyDisposition, NanocodexError, Result};
+pub use error::{ExecutionPolicyDisposition, NanocodeError, Result};
 pub use nanocode_tool_host::tool;
 
 pub use nanocode_tool_host::{Tool, Tools};

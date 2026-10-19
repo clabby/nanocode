@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use nanocode_agent_core::{AgentEvents, BackendRequest, Nanocodex, Result, backend::BackendFuture};
+use nanocode_agent_core::{Agent, AgentEvents, BackendRequest, Result, backend::BackendFuture};
 use nanocode_durability::{
     CheckpointFormat, DurableAgentExt as _, DurableBackendRegistration, DurableSession,
 };
 use tower::Service;
 
 use crate::{
-    NanocodexBuilder, OpenAi,
+    CodexBuilder, OpenAi,
     client::{
         __private::ResponsesServiceFactory,
         ResponseError,
@@ -25,7 +25,7 @@ trait PlatformSend {}
 #[cfg(target_family = "wasm")]
 impl<T> PlatformSend for T {}
 
-impl<F> DurableBackendRegistration for NanocodexBuilder<F>
+impl<F> DurableBackendRegistration for CodexBuilder<F>
 where
     F: ResponsesServiceFactory + Send + Sync + 'static,
     F::Service:
@@ -41,7 +41,7 @@ where
         &self,
         request: BackendRequest,
         state: DurableSession,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let prepared = self.clone().prepare(request);
         Box::pin(async move {
             let builder = prepared?;
@@ -49,7 +49,7 @@ where
                 .state_id()
                 .parse::<crate::session::SessionId>()
                 .map_err(|error| {
-                    nanocode_agent_core::NanocodexError::InvalidRequest(format!(
+                    nanocode_agent_core::NanocodeError::InvalidRequest(format!(
                         "registered durable Codex state ID must be a UUID: {error}"
                     ))
                 })?;
@@ -78,7 +78,7 @@ where
         &self,
         request: BackendRequest,
         state: DurableSession,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
-        Nanocodex::builder(self.clone()).build_durable(request, state)
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
+        Agent::builder(self.clone()).build_durable(request, state)
     }
 }

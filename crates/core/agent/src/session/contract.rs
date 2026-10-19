@@ -3,7 +3,7 @@ use std::{any::Any, fmt, sync::Arc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    HarnessFamily, ModelSelection, NanocodexError, Result, ServiceTier, Thinking, TurnResult,
+    HarnessFamily, ModelSelection, NanocodeError, Result, ServiceTier, Thinking, TurnResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,18 +143,18 @@ impl SessionCheckpoint {
 
     pub fn from_json(json: &str) -> Result<Self> {
         let checkpoint: Self = serde_json::from_str(json)
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
         checkpoint.validate()?;
         Ok(checkpoint)
     }
 
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string(self)
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))
     }
 
     pub fn validate(&self) -> Result<()> {
-        let invalid = |reason: String| Err(NanocodexError::InvalidCheckpoint(reason));
+        let invalid = |reason: String| Err(NanocodeError::InvalidCheckpoint(reason));
         if self.format != CHECKPOINT_FORMAT {
             return invalid(format!(
                 "unsupported session checkpoint format {:?}; expected {CHECKPOINT_FORMAT:?}",
@@ -173,7 +173,7 @@ impl SessionCheckpoint {
         }
         self.model
             .validate()
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
         if !self.model.supports_thinking(self.thinking) {
             return invalid(format!(
                 "model {} does not support {} thinking",
@@ -184,7 +184,7 @@ impl SessionCheckpoint {
         self.model
             .capabilities(crate::ModelTransport::Native)
             .check_reasoning_mode(self.reasoning_mode)
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
         let lineage = &self.lineage;
         if lineage.root_session_id.trim().is_empty() {
             return invalid("lineage root session identity must not be empty".into());
@@ -293,7 +293,7 @@ impl SessionCheckpoint {
         if self.family() == family {
             Ok(())
         } else {
-            Err(NanocodexError::CheckpointFamilyMismatch {
+            Err(NanocodeError::CheckpointFamilyMismatch {
                 expected: family,
                 found: self.family(),
             })

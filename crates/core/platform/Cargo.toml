@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Rust host interfaces for portable Nanocodex execution"
+description = "Rust host interfaces for portable Nanocode execution"
 autotests = false
 autobenches = false
 

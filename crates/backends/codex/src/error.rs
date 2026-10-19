@@ -1,7 +1,7 @@
 use crate::client::ResponseError;
 pub use crate::client::transport::ResponsesError;
 pub use nanocode_agent_core::{
-    CompactionRecovery, ExecutionPolicyDisposition, NanocodexError, Result,
+    CompactionRecovery, ExecutionPolicyDisposition, NanocodeError, Result,
 };
 
 pub trait ErrorExt {
@@ -9,7 +9,7 @@ pub trait ErrorExt {
 
     fn rejected_request_repair(&self) -> crate::client::__private::RejectedRequestRepair<'_>;
 }
-impl ErrorExt for NanocodexError {
+impl ErrorExt for NanocodeError {
     fn responses_error(&self) -> Option<&ResponsesError> {
         match self {
             Self::Response(error) => error

@@ -60,7 +60,7 @@ impl ModelRun {
             return Ok(None);
         };
         if saved.stats.model_calls == u32::MAX {
-            return Err(NanocodexError::InvalidExecutionPolicy(
+            return Err(NanocodeError::InvalidExecutionPolicy(
                 "invalid execution continuation".into(),
             ));
         }
@@ -95,14 +95,14 @@ impl ModelRun {
         self.model = saved
             .model
             .parse::<crate::Model>()
-            .map_err(NanocodexError::InvalidExecutionPolicy)?;
+            .map_err(NanocodeError::InvalidExecutionPolicy)?;
         self.thinking = saved.effort;
         self.service_tier = saved.service_tier;
         let config = Arc::make_mut(&mut self.config);
         config.reasoning_mode = saved
             .reasoning_mode
             .parse::<crate::ReasoningMode>()
-            .map_err(NanocodexError::InvalidExecutionPolicy)?;
+            .map_err(NanocodeError::InvalidExecutionPolicy)?;
         config.model_id_prefix = saved.model_id_prefix.clone().map(Arc::from);
         config.store_responses = saved.store_responses;
         config.context_window_tokens = saved.context_window_tokens;
@@ -117,7 +117,7 @@ impl ModelRun {
                 saved
                     .reasoning_mode
                     .parse::<crate::ReasoningMode>()
-                    .map_err(NanocodexError::InvalidExecutionPolicy)?,
+                    .map_err(NanocodeError::InvalidExecutionPolicy)?,
                 saved.store_responses,
             )
             .for_logical_turn(logical_turn);

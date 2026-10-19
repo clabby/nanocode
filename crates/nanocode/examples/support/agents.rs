@@ -1,7 +1,7 @@
 use crate::support::Result;
-use nanocode::{ClaudeClient, Nanocodex, OpenAi, Thinking, Tools};
+use nanocode::{ClaudeClient, Nanocode, OpenAi, Thinking, Tools};
 
-pub fn runtime(tools: Tools) -> Result<nanocode::NanocodexBuilder> {
+pub fn runtime(tools: Tools) -> Result<nanocode::NanocodeBuilder> {
     let (openai, claude) = match std::env::var("NANOCODE_EXAMPLE_API_BASE") {
         Ok(base) => (
             OpenAi::builder(std::env::var("OPENAI_API_KEY")?)
@@ -18,7 +18,7 @@ pub fn runtime(tools: Tools) -> Result<nanocode::NanocodexBuilder> {
         Err(std::env::VarError::NotPresent) => (OpenAi::default(), ClaudeClient::default()),
         Err(error) => return Err(error.into()),
     };
-    Ok(Nanocodex::builder()
+    Ok(Nanocode::builder()
         .openai(openai)
         .claude(claude)
         .tools(tools)
@@ -28,7 +28,7 @@ pub fn runtime(tools: Tools) -> Result<nanocode::NanocodexBuilder> {
 }
 
 pub async fn spawn(
-    runtime: &Nanocodex,
+    runtime: &Nanocode,
     backend: &str,
 ) -> Result<(nanocode::Agent, nanocode::AgentEvents)> {
     Ok(match backend {

@@ -1,4 +1,4 @@
-use nanocode_agent_core::{NanocodexError, Result, SessionInfo};
+use nanocode_agent_core::{NanocodeError, Result, SessionInfo};
 use serde_json::{Value, value::RawValue};
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -70,7 +70,7 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         _input_json: String,
     ) -> PolicyFuture<'_, Option<u32>> {
         Box::pin(async {
-            Err(NanocodexError::InvalidRequest(
+            Err(NanocodeError::InvalidRequest(
                 "Claude execution policy does not support accept_steer".into(),
             ))
         })
@@ -80,14 +80,14 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
     }
     fn withdraw_steer(&self, _id: String, _index: u32) -> PolicyFuture<'_, ()> {
         Box::pin(async {
-            Err(NanocodexError::InvalidRequest(
+            Err(NanocodeError::InvalidRequest(
                 "Claude execution policy does not support withdraw_steer".into(),
             ))
         })
     }
     fn bind_steer(&self, _id: String, _index: u32, _boundary: u32) -> PolicyFuture<'_, ()> {
         Box::pin(async {
-            Err(NanocodexError::InvalidRequest(
+            Err(NanocodeError::InvalidRequest(
                 "Claude execution policy does not support bind_steer".into(),
             ))
         })
@@ -100,7 +100,7 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         match serde_json::from_str(state.get()) {
             Ok(state) => self.advance(id, state),
             Err(error) => Box::pin(async move {
-                Err(NanocodexError::InvalidRequest(format!(
+                Err(NanocodeError::InvalidRequest(format!(
                     "invalid encoded Claude execution state: {error}"
                 )))
             }),
@@ -125,7 +125,7 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         match serde_json::from_str(input.get()) {
             Ok(input) => self.begin_step(id, step_id, kind, input),
             Err(error) => Box::pin(async move {
-                Err(NanocodexError::InvalidRequest(format!(
+                Err(NanocodeError::InvalidRequest(format!(
                     "invalid encoded Claude execution state: {error}"
                 )))
             }),

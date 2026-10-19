@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use nanocode_agent_core::{ExecutionPolicyDisposition, NanocodexError, Result as AgentResult};
+use nanocode_agent_core::{ExecutionPolicyDisposition, NanocodeError, Result as AgentResult};
 use nanocode_durability::{
     Admission, BeginStep, Branches, DurableAgentExt, DurableOwner, DurableSession, EncodedPayload,
     InitialAcquisition, InitialSettings, JournalClaim, JournalSeed, OperationStatus, SessionRecord,
@@ -15,7 +15,7 @@ use nanocode_durability::{
 use serde_json::value::RawValue;
 
 use crate::{
-    NanocodexBuilder,
+    CodexBuilder,
     execution::{
         ExecutionAdmission, ExecutionContinuation, ExecutionFuture, ExecutionOutput,
         ExecutionPolicy, ExecutionSteer, ExecutionStepAdmission, IdentifiedExecutionSteer,
@@ -33,7 +33,7 @@ pub use session::DurableSessionExt;
 
 const MAINTENANCE_KINDS: &[&str] = &["standalone_compaction"];
 
-impl<F> DurableAgentExt for NanocodexBuilder<F> {
+impl<F> DurableAgentExt for CodexBuilder<F> {
     async fn durability(self, state: DurableSession) -> AgentResult<Self> {
         let state_id = state.state_id().to_owned();
         let (owner, checkpoint) = state
@@ -85,11 +85,11 @@ impl<F> DurableAgentExt for NanocodexBuilder<F> {
             };
             if let Some(configured) = builder.resume_snapshot()
                 && serde_json::to_string(configured)
-                    .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?
+                    .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?
                     != serde_json::to_string(&restored)
-                        .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?
+                        .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?
             {
-                return Err(NanocodexError::InvalidCheckpoint(
+                return Err(NanocodeError::InvalidCheckpoint(
                     "configured resume snapshot does not match the durability state".to_owned(),
                 ));
             }
@@ -124,13 +124,13 @@ impl<F> DurableAgentExt for NanocodexBuilder<F> {
                 let (owner, keys, branches) = owner
                     .lock()
                     .map_err(|_| {
-                        NanocodexError::InvalidExecutionPolicy(
+                        NanocodeError::InvalidExecutionPolicy(
                             "the durability-attached builder owner lock was poisoned".to_owned(),
                         )
                     })?
                     .take()
                     .ok_or_else(|| {
-                        NanocodexError::InvalidExecutionPolicy(
+                        NanocodeError::InvalidExecutionPolicy(
                             "a durability-attached builder can build only one agent; attach durability again to reopen the state"
                                 .to_owned(),
                         )
@@ -143,7 +143,7 @@ impl<F> DurableAgentExt for NanocodexBuilder<F> {
     }
 }
 
-impl<F> NanocodexBuilder<F> {
+impl<F> CodexBuilder<F> {
     pub(crate) fn deferred_durability(
         self,
         state: &DurableSession,
@@ -197,13 +197,13 @@ impl DurableExecution {
         let known = self
             .context_records
             .lock()
-            .map_err(|_| NanocodexError::InvalidExecutionPolicy("context cache poisoned".into()))?;
+            .map_err(|_| NanocodeError::InvalidExecutionPolicy("context cache poisoned".into()))?;
         context::prepare_snapshot(snapshot, &known).map_err(agent_error)
     }
 
     fn remember(&self, keys: HashSet<String>) -> AgentResult<()> {
         *self.context_records.lock().map_err(|_| {
-            NanocodexError::InvalidExecutionPolicy("context cache poisoned".into())
+            NanocodeError::InvalidExecutionPolicy("context cache poisoned".into())
         })? = keys;
         Ok(())
     }
@@ -235,8 +235,8 @@ impl ExecutionPolicy for DurableExecution {
     fn recover_failure<'a>(
         &'a self,
         operation_id: String,
-        error: NanocodexError,
-    ) -> ExecutionFuture<'a, NanocodexError> {
+        error: NanocodeError,
+    ) -> ExecutionFuture<'a, NanocodeError> {
         Box::pin(async move {
             if matches!(
                 error.execution_policy_disposition(),
@@ -247,9 +247,9 @@ impl ExecutionPolicy for DurableExecution {
             let owner = &self.owner;
             match owner.recover_failure(operation_id).await {
                 Ok(Some(OperationStatus::Failed { error, .. })) => {
-                    NanocodexError::ReplayedExecutionFailed(error)
+                    NanocodeError::ReplayedExecutionFailed(error)
                 }
-                Ok(Some(OperationStatus::Cancelled { .. })) => NanocodexError::TurnCancelled,
+                Ok(Some(OperationStatus::Cancelled { .. })) => NanocodeError::TurnCancelled,
 
                 Ok(Some(OperationStatus::Pending | OperationStatus::Completed { .. })) => {
                     if error.execution_policy_disposition()
@@ -257,7 +257,7 @@ impl ExecutionPolicy for DurableExecution {
                     {
                         return error;
                     }
-                    NanocodexError::execution_policy_with_disposition(
+                    NanocodeError::execution_policy_with_disposition(
                         "durable operation recovery",
                         ExecutionPolicyDisposition::Retry,
                         error,
@@ -517,7 +517,7 @@ impl ExecutionPolicy for DurableExecution {
         Box::pin(async move {
             let prepared = {
                 let known = self.context_records.lock().map_err(|_| {
-                    NanocodexError::InvalidExecutionPolicy("context cache poisoned".into())
+                    NanocodeError::InvalidExecutionPolicy("context cache poisoned".into())
                 })?;
                 context::prepare_continuation(continuation, &known).map_err(agent_error)?
             };
@@ -748,7 +748,7 @@ impl LazyExecution {
                             .is_empty(),
                     std::sync::atomic::Ordering::SeqCst,
                 );
-                Ok::<_, NanocodexError>(DurableExecution::ready(
+                Ok::<_, NanocodeError>(DurableExecution::ready(
                     owner,
                     record.session_id.clone(),
                     Some(Branches {
@@ -788,8 +788,8 @@ impl ExecutionPolicy for LazyExecution {
     fn recover_failure<'a>(
         &'a self,
         operation_id: String,
-        error: NanocodexError,
-    ) -> ExecutionFuture<'a, NanocodexError> {
+        error: NanocodeError,
+    ) -> ExecutionFuture<'a, NanocodeError> {
         Box::pin(async move {
             match self.get().await {
                 Ok(policy) => policy.recover_failure(operation_id, error).await,
@@ -824,7 +824,7 @@ impl ExecutionPolicy for LazyExecution {
                 return Ok(());
             }
             if self.existing.is_some() && self.attempted.swap(true, Ordering::SeqCst) {
-                return Err(NanocodexError::InvalidExecutionPolicy(
+                return Err(NanocodeError::InvalidExecutionPolicy(
                     "the deferred durable acquisition already failed".to_owned(),
                 ));
             }
@@ -847,7 +847,7 @@ impl ExecutionPolicy for LazyExecution {
                 .await?;
             if let Some(existing) = self.existing.as_ref().filter(|_| !committed) {
                 existing.store(true, Ordering::SeqCst);
-                return Err(NanocodexError::InvalidExecutionPolicy(
+                return Err(NanocodeError::InvalidExecutionPolicy(
                     "the prepared durable session already holds state".to_owned(),
                 ));
             }
@@ -1123,5 +1123,5 @@ async fn map_admission(
 }
 
 fn raw(json: String) -> AgentResult<Box<RawValue>> {
-    RawValue::from_string(json).map_err(NanocodexError::ExecutionPayload)
+    RawValue::from_string(json).map_err(NanocodeError::ExecutionPayload)
 }

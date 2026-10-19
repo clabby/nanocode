@@ -55,7 +55,7 @@ impl Snapshot {
     }
     pub(super) fn validated(self) -> Result<Self> {
         if self.provider != "claude" || self.version != 1 {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "unsupported Claude checkpoint version/provider".into(),
             ));
         }
@@ -490,7 +490,7 @@ impl State {
             self.stopped.store(true, Ordering::SeqCst);
             return Ok(());
         }
-        if matches!(result, Err(NanocodexError::TurnCancelled))
+        if matches!(result, Err(NanocodeError::TurnCancelled))
             && self.closing.load(Ordering::SeqCst)
         {
             let released = policy.release(operation.clone()).await;
@@ -505,29 +505,28 @@ impl State {
         let checkpoint = serde_json::to_value(&snapshot).map_err(provider_error);
         *conversation = snapshot.conversation;
         let checkpoint = checkpoint?;
-        let settled =
-            match result {
-                Ok(result) => policy
+        let settled = match result {
+            Ok(result) => {
+                policy
                     .complete(
                         operation.clone(),
                         checkpoint,
                         json!({"final_message": result.final_message(), "usage":result.usage()}),
                     )
-                    .await,
-                Err(NanocodexError::TurnCancelled) => {
-                    policy.cancel(operation.clone(), checkpoint).await
-                }
-                Err(NanocodexError::Response(error)) if self.code_only && error.retryable() => {
-                    policy
-                        .fail_attempt(operation.clone(), checkpoint, error.to_string())
-                        .await
-                }
-                Err(error) => {
-                    policy
-                        .fail(operation.clone(), checkpoint, error.to_string())
-                        .await
-                }
-            };
+                    .await
+            }
+            Err(NanocodeError::TurnCancelled) => policy.cancel(operation.clone(), checkpoint).await,
+            Err(NanocodeError::Response(error)) if self.code_only && error.retryable() => {
+                policy
+                    .fail_attempt(operation.clone(), checkpoint, error.to_string())
+                    .await
+            }
+            Err(error) => {
+                policy
+                    .fail(operation.clone(), checkpoint, error.to_string())
+                    .await
+            }
+        };
         if settled.is_err() {
             self.stopped.store(true, Ordering::SeqCst);
         }
@@ -679,8 +678,8 @@ pub(super) fn candidate_id(kind: &str) -> String {
     format!("claude-{kind}-{}", nanocode_platform::uuid_v4())
 }
 
-pub(super) fn recovery_error(error: impl std::fmt::Display) -> NanocodexError {
-    NanocodexError::execution_policy_with_disposition(
+pub(super) fn recovery_error(error: impl std::fmt::Display) -> NanocodeError {
+    NanocodeError::execution_policy_with_disposition(
         "Claude recovery",
         nanocode_agent_core::ExecutionPolicyDisposition::Reopen,
         provider_error(error),
@@ -758,7 +757,7 @@ pub struct ClaudeCheckpointView {
 
 pub fn decode_checkpoint(checkpoint: Value) -> Result<ClaudeCheckpointView> {
     let snapshot: Snapshot = serde_json::from_value::<Snapshot>(checkpoint)
-        .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?
+        .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?
         .validated()?;
     snapshot.view()
 }
@@ -778,7 +777,7 @@ pub fn session_checkpoint(
                 .is_ok_and(|model| model.family() == HarnessFamily::Claude)
         })
         .ok_or_else(|| {
-            NanocodexError::InvalidCheckpoint("checkpoint records no Claude model".into())
+            NanocodeError::InvalidCheckpoint("checkpoint records no Claude model".into())
         })?;
     let conversation_id = snapshot
         .conversation_id
@@ -813,7 +812,7 @@ pub fn decode_session_checkpoint(checkpoint: &SessionCheckpoint) -> Result<Claud
     checkpoint.validate()?;
     checkpoint.require_family(HarnessFamily::Claude)?;
     let stored: NativeChildState = serde_json::from_value(checkpoint.payload().clone())
-        .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?;
+        .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
     let mut view = stored.snapshot.validated()?.view()?;
     view.model = Some(checkpoint.model());
     view.lineage = Some(checkpoint.lineage().clone());
@@ -831,7 +830,7 @@ impl Snapshot {
                     .ok()
                     .filter(|model| model.family() == HarnessFamily::Claude)
                     .ok_or_else(|| {
-                        NanocodexError::InvalidCheckpoint(
+                        NanocodeError::InvalidCheckpoint(
                             "checkpoint model is not a Claude model".into(),
                         )
                     })

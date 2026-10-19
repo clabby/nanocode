@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use nanocode_agent_core::{NanocodexError, Result};
+use nanocode_agent_core::{NanocodeError, Result};
 use nanocode_tool_host::{Tool, ToolContext, ToolInput, contract::ToolOutputBody};
 use serde_json::Value;
 
@@ -14,7 +14,7 @@ pub(super) fn bridge<T: Tool>(tool: T) -> Result<(ToolDefinition, Handler)> {
 pub(super) fn bridge_shared(tool: Arc<dyn Tool>) -> Result<(ToolDefinition, Handler)> {
     let shared = tool.definition();
     let parameters = shared.parameters().ok_or_else(|| {
-        NanocodexError::InvalidRequest(format!(
+        NanocodeError::InvalidRequest(format!(
             "Claude can only call function tools; `{}` is not one",
             shared.name()
         ))

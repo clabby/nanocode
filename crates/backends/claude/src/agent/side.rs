@@ -1,5 +1,5 @@
 use super::{
-    Cancellation, ContentBlock, CostStatus, Message, NanocodexError, ReportedTurnUsage,
+    Cancellation, ContentBlock, CostStatus, Message, NanocodeError, ReportedTurnUsage,
     ResponseContext, Result, Role, State, TurnUsage, provider_error,
 };
 use crate::ToolResultContent;
@@ -123,7 +123,7 @@ fn side_messages(mut messages: Vec<Message>, question: &str) -> Vec<Message> {
 impl State {
     pub(super) async fn transcript(&self) -> Result<Vec<PromptMessage>> {
         if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(NanocodexError::AgentStopped);
+            return Err(NanocodeError::AgentStopped);
         }
         let snapshot = self.latest_boundary().await?;
         Ok(claude_transcript(&snapshot.conversation.packed_messages()))
@@ -150,7 +150,7 @@ impl State {
 impl State {
     pub(super) async fn side_question(&self, question: String) -> Result<SideAnswer> {
         if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(NanocodexError::AgentStopped);
+            return Err(NanocodeError::AgentStopped);
         }
         let messages = side_messages(self.side_transcript().await?, &question);
         let template = self.request_template(self.speed());

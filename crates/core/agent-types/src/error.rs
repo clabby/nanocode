@@ -19,7 +19,7 @@ pub enum CompactionRecovery {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum NanocodexError {
+pub enum NanocodeError {
     #[error("invalid task request: {0}")]
     InvalidRequest(String),
 
@@ -161,7 +161,7 @@ pub enum NanocodexError {
     Tools(#[from] nanocode_tool_contracts::ToolsBuildError),
 }
 
-impl NanocodexError {
+impl NanocodeError {
     #[doc(hidden)]
     pub fn backend<E>(backend: &'static str, source: E) -> Self
     where
@@ -226,7 +226,7 @@ impl NanocodexError {
     }
 }
 
-pub type Result<T> = std::result::Result<T, NanocodexError>;
+pub type Result<T> = std::result::Result<T, NanocodeError>;
 
 pub trait BackendFailure: std::error::Error + Send + Sync + 'static {
     fn requires_image_repair(&self) -> bool {

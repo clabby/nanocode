@@ -1,7 +1,7 @@
 use crate::agent::AgentSend;
 use crate::client::tower::{ResponsesAttempt, ResponsesServiceResponse};
 use crate::client::{__private::ResponsesServiceFactory, Model, ResponseError};
-use crate::{AgentEvents, Nanocodex, NanocodexBuilder, NanocodexError, OpenAi, Result};
+use crate::{Agent, AgentEvents, CodexBuilder, NanocodeError, OpenAi, Result};
 use nanocode_agent_core::{BackendId, BackendRegistration, BackendRequest};
 use tower::Service;
 
@@ -17,7 +17,7 @@ impl<F> nanocode_agent_core::BackendKind for OpenAi<F> {
     }
 }
 
-impl<F> nanocode_agent_core::BackendKind for NanocodexBuilder<F> {
+impl<F> nanocode_agent_core::BackendKind for CodexBuilder<F> {
     type Model = Model;
 
     fn backend_id() -> BackendId {
@@ -64,12 +64,12 @@ where
     fn build(
         &self,
         request: BackendRequest,
-    ) -> nanocode_agent_core::backend::BackendFuture<Result<(Nanocodex, AgentEvents)>> {
-        BackendRegistration::build(&Nanocodex::builder(self.clone()), request)
+    ) -> nanocode_agent_core::backend::BackendFuture<Result<(Agent, AgentEvents)>> {
+        BackendRegistration::build(&Agent::builder(self.clone()), request)
     }
 }
 
-impl<F> BackendRegistration for NanocodexBuilder<F>
+impl<F> BackendRegistration for CodexBuilder<F>
 where
     F: ResponsesServiceFactory + Send + Sync + 'static,
     F::Service:
@@ -96,7 +96,7 @@ where
     fn build(
         &self,
         request: BackendRequest,
-    ) -> nanocode_agent_core::backend::BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> nanocode_agent_core::backend::BackendFuture<Result<(Agent, AgentEvents)>> {
         let prepared = self.clone().prepare(request);
         Box::pin(async move { prepared?.build() })
     }
@@ -106,13 +106,13 @@ fn validate_model(model: &str) -> Result<()> {
     model
         .parse::<Model>()
         .map(|_| ())
-        .map_err(NanocodexError::InvalidRequest)
+        .map_err(NanocodeError::InvalidRequest)
 }
 
-impl<F> NanocodexBuilder<F> {
+impl<F> CodexBuilder<F> {
     pub fn prepare(self, request: BackendRequest) -> Result<Self> {
         if request.model.backend != BackendId::new("codex") {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "Codex registration requires the Codex backend".into(),
             ));
         }
@@ -120,7 +120,7 @@ impl<F> NanocodexBuilder<F> {
             .model
             .model
             .parse::<Model>()
-            .map_err(NanocodexError::InvalidRequest)?;
+            .map_err(NanocodeError::InvalidRequest)?;
         let mut builder = self
             .runtime_tools(request.tools)
             .model(model)

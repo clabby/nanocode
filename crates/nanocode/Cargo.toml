@@ -12,7 +12,7 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Public composition and builders for the Nanocodex Rust agent crates"
+description = "Public composition and builders for the Nanocode Rust agent crates"
 
 [package.metadata.docs.rs]
 rustdoc-args = ["-D", "warnings"]

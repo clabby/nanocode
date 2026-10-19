@@ -8,7 +8,7 @@ mod native {
 
     use nanocode::{
         Claude, ClaudeClient, ClaudeModel, Codex, HarnessFamily, JsonlStore, Model, ModelSelection,
-        Nanocodex, PromptRequest, Thinking, Tools,
+        Nanocode, PromptRequest, Thinking, Tools,
         durability::{SessionStore, TurnStatus},
     };
 
@@ -269,7 +269,7 @@ Examples:
         {
             return Err("brain unexpectedly enabled default tools".into());
         }
-        let mut builder = Nanocodex::builder()
+        let mut builder = Nanocode::builder()
             .openai(nanocode::OpenAi::default())
             .claude(ClaudeClient::default())
             .tools(tools)
@@ -302,7 +302,7 @@ Examples:
         Ok(())
     }
 
-    async fn inference(runtime: &Nanocodex, store: &SessionStore, args: &Args) -> Result<()> {
+    async fn inference(runtime: &Nanocode, store: &SessionStore, args: &Args) -> Result<()> {
         let pending = if let Some(id) = &args.resume {
             store
                 .load(id)

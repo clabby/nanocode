@@ -357,7 +357,7 @@ impl nanocode_agent_types::BackendFailure for ResponseError {
     }
 }
 
-impl From<ResponseError> for nanocode_agent_types::NanocodexError {
+impl From<ResponseError> for nanocode_agent_types::NanocodeError {
     fn from(error: ResponseError) -> Self {
         Self::Response(nanocode_agent_types::BackendError(Box::new(error)))
     }

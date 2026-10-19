@@ -3,7 +3,7 @@ use nanocode_agent_config::configuration::{
     AgentResult, AgentTools, RuntimeBackend, RuntimeRequest, Settings,
 };
 use nanocode_agent_core::{
-    AgentHandle, BackendId, HarnessFamily, ModelSelection, NanocodexError, Result,
+    AgentHandle, BackendId, HarnessFamily, ModelSelection, NanocodeError, Result,
     backend::BackendFuture,
 };
 #[cfg(target_family = "wasm")]
@@ -115,11 +115,11 @@ impl RuntimeBackend for ClaudeHarness {
             let host = services.clone();
             let shared = services.shared_tools(remote).await?;
             if spec.model.family() != HarnessFamily::Claude {
-                return Err(NanocodexError::InvalidRequest(
+                return Err(NanocodeError::InvalidRequest(
                     "the Claude harness requires a Claude model".into(),
                 ));
             }
-            let mut builder = nanocode_agent_core::Nanocodex::builder(crate::Claude::new(
+            let mut builder = nanocode_agent_core::Agent::builder(crate::Claude::new(
                 client,
                 spec.model.as_str(),
             ))
@@ -144,11 +144,11 @@ impl RuntimeBackend for ClaudeHarness {
                     .as_ref()
                     .map(|tools| tools.materialize(handle.clone()))
                     .transpose()
-                    .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+                    .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
                 let selected = selected
                     .map(|tools| services.prepare_tools(&handle, tools, process_store.clone()))
                     .transpose()
-                    .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+                    .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
                 let mut additive = if selected
                     .as_ref()
                     .is_some_and(nanocode_tool_host::Tools::has_code_mode_host)
@@ -206,7 +206,7 @@ impl RuntimeBackend for ClaudeHarness {
                         builder
                             .clone()
                             .deferred_durability(&state, record, text.clone())?;
-                    match nanocode_agent_core::Nanocodex::persist_created(deferred.build()).await {
+                    match nanocode_agent_core::Agent::persist_created(deferred.build()).await {
                         Ok((agent, events)) => {
                             host.initial_notice_committed(&agent, text);
                             return Ok((agent, events));

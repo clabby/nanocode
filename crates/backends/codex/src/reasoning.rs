@@ -31,7 +31,7 @@ impl ReasoningState {
         history: &[crate::client::responses::ResponseItem],
     ) -> crate::Result<()> {
         use crate::client::{Model, responses::ResponseItem};
-        let invalid = |detail: &str| crate::NanocodexError::InvalidCheckpoint(detail.to_owned());
+        let invalid = |detail: &str| crate::NanocodeError::InvalidCheckpoint(detail.to_owned());
         let ReasoningPin::Active { model, effort } = &self.pin else {
             return if self.latest_override.is_none() {
                 Ok(())

@@ -1,7 +1,7 @@
 pub use nanocode_agent_config::HarnessRequest;
 use std::{collections::HashMap, future::Future, sync::Arc};
 
-use crate::{Agent, AgentEvents, HarnessFamily, ModelSelection, NanocodexError, Thinking};
+use crate::{Agent, AgentEvents, HarnessFamily, ModelSelection, NanocodeError, Thinking};
 use nanocode_agent_core::{
     AgentHandle, ForkRequest, SessionCheckpoint, SpawnOptions,
     backend::{AgentFactory, BackendFuture},
@@ -316,16 +316,16 @@ impl Router {
         reopen: Reopen,
     ) -> AgentResult {
         let model = options.selected_harness_model().ok_or_else(|| {
-            NanocodexError::InvalidRequest("harness construction requires a resolved model".into())
+            NanocodeError::InvalidRequest("harness construction requires a resolved model".into())
         })?;
         let thinking = options.selected_thinking().ok_or_else(|| {
-            NanocodexError::InvalidRequest("harness construction requires a resolved effort".into())
+            NanocodeError::InvalidRequest("harness construction requires a resolved effort".into())
         })?;
         let recipe = self
             .recipes
             .get(&model.family())
             .ok_or_else(|| {
-                NanocodexError::InvalidRequest(format!(
+                NanocodeError::InvalidRequest(format!(
                     "{} harness is not configured for this host",
                     model.family()
                 ))
@@ -444,14 +444,10 @@ impl AgentFactory for RoutedFactory {
                     checkpoint.validate()?;
 
                     let checkpoint = match &inner.recovery_store {
-                        Some(store) => {
-                            store
-                                .recovery_checkpoint(checkpoint)
-                                .await
-                                .map_err(|error| {
-                                    NanocodexError::InvalidCheckpoint(error.to_string())
-                                })?
-                        }
+                        Some(store) => store
+                            .recovery_checkpoint(checkpoint)
+                            .await
+                            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?,
                         None => checkpoint,
                     };
                     if checkpoint.family() == parent.harness_family() {
@@ -480,12 +476,12 @@ impl AgentFactory for RoutedFactory {
     }
 }
 
-fn catalog_error(error: crate::durability::Error) -> NanocodexError {
+fn catalog_error(error: crate::durability::Error) -> NanocodeError {
     match error {
         crate::durability::Error::SessionNotFound { .. } => {
-            NanocodexError::InvalidRequest(error.to_string())
+            NanocodeError::InvalidRequest(error.to_string())
         }
-        error => NanocodexError::Backend {
+        error => NanocodeError::Backend {
             backend: "durability",
             source: Arc::new(error),
         },

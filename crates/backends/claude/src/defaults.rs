@@ -1,4 +1,4 @@
-use nanocode_agent_core::{AgentHandle, NanocodexError, Result};
+use nanocode_agent_core::{AgentHandle, NanocodeError, Result};
 use nanocode_tool_host::{Tool, Tools};
 use nanocode_tools::ToolCollection as _;
 use std::{path::PathBuf, sync::Arc};
@@ -38,7 +38,7 @@ pub fn runner_tools_with_executor(
     executor: Arc<dyn nanocode_process_contracts::ForegroundExecutor>,
 ) -> Result<Tools> {
     let files = crate::tools::ClaudeWorkspaceFiles::new(&workspace).map_err(|error| {
-        NanocodexError::InvalidRequest(format!(
+        NanocodeError::InvalidRequest(format!(
             "Claude file tools require the runner workspace {}: {error}",
             workspace.display()
         ))
@@ -50,12 +50,12 @@ pub fn runner_tools_with_executor(
         Arc::new(crate::claude_bash::Jobs::default()),
         executor,
     )
-    .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))
+    .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))
 }
 
 pub fn hand_tools(directory: PathBuf) -> Result<Tools> {
     let files = crate::tools::ClaudeWorkspaceFiles::machine(&directory).map_err(|error| {
-        NanocodexError::InvalidRequest(format!(
+        NanocodeError::InvalidRequest(format!(
             "Claude file tools require the hand directory {}: {error}",
             directory.display()
         ))
@@ -67,7 +67,7 @@ pub fn hand_tools(directory: PathBuf) -> Result<Tools> {
         Arc::new(crate::claude_bash::Jobs::default()),
         Arc::new(nanocode_process::NativeForeground),
     )
-    .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))
+    .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))
 }
 
 pub fn install_default_tools_with_runner_pool(
@@ -103,7 +103,7 @@ pub fn install_default_tools_with_executor(
         Some(tools) => tools,
         None => {
             let files = crate::tools::ClaudeWorkspaceFiles::new(&workspace).map_err(|error| {
-                NanocodexError::InvalidRequest(format!(
+                NanocodeError::InvalidRequest(format!(
                     "Claude file tools require the runtime workspace {}: {error}",
                     workspace.display()
                 ))
@@ -115,7 +115,7 @@ pub fn install_default_tools_with_executor(
                 jobs.clone(),
                 executor,
             )
-            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?
+            .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?
         }
     };
     let selected = if selected.has_code_mode_host() {
@@ -134,7 +134,7 @@ pub fn install_default_tools_with_executor(
         .into_builder()
         .exposure(nanocode_tool_host::ToolExposure::CodeModeOnly)
         .build()
-        .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+        .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
     for tool in additive {
         selected = selected.add_shared_tool(tool)?;
     }

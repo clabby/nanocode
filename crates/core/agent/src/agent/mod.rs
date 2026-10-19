@@ -1,5 +1,5 @@
 use crate::{
-    NanocodexError, Result,
+    NanocodeError, Result,
     session::{
         Capabilities, ForkRequest, Lineage, Persistence, SessionCheckpoint, SessionInfo,
         TurnBoundary,
@@ -28,7 +28,7 @@ mod owned;
 mod session_context;
 mod turn;
 pub use backend::BuilderBackend;
-pub use handle::{AgentHandle, Nanocodex, WeakAgent, created, created_batch};
+pub use handle::{Agent, AgentHandle, WeakAgent, created, created_batch};
 pub use owned::{AgentOwner, adopt};
 pub use session_context::AgentSessionContext;
 pub use turn::{

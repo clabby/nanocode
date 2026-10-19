@@ -5,11 +5,11 @@ mod runtime_tools;
 pub mod session;
 pub mod usage;
 pub use agent::{
-    AgentHandle, AgentSessionContext, BuilderBackend, Nanocodex, PromptRequest, PromptRoute,
+    Agent, AgentHandle, AgentSessionContext, BuilderBackend, PromptRequest, PromptRoute,
     SideAnswer, SpawnOptions, Turn, TurnControl, TurnResult, WeakAgent,
 };
 pub use error::{
-    BackendError, BackendFailure, CompactionRecovery, ExecutionPolicyDisposition, NanocodexError,
+    BackendError, BackendFailure, CompactionRecovery, ExecutionPolicyDisposition, NanocodeError,
     Result,
 };
 pub use harness::{ClaudeModel, HarnessFamily, ModelCapabilities, ModelSelection, ModelTransport};
@@ -65,7 +65,7 @@ pub trait BackendRegistration: Send + Sync {
     fn build(
         &self,
         request: BackendRequest,
-    ) -> backend::BackendFuture<Result<(Nanocodex, AgentEvents)>>;
+    ) -> backend::BackendFuture<Result<(Agent, AgentEvents)>>;
 }
 
 impl BackendRequest {

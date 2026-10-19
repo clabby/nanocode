@@ -12,7 +12,7 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Portable durable execution state and stores for Nanocodex"
+description = "Portable durable execution state and stores for Nanocode"
 
 [package.metadata.docs.rs]
 rustdoc-args = ["-D", "warnings"]

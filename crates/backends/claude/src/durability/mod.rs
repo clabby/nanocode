@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use nanocode_agent_core::{
-    AgentEvents, BackendRequest, Nanocodex, Result as AgentResult, backend::BackendFuture,
+    Agent, AgentEvents, BackendRequest, Result as AgentResult, backend::BackendFuture,
 };
 use nanocode_durability::{
     Admission, BeginStep, Branches, CheckpointFormat, DurableAgentExt, DurableBackendRegistration,
@@ -35,7 +35,7 @@ impl DurableBackendRegistration for ClaudeBuilder {
         &self,
         request: BackendRequest,
         state: DurableSession,
-    ) -> BackendFuture<AgentResult<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<AgentResult<(Agent, AgentEvents)>> {
         let prepared = self.clone().prepare(request);
         Box::pin(async move { prepared?.durability(state).await?.build() })
     }
@@ -50,8 +50,8 @@ impl DurableBackendRegistration for Claude {
         &self,
         request: BackendRequest,
         state: DurableSession,
-    ) -> BackendFuture<AgentResult<(Nanocodex, AgentEvents)>> {
-        Nanocodex::builder(self.clone()).build_durable(request, state)
+    ) -> BackendFuture<AgentResult<(Agent, AgentEvents)>> {
+        Agent::builder(self.clone()).build_durable(request, state)
     }
 }
 
@@ -303,7 +303,7 @@ impl LazyClaudeExecution {
                             .is_empty(),
                     std::sync::atomic::Ordering::SeqCst,
                 );
-                Ok::<_, nanocode_agent_core::NanocodexError>(ClaudeExecution {
+                Ok::<_, nanocode_agent_core::NanocodeError>(ClaudeExecution {
                     state_id: record.session_id.clone(),
                     owner,
                     session: state,
@@ -471,7 +471,7 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
                 return Ok(());
             }
             if self.existing.is_some() && self.attempted.swap(true, Ordering::SeqCst) {
-                return Err(nanocode_agent_core::NanocodexError::InvalidExecutionPolicy(
+                return Err(nanocode_agent_core::NanocodeError::InvalidExecutionPolicy(
                     "the deferred durable acquisition already failed".to_owned(),
                 ));
             }
@@ -488,7 +488,7 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
             let (policy, committed) = self.acquire(prepared).await?;
             if let Some(existing) = self.existing.as_ref().filter(|_| !committed) {
                 existing.store(true, Ordering::SeqCst);
-                return Err(nanocode_agent_core::NanocodexError::InvalidExecutionPolicy(
+                return Err(nanocode_agent_core::NanocodeError::InvalidExecutionPolicy(
                     "the prepared durable session already holds state".to_owned(),
                 ));
             }
@@ -583,7 +583,7 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         Box::pin(async move {
             let input: Box<serde_json::value::RawValue> = serde_json::from_str(&input_json)
                 .map_err(|error| {
-                    nanocode_agent_core::NanocodexError::InvalidRequest(error.to_string())
+                    nanocode_agent_core::NanocodeError::InvalidRequest(error.to_string())
                 })?;
             self.owner
                 .identified_steer_accepted(message_id, &input)
@@ -602,7 +602,7 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         Box::pin(async move {
             let input: Box<serde_json::value::RawValue> = serde_json::from_str(&input_json)
                 .map_err(|error| {
-                    nanocode_agent_core::NanocodexError::InvalidRequest(error.to_string())
+                    nanocode_agent_core::NanocodeError::InvalidRequest(error.to_string())
                 })?;
             self.owner
                 .accept_steer(id, after, &input, message_id)
@@ -788,7 +788,7 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         Box::pin(async move {
             let state = self.session.state().await.map_err(agent_error)?;
             let operation = state.operation(&id).ok_or_else(|| {
-                nanocode_agent_core::NanocodexError::InvalidCheckpoint(
+                nanocode_agent_core::NanocodeError::InvalidCheckpoint(
                     "Claude notice operation is missing".into(),
                 )
             })?;

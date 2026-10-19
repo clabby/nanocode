@@ -56,7 +56,7 @@ use super::{
     terminal_payload,
 };
 use crate::{
-    NanocodexError, Result,
+    NanocodeError, Result,
     agent::{ContextSource, ExecutionSteps, ResponsesClientBox, execution::QueuedSteer},
     prompt_cache::ModelPromptCache,
     usage::TurnUsage,
@@ -113,7 +113,7 @@ pub(crate) enum ModelTurnOutcome {
     Completed(CompletedModelTurn),
     Cancelled(ModelCheckpoint),
     Failed {
-        error: NanocodexError,
+        error: NanocodeError,
         checkpoint: ModelCheckpoint,
     },
 }
@@ -122,7 +122,7 @@ pub(crate) enum ModelCompactOutcome {
     Completed(ModelCheckpoint),
     Cancelled(ModelCheckpoint),
     Failed {
-        error: NanocodexError,
+        error: NanocodeError,
         checkpoint: ModelCheckpoint,
     },
 }
@@ -456,7 +456,7 @@ impl ModelRun {
             self.session = Some(self.empty_session(requested_workspace)?);
         }
         let session = self.session.as_mut().ok_or_else(|| {
-            NanocodexError::InvalidCheckpoint(
+            NanocodeError::InvalidCheckpoint(
                 "developer context did not establish a model session".to_owned(),
             )
         })?;

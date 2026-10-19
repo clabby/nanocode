@@ -6,11 +6,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-authors = ["Nanocodex Contributors", "Ben Clabby"]
+authors = ["Nanocode Contributors", "Ben Clabby"]
 license = "Apache-2.0"
 homepage.workspace = true
 repository.workspace = true
-description = "Interactive terminal coding agent built on the Nanocodex Rust crates"
+description = "Interactive terminal coding agent built on the Nanocode Rust crates"
 
 [[bin]]
 name = "nanocodex"

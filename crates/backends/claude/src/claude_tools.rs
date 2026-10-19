@@ -4,7 +4,7 @@ use crate::{
     ClaudeNestedToolUpdate, ClaudeToolInvocation, ClaudeToolProgress, ClaudeToolReply, ClaudeTools,
     ToolDefinition, ToolResultContent,
 };
-use nanocode_agent_core::{AgentHandle, NanocodexError, Result};
+use nanocode_agent_core::{AgentHandle, NanocodeError, Result};
 use nanocode_tool_host::{
     ToolContext, ToolDefinition as RuntimeDefinition, ToolInput, Tools,
     contract::{ToolOutputBody, ToolOutputContent},
@@ -136,7 +136,7 @@ pub(super) fn install(
                 Call::Function(Arc::from("tool_search")),
             ),
             other => {
-                return Err(NanocodexError::InvalidRequest(format!(
+                return Err(NanocodeError::InvalidRequest(format!(
                     "Claude requires a function tool; `{}` cannot be installed directly",
                     other.name()
                 )));

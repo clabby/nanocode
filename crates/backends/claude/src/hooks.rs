@@ -158,9 +158,9 @@ pub async fn run_lifecycle_hooks(
     policy: Option<&dyn crate::execution::ClaudeExecutionPolicy>,
 ) -> nanocode_agent_core::Result<ClaudeLifecycleOutcome> {
     use crate::execution::Step;
-    use nanocode_agent_core::NanocodexError;
+    use nanocode_agent_core::NanocodeError;
     let serialization_error =
-        |error: serde_json::Error| NanocodexError::backend("Claude lifecycle receipt", error);
+        |error: serde_json::Error| NanocodeError::backend("Claude lifecycle receipt", error);
     let mut combined = ClaudeLifecycleOutcome::default();
     for (index, hook) in hooks.iter().enumerate() {
         if !hook.handles_lifecycle(&invocation.event) {
@@ -182,7 +182,7 @@ pub async fn run_lifecycle_hooks(
         };
         let outcome: ClaudeLifecycleOutcome = match admitted {
             Step::Interrupted => {
-                return Err(nanocode_agent_core::NanocodexError::InvalidExecutionPolicy(
+                return Err(nanocode_agent_core::NanocodeError::InvalidExecutionPolicy(
                     "lifecycle step was admitted with an interrupted tool outcome".into(),
                 ));
             }

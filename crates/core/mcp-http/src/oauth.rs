@@ -29,7 +29,7 @@ mod refresh;
 const LOGIN_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
-const OAUTH_CLIENT_NAME: &str = "Nanocodex";
+const OAUTH_CLIENT_NAME: &str = "Nanocode";
 
 #[derive(Default)]
 pub struct OAuthMetadataCache {

@@ -1,11 +1,11 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
-pub use nanocode_agent::Nanocodex as Agent;
+pub use nanocode_agent::Agent;
 pub use nanocode_agent::input::PromptMessage;
 pub use nanocode_agent::{
     AgentEvents, AgentSessionContext, Capabilities, ClaudeModel, CostStatus, EstimatedUsdCost,
     ExecutionPolicyDisposition, ForkPoint, ForkRequest, HarnessFamily, Lineage, ModelCapabilities,
-    ModelTransport, Mutability, NanocodexError, Origin, Persistence, PromptRequest, PromptRoute,
+    ModelTransport, Mutability, NanocodeError, Origin, Persistence, PromptRequest, PromptRoute,
     ReportedTurnUsage, ServiceTier, SessionCheckpoint, SessionInfo, SideAnswer, Turn, TurnControl,
     TurnResult, TurnUsage, UsdAmount, WeakAgent,
 };
@@ -21,7 +21,7 @@ pub type Harness = nanocode_agent::Harness<Defaults>;
 pub type HarnessBuilder = nanocode_agent::HarnessBuilder<Defaults>;
 #[cfg(not(target_family = "wasm"))]
 pub use nanocode_agent_host as runners;
-pub use nanocode_backend_codex::NanocodexBuilder as CodexBuilder;
+pub use nanocode_backend_codex::CodexBuilder;
 
 pub use nanocode_agent::{Model, ReasoningMode, Thinking};
 pub use nanocode_backend_claude::{Claude, ClaudeClient};
@@ -51,20 +51,20 @@ pub mod hand {
 
     pub use nanocode_tool_runtime::remote::{Hand, HandEndpoint, HandEvent, SocketPolicy};
 
-    pub fn tools(directory: impl Into<PathBuf>) -> Result<crate::Tools, crate::NanocodexError> {
+    pub fn tools(directory: impl Into<PathBuf>) -> Result<crate::Tools, crate::NanocodeError> {
         let directory = directory.into();
         crate::claude::hand_tools(directory.clone())?
             .into_builder()
             .add(crate::tools::WorkspaceTools::new(directory))
             .build()
-            .map_err(|error| crate::NanocodexError::InvalidRequest(error.to_string()))
+            .map_err(|error| crate::NanocodeError::InvalidRequest(error.to_string()))
     }
 
     pub fn connect(
         url: impl Into<String>,
         token: impl Into<String>,
         directory: impl Into<PathBuf>,
-    ) -> Result<Hand, crate::NanocodexError> {
+    ) -> Result<Hand, crate::NanocodeError> {
         let directory = directory.into();
         Ok(Hand::connect(url, token, tools(directory.clone())?).directory(directory))
     }
@@ -73,7 +73,7 @@ pub mod hand {
         address: SocketAddr,
         token: impl Into<String>,
         directory: impl Into<PathBuf>,
-    ) -> Result<Hand, crate::NanocodexError> {
+    ) -> Result<Hand, crate::NanocodeError> {
         let directory = directory.into();
         Ok(Hand::listen(address, token, tools(directory.clone())?).directory(directory))
     }
@@ -89,18 +89,18 @@ pub use nanocode_subagents::{
     ScopedAgentUpdate, SubagentControl, SubagentRuntimeId,
 };
 pub type Defaults = nanocode_agent_host::Defaults<CodexHarness, ClaudeHarness>;
-pub type Nanocodex = nanocode_agent::Runtime<Defaults>;
-pub type NanocodexBuilder<B = nanocode_agent::Unselected> =
+pub type Nanocode = nanocode_agent::Runtime<Defaults>;
+pub type NanocodeBuilder<B = nanocode_agent::Unselected> =
     nanocode_agent::RuntimeBuilder<B, Defaults>;
 pub use nanocode_agent::{SpawnBuilder, SubagentUpdates, Unselected};
 
 pub mod agent {
 
     pub use crate::durability;
-    pub use nanocode_agent::Nanocodex as Agent;
+    pub use nanocode_agent::Agent;
     pub use nanocode_agent::{
         AgentEvents, AgentSessionContext, BuilderBackend, CostStatus, EstimatedUsdCost,
-        ExecutionPolicyDisposition, NanocodexError, PromptRequest, PromptRoute, ReportedTurnUsage,
+        ExecutionPolicyDisposition, NanocodeError, PromptRequest, PromptRoute, ReportedTurnUsage,
         Result, ServiceTier, SpawnOptions, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
         WeakAgent, events, input, session, usage,
     };
@@ -110,8 +110,7 @@ pub mod agent {
     };
 
     pub use nanocode_backend_codex::{
-        ExecutionEnvironment, NanocodexBuilder as CodexBuilder, durability::DurableSessionExt,
-        execution,
+        CodexBuilder, ExecutionEnvironment, durability::DurableSessionExt, execution,
     };
 }
 
@@ -147,7 +146,7 @@ pub mod prelude {
     pub use crate::CodexHarness;
 
     pub use crate::DurableAgentExt;
-    pub use crate::Nanocodex;
+    pub use crate::Nanocode;
     pub use crate::SubagentUpdates;
     pub use crate::Tool;
     pub use crate::{AgentStatus, AgentUpdate, ScopedAgentUpdate, SubagentControl};
@@ -184,10 +183,10 @@ pub mod backend {
     pub use nanocode_agent::backend::*;
     pub use nanocode_agent::input::{Prompt, PromptInput};
     pub use nanocode_agent::{
-        AgentHandle, AgentSessionContext, AgentToolsFactory, BackendId, BackendKind,
+        Agent, AgentHandle, AgentSessionContext, AgentToolsFactory, BackendId, BackendKind,
         BackendRegistration, BackendRequest, Capabilities, ForkRequest, HarnessFamily,
-        ModelSelection, Nanocodex as Agent, NanocodexError, Result, RuntimeTools,
-        SessionCheckpoint, SpawnOptions, Thinking, TurnResult,
+        ModelSelection, NanocodeError, Result, RuntimeTools, SessionCheckpoint, SpawnOptions,
+        Thinking, TurnResult,
     };
     pub use nanocode_durability::{CheckpointFormat, DurableBackendRegistration};
     pub use nanocode_tools::{Tool, ToolCollection, ToolContext, ToolInput};

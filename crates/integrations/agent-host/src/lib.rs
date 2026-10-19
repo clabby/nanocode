@@ -1,9 +1,7 @@
 use nanocode_agent::configuration::{
     DefaultRuntimeBackend, HostServices, RuntimeBackend, RuntimeDefaults,
 };
-use nanocode_agent_core::{
-    AgentHandle, BackendId, Nanocodex as Agent, Result, backend::BackendFuture,
-};
+use nanocode_agent_core::{Agent, AgentHandle, BackendId, Result, backend::BackendFuture};
 use nanocode_durability::{SessionStore, SharedStore};
 use nanocode_tool_host::{Tools, ToolsBuildError};
 use std::{marker::PhantomData, sync::Arc};
@@ -11,7 +9,7 @@ use std::{marker::PhantomData, sync::Arc};
 #[cfg(not(target_family = "wasm"))]
 use nanocode_agent::configuration::{NativeDefaults, RunnerServices};
 #[cfg(not(target_family = "wasm"))]
-use nanocode_agent_core::{NanocodexError, WeakAgent};
+use nanocode_agent_core::{NanocodeError, WeakAgent};
 #[cfg(not(target_family = "wasm"))]
 pub use nanocode_cua::{ComputerConfig, ComputerTools};
 #[cfg(not(target_family = "wasm"))]
@@ -136,12 +134,12 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
             for runner in &self.runners {
                 runner
                     .validate()
-                    .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+                    .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
             }
             for config in &self.servers {
                 config
                     .validate()
-                    .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+                    .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
             }
             #[cfg(target_os = "macos")]
             if !self.machine_tools_disabled {
@@ -303,7 +301,7 @@ impl HostServices for Services {
             Box::pin(async move {
                 pool.shutdown()
                     .await
-                    .map_err(|error| NanocodexError::Backend {
+                    .map_err(|error| NanocodeError::Backend {
                         backend: "runners",
                         source: Arc::new(error),
                     })

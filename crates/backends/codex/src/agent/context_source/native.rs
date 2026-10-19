@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::agents_md::{combine_instructions, load_global_instructions, load_instructions};
-use crate::{NanocodexError, Result};
+use crate::{NanocodeError, Result};
 
 #[derive(Clone, Default)]
 pub(crate) struct ContextSourceConfig {
@@ -58,18 +58,18 @@ impl ContextSource {
         }
         let requested = PathBuf::from(requested.unwrap_or("."));
         let resolved = std::fs::canonicalize(&requested).map_err(|source| {
-            NanocodexError::ResolveWorkspace {
+            NanocodeError::ResolveWorkspace {
                 path: requested,
                 source,
             }
         })?;
         if !resolved.is_dir() {
-            return Err(NanocodexError::WorkspaceNotDirectory { path: resolved });
+            return Err(NanocodeError::WorkspaceNotDirectory { path: resolved });
         }
         resolved
             .into_os_string()
             .into_string()
-            .map_err(|path| NanocodexError::WorkspaceNotUtf8 {
+            .map_err(|path| NanocodeError::WorkspaceNotUtf8 {
                 path: PathBuf::from(path),
             })
     }

@@ -12,31 +12,31 @@ pub(super) fn resolve_fork_point(
         crate::session::ForkPoint::Turn(completed) => {
             let boundary = completed
                 .boundary()
-                .ok_or(NanocodexError::ReplayedCheckpointUnavailable)?;
+                .ok_or(NanocodeError::ReplayedCheckpointUnavailable)?;
             let Some(committed) = boundary.downcast::<CommittedSession>() else {
                 if !boundary.is::<super::checkpoint::ReplayedBoundary>()
                     && let Ok(checkpoint) = boundary.checkpoint()
                 {
                     checkpoint.require_family(crate::HarnessFamily::Codex)?;
                 }
-                return Err(NanocodexError::ReplayedCheckpointUnavailable);
+                return Err(NanocodeError::ReplayedCheckpointUnavailable);
             };
             if committed.lineage_id() != conversation_id {
-                return Err(NanocodexError::CheckpointLineageMismatch);
+                return Err(NanocodeError::CheckpointLineageMismatch);
             }
             Ok(ForkFrom::Live(committed))
         }
         crate::session::ForkPoint::Checkpoint(checkpoint) => {
             checkpoint.require_family(crate::HarnessFamily::Codex)?;
             if checkpoint.conversation_id() != conversation_id {
-                return Err(NanocodexError::CheckpointLineageMismatch);
+                return Err(NanocodeError::CheckpointLineageMismatch);
             }
             let conversation = ChildState::from_checkpoint(checkpoint)?
                 .conversation
-                .ok_or(NanocodexError::ForkBeforeCompletedTurn)?;
+                .ok_or(NanocodeError::ForkBeforeCompletedTurn)?;
             Ok(ForkFrom::Snapshot(Box::new(conversation)))
         }
-        _ => Err(NanocodexError::ReplayedCheckpointUnavailable),
+        _ => Err(NanocodeError::ReplayedCheckpointUnavailable),
     }
 }
 
@@ -137,7 +137,7 @@ impl LifecycleBackend for LocalLifecycle {
             let request_id = if let Some(acceptance) = acceptance {
                 Some(match acceptance.await {
                     Ok(Ok(request_id)) => request_id,
-                    Ok(Err(NanocodexError::AgentStopped)) | Err(_) => {
+                    Ok(Err(NanocodeError::AgentStopped)) | Err(_) => {
                         return Err(shutdown.stopped_error().await);
                     }
                     Ok(Err(error)) => return Err(error),
@@ -147,9 +147,9 @@ impl LifecycleBackend for LocalLifecycle {
             };
             Ok(BackendTurn {
                 request_id,
-                result: Box::pin(async move {
-                    receiver.await.map_err(|_| NanocodexError::TurnStopped)?
-                }),
+                result: Box::pin(
+                    async move { receiver.await.map_err(|_| NanocodeError::TurnStopped)? },
+                ),
             })
         })
     }
@@ -193,12 +193,12 @@ impl LifecycleBackend for LocalLifecycle {
                         result: Box::pin(async move {
                             turn_receiver
                                 .await
-                                .map_err(|_| NanocodexError::TurnStopped)?
+                                .map_err(|_| NanocodeError::TurnStopped)?
                         }),
                     }))
                 }
                 Ok(Ok(PromptRouteKind::Steered)) => Ok(BackendPromptRoute::Steered),
-                Ok(Err(NanocodexError::AgentStopped)) | Err(_) => {
+                Ok(Err(NanocodeError::AgentStopped)) | Err(_) => {
                     Err(shutdown.stopped_error().await)
                 }
                 Ok(Err(error)) => Err(error),
@@ -277,7 +277,7 @@ impl LifecycleBackend for LocalLifecycle {
     fn set_harness_model(&self, model: crate::ModelSelection) -> BackendFuture<Result<()>> {
         let Some(model) = model.as_codex() else {
             return Box::pin(async {
-                Err(NanocodexError::InvalidRequest(
+                Err(NanocodeError::InvalidRequest(
                     "model belongs to another harness family".into(),
                 ))
             });
@@ -426,7 +426,7 @@ impl LifecycleBackend for LocalLifecycle {
             .and_then(|mut ready| ready.take());
         Box::pin(async move {
             match ready {
-                Some(ready) => ready.await.map_err(|_| NanocodexError::AgentStopped)?,
+                Some(ready) => ready.await.map_err(|_| NanocodeError::AgentStopped)?,
                 None => Ok(()),
             }
         })
@@ -437,12 +437,12 @@ impl LifecycleBackend for LocalLifecycle {
         Box::pin(async move { execution.discard_initial_checkpoint().await })
     }
 
-    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let parent = self.child_handle.clone();
         Box::pin(async move { parent.spawn_with(options).await })
     }
 
-    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();
         let checkpoints = Arc::clone(&self.checkpoints);
@@ -476,15 +476,15 @@ impl LifecycleBackend for LocalLifecycle {
             let (initiate, receiver) = shutdown.request();
             if initiate && commands.send(Command::Shutdown).await.is_err() {
                 let outcome = match execution.shutdown().await {
-                    Ok(()) => Err(NanocodexError::AgentStopped),
+                    Ok(()) => Err(NanocodeError::AgentStopped),
                     Err(error) => Err(error),
                 };
                 shutdown.complete(outcome);
             }
             match receiver.await {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(NanocodexError::Shutdown(error)),
-                Err(_) => Err(NanocodexError::AgentStopped),
+                Ok(Err(error)) => Err(NanocodeError::Shutdown(error)),
+                Err(_) => Err(NanocodeError::AgentStopped),
             }
         })
     }

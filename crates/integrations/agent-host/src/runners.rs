@@ -318,7 +318,7 @@ impl RunnerAgents {
                         prefix: Some(NOTICE_PREFIX.to_owned()),
                         completed: awaited.then_some(completed),
                     })
-                    .map_err(|_| crate::NanocodexError::AgentStopped)?;
+                    .map_err(|_| crate::NanocodeError::AgentStopped)?;
             }
             state
                 .agents
@@ -329,7 +329,7 @@ impl RunnerAgents {
                 let outcome = worker
                     .append_developer_notice(notice.text, notice.prefix)
                     .await
-                    .unwrap_or(Err(crate::NanocodexError::AgentStopped))
+                    .unwrap_or(Err(crate::NanocodeError::AgentStopped))
                     .map(|_| ());
                 let failed = outcome.is_err();
                 if let Some(completed) = notice.completed {
@@ -343,7 +343,7 @@ impl RunnerAgents {
         if awaited {
             result
                 .await
-                .map_err(|_| crate::NanocodexError::AgentStopped)?
+                .map_err(|_| crate::NanocodeError::AgentStopped)?
         } else {
             Ok(())
         }

@@ -138,7 +138,7 @@ impl ModelRun {
                 conversation.install_pre_turn_compaction(item, factory.profile().prefix());
             }
             CompactionPhase::MidTurn => {
-                let snapshot = snapshot.ok_or(NanocodexError::InvalidAttemptState {
+                let snapshot = snapshot.ok_or(NanocodeError::InvalidAttemptState {
                     detail: "mid-turn compaction is missing its context snapshot",
                 })?;
                 let canonical_context = snapshot.full_item();
@@ -305,7 +305,7 @@ impl ModelRun {
         {
             Ok(success) => success,
             Err(error) => {
-                let error = NanocodexError::from(error);
+                let error = NanocodeError::from(error);
                 if !error
                     .responses_error()
                     .is_some_and(|source| source.is_misalignment_policy_violation())
@@ -322,7 +322,7 @@ impl ModelRun {
         let ResponsesOutput::Warmup(response) = success.into_output() else {
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
-            return Err(NanocodexError::InvalidAttemptState {
+            return Err(NanocodeError::InvalidAttemptState {
                 detail: "warmup returned a non-warmup response",
             });
         };
@@ -343,7 +343,7 @@ impl ModelRun {
     pub(super) fn warmup_failed<T>(
         &mut self,
         started_at: Instant,
-        error: NanocodexError,
+        error: NanocodeError,
     ) -> Result<T> {
         let duration_ns = elapsed_ns(started_at);
         self.stats.warmup_duration_ns += duration_ns;
@@ -403,7 +403,7 @@ impl ModelRun {
                         true
                     }
                     crate::agent::ExecutionStep::Interrupted => {
-                        return Err(NanocodexError::InvalidExecutionPolicy(
+                        return Err(NanocodeError::InvalidExecutionPolicy(
                             "non-tool step was admitted with an interrupted tool outcome".into(),
                         ));
                     }
@@ -464,7 +464,7 @@ impl ModelRun {
                     .await?
                 {
                     crate::agent::ExecutionStep::Interrupted => {
-                        return Err(NanocodexError::InvalidExecutionPolicy(
+                        return Err(NanocodeError::InvalidExecutionPolicy(
                             "non-tool step was admitted with an interrupted tool outcome".into(),
                         ));
                     }
@@ -480,7 +480,7 @@ impl ModelRun {
                 let success = match self.client.execute(request).instrument(span.clone()).await {
                     Ok(success) => success,
                     Err(error) => {
-                        let error = NanocodexError::from(error);
+                        let error = NanocodeError::from(error);
 
                         if error.responses_error().is_none() {
                             return Err(error);
@@ -506,7 +506,7 @@ impl ModelRun {
                                 )
                                 .await?;
                         }
-                        return Err(NanocodexError::CompactionFailed {
+                        return Err(NanocodeError::CompactionFailed {
                             detail: compaction_error,
                             requires_session_stop,
                             recovery,
@@ -517,7 +517,7 @@ impl ModelRun {
                 let connection_generation = success.connection_generation();
                 let server_reasoning_included = success.server_reasoning_included();
                 let ResponsesOutput::Compaction(response) = success.into_output() else {
-                    let error = NanocodexError::InvalidAttemptState {
+                    let error = NanocodeError::InvalidAttemptState {
                         detail: "compaction returned a non-compaction response",
                     };
                     return Err(error);
@@ -548,7 +548,7 @@ impl ModelRun {
                     requires_session_stop,
                     recovery,
                 } => {
-                    return Err(NanocodexError::CompactionFailed {
+                    return Err(NanocodeError::CompactionFailed {
                         detail: compaction_error,
                         requires_session_stop,
                         recovery,

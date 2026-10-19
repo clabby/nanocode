@@ -6,7 +6,7 @@ use super::{
 };
 use nanocode_agent_core::input::Prompt;
 use nanocode_agent_core::{
-    Nanocodex, NanocodexError, Result as AgentResult, SessionCheckpoint, TurnControl, TurnResult,
+    Agent, NanocodeError, Result as AgentResult, SessionCheckpoint, TurnControl, TurnResult,
 };
 use std::{
     collections::VecDeque,
@@ -72,7 +72,7 @@ enum HarnessCommand {
         response: oneshot::Sender<std::io::Result<SessionCheckpoint>>,
     },
     Agent {
-        response: oneshot::Sender<std::io::Result<Nanocodex>>,
+        response: oneshot::Sender<std::io::Result<Agent>>,
     },
     Start {
         prompt: String,
@@ -91,7 +91,7 @@ struct Harness {
     root_session_id: String,
     id: AgentId,
     context: Option<AgentContext>,
-    agent: Option<Nanocodex>,
+    agent: Option<Agent>,
     active: Option<ActiveTurn>,
     commands: mpsc::Receiver<HarnessCommand>,
     deferred: mpsc::UnboundedReceiver<DeliveryCommand>,
@@ -140,7 +140,7 @@ impl HarnessHandle {
         self.side_questions.load(Ordering::SeqCst) > 0
     }
 
-    pub(super) async fn agent(&self) -> std::io::Result<Nanocodex> {
+    pub(super) async fn agent(&self) -> std::io::Result<Agent> {
         let (response, result) = oneshot::channel();
         self.commands
             .send(HarnessCommand::Agent { response })
@@ -217,7 +217,7 @@ pub(super) fn spawn(
     root_session_id: String,
     id: AgentId,
     context: Option<AgentContext>,
-    agent: Nanocodex,
+    agent: Agent,
     capacity: Capacity,
     registry: Weak<Registry>,
     output_schema: String,
@@ -407,7 +407,7 @@ impl Harness {
                     .await;
                     return;
                 }
-                Err(NanocodexError::TurnNotSteerable | NanocodexError::TurnStopped) => {
+                Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => {
                     self.rollback_delegation(delegation).await;
                 }
                 Err(error) => {
@@ -687,7 +687,7 @@ impl Harness {
         let cancellation = active.control.cancel().await;
         self.finish_active().await;
         match cancellation {
-            Ok(()) | Err(NanocodexError::TurnNotCancellable) => Ok(()),
+            Ok(()) | Err(NanocodeError::TurnNotCancellable) => Ok(()),
             Err(error) => Err(std::io::Error::other(format!(
                 "could not stop agent {}: {error}",
                 self.id
@@ -712,7 +712,7 @@ impl Harness {
 
     async fn publish_turn_result(&self, result: Result<AgentResult<TurnResult>, TaskError>) {
         let result = result.unwrap_or_else(|error| {
-            Err(NanocodexError::InvalidRequest(format!(
+            Err(NanocodeError::InvalidRequest(format!(
                 "subagent turn task failed: {error}"
             )))
         });

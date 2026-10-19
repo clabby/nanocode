@@ -1,5 +1,5 @@
 pub use nanocode_agent_config::configuration;
-pub use nanocode_agent_core::Nanocodex as Agent;
+pub use nanocode_agent_core::Agent;
 pub use nanocode_agent_core::*;
 pub use nanocode_durability as durability;
 mod router;

@@ -12,7 +12,7 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Composable task-tree subagents for Nanocodex"
+description = "Composable task-tree subagents for Nanocode"
 
 [dependencies]
 nanocode-platform.workspace = true

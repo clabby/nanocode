@@ -10,7 +10,7 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Native Streamable HTTP transport and OAuth flows for the Nanocodex MCP client"
+description = "Native Streamable HTTP transport and OAuth flows for the Nanocode MCP client"
 autotests = false
 autobenches = false
 

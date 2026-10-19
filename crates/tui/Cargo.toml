@@ -6,11 +6,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-authors = ["Nanocodex Contributors", "Ben Clabby"]
+authors = ["Nanocode Contributors", "Ben Clabby"]
 license = "Apache-2.0"
 homepage.workspace = true
 repository.workspace = true
-description = "Terminal UI components for Nanocodex hosts, derived from clabby/tact"
+description = "Terminal UI components for Nanocode hosts, derived from clabby/tact"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 crossterm = { version = "0.29.0", default-features = false, features = ["bracketed-paste", "events", "event-stream", "osc52"] }

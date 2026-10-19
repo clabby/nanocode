@@ -2,7 +2,7 @@ use crate::{ContentBlock, Message, Role};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::ImageReader;
 use nanocode_agent_core::{
-    NanocodexError, Result,
+    NanocodeError, Result,
     input::{Prompt, PromptInput, PromptMessageRole, UserInput},
 };
 use nanocode_media::image::prepare_base64_images;
@@ -20,8 +20,8 @@ const MAX_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FILENAME_BYTES: usize = 255;
 
-fn invalid(message: impl Into<String>) -> NanocodexError {
-    NanocodexError::InvalidRequest(message.into())
+fn invalid(message: impl Into<String>) -> NanocodeError {
+    NanocodeError::InvalidRequest(message.into())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

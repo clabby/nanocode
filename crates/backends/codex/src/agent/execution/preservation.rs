@@ -2,7 +2,7 @@ use crate::client::responses::{ContentItem, MessageRole, ResponseHistory, Respon
 use serde::{Deserialize, Serialize};
 
 use super::ExecutionFuture;
-use crate::{NanocodexError, Result};
+use crate::{NanocodeError, Result};
 
 pub trait BeforeCompaction: Send + Sync {
     fn preserve(
@@ -41,7 +41,7 @@ pub struct CompactionReceipt {
 impl CompactionReceipt {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.receipt_id.trim().is_empty() || self.receipt_id.len() > 256 {
-            return Err(NanocodexError::BeforeCompactionFailed(
+            return Err(NanocodeError::BeforeCompactionFailed(
                 "host returned an invalid durable receipt".into(),
             ));
         }

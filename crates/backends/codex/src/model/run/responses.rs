@@ -77,7 +77,7 @@ impl ModelRun {
                 .await?
             {
                 crate::agent::ExecutionStep::Interrupted => {
-                    return Err(NanocodexError::InvalidExecutionPolicy(
+                    return Err(NanocodeError::InvalidExecutionPolicy(
                         "non-tool step was admitted with an interrupted tool outcome".into(),
                     ));
                 }
@@ -101,7 +101,7 @@ impl ModelRun {
                     return self.model_call_failed(
                         call_index,
                         started_at,
-                        NanocodexError::from(error),
+                        NanocodeError::from(error),
                     );
                 }
             };
@@ -111,7 +111,7 @@ impl ModelRun {
             let ResponsesOutput::Generation(response) = success.into_output() else {
                 span.record("status", "failed");
                 span.record("otel.status_code", "ERROR");
-                return Err(NanocodexError::InvalidAttemptState {
+                return Err(NanocodeError::InvalidAttemptState {
                     detail: "generation returned a non-generation response",
                 });
             };
@@ -185,7 +185,7 @@ impl ModelRun {
         &mut self,
         call_index: u32,
         started_at: Instant,
-        error: crate::NanocodexError,
+        error: crate::NanocodeError,
     ) -> Result<T> {
         let duration_ns = elapsed_ns(started_at);
         self.stats.model_duration_ns += duration_ns;
@@ -205,7 +205,7 @@ impl ModelRun {
 
 pub(super) fn validate_provider_response_id(response_id: &str) -> Result<()> {
     if response_id.trim().is_empty() {
-        return Err(NanocodexError::MalformedResponse {
+        return Err(NanocodeError::MalformedResponse {
             detail: "completed turn did not have a response ID",
         });
     }
@@ -311,7 +311,7 @@ pub(super) fn owned_code_context(
     if call.name != "exec" {
         return Ok(None);
     }
-    let history = history.ok_or(NanocodexError::MalformedResponse {
+    let history = history.ok_or(NanocodeError::MalformedResponse {
         detail: "exec call did not have an owned history snapshot",
     })?;
     Ok(Some(
@@ -566,7 +566,7 @@ pub(super) fn request_profile(
     system_prompt: &str,
 ) -> Result<RequestProfile> {
     let prefix = responses_lite_request_prefix(prompt_cache_key, tool_specs, system_prompt)
-        .map_err(NanocodexError::SerializePromptPrefix)?;
+        .map_err(NanocodeError::SerializePromptPrefix)?;
     Ok(with_code_mode_tool_names(
         RequestProfile::new(session_id, prompt_cache_key, Arc::from(prefix)),
         code_mode_tool_names,

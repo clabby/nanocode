@@ -2,7 +2,7 @@ use super::spawn::{validate_model_reasoning_mode, validate_model_thinking};
 use super::*;
 
 #[derive(Clone)]
-pub struct NanocodexBuilder<F = StandardServiceFactory> {
+pub struct CodexBuilder<F = StandardServiceFactory> {
     pub(crate) config: ModelConfig,
     pub(super) tools: ToolsConfiguration,
     pub(super) workspace: Option<PathBuf>,
@@ -22,11 +22,11 @@ impl<F> BuilderBackend for OpenAi<F>
 where
     F: ResponsesServiceFactory,
 {
-    type Builder = NanocodexBuilder<F>;
+    type Builder = CodexBuilder<F>;
 
     fn into_builder(self) -> Self::Builder {
         let (config, factory) = into_openai_parts(self);
-        NanocodexBuilder {
+        CodexBuilder {
             config,
             tools: ToolsConfiguration::Shared(Tools::default()),
             workspace: None,
@@ -75,7 +75,7 @@ impl Default for CodexCompatibility {
     }
 }
 
-impl<F> NanocodexBuilder<F> {
+impl<F> CodexBuilder<F> {
     #[must_use]
     pub const fn stateless_http(mut self) -> Self {
         self.config.responses_transport = ResponsesTransport::Https;
@@ -105,7 +105,7 @@ impl<F> NanocodexBuilder<F> {
             .reasoning_mode(snapshot.reasoning_mode)
             .service_tier(snapshot.service_tier);
         self.session_id = Some(snapshot.session_id.parse().map_err(|error| {
-            NanocodexError::InvalidCheckpoint(format!("invalid child session: {error}"))
+            NanocodeError::InvalidCheckpoint(format!("invalid child session: {error}"))
         })?);
 
         self.session_id_explicit = false;
@@ -363,31 +363,31 @@ impl<F> NanocodexBuilder<F> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-impl<F> NanocodexBuilder<F>
+impl<F> CodexBuilder<F>
 where
     F: ResponsesServiceFactory + Send + Sync + 'static,
     F::Service: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
     <F::Service as Service<ResponsesAttempt>>::Error: Into<ResponseError> + Send + 'static,
     <F::Service as Service<ResponsesAttempt>>::Future: Send,
 {
-    pub fn build(self) -> Result<(Nanocodex, AgentEvents)> {
+    pub fn build(self) -> Result<(Agent, AgentEvents)> {
         build(self)
     }
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-impl<F> NanocodexBuilder<F>
+impl<F> CodexBuilder<F>
 where
     F: ResponsesServiceFactory + 'static,
     F::Service: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + 'static,
     <F::Service as Service<ResponsesAttempt>>::Error: Into<ResponseError> + 'static,
 {
-    pub fn build(self) -> Result<(Nanocodex, AgentEvents)> {
+    pub fn build(self) -> Result<(Agent, AgentEvents)> {
         build(self)
     }
 }
 
-fn build<F>(builder: NanocodexBuilder<F>) -> Result<(Nanocodex, AgentEvents)>
+fn build<F>(builder: CodexBuilder<F>) -> Result<(Agent, AgentEvents)>
 where
     F: ResponsesServiceFactory + AgentFactory + 'static,
     F::Service:
@@ -429,17 +429,17 @@ fn validate_execution_environment(environment: Option<&ExecutionEnvironment>) ->
         return Ok(());
     };
     if environment.current_date.trim().is_empty() {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "execution-environment current date must not be empty".to_owned(),
         ));
     }
     if !is_iso_date(environment.current_date.trim()) {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "execution-environment current date must use YYYY-MM-DD".to_owned(),
         ));
     }
     if environment.timezone.trim().is_empty() {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "execution-environment timezone must not be empty".to_owned(),
         ));
     }
@@ -448,7 +448,7 @@ fn validate_execution_environment(environment: Option<&ExecutionEnvironment>) ->
         .as_deref()
         .is_some_and(|instructions| instructions.trim().is_empty())
     {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "execution-environment project instructions must not be empty".to_owned(),
         ));
     }

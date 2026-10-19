@@ -245,7 +245,7 @@ impl AgentDriver {
                                         service_tier,
                                     );
                                     model.set_events(self.events.clone());
-                                    emitted.and(Err(NanocodexError::TurnCancelled))
+                                    emitted.and(Err(NanocodeError::TurnCancelled))
                                 }
                                 Err(error) => {
                                     model.set_events(events);
@@ -269,7 +269,7 @@ impl AgentDriver {
                                 .await;
                             if !commands_open
                                 && let Err(error) = &outcome
-                                && !matches!(error, NanocodexError::TurnCancelled)
+                                && !matches!(error, NanocodeError::TurnCancelled)
                             {
                                 shutdown_failures.push(error.to_string());
                             }
@@ -350,7 +350,7 @@ impl AgentDriver {
                             .await;
                             commands_open = false;
                             for (_, pending_result) in developer_messages {
-                                pending_result.fail(NanocodexError::AgentStopped);
+                                pending_result.fail(NanocodeError::AgentStopped);
                             }
                             break;
                         }
@@ -402,7 +402,7 @@ impl AgentDriver {
                 return if shutdown_failures.is_empty() {
                     Ok(())
                 } else {
-                    Err(NanocodexError::InvalidExecutionPolicy(format!(
+                    Err(NanocodeError::InvalidExecutionPolicy(format!(
                         "shutdown could not durably settle accepted work: {}",
                         shutdown_failures.join("; ")
                     )))
@@ -633,7 +633,7 @@ impl AgentDriver {
                         admission,
                         AdmittedExecution::Execute | AdmittedExecution::Resume
                     ) {
-                        let error = NanocodexError::InvalidExecutionPolicy(
+                        let error = NanocodeError::InvalidExecutionPolicy(
                             "standalone compaction identity resolved to an unexpected terminal operation"
                                 .to_owned(),
                         );
@@ -817,7 +817,7 @@ impl AgentDriver {
                                         break execution.as_mut().await;
                                     }
                                     Some(Command::CancelActive { result }) => {
-                                        drop(result.send(Err(NanocodexError::TurnNotCancellable)));
+                                        drop(result.send(Err(NanocodeError::TurnNotCancellable)));
                                     }
                                     Some(Command::Cancel { key, result }) => {
                                         let outcome = match queued_execution_operation(
@@ -857,11 +857,11 @@ impl AgentDriver {
                                                     ) {
                                                         Ok(())
                                                     } else {
-                                                        Err(NanocodexError::TurnNotCancellable)
+                                                        Err(NanocodeError::TurnNotCancellable)
                                                     }
                                                 })
                                             }
-                                            None => Err(NanocodexError::TurnNotCancellable),
+                                            None => Err(NanocodeError::TurnNotCancellable),
                                         };
                                         let reopen = outcome_requires_reopen(&outcome);
                                         drop(result.send(outcome));
@@ -884,7 +884,7 @@ impl AgentDriver {
                                         drop(result.send(Ok(false)));
                                     }
                                     Some(Command::SteerWithId { result, .. } | Command::Steer { result, .. }) => {
-                                        drop(result.send(Err(NanocodexError::TurnNotSteerable)));
+                                        drop(result.send(Err(NanocodeError::TurnNotSteerable)));
                                     }
                                     Some(command @ (Command::ChildSnapshot { .. } | Command::Fork { .. } | Command::Spawn { .. } | Command::SpawnBatch { .. } | Command::SideQuestion { .. })) => {
                                         handle_idle_command(
@@ -1008,7 +1008,7 @@ impl AgentDriver {
                                     model.replace_client((self.spawner.service_factory)(
                                         Arc::clone(&self.spawner.config),
                                     ));
-                                    Err(NanocodexError::TurnCancelled)
+                                    Err(NanocodeError::TurnCancelled)
                                 }
                                 Err(error) => Err(error),
                             }
@@ -1067,7 +1067,7 @@ impl AgentDriver {
                     }
                     span.record(
                         "status",
-                        if matches!(&outcome, Err(NanocodexError::TurnCancelled)) {
+                        if matches!(&outcome, Err(NanocodeError::TurnCancelled)) {
                             "cancelled"
                         } else if outcome.is_ok() {
                             "completed"
@@ -1089,7 +1089,7 @@ impl AgentDriver {
                     if !developer_checkpoint_ready && let Err(error) = &outcome {
                         let detail = error.to_string();
                         for (_, message_result) in pending_developer_messages.drain(..) {
-                            message_result.fail(NanocodexError::InvalidExecutionPolicy(format!(
+                            message_result.fail(NanocodeError::InvalidExecutionPolicy(format!(
                                 "developer message was not committed because the preceding compaction failed: {detail}"
                             )));
                         }
@@ -1374,7 +1374,7 @@ impl AgentDriver {
                             }
                             Some(Command::Steer { key: target, prompt, result }) => {
                                 if target != key {
-                                    drop(result.send(Err(NanocodexError::TurnNotSteerable)));
+                                    drop(result.send(Err(NanocodeError::TurnNotSteerable)));
                                     continue;
                                 }
                                 let outcome = accept_turn_steer(
@@ -1408,21 +1408,21 @@ impl AgentDriver {
                             }
                             Some(Command::SteerWithId { key: target, id, prompt, result }) => {
                                 if target != key {
-                                    drop(result.send(Err(NanocodexError::TurnNotSteerable)));
+                                    drop(result.send(Err(NanocodeError::TurnNotSteerable)));
                                     continue;
                                 }
                                 let receipt = match (!execution_turn.supports_steer_receipts()).then(|| serde_json::to_string(&prompt)).transpose() {
                                     Ok(receipt) => receipt,
                                     Err(error) => {
-                                        drop(result.send(Err(NanocodexError::InvalidRequest(error.to_string()))));
+                                        drop(result.send(Err(NanocodeError::InvalidRequest(error.to_string()))));
                                         continue;
                                     }
                                 };
                                 if let Some(input) = &receipt && let Some((known, withdrawn)) = steer_ids.get(&id) {
                                     drop(result.send(if known != input {
-                                        Err(NanocodexError::InvalidRequest(format!("steering message `{id}` already has different input")))
+                                        Err(NanocodeError::InvalidRequest(format!("steering message `{id}` already has different input")))
                                     } else if *withdrawn {
-                                        Err(NanocodexError::InvalidRequest(format!("steering message `{id}` was withdrawn")))
+                                        Err(NanocodeError::InvalidRequest(format!("steering message `{id}` was withdrawn")))
                                     } else {
                                         Ok(())
                                     }));
@@ -1503,7 +1503,7 @@ impl AgentDriver {
                                 )
                                 .await
                                 .map(|()| PromptRouteKind::Steered);
-                                if matches!(outcome, Err(NanocodexError::TurnNotSteerable)) {
+                                if matches!(outcome, Err(NanocodeError::TurnNotSteerable)) {
                                     let mut reopen = false;
                                     let routed = accept_idle_route(
                                         &self.execution,
@@ -1596,11 +1596,11 @@ impl AgentDriver {
                                                 ) {
                                                     Ok(())
                                                 } else {
-                                                    Err(NanocodexError::TurnNotCancellable)
+                                                    Err(NanocodeError::TurnNotCancellable)
                                                 }
                                             })
                                         }
-                                        None => Err(NanocodexError::TurnNotCancellable),
+                                        None => Err(NanocodeError::TurnNotCancellable),
                                     };
                                     let reopen = outcome_requires_reopen(&outcome);
                                     drop(cancellation.send(outcome));
@@ -1622,7 +1622,7 @@ impl AgentDriver {
                                 }
                                 let Some(cancel) = cancel.take() else {
                                     drop(cancellation.send(Err(
-                                        NanocodexError::TurnNotCancellable,
+                                        NanocodeError::TurnNotCancellable,
                                     )));
                                     continue;
                                 };
@@ -1633,7 +1633,7 @@ impl AgentDriver {
                             Some(Command::CancelActive { result: cancellation }) => {
                                 let Some(cancel) = cancel.take() else {
                                     drop(cancellation.send(Err(
-                                        NanocodexError::TurnNotCancellable,
+                                        NanocodeError::TurnNotCancellable,
                                     )));
                                     continue;
                                 };
@@ -1827,7 +1827,7 @@ impl AgentDriver {
                     model.replace_client((self.spawner.service_factory)(Arc::clone(
                         &self.spawner.config,
                     )));
-                    (Err(NanocodexError::TurnStopped), true, None)
+                    (Err(NanocodeError::TurnStopped), true, None)
                 }
                 Ok(ModelTurnOutcome::Cancelled(checkpoint)) => {
                     let checkpoint = Arc::new(CommittedSession::new(
@@ -1855,7 +1855,7 @@ impl AgentDriver {
                         &self.spawner.config,
                     )));
                     (
-                        persisted.and(Err(NanocodexError::TurnCancelled)),
+                        persisted.and(Err(NanocodeError::TurnCancelled)),
                         true,
                         Some(cancellation_persisted),
                     )
@@ -1915,8 +1915,8 @@ impl AgentDriver {
                 }
             };
             let outcome = match outcome {
-                Err(NanocodexError::TurnStopped) if !commands_open => {
-                    Err(NanocodexError::TurnStopped)
+                Err(NanocodeError::TurnStopped) if !commands_open => {
+                    Err(NanocodeError::TurnStopped)
                 }
                 outcome => {
                     self.execution
@@ -1927,7 +1927,7 @@ impl AgentDriver {
 
             let terminal = match &outcome {
                 Ok(_) => "completed",
-                Err(NanocodexError::TurnCancelled | NanocodexError::TurnStopped) => "cancelled",
+                Err(NanocodeError::TurnCancelled | NanocodeError::TurnStopped) => "cancelled",
                 Err(_) => "failed",
             };
             let emitted = model.emit_terminal(terminal);
@@ -1950,7 +1950,7 @@ impl AgentDriver {
                 && let Err(error) = &outcome
                 && !matches!(
                     error,
-                    NanocodexError::TurnCancelled | NanocodexError::TurnStopped
+                    NanocodeError::TurnCancelled | NanocodeError::TurnStopped
                 )
             {
                 shutdown_failures.push(error.to_string());
@@ -1998,7 +1998,7 @@ impl AgentDriver {
             drop(result.send(outcome));
             if reopen_after_turn {
                 for (_, message_result) in pending_developer_messages.drain(..) {
-                    message_result.fail(NanocodexError::AgentStopped);
+                    message_result.fail(NanocodeError::AgentStopped);
                 }
             }
             developer_checkpoint_ready =
@@ -2018,7 +2018,7 @@ impl AgentDriver {
                     if was_cancelled {
                         Ok(())
                     } else {
-                        Err(NanocodexError::TurnNotCancellable)
+                        Err(NanocodeError::TurnNotCancellable)
                     }
                 });
                 drop(cancel_result.send(outcome));
@@ -2027,18 +2027,18 @@ impl AgentDriver {
     }
 }
 
-fn duplicate_policy_error(error: &NanocodexError) -> NanocodexError {
+fn duplicate_policy_error(error: &NanocodeError) -> NanocodeError {
     match error {
-        NanocodexError::ExecutionPolicy {
+        NanocodeError::ExecutionPolicy {
             layer,
             disposition,
             source,
-        } => NanocodexError::ExecutionPolicy {
+        } => NanocodeError::ExecutionPolicy {
             layer,
             disposition: *disposition,
             source: Arc::clone(source),
         },
-        error => NanocodexError::InvalidExecutionPolicy(error.to_string()),
+        error => NanocodeError::InvalidExecutionPolicy(error.to_string()),
     }
 }
 
@@ -2076,13 +2076,13 @@ fn requires_reopen_after_turn<T>(provider_requires_stop: bool, outcome: &Result<
     provider_requires_stop || outcome_requires_reopen(outcome)
 }
 
-fn error_requires_stop(error: &NanocodexError) -> bool {
+fn error_requires_stop(error: &NanocodeError) -> bool {
     match error {
-        NanocodexError::CompactionFailed {
+        NanocodeError::CompactionFailed {
             requires_session_stop,
             ..
         } => *requires_session_stop,
-        NanocodexError::Shutdown(source) => error_requires_stop(source),
+        NanocodeError::Shutdown(source) => error_requires_stop(source),
         _ => error
             .responses_error()
             .is_some_and(|source| source.is_misalignment_policy_violation()),
@@ -2101,7 +2101,7 @@ async fn accept_turn_steer(
     model_call_index: &tokio::sync::Mutex<u32>,
     prompt: Prompt,
 ) -> Result<()> {
-    let steers = steers.upgrade().ok_or(NanocodexError::TurnNotSteerable)?;
+    let steers = steers.upgrade().ok_or(NanocodeError::TurnNotSteerable)?;
     let mut pending = Vec::new();
     for receipt in accepted.drain(..) {
         if *receipt.1.delivery.lock().await == SteerDelivery::Pending {
@@ -2226,7 +2226,7 @@ fn settle_cancelled_queued_turn(
                 "cancelled",
                 &TurnUsage::default(),
             )
-            .and(Err(NanocodexError::TurnCancelled));
+            .and(Err(NanocodeError::TurnCancelled));
             drop(result.send(outcome));
             true
         }
@@ -2384,7 +2384,7 @@ async fn accept_execution_command(
                 drop(result.send(Err(event_error)));
                 return None;
             }
-            drop(result.send(Err(NanocodexError::ReplayedExecutionFailed(error))));
+            drop(result.send(Err(NanocodeError::ReplayedExecutionFailed(error))));
             None
         }
         Ok((operation_id, AdmittedExecution::Cancelled)) => {
@@ -2401,7 +2401,7 @@ async fn accept_execution_command(
                 drop(result.send(Err(error)));
                 return None;
             }
-            drop(result.send(Err(NanocodexError::TurnCancelled)));
+            drop(result.send(Err(NanocodeError::TurnCancelled)));
             None
         }
         Err(error) => {
@@ -2596,7 +2596,7 @@ async fn accept_idle_route(
                 drop(turn_result.send(Err(event_error)));
                 return None;
             }
-            drop(turn_result.send(Err(NanocodexError::ReplayedExecutionFailed(error))));
+            drop(turn_result.send(Err(NanocodeError::ReplayedExecutionFailed(error))));
             None
         }
         Ok((operation_id, AdmittedExecution::Cancelled)) => {
@@ -2618,7 +2618,7 @@ async fn accept_idle_route(
                 drop(turn_result.send(Err(error)));
                 return None;
             }
-            drop(turn_result.send(Err(NanocodexError::TurnCancelled)));
+            drop(turn_result.send(Err(NanocodeError::TurnCancelled)));
             None
         }
         Err(error) => {

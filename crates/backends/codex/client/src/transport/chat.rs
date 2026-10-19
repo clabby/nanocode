@@ -188,7 +188,7 @@ impl ChatGateway {
                 header::USER_AGENT,
                 concat!("nanocode/", env!("CARGO_PKG_VERSION")),
             )
-            .header("X-Title", "Nanocodex")
+            .header("X-Title", "Nanocode")
             .body(Value::Object(chat).to_string())
             .send();
         let response = tokio::time::timeout(self.stall_timeout, pending)

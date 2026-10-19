@@ -18,7 +18,7 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
             if available {
                 Ok(())
             } else {
-                Err(NanocodexError::AgentStopped)
+                Err(NanocodeError::AgentStopped)
             }
         })
     }
@@ -27,7 +27,7 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
         _parent: AgentHandle,
         options: SpawnOptions,
         host_context: Option<Arc<str>>,
-    ) -> super::backend::BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> super::backend::BackendFuture<Result<(Agent, AgentEvents)>> {
         let commands = self.commands.upgrade();
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
@@ -36,11 +36,11 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
                 .selected_family()
                 .is_some_and(|family| family != crate::HarnessFamily::Codex)
             {
-                return Err(NanocodexError::InvalidRequest(
+                return Err(NanocodeError::InvalidRequest(
                     "Claude harness requires a configured child factory".into(),
                 ));
             }
-            let commands = commands.ok_or(NanocodexError::AgentStopped)?;
+            let commands = commands.ok_or(NanocodeError::AgentStopped)?;
             created(
                 request_spawn_with_host_context(&commands, &shutdown, options, host_context).await,
             )
@@ -53,11 +53,11 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
         count: usize,
         observer: Arc<dyn Fn(&str) + Send + Sync>,
         host_context: Option<Arc<str>>,
-    ) -> super::backend::BackendFuture<Result<Vec<(Nanocodex, AgentEvents)>>> {
+    ) -> super::backend::BackendFuture<Result<Vec<(Agent, AgentEvents)>>> {
         let commands = self.commands.upgrade();
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
-            let commands = commands.ok_or(NanocodexError::AgentStopped)?;
+            let commands = commands.ok_or(NanocodeError::AgentStopped)?;
             created_batch(
                 request_spawn_many(&commands, &shutdown, count, Some(observer), host_context).await,
             )
@@ -71,7 +71,7 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
         let commands = self.commands.upgrade();
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
-            let commands = commands.ok_or(NanocodexError::AgentStopped)?;
+            let commands = commands.ok_or(NanocodeError::AgentStopped)?;
             let snapshot = request_command(&commands, &shutdown, |result| Command::ChildSnapshot {
                 result,
             })
@@ -89,7 +89,7 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
         let commands = self.commands.upgrade();
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
-            let commands = commands.ok_or(NanocodexError::AgentStopped)?;
+            let commands = commands.ok_or(NanocodeError::AgentStopped)?;
             let snapshot = request_command(&commands, &shutdown, |result| Command::ChildSnapshot {
                 result,
             })
@@ -103,12 +103,12 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
         _parent: AgentHandle,
         checkpoint: SessionCheckpoint,
         host_context: Option<Arc<str>>,
-    ) -> super::backend::BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> super::backend::BackendFuture<Result<(Agent, AgentEvents)>> {
         let commands = self.commands.upgrade();
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
             let snapshot = ChildState::from_checkpoint(checkpoint)?;
-            let commands = commands.ok_or(NanocodexError::AgentStopped)?;
+            let commands = commands.ok_or(NanocodeError::AgentStopped)?;
             let restored = request_command(&commands, &shutdown, |result| Command::Spawn {
                 options: SpawnOptions::new()
                     .model(snapshot.model)
@@ -126,12 +126,12 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
         &self,
         _parent: AgentHandle,
         request: ForkRequest,
-    ) -> super::backend::BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> super::backend::BackendFuture<Result<(Agent, AgentEvents)>> {
         let commands = self.commands.upgrade();
         let shutdown = self.shutdown.clone();
         let conversation_id = Arc::clone(&self.conversation_id);
         Box::pin(async move {
-            let commands = commands.ok_or(NanocodexError::AgentStopped)?;
+            let commands = commands.ok_or(NanocodeError::AgentStopped)?;
             let (point, origin) = request.into_parts();
             let point = super::backend::resolve_fork_point(point, &conversation_id)?;
             created(request_fork(&commands, &shutdown, point, origin, SessionId::new(), None).await)
@@ -147,12 +147,12 @@ pub(super) async fn request_fork(
     origin: crate::Origin,
     session_id: SessionId,
     policy: Option<Arc<dyn execution::ExecutionPolicy>>,
-) -> Result<(Nanocodex, AgentEvents)> {
+) -> Result<(Agent, AgentEvents)> {
     if !matches!(
         origin,
         crate::Origin::Fork | crate::Origin::SideConversation
     ) {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "a fork must be a fork or a side conversation".into(),
         ));
     }
@@ -171,7 +171,7 @@ async fn request_spawn_with_host_context(
     shutdown: &DriverShutdown,
     options: SpawnOptions,
     host_context: Option<Arc<str>>,
-) -> Result<(Nanocodex, AgentEvents)> {
+) -> Result<(Agent, AgentEvents)> {
     request_command(commands, shutdown, |result| Command::Spawn {
         restore: None,
         options,
@@ -187,7 +187,7 @@ async fn request_spawn_many(
     count: usize,
     observer: Option<Arc<SpawnObserver>>,
     host_context: Option<Arc<str>>,
-) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+) -> Result<Vec<(Agent, AgentEvents)>> {
     request_command(commands, shutdown, |result| Command::SpawnBatch {
         count,
         observer,
@@ -207,7 +207,7 @@ pub(super) async fn request_command<T>(
         return Err(shutdown.stopped_error().await);
     }
     match receiver.await {
-        Ok(Err(NanocodexError::AgentStopped)) | Err(_) => Err(shutdown.stopped_error().await),
+        Ok(Err(NanocodeError::AgentStopped)) | Err(_) => Err(shutdown.stopped_error().await),
         Ok(outcome) => outcome,
     }
 }

@@ -1,4 +1,4 @@
-# Nanocodex workspace runtime
+# Nanocode workspace runtime
 
 `workspace_runtime::WorkspaceToolRuntime` executes `exec_command`, `write_stdin`,
 `apply_patch`, and `view_image` through the same handlers as the native tool
@@ -16,7 +16,7 @@ contracts live in `nanocode-tools` and wire types in `nanocode-types`.
 
 ## Remote workspace runners
 
-The native SDK owns a shared `RunnerPool` for each `Nanocodex` runtime. Configure
+The native SDK owns a shared `RunnerPool` for each `Nanocode` runtime. Configure
 outgoing runners with `.runner(Runner::connect(url).token(token).name("box").alongside())`
 on the builder, or call `runtime.connect_runner(...)` on a live runtime. Use
 `.runner_server(RunnerServerConfig::listen(address).token(token))` at startup or
@@ -40,7 +40,7 @@ remains unavailable while its runner is disconnected.
 A static Code Mode tool named `runners` lets the model list, connect, listen,
 disconnect, or stop listening when requested. List and connect results omit
 credentials; listen returns the credential required to start an incoming runner.
-Hosts can disable this tool with `NanocodexBuilder::runner_management(false)` or
+Hosts can disable this tool with `NanocodeBuilder::runner_management(false)` or
 `RunnerPool::with_model_management(false)` before constructing their tools.
 
 When composing Code Mode directly, install a shared pool with

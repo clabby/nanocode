@@ -31,21 +31,21 @@ fn expand_tool(
     validate_signature(&function)?;
     let output = result_output(&function.sig.output)?;
     let original_ident = &function.sig.ident;
-    let handler_ident = format_ident!("__nanocodex_tool_{original_ident}");
-    let input_ident = format_ident!("__NanocodexTool{}Input", pascal_case(original_ident));
+    let handler_ident = format_ident!("__nanocode_tool_{original_ident}");
+    let input_ident = format_ident!("__NanocodeTool{}Input", pascal_case(original_ident));
     let visibility = &function.vis;
     let description = arguments.description;
     let parallel = arguments.parallel;
     let tool_name = arguments
         .name
         .unwrap_or_else(|| LitStr::new(&original_ident.to_string(), original_ident.span()));
-    let (nanocode, nanocodex_path) = nanocodex_path();
+    let (nanocode, nanocode_path) = nanocode_path();
     let serde_path = LitStr::new(
-        &format!("{nanocodex_path}::__private::serde"),
+        &format!("{nanocode_path}::__private::serde"),
         Span::call_site(),
     );
     let schemars_path = LitStr::new(
-        &format!("{nanocodex_path}::__private::schemars"),
+        &format!("{nanocode_path}::__private::schemars"),
         Span::call_site(),
     );
 
@@ -258,7 +258,7 @@ fn result_output(output: &ReturnType) -> syn::Result<&Type> {
         .ok_or_else(|| Error::new_spanned(ty, "expected Result<T, E>"))
 }
 
-fn nanocodex_path() -> (proc_macro2::TokenStream, String) {
+fn nanocode_path() -> (proc_macro2::TokenStream, String) {
     for package in [
         "nanocode-tools",
         "nanocode",

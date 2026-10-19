@@ -5,10 +5,10 @@ use crate::{
 };
 use futures_util::{FutureExt as _, StreamExt};
 use nanocode_agent_core::{
-    AgentEvents, AgentHandle, AgentSessionContext, Capabilities, CostStatus, ForkPoint,
-    ForkRequest, HarnessFamily, Lineage, ModelSelection, ModelTransport, Mutability, Nanocodex,
-    NanocodexError, Origin, Persistence, ReportedTurnUsage, Result, SessionCheckpoint,
-    SpawnOptions, Thinking, TurnResult, TurnUsage,
+    Agent, AgentEvents, AgentHandle, AgentSessionContext, Capabilities, CostStatus, ForkPoint,
+    ForkRequest, HarnessFamily, Lineage, ModelSelection, ModelTransport, Mutability, NanocodeError,
+    Origin, Persistence, ReportedTurnUsage, Result, SessionCheckpoint, SpawnOptions, Thinking,
+    TurnResult, TurnUsage,
     backend::{
         AgentFactory, BackendFuture, BackendPrompt, BackendPromptRoute, BackendRuntime,
         BackendTurn, BackendTurnKey, BuilderBackend, LifecycleBackend, TurnBoundary,
@@ -212,7 +212,7 @@ pub struct ClaudeTools {
     pub(crate) shared_shutdown: Option<ToolCleanup>,
 }
 impl nanocode_tools::ToolCollection for ClaudeTools {
-    type Error = NanocodexError;
+    type Error = NanocodeError;
 
     fn add_shared_tool(mut self, tool: Arc<dyn nanocode_tools::Tool>) -> Result<Self> {
         if let Some((catalog, workspace, handle)) = self.shared_catalog.take() {
@@ -627,7 +627,7 @@ impl ClaudeBuilder {
             .as_ref()
             .map(serde_json::to_value)
             .transpose()
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))
     }
 
     pub fn execution_policy(
@@ -639,7 +639,7 @@ impl ClaudeBuilder {
         if let (Some(configured), Some(stored)) = (&self.restored, &restored)
             && configured != stored
         {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "configured resume snapshot does not match the durability state".into(),
             ));
         }
@@ -648,7 +648,7 @@ impl ClaudeBuilder {
             .and_then(|snapshot| snapshot.model.as_ref())
         {
             if model.trim().is_empty() {
-                return Err(NanocodexError::InvalidCheckpoint(
+                return Err(NanocodeError::InvalidCheckpoint(
                     "recorded Claude model must not be empty".into(),
                 ));
             }
@@ -663,7 +663,7 @@ impl ClaudeBuilder {
                     && !model.supports_thinking(effort_thinking(snapshot.effort)))
                     || (snapshot.fast_mode && !model.supports_fast_mode()))
             {
-                return Err(NanocodexError::InvalidCheckpoint(format!(
+                return Err(NanocodeError::InvalidCheckpoint(format!(
                     "recorded Claude thinking or fast mode is unsupported by {model}"
                 )));
             }
@@ -746,7 +746,7 @@ impl ClaudeBuilder {
         let lineage = checkpoint.lineage().clone();
         let conversation_id = checkpoint.conversation_id().to_owned();
         let stored: NativeChildState = serde_json::from_value(checkpoint.into_payload())
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
         if stored.version != 1
             || ModelSelection::new(HarnessFamily::Claude, stored.model.clone()) != model
             || !model.supports_thinking(thinking)
@@ -758,7 +758,7 @@ impl ClaudeBuilder {
             || stored.max_tokens == Some(0)
             || stored.context_window_tokens == 0
         {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "invalid Claude native checkpoint policy".into(),
             ));
         }
@@ -1138,7 +1138,7 @@ impl ClaudeBuilder {
         self
     }
 
-    pub fn build(mut self) -> Result<(Nanocodex, AgentEvents)> {
+    pub fn build(mut self) -> Result<(Agent, AgentEvents)> {
         if let Ok(model) = self.claude.model.parse::<ModelSelection>() {
             model
                 .capabilities(ModelTransport::Native)
@@ -2426,9 +2426,9 @@ impl ClaudeNativeFactory {
             .lock()
             .map_err(|_| unsupported("Claude capability lock poisoned"))?
             .upgrade()
-            .ok_or(NanocodexError::AgentStopped)?;
+            .ok_or(NanocodeError::AgentStopped)?;
         if state.stopped.load(Ordering::SeqCst) {
-            return Err(NanocodexError::AgentStopped);
+            return Err(NanocodeError::AgentStopped);
         }
         Ok(state)
     }
@@ -2455,20 +2455,20 @@ impl AgentFactory for ClaudeNativeFactory {
         &self,
         _parent: AgentHandle,
         request: ForkRequest,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let state = self.owner();
         let mut recipe = self.recipe();
         Box::pin(async move {
             let state = state?;
             let (point, origin) = request.into_parts();
             if !matches!(origin, Origin::Fork | Origin::SideConversation) {
-                return Err(NanocodexError::InvalidRequest(
+                return Err(NanocodeError::InvalidRequest(
                     "a fork must be a fork or a side conversation".into(),
                 ));
             }
             let mut snapshot = state.fork_point(point).await?;
             if !snapshot.has_conversation() {
-                return Err(NanocodexError::ForkBeforeCompletedTurn);
+                return Err(NanocodeError::ForkBeforeCompletedTurn);
             }
 
             snapshot.tasks = None;
@@ -2493,12 +2493,12 @@ impl AgentFactory for ClaudeNativeFactory {
                     lineage.clone(),
                 );
 
-                let policy = parent.branch(&child)?.ok_or(
-                    NanocodexError::ExecutionPolicyBranchUnsupported { operation: "fork" },
-                )?;
+                let policy = parent
+                    .branch(&child)?
+                    .ok_or(NanocodeError::ExecutionPolicyBranchUnsupported { operation: "fork" })?;
                 {
                     if policy.state_id() != child_id {
-                        return Err(NanocodexError::InvalidRequest(
+                        return Err(NanocodeError::InvalidRequest(
                             "durable branch state ID must equal the child session ID".into(),
                         ));
                     }
@@ -2513,7 +2513,7 @@ impl AgentFactory for ClaudeNativeFactory {
             recipe.lineage = Some(lineage);
             recipe.conversation_id = Some(state.conversation_id.clone());
             state.initialize_child_workspace(&mut recipe)?;
-            Nanocodex::persist_created(recipe.build()).await
+            Agent::persist_created(recipe.build()).await
         })
     }
     fn ensure_available(&self, _parent: AgentHandle) -> BackendFuture<Result<()>> {
@@ -2534,7 +2534,7 @@ impl AgentFactory for ClaudeNativeFactory {
         parent: AgentHandle,
         options: SpawnOptions,
         host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let state = self.owner();
         let recipe = self.recipe();
         let journal_backed = parent.child_journal().is_some();
@@ -2565,7 +2565,7 @@ impl AgentFactory for ClaudeNativeFactory {
                     recipe = recipe.thinking(thinking)?;
                 }
                 state.initialize_child_workspace(&mut recipe)?;
-                return Nanocodex::persist_created(recipe.host_context(host_context).build()).await;
+                return Agent::persist_created(recipe.host_context(host_context).build()).await;
             }
 
             let (model, thinking) = match state.model().parse::<ModelSelection>() {
@@ -2581,7 +2581,7 @@ impl AgentFactory for ClaudeNativeFactory {
             let options = options.resolve(model, thinking)?;
             let selected = options.selected_harness_model().expect("resolved model");
             if selected.family() != HarnessFamily::Claude {
-                return Err(NanocodexError::UnsupportedCapability {
+                return Err(NanocodeError::UnsupportedCapability {
                     capability: "cross_family_spawn",
                 });
             }
@@ -2595,7 +2595,7 @@ impl AgentFactory for ClaudeNativeFactory {
                 .thinking(options.selected_thinking().expect("resolved thinking"))?
                 .host_context(host_context)
                 .build();
-            Nanocodex::persist_created(child).await
+            Agent::persist_created(child).await
         })
     }
     fn restore(
@@ -2603,7 +2603,7 @@ impl AgentFactory for ClaudeNativeFactory {
         parent: AgentHandle,
         checkpoint: SessionCheckpoint,
         host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let available = self.owner();
         let recipe = self.recipe();
         let journal_backed = parent.child_journal().is_some();
@@ -2617,7 +2617,7 @@ impl AgentFactory for ClaudeNativeFactory {
                 state.durable_child(&mut recipe, &child_id, &lineage, "restore", journal_backed)?;
             }
             state.initialize_child_workspace(&mut recipe)?;
-            Nanocodex::persist_created(recipe.host_context(host_context).build()).await
+            Agent::persist_created(recipe.host_context(host_context).build()).await
         })
     }
 }
@@ -2941,7 +2941,7 @@ async fn fail_begun(
     state: &State,
     policy: &dyn ClaudeExecutionPolicy,
     id: String,
-    error: &NanocodexError,
+    error: &NanocodeError,
 ) {
     if error.execution_policy_disposition().is_some() {
         let _ = policy.release(id).await;
@@ -3051,7 +3051,7 @@ async fn start_turn(
             .catch_unwind()
             .await;
         let panicked = outcome.is_err();
-        let result = outcome.unwrap_or(Err(NanocodexError::TurnStopped));
+        let result = outcome.unwrap_or(Err(NanocodeError::TurnStopped));
         telemetry::finish_turn(&finished_span, &result);
         if panicked {
             running.stopped.store(true, Ordering::SeqCst);
@@ -3083,7 +3083,7 @@ async fn start_turn(
     spawn_task(Box::pin(task));
     BackendTurn {
         request_id,
-        result: Box::pin(async move { receiver.await.unwrap_or(Err(NanocodexError::TurnStopped)) }),
+        result: Box::pin(async move { receiver.await.unwrap_or(Err(NanocodeError::TurnStopped)) }),
     }
 }
 
@@ -3111,15 +3111,15 @@ async fn defer_turn(
             let mut retired = std::pin::pin!(state.idle.notified());
             retired.as_mut().enable();
             if cancellation.is_cancelled() {
-                break Err((NanocodexError::TurnCancelled, false));
+                break Err((NanocodeError::TurnCancelled, false));
             }
 
             let admission = tokio::select! {
                 admission = state.admission.lock() => admission,
-                () = cancellation.cancelled() => break Err((NanocodexError::TurnCancelled, false)),
+                () = cancellation.cancelled() => break Err((NanocodeError::TurnCancelled, false)),
             };
             if state.stopped.load(Ordering::SeqCst) {
-                break Err((NanocodexError::AgentStopped, false));
+                break Err((NanocodeError::AgentStopped, false));
             }
             match policy.begin_attempt(id.clone()).await {
                 Ok(()) => {
@@ -3181,7 +3181,7 @@ async fn defer_turn(
     spawn_task(Box::pin(task));
     BackendTurn {
         request_id,
-        result: Box::pin(async move { receiver.await.unwrap_or(Err(NanocodexError::TurnStopped)) }),
+        result: Box::pin(async move { receiver.await.unwrap_or(Err(NanocodeError::TurnStopped)) }),
     }
 }
 
@@ -3193,15 +3193,15 @@ async fn abandon_deferred(
     key: BackendTurnKey,
     id: String,
     order: u64,
-    error: NanocodexError,
+    error: NanocodeError,
     begun: bool,
-) -> NanocodexError {
+) -> NanocodeError {
     state.waiters.lock().expect("waiters lock").remove(&order);
     if !begun {
         retire_unstarted(policy, id).await;
     }
     state.cancellations.lock().await.remove(&key);
-    let cancelled = matches!(error, NanocodexError::TurnCancelled);
+    let cancelled = matches!(error, NanocodeError::TurnCancelled);
     if !cancelled {
         state.emit(
             events,
@@ -3231,10 +3231,10 @@ async fn abandon_deferred(
     state.idle.notify_waiters();
     error
 }
-fn unsupported(message: &str) -> NanocodexError {
-    NanocodexError::InvalidRequest(message.into())
+fn unsupported(message: &str) -> NanocodeError {
+    NanocodeError::InvalidRequest(message.into())
 }
-fn provider_error(error: impl std::fmt::Display) -> NanocodexError {
+fn provider_error(error: impl std::fmt::Display) -> NanocodeError {
     unsupported(&format!("Claude Messages: {error}"))
 }
 
@@ -3283,7 +3283,7 @@ struct ClaudeBoundary {
 impl ClaudeBoundary {
     fn checkpoint(&self) -> Result<SessionCheckpoint> {
         let invalid_checkpoint =
-            |error: &dyn std::fmt::Display| NanocodexError::InvalidCheckpoint(error.to_string());
+            |error: &dyn std::fmt::Display| NanocodeError::InvalidCheckpoint(error.to_string());
         let model = ModelSelection::new(HarnessFamily::Claude, self.policy.model.clone());
         let thinking = if self.policy.effort.is_none() && !self.policy.thinking_disabled {
             model.default_thinking()
@@ -3379,7 +3379,7 @@ impl State {
     async fn latest_boundary(&self) -> Result<Snapshot> {
         if let Ok(conversation) = self.conversation.try_lock() {
             if self.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
+                return Err(NanocodeError::AgentStopped);
             }
             return self.snapshot(&conversation).await;
         }
@@ -3396,7 +3396,7 @@ impl State {
         );
         let mut snapshot = Snapshot::clone(&boundary);
         if self.stopped.load(Ordering::SeqCst) {
-            return Err(NanocodexError::AgentStopped);
+            return Err(NanocodeError::AgentStopped);
         }
 
         snapshot.developer_notices = self.developer_notices.lock().await.clone();
@@ -3412,17 +3412,17 @@ impl State {
             ForkPoint::Turn(completed) => {
                 let boundary = completed
                     .boundary()
-                    .ok_or(NanocodexError::ReplayedCheckpointUnavailable)?;
+                    .ok_or(NanocodeError::ReplayedCheckpointUnavailable)?;
                 if let Some(native) = boundary.downcast::<ClaudeBoundary>() {
                     if native.conversation_id != self.conversation_id {
-                        return Err(NanocodexError::CheckpointLineageMismatch);
+                        return Err(NanocodeError::CheckpointLineageMismatch);
                     }
                     return Ok(Snapshot::clone(&native.snapshot));
                 }
                 self.checkpoint_snapshot(boundary.checkpoint()?)
             }
             ForkPoint::Checkpoint(checkpoint) => self.checkpoint_snapshot(checkpoint),
-            _ => Err(NanocodexError::UnsupportedCapability {
+            _ => Err(NanocodeError::UnsupportedCapability {
                 capability: "fork_point",
             }),
         }
@@ -3431,10 +3431,10 @@ impl State {
         checkpoint.validate()?;
         checkpoint.require_family(HarnessFamily::Claude)?;
         if checkpoint.conversation_id() != self.conversation_id {
-            return Err(NanocodexError::CheckpointLineageMismatch);
+            return Err(NanocodeError::CheckpointLineageMismatch);
         }
         let stored: NativeChildState = serde_json::from_value(checkpoint.into_payload())
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
         stored.snapshot.validated()
     }
 
@@ -3496,11 +3496,11 @@ impl ServerRecovery {
     }
 }
 struct ResponseFailure {
-    error: NanocodexError,
+    error: NanocodeError,
     recovery: Option<ServerRecovery>,
 }
-impl From<NanocodexError> for ResponseFailure {
-    fn from(error: NanocodexError) -> Self {
+impl From<NanocodeError> for ResponseFailure {
+    fn from(error: NanocodeError) -> Self {
         Self {
             error,
             recovery: None,
@@ -3561,7 +3561,7 @@ impl State {
             notified.as_mut().enable();
             let update = self.persistence_update.lock().await;
             if self.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
+                return Err(NanocodeError::AgentStopped);
             }
             let mut snapshot = self.latest_boundary().await?;
             if prefix
@@ -3643,11 +3643,11 @@ impl State {
             return if journal_backed {
                 Ok(())
             } else {
-                Err(NanocodexError::ExecutionPolicyBranchUnsupported { operation })
+                Err(NanocodeError::ExecutionPolicyBranchUnsupported { operation })
             };
         };
         if policy.state_id() != child_id {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "durable branch state ID must equal the child session ID".into(),
             ));
         }
@@ -3849,7 +3849,7 @@ impl State {
         }
         let (status, kind) = match result {
             Ok(_) => ("completed", AgentEventKind::RunCompleted),
-            Err(NanocodexError::TurnCancelled | NanocodexError::TurnStopped) => {
+            Err(NanocodeError::TurnCancelled | NanocodeError::TurnStopped) => {
                 ("cancelled", AgentEventKind::RunFailed)
             }
             Err(_) => ("failed", AgentEventKind::RunFailed),
@@ -4054,7 +4054,7 @@ impl State {
         request.cache_system_prefix().map_err(provider_error)?;
         client.prepare_request(&mut request);
         if cancel.flag.load(Ordering::SeqCst) && context.effect.is_none() {
-            return Err(NanocodexError::TurnCancelled.into());
+            return Err(NanocodeError::TurnCancelled.into());
         }
         let needs_upgrade = self.code_only && !durable::is_code_only_catalog(&request.tools);
 
@@ -4164,7 +4164,7 @@ impl State {
         loop {
             if cancel.flag.load(Ordering::SeqCst) {
                 return Err(ResponseFailure {
-                    error: NanocodexError::TurnCancelled,
+                    error: NanocodeError::TurnCancelled,
                     recovery: if upgrade.is_some() { recovery } else { None },
                 });
             }
@@ -4193,7 +4193,7 @@ impl State {
                 result = client.stream(&request).instrument(attempt_span.clone()) => result,
                 () = cancel.cancelled() => {
                     telemetry::cancel_attempt(&attempt_span);
-                    return Err(ResponseFailure { error: NanocodexError::TurnCancelled, recovery });
+                    return Err(ResponseFailure { error: NanocodeError::TurnCancelled, recovery });
                 }
             };
             if opened.is_ok() {
@@ -4212,7 +4212,7 @@ impl State {
                             event = stream.next() => event,
                             () = cancel.cancelled() => {
                                 telemetry::cancel_attempt(&attempt_span);
-                                return Err(ResponseFailure { error: NanocodexError::TurnCancelled, recovery });
+                                return Err(ResponseFailure { error: NanocodeError::TurnCancelled, recovery });
                             }
                         };
                         pipeline.receive_decode_ns = pipeline
@@ -4364,7 +4364,7 @@ impl State {
             {
                 telemetry::fail_attempt(&attempt_span, &error, None, retry_after.is_some());
                 return Err(ResponseFailure {
-                    error: NanocodexError::Response(nanocode_agent_core::BackendError(Box::new(
+                    error: NanocodeError::Response(nanocode_agent_core::BackendError(Box::new(
                         error,
                     ))),
                     recovery: if uncertain || upgrade.is_some() {
@@ -4412,7 +4412,7 @@ impl State {
         let mut conversation = if self.policy.is_none() {
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => return Err(NanocodexError::TurnCancelled),
+                () = cancel.cancelled() => return Err(NanocodeError::TurnCancelled),
                 conversation = self.conversation.lock() => conversation,
             }
         } else {
@@ -4446,7 +4446,7 @@ impl State {
         }
         if let Err(error) = &result
             && error.execution_policy_disposition().is_none()
-            && !matches!(error, NanocodexError::TurnCancelled)
+            && !matches!(error, NanocodeError::TurnCancelled)
             && error.to_string().contains("Claude Messages:")
         {
             let invocation = crate::ClaudeLifecycleInvocation {
@@ -4490,10 +4490,10 @@ impl State {
         if let Err(error) = self.settle(&mut conversation, &request, &result).await {
             result = Err(error);
         }
-        if matches!(result, Err(NanocodexError::TurnCancelled))
+        if matches!(result, Err(NanocodeError::TurnCancelled))
             && self.closing.load(Ordering::SeqCst)
         {
-            result = Err(NanocodexError::TurnStopped);
+            result = Err(NanocodeError::TurnStopped);
         }
         if result
             .as_ref()
@@ -4834,7 +4834,7 @@ impl State {
         prompt: Prompt,
     ) -> Result<()> {
         if id.as_ref().is_some_and(|id| id.is_empty()) {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "steer identity must not be empty".into(),
             ));
         }
@@ -4844,24 +4844,24 @@ impl State {
             && let Some((input, withdrawn)) = turn.receipts.get(id)
         {
             if input != &input_json {
-                return Err(NanocodexError::InvalidRequest(format!(
+                return Err(NanocodeError::InvalidRequest(format!(
                     "steering message `{id}` already has different input"
                 )));
             }
             if *withdrawn {
-                return Err(NanocodexError::InvalidRequest(format!(
+                return Err(NanocodeError::InvalidRequest(format!(
                     "steering message `{id}` was withdrawn"
                 )));
             }
             return Ok(());
         }
         if !turn.accepting {
-            return Err(NanocodexError::TurnNotSteerable);
+            return Err(NanocodeError::TurnNotSteerable);
         }
         if self.policy.is_some()
             && matches!(&prompt.instruction, nanocode_agent_core::input::PromptInput::Content(items) if items.iter().any(|item| matches!(item, nanocode_agent_core::input::UserInput::LocalImage { .. })))
         {
-            return Err(NanocodexError::InvalidRequest("durable Claude steering requires inline images; local image paths cannot be retained safely".into()));
+            return Err(NanocodeError::InvalidRequest("durable Claude steering requires inline images; local image paths cannot be retained safely".into()));
         }
         let frozen = crate::prompt::freeze(prompt, turn.images).await?;
         let local_index = || {
@@ -4888,7 +4888,7 @@ impl State {
             (index, true)
         } else {
             if self.policy.is_some() && id.is_some() {
-                return Err(NanocodexError::InvalidRequest(
+                return Err(NanocodeError::InvalidRequest(
                     "Claude execution policy does not support identified steering receipts".into(),
                 ));
             }
@@ -5175,7 +5175,7 @@ impl State {
         tokio::select! {
             biased;
             result = crate::hooks::run_lifecycle_hooks(&self.tool_hooks, &invocation, self.policy.as_deref()) => result,
-            () = cancel.cancelled() => Err(NanocodexError::TurnCancelled),
+            () = cancel.cancelled() => Err(NanocodeError::TurnCancelled),
         }
     }
     fn hook_context(context: &mut Conversation, outcome: &crate::ClaudeLifecycleOutcome) {
@@ -5198,7 +5198,7 @@ impl State {
             cancel.cancel();
         }
         if cancel.flag.load(Ordering::SeqCst) && self.policy.is_none() {
-            return Err(NanocodexError::TurnCancelled);
+            return Err(NanocodeError::TurnCancelled);
         }
         self.publish_side_view(None);
         let mut prompt = prompt_messages(&request.prompt)?;
@@ -5207,7 +5207,7 @@ impl State {
             .lock()
             .await
             .get(&request.key)
-            .ok_or(NanocodexError::TurnStopped)?
+            .ok_or(NanocodeError::TurnStopped)?
             .developer_notice_ids
             .clone();
         let mut cursor = self
@@ -5223,7 +5223,7 @@ impl State {
             let mut turns = self.steering.lock().await;
             let turn = turns
                 .get_mut(&request.key)
-                .ok_or(NanocodexError::TurnStopped)?;
+                .ok_or(NanocodeError::TurnStopped)?;
             for steer in policy.retained_steers(operation.clone()).await? {
                 turn.next_index = turn.next_index.max(steer.index);
                 if steer.index <= cursor.steers
@@ -5411,7 +5411,7 @@ impl State {
                 }
             }
             if cancel.flag.load(Ordering::SeqCst) && self.policy.is_none() {
-                return Err(NanocodexError::TurnCancelled);
+                return Err(NanocodeError::TurnCancelled);
             }
             if !replaying_boundary
                 && index > 0
@@ -5853,7 +5853,7 @@ impl State {
 
                 self.publish_round_boundary(conversation).await;
                 if interrupted {
-                    return Err(NanocodexError::TurnCancelled);
+                    return Err(NanocodeError::TurnCancelled);
                 }
                 cursor.index = index + 1;
                 self.retain_pending(&mut cursor, &pending);
@@ -5910,7 +5910,7 @@ impl State {
             }
             if output_exhausted {
                 if cancel.flag.load(Ordering::SeqCst) {
-                    return Err(NanocodexError::TurnCancelled);
+                    return Err(NanocodeError::TurnCancelled);
                 }
 
                 if cursor.output_continuations >= 3 {
@@ -5934,7 +5934,7 @@ impl State {
             }
             if exhausted {
                 if cancel.flag.load(Ordering::SeqCst) {
-                    return Err(NanocodexError::TurnCancelled);
+                    return Err(NanocodeError::TurnCancelled);
                 }
                 if cursor.context_recovery_attempted {
                     return Err(provider_error("context window exhausted after recovery"));
@@ -5974,7 +5974,7 @@ impl State {
                 )));
             }
             if cancel.flag.load(Ordering::SeqCst) {
-                return Err(NanocodexError::TurnCancelled);
+                return Err(NanocodeError::TurnCancelled);
             }
 
             conversation.messages = pending.clone();
@@ -6154,12 +6154,10 @@ impl Driver {
         let state = self.state.clone();
         Box::pin(async move {
             if state.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
+                return Err(NanocodeError::AgentStopped);
             }
             let mut turns = state.steering.lock().await;
-            let turn = turns
-                .get_mut(&key)
-                .ok_or(NanocodexError::TurnNotSteerable)?;
+            let turn = turns.get_mut(&key).ok_or(NanocodeError::TurnNotSteerable)?;
             state.accept_steer(turn, id, prompt).await
         })
     }
@@ -6168,11 +6166,11 @@ impl Driver {
 impl LifecycleBackend for Driver {
     fn decode_durable_prompt(&self, input: Value) -> Result<Prompt> {
         serde_json::from_value(input.get("prompt").cloned().ok_or_else(|| {
-            NanocodexError::InvalidCheckpoint(
+            NanocodeError::InvalidCheckpoint(
                 "durable Claude prompt envelope is missing its prompt".into(),
             )
         })?)
-        .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))
+        .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))
     }
 
     fn harness_family(&self) -> HarnessFamily {
@@ -6233,7 +6231,7 @@ impl LifecycleBackend for Driver {
         Box::pin(async move {
             let _admission = state.admission.lock().await;
             if state.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
+                return Err(NanocodeError::AgentStopped);
             }
             if model.family() != HarnessFamily::Claude {
                 return Err(unsupported("model belongs to another harness family"));
@@ -6256,7 +6254,7 @@ impl LifecycleBackend for Driver {
                 let result = async move {
                     let _admission = state.admission.lock().await;
                     if state.stopped.load(Ordering::SeqCst) {
-                        return Err(NanocodexError::AgentStopped);
+                        return Err(NanocodeError::AgentStopped);
                     }
                     let resolution = crate::prompt::ImageResolution::of(&state.model());
                     let Some(policy) = state.policy.clone() else {
@@ -6289,9 +6287,9 @@ impl LifecycleBackend for Driver {
                                 .map(|completed| state.replayed_boundary(completed, checkpoint)),
                         ),
                         Admission::Failed { error, .. } => {
-                            Some(Err(NanocodexError::ReplayedExecutionFailed(error)))
+                            Some(Err(NanocodeError::ReplayedExecutionFailed(error)))
                         }
-                        Admission::Cancelled => Some(Err(NanocodexError::TurnCancelled)),
+                        Admission::Cancelled => Some(Err(NanocodeError::TurnCancelled)),
                         Admission::Execute | Admission::Resume => None,
                     };
                     let mut attempt = None;
@@ -6306,7 +6304,7 @@ impl LifecycleBackend for Driver {
                                     && request.cancel_on_admission
                                     && policy.cancel_unstarted(id.clone()).await.unwrap_or(false)
                                 {
-                                    terminal = Some(Err(NanocodexError::TurnCancelled));
+                                    terminal = Some(Err(NanocodeError::TurnCancelled));
                                 } else if blocked && automatic && state.local_blocker(order) {
                                     return Ok(defer_turn(
                                         state.clone(),
@@ -6332,7 +6330,7 @@ impl LifecycleBackend for Driver {
                         state.accepted_turns.fetch_add(1, Ordering::SeqCst);
                         let (status, kind) = match &result {
                             Ok(_) => ("completed", AgentEventKind::RunCompleted),
-                            Err(NanocodexError::TurnCancelled) => {
+                            Err(NanocodeError::TurnCancelled) => {
                                 ("cancelled", AgentEventKind::RunFailed)
                             }
                             Err(_) => ("failed", AgentEventKind::RunFailed),
@@ -6381,7 +6379,7 @@ impl LifecycleBackend for Driver {
             }
             .instrument(parent);
             spawn_task(Box::pin(task));
-            receipt.await.unwrap_or(Err(NanocodexError::TurnStopped))
+            receipt.await.unwrap_or(Err(NanocodeError::TurnStopped))
         })
     }
 
@@ -6392,7 +6390,7 @@ impl LifecycleBackend for Driver {
         let start = self.submit(request);
         Box::pin(async move {
             if state.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
+                return Err(NanocodeError::AgentStopped);
             }
             {
                 let mut turns = state.steering.lock().await;
@@ -6462,7 +6460,7 @@ impl LifecycleBackend for Driver {
                 let cancels = state.cancellations.lock().await;
                 cancels
                     .get(&key)
-                    .ok_or(NanocodexError::TurnNotCancellable)?
+                    .ok_or(NanocodeError::TurnNotCancellable)?
                     .cancel();
             }
             if let Some(turn) = state.steering.lock().await.get_mut(&key) {
@@ -6479,7 +6477,7 @@ impl LifecycleBackend for Driver {
                     notified.await;
                 }
                 if state.stopped.load(Ordering::SeqCst) {
-                    return Err(NanocodexError::ExecutionPolicyOwnerStopped);
+                    return Err(NanocodeError::ExecutionPolicyOwnerStopped);
                 }
             }
             Ok(())
@@ -6496,7 +6494,7 @@ impl LifecycleBackend for Driver {
                 .keys()
                 .min_by_key(|key| key.0)
                 .copied()
-                .ok_or(NanocodexError::TurnNotCancellable)?;
+                .ok_or(NanocodeError::TurnNotCancellable)?;
             driver.cancel(key).await
         })
     }
@@ -6505,7 +6503,7 @@ impl LifecycleBackend for Driver {
         Box::pin(async move {
             let _admission = state.admission.lock().await;
             if state.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
+                return Err(NanocodeError::AgentStopped);
             }
 
             let model: ModelSelection = state.model().parse().map_err(unsupported)?;
@@ -6531,7 +6529,7 @@ impl LifecycleBackend for Driver {
         Box::pin(async move {
             let _admission = state.admission.lock().await;
             if state.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
+                return Err(NanocodeError::AgentStopped);
             }
             if let Ok(model) = state.model().parse::<ModelSelection>() {
                 model
@@ -6554,7 +6552,7 @@ impl LifecycleBackend for Driver {
                     let _admission = state.admission.lock().await;
                     *state.compaction_cancel.lock().await = Some(cancellation.clone());
                     if state.stopped.load(Ordering::SeqCst) {
-                        return Err(NanocodexError::AgentStopped);
+                        return Err(NanocodeError::AgentStopped);
                     }
 
                     for cancel in state.cancellations.lock().await.values() {
@@ -6583,9 +6581,9 @@ impl LifecycleBackend for Driver {
                         match admission {
                             Admission::Completed { .. } => return Ok(()),
                             Admission::Failed { error, .. } => {
-                                return Err(NanocodexError::ReplayedExecutionFailed(error));
+                                return Err(NanocodeError::ReplayedExecutionFailed(error));
                             }
-                            Admission::Cancelled => return Err(NanocodexError::TurnCancelled),
+                            Admission::Cancelled => return Err(NanocodeError::TurnCancelled),
                             Admission::Execute | Admission::Resume => {
                                 if let Err(error) = policy.begin_attempt(id.clone()).await {
                                     retire_unstarted(policy.as_ref(), id).await;
@@ -6627,7 +6625,7 @@ impl LifecycleBackend for Driver {
                                 .map_err(provider_error)?;
                             let settled = match &result {
                                 Ok(_) => policy.complete(id, checkpoint, Value::Null).await,
-                                Err(NanocodexError::TurnCancelled) => {
+                                Err(NanocodeError::TurnCancelled) => {
                                     policy.cancel(id, checkpoint).await
                                 }
                                 Err(error) => policy.fail(id, checkpoint, error.to_string()).await,
@@ -6673,7 +6671,7 @@ impl LifecycleBackend for Driver {
                 let _ = accepted.send(result);
             };
             spawn_task(Box::pin(task));
-            receipt.await.unwrap_or(Err(NanocodexError::TurnStopped))
+            receipt.await.unwrap_or(Err(NanocodeError::TurnStopped))
         })
     }
     fn append_developer_message(&self, text: String) -> BackendFuture<Result<AgentSessionContext>> {
@@ -6701,7 +6699,7 @@ impl LifecycleBackend for Driver {
     }
     fn context(&self) -> BackendFuture<Result<AgentSessionContext>> {
         Box::pin(async {
-            Err(NanocodexError::UnsupportedCapability {
+            Err(NanocodeError::UnsupportedCapability {
                 capability: "context",
             })
         })
@@ -6717,11 +6715,11 @@ impl LifecycleBackend for Driver {
         let state = self.state.clone();
         Box::pin(async move { state.transcript().await })
     }
-    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let handle = self.handle.clone();
         Box::pin(async move { handle.spawn_with(options).await })
     }
-    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let handle = self.handle.clone();
         Box::pin(async move { handle.fork(request).await })
     }
@@ -6729,7 +6727,7 @@ impl LifecycleBackend for Driver {
         let state = self.state.clone();
         Box::pin(async move {
             if state.stopped.load(Ordering::SeqCst) {
-                return Err(NanocodexError::AgentStopped);
+                return Err(NanocodeError::AgentStopped);
             }
             Ok(())
         })
@@ -6912,7 +6910,7 @@ impl nanocode_agent_core::BackendRegistration for Claude {
     fn build(
         &self,
         request: nanocode_agent_core::BackendRequest,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         nanocode_agent_core::BackendRegistration::build(&ClaudeBuilder::new(self.clone()), request)
     }
 }
@@ -6933,7 +6931,7 @@ impl nanocode_agent_core::BackendRegistration for ClaudeBuilder {
     fn build(
         &self,
         request: nanocode_agent_core::BackendRequest,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let prepared = self.clone().prepare(request);
         Box::pin(async move { prepared?.build() })
     }

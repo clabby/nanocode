@@ -90,7 +90,7 @@ impl ModelCheckpoint {
         );
         let success = client.execute(request).await?;
         let ResponsesOutput::Generation(response) = success.into_output() else {
-            return Err(NanocodexError::InvalidAttemptState {
+            return Err(NanocodeError::InvalidAttemptState {
                 detail: "side question returned a non-generation response",
             });
         };
@@ -98,7 +98,7 @@ impl ModelCheckpoint {
             .final_message
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| {
-                NanocodexError::InvalidRequest(if response.code_calls.is_empty() {
+                NanocodeError::InvalidRequest(if response.code_calls.is_empty() {
                     "the side question response contained no text".to_owned()
                 } else {
                     "the side question response called a tool instead of answering directly"

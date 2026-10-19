@@ -3,7 +3,7 @@ use super::backend::{
 };
 use super::*;
 
-pub struct Nanocodex {
+pub struct Agent {
     pub(super) backend: Arc<dyn LifecycleBackend>,
     pub(super) events: nanocode_types::events::AgentEventPublisher,
     pub(super) next_turn: Arc<AtomicU64>,
@@ -40,7 +40,7 @@ fn release_seed(seed: &std::sync::Mutex<SeedState>, completed: bool) {
     }
 }
 
-impl Clone for Nanocodex {
+impl Clone for Agent {
     fn clone(&self) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
@@ -72,7 +72,7 @@ impl WeakAgent {
         let backend = self.backend.upgrade()?;
         let text = text.into();
         if text.trim().is_empty() {
-            return Some(Err(NanocodexError::InvalidRequest(
+            return Some(Err(NanocodeError::InvalidRequest(
                 "developer message must not be empty".to_owned(),
             )));
         }
@@ -87,7 +87,7 @@ impl WeakAgent {
         let backend = self.backend.upgrade()?;
         let text = text.into();
         if text.trim().is_empty() {
-            return Some(Err(NanocodexError::InvalidRequest(
+            return Some(Err(NanocodeError::InvalidRequest(
                 "developer message must not be empty".to_owned(),
             )));
         }
@@ -211,11 +211,11 @@ impl AgentHandle {
         self.native.ensure_available(self.clone()).await
     }
 
-    pub async fn spawn(&self) -> Result<(Nanocodex, AgentEvents)> {
+    pub async fn spawn(&self) -> Result<(Agent, AgentEvents)> {
         self.spawn_with(SpawnOptions::new()).await
     }
 
-    pub async fn spawn_with(&self, options: SpawnOptions) -> Result<(Nanocodex, AgentEvents)> {
+    pub async fn spawn_with(&self, options: SpawnOptions) -> Result<(Agent, AgentEvents)> {
         self.spawn_with_host_context(options, None).await
     }
 
@@ -223,7 +223,7 @@ impl AgentHandle {
         &self,
         options: SpawnOptions,
         host_context: Option<Arc<str>>,
-    ) -> Result<(Nanocodex, AgentEvents)> {
+    ) -> Result<(Agent, AgentEvents)> {
         options.validate_harness()?;
         self.native.ensure_available(self.clone()).await?;
         created(
@@ -240,7 +240,7 @@ impl AgentHandle {
         &self,
         options: SpawnOptions,
         host_context: Option<Arc<str>>,
-    ) -> Result<(Nanocodex, AgentEvents)> {
+    ) -> Result<(Agent, AgentEvents)> {
         options.validate_harness()?;
         created(self.native.spawn(self.clone(), options, host_context).await).await
     }
@@ -249,7 +249,7 @@ impl AgentHandle {
         &self,
         checkpoint: SessionCheckpoint,
         host_context: Option<Arc<str>>,
-    ) -> Result<(Nanocodex, AgentEvents)> {
+    ) -> Result<(Agent, AgentEvents)> {
         self.native.ensure_available(self.clone()).await?;
         let restored = if let Some(factory) = &self.factory {
             factory
@@ -260,7 +260,7 @@ impl AgentHandle {
                 .restore(self.clone(), checkpoint, host_context)
                 .await
         } else {
-            return Err(NanocodexError::UnsupportedCapability {
+            return Err(NanocodeError::UnsupportedCapability {
                 capability: "cross_family_restore",
             });
         };
@@ -271,7 +271,7 @@ impl AgentHandle {
         &self,
         checkpoint: SessionCheckpoint,
         host_context: Option<Arc<str>>,
-    ) -> Result<(Nanocodex, AgentEvents)> {
+    ) -> Result<(Agent, AgentEvents)> {
         created(
             self.native
                 .restore(self.clone(), checkpoint, host_context)
@@ -280,7 +280,7 @@ impl AgentHandle {
         .await
     }
 
-    pub async fn spawn_many(&self, count: usize) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+    pub async fn spawn_many(&self, count: usize) -> Result<Vec<(Agent, AgentEvents)>> {
         self.spawn_many_observed_with_host_context(count, |_| {}, None)
             .await
     }
@@ -289,7 +289,7 @@ impl AgentHandle {
         &self,
         count: usize,
         observer: impl Fn(&str) + Send + Sync + 'static,
-    ) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+    ) -> Result<Vec<(Agent, AgentEvents)>> {
         self.spawn_many_observed_with_host_context(count, observer, None)
             .await
     }
@@ -299,7 +299,7 @@ impl AgentHandle {
         count: usize,
         observer: impl Fn(&str) + Send + Sync + 'static,
         host_context: Option<Arc<str>>,
-    ) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+    ) -> Result<Vec<(Agent, AgentEvents)>> {
         self.native.ensure_available(self.clone()).await?;
 
         created_batch(
@@ -317,7 +317,7 @@ impl AgentHandle {
         count: usize,
         observer: impl Fn(&str) + Send + Sync + 'static,
         host_context: Option<Arc<str>>,
-    ) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+    ) -> Result<Vec<(Agent, AgentEvents)>> {
         self.native.ensure_available(self.clone()).await?;
         created_batch(
             self.native
@@ -327,13 +327,13 @@ impl AgentHandle {
         .await
     }
 
-    pub async fn fork(&self, request: ForkRequest) -> Result<(Nanocodex, AgentEvents)> {
+    pub async fn fork(&self, request: ForkRequest) -> Result<(Agent, AgentEvents)> {
         self.native.ensure_available(self.clone()).await?;
         created(self.native.fork(self.clone(), request).await).await
     }
 }
 
-pub async fn created(child: Result<(Nanocodex, AgentEvents)>) -> Result<(Nanocodex, AgentEvents)> {
+pub async fn created(child: Result<(Agent, AgentEvents)>) -> Result<(Agent, AgentEvents)> {
     let child = child?;
     if let Err(error) = child.0.backend.persist_initial().await {
         child.0.abandon_created().await;
@@ -343,8 +343,8 @@ pub async fn created(child: Result<(Nanocodex, AgentEvents)>) -> Result<(Nanocod
 }
 
 pub async fn created_batch(
-    children: Result<Vec<(Nanocodex, AgentEvents)>>,
-) -> Result<Vec<(Nanocodex, AgentEvents)>> {
+    children: Result<Vec<(Agent, AgentEvents)>>,
+) -> Result<Vec<(Agent, AgentEvents)>> {
     let children = children?;
     let mut failure = None;
     for (child, _) in &children {
@@ -361,7 +361,7 @@ pub async fn created_batch(
     Ok(children)
 }
 
-impl Nanocodex {
+impl Agent {
     #[must_use]
     pub fn builder<B>(backend: B) -> B::Builder
     where
@@ -399,7 +399,7 @@ impl Nanocodex {
 
     pub async fn set_harness_model(&self, model: crate::ModelSelection) -> Result<()> {
         if model.family() != self.harness_family() {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "model belongs to another harness family".into(),
             ));
         }
@@ -440,12 +440,12 @@ impl Nanocodex {
         } = request.into();
         prompt
             .validate()
-            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
         if request_id
             .as_deref()
             .is_some_and(|request_id| request_id.trim().is_empty())
         {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "request ID must not be empty".to_owned(),
             ));
         }
@@ -510,12 +510,12 @@ impl Nanocodex {
         } = request.into();
         prompt
             .validate()
-            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
         if request_id
             .as_deref()
             .is_some_and(|request_id| request_id.trim().is_empty())
         {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "request ID must not be empty".to_owned(),
             ));
         }
@@ -581,7 +581,7 @@ impl Nanocodex {
     ) -> Result<AgentSessionContext> {
         let text = text.into();
         if text.trim().is_empty() {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "developer message must not be empty".to_owned(),
             ));
         }
@@ -605,7 +605,7 @@ impl Nanocodex {
         Prompt::new("transcript")
             .with_transcript(transcript.clone())
             .validate()
-            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
         *self.seed.lock().expect("transcript seed lock poisoned") = SeedState {
             transcript: (!transcript.is_empty()).then_some(transcript),
             in_flight: false,
@@ -635,7 +635,7 @@ impl Nanocodex {
         };
         let committed = match self.backend.transcript().await {
             Ok(transcript) => !transcript.is_empty(),
-            Err(NanocodexError::UnsupportedCapability { .. }) => false,
+            Err(NanocodeError::UnsupportedCapability { .. }) => false,
             Err(error) => return Err(error),
         };
         let mut state = self.seed.lock().expect("transcript seed lock poisoned");
@@ -680,7 +680,7 @@ impl Nanocodex {
     pub async fn side_question(&self, question: impl Into<String>) -> Result<SideAnswer> {
         let question = question.into();
         if question.trim().is_empty() {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "side question must not be empty".to_owned(),
             ));
         }

@@ -54,7 +54,7 @@ pub(super) enum Command {
         point: ForkFrom,
         session_id: SessionId,
         policy: Option<Arc<dyn execution::ExecutionPolicy>>,
-        result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
+        result: oneshot::Sender<Result<(Agent, AgentEvents)>>,
     },
 
     ChildSnapshot {
@@ -64,13 +64,13 @@ pub(super) enum Command {
         restore: Option<ChildState>,
         options: SpawnOptions,
         host_context: Option<Arc<str>>,
-        result: oneshot::Sender<Result<(Nanocodex, AgentEvents)>>,
+        result: oneshot::Sender<Result<(Agent, AgentEvents)>>,
     },
     SpawnBatch {
         count: usize,
         observer: Option<Arc<SpawnObserver>>,
         host_context: Option<Arc<str>>,
-        result: oneshot::Sender<Result<Vec<(Nanocodex, AgentEvents)>>>,
+        result: oneshot::Sender<Result<Vec<(Agent, AgentEvents)>>>,
     },
     SetModel {
         model: Model,
@@ -118,7 +118,7 @@ impl DeveloperMessageResult {
         }
     }
 
-    pub(super) fn fail(self, error: NanocodexError) {
+    pub(super) fn fail(self, error: NanocodeError) {
         match self {
             Self::Context(result) => drop(result.send(Err(error))),
             Self::Notice { result, .. } => drop(result.send(Err(error))),

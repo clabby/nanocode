@@ -11,7 +11,7 @@ use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    NanocodexError, Result, ServiceTier,
+    NanocodeError, Result, ServiceTier,
     session::{CommittedSession, SessionSnapshot},
     usage::TurnUsage,
 };
@@ -104,8 +104,8 @@ pub trait ExecutionPolicy: Send + Sync {
     fn recover_failure<'a>(
         &'a self,
         _operation_id: String,
-        error: NanocodexError,
-    ) -> ExecutionFuture<'a, NanocodexError> {
+        error: NanocodeError,
+    ) -> ExecutionFuture<'a, NanocodeError> {
         Box::pin(async move { error })
     }
 
@@ -118,7 +118,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _snapshot: SessionSnapshot,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "commit_checkpoint",
             })
         })
@@ -156,7 +156,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _snapshot: Option<SessionSnapshot>,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "cancel",
             })
         })
@@ -171,7 +171,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _input_json: String,
     ) -> ExecutionFuture<'a, Result<u32>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "accept_steer",
             })
         })
@@ -227,7 +227,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _steer_index: u32,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "withdraw_steer",
             })
         })
@@ -240,7 +240,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _model_call_index: u32,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "bind_steer",
             })
         })
@@ -310,8 +310,8 @@ pub trait ExecutionPolicy: Send + Sync {
     fn recover_failure<'a>(
         &'a self,
         _operation_id: String,
-        error: NanocodexError,
-    ) -> ExecutionFuture<'a, NanocodexError> {
+        error: NanocodeError,
+    ) -> ExecutionFuture<'a, NanocodeError> {
         Box::pin(async move { error })
     }
 
@@ -324,7 +324,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _snapshot: SessionSnapshot,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "commit_checkpoint",
             })
         })
@@ -362,7 +362,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _snapshot: Option<SessionSnapshot>,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "cancel",
             })
         })
@@ -377,7 +377,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _input_json: String,
     ) -> ExecutionFuture<'a, Result<u32>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "accept_steer",
             })
         })
@@ -433,7 +433,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _steer_index: u32,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "withdraw_steer",
             })
         })
@@ -446,7 +446,7 @@ pub trait ExecutionPolicy: Send + Sync {
         _model_call_index: u32,
     ) -> ExecutionFuture<'a, Result<()>> {
         Box::pin(async {
-            Err(NanocodexError::ExecutionPolicyCapabilityUnsupported {
+            Err(NanocodeError::ExecutionPolicyCapabilityUnsupported {
                 capability: "bind_steer",
             })
         })
@@ -540,7 +540,7 @@ impl ExecutionConfig {
     ) -> Result<Self> {
         let saved_by_journal = journal_backed && operation != "fork";
         if self.policy.is_some() && branch_policy.is_none() && !saved_by_journal {
-            return Err(NanocodexError::ExecutionPolicyBranchUnsupported { operation });
+            return Err(NanocodeError::ExecutionPolicyBranchUnsupported { operation });
         }
         Ok(Self {
             platform: self.platform.for_new_thread(),
@@ -695,7 +695,7 @@ impl Execution {
         let policy = self
             .policy
             .as_ref()
-            .ok_or(NanocodexError::ExecutionPolicyNotConfigured)?;
+            .ok_or(NanocodeError::ExecutionPolicyNotConfigured)?;
         let input = encode(input)?;
         Ok(map_admission(
             policy.admit(operation_id.to_owned(), input).await?,
@@ -725,7 +725,7 @@ impl Execution {
         let policy = self
             .policy
             .as_ref()
-            .ok_or(NanocodexError::ExecutionPolicyNotConfigured)?;
+            .ok_or(NanocodeError::ExecutionPolicyNotConfigured)?;
         let (operation_id, admission) = policy
             .admit_automatic(candidate_operation_id, encode(input)?)
             .await?;
@@ -753,7 +753,7 @@ impl Execution {
         let policy = self
             .policy
             .as_ref()
-            .ok_or(NanocodexError::ExecutionPolicyNotConfigured)?;
+            .ok_or(NanocodeError::ExecutionPolicyNotConfigured)?;
         cancel_with_reclaim(policy, operation_id.to_owned(), Some(encode(input)?), None).await
     }
 
@@ -1276,7 +1276,7 @@ async fn persist_operation(
                     .await
             }
         }
-        ExecutionOutcome::Started => Err(NanocodexError::InvalidExecutionPolicy(
+        ExecutionOutcome::Started => Err(NanocodeError::InvalidExecutionPolicy(
             "an operation reached persistence without a terminal attempt outcome".to_owned(),
         )),
     }
@@ -1299,7 +1299,7 @@ async fn cancel_with_reclaim(
     }
 
     let input_json = input_json.ok_or_else(|| {
-        NanocodexError::InvalidExecutionPolicy(format!(
+        NanocodeError::InvalidExecutionPolicy(format!(
             "cancel retry for operation `{operation_id}` did not retain its admission input"
         ))
     })?;
@@ -1322,19 +1322,19 @@ async fn cancel_with_reclaim(
         }
         ExecutionAdmission::Cancelled => Ok(()),
         ExecutionAdmission::Completed { .. } | ExecutionAdmission::Failed { .. } => {
-            Err(NanocodexError::InvalidExecutionPolicy(format!(
+            Err(NanocodeError::InvalidExecutionPolicy(format!(
                 "cancel retry for operation `{operation_id}` replayed an incompatible terminal outcome"
             )))
         }
     }
 }
 
-fn reopen_after_cancel_retry(error: NanocodexError) -> NanocodexError {
+fn reopen_after_cancel_retry(error: NanocodeError) -> NanocodeError {
     if matches!(
         error.execution_policy_disposition(),
         Some(crate::ExecutionPolicyDisposition::Retry)
     ) {
-        NanocodexError::execution_policy_with_disposition(
+        NanocodeError::execution_policy_with_disposition(
             "cancellation recovery",
             crate::ExecutionPolicyDisposition::Reopen,
             error,
@@ -1345,9 +1345,9 @@ fn reopen_after_cancel_retry(error: NanocodexError) -> NanocodexError {
 }
 
 fn encode<T: Serialize + ?Sized>(value: &T) -> Result<String> {
-    serde_json::to_string(value).map_err(NanocodexError::ExecutionPayload)
+    serde_json::to_string(value).map_err(NanocodeError::ExecutionPayload)
 }
 
 fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
-    serde_json::from_str(value).map_err(NanocodexError::ExecutionPayload)
+    serde_json::from_str(value).map_err(NanocodeError::ExecutionPayload)
 }

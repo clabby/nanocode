@@ -1,5 +1,5 @@
 use crate::{
-    Agent, AgentEvents, HarnessFamily, ModelSelection, NanocodexError, SessionCheckpoint, Thinking,
+    Agent, AgentEvents, HarnessFamily, ModelSelection, NanocodeError, SessionCheckpoint, Thinking,
     router::{AgentResult, Harness, HarnessRequest},
 };
 use nanocode_agent_core::AgentHandle;
@@ -216,7 +216,7 @@ impl<B, D: RuntimeDefaults> RuntimeBuilder<B, D> {
         #[cfg(not(target_family = "wasm"))]
         {
             let runtime = tokio::runtime::Handle::try_current()
-                .map_err(|_| NanocodexError::TokioRuntimeUnavailable)?;
+                .map_err(|_| NanocodeError::TokioRuntimeUnavailable)?;
             let mut builder = self;
             if builder.data.durability.is_none()
                 && let Some(store) = D::default_store_async()
@@ -234,10 +234,10 @@ impl<B, D: RuntimeDefaults> RuntimeBuilder<B, D> {
                     let _runtime = runtime.enter();
                     let _ = completed.send(span.in_scope(|| builder.build()));
                 })
-                .map_err(|error| NanocodexError::backend("runtime construction", error))?;
+                .map_err(|error| NanocodeError::backend("runtime construction", error))?;
             result
                 .await
-                .map_err(|error| NanocodexError::backend("runtime construction", error))?
+                .map_err(|error| NanocodeError::backend("runtime construction", error))?
         }
         #[cfg(target_family = "wasm")]
         {
@@ -255,16 +255,16 @@ fn assemble(
 
     for backend in &data.backends {
         let family: HarnessFamily = backend.id().as_str().parse().map_err(|error| {
-            NanocodexError::InvalidRequest(format!("invalid backend identity: {error}"))
+            NanocodeError::InvalidRequest(format!("invalid backend identity: {error}"))
         })?;
         if family.as_str().trim().is_empty() {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "backend identity must not be empty".into(),
             ));
         }
         backend.validate_model(backend.default_model().as_str())?;
         if configured.contains(&family) {
-            return Err(NanocodexError::InvalidRequest(format!(
+            return Err(NanocodeError::InvalidRequest(format!(
                 "backend {family} is configured more than once"
             )));
         }
@@ -274,14 +274,14 @@ fn assemble(
         .filter(|family| configured.contains(family))
         .or_else(|| configured.first().cloned())
     else {
-        return Err(NanocodexError::InvalidRequest(
-            "a Nanocodex runtime requires at least one harness backend".into(),
+        return Err(NanocodeError::InvalidRequest(
+            "a Nanocode runtime requires at least one harness backend".into(),
         ));
     };
     if let (Some(family), Some(model)) = (data.harness.as_ref(), data.model.as_ref())
         && *family != model.family()
     {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "model does not belong to selected harness".into(),
         ));
     }
@@ -342,7 +342,7 @@ fn assemble(
     let durability = data
         .durability
         .transpose()
-        .map_err(|error| NanocodexError::Backend {
+        .map_err(|error| NanocodeError::Backend {
             backend: "durability",
             source: error,
         })?;
@@ -375,7 +375,7 @@ fn assemble(
 
     for backend in data.backends {
         let family = backend.id().as_str().parse().map_err(|error| {
-            NanocodexError::InvalidRequest(format!("invalid backend identity: {error}"))
+            NanocodeError::InvalidRequest(format!("invalid backend identity: {error}"))
         })?;
         recipes.push((
             family,
@@ -573,7 +573,7 @@ impl RuntimeBackend for Registered {
             let settings = settings.or(&defaults);
             backend.validate_model(spec.model.as_str())?;
             if settings.tools.is_some() {
-                return Err(NanocodexError::InvalidRequest("registered backends cannot receive facade tool selections; configure tools on the backend or use the Codex or Claude harness".into()));
+                return Err(NanocodeError::InvalidRequest("registered backends cannot receive facade tool selections; configure tools on the backend or use the Codex or Claude harness".into()));
             }
             let mut tools = nanocode_agent_core::RuntimeTools::default()
                 .shared(services.shared_tools(false).await?);
@@ -637,7 +637,7 @@ fn persistent_recipe(
                             || (!automatic_restore && record.model != spec.model)
                             || record.lineage != *checkpoint.lineage()
                         {
-                            return Err(NanocodexError::InvalidCheckpoint(
+                            return Err(NanocodeError::InvalidCheckpoint(
                                 "checkpoint identity differs from the stored session".into(),
                             ));
                         }
@@ -790,7 +790,7 @@ impl AgentRuntime {
 
     pub async fn open_session(&self, session_id: &str) -> AgentResult {
         let store = self.inner.durability.as_ref().ok_or_else(|| {
-            NanocodexError::InvalidRequest("runtime durability is not configured".into())
+            NanocodeError::InvalidRequest("runtime durability is not configured".into())
         })?;
         self.open(store, session_id).await
     }
@@ -868,10 +868,10 @@ impl AgentRuntime {
         store: &crate::durability::SessionStore,
     ) -> Result<&crate::durability::SessionStore> {
         let configured = self.inner.durability.as_ref().ok_or_else(|| {
-            NanocodexError::InvalidRequest("runtime durability is not configured".into())
+            NanocodeError::InvalidRequest("runtime durability is not configured".into())
         })?;
         if !configured.same_store(store) {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "session store differs from the runtime's configured durability store".into(),
             ));
         }
@@ -910,7 +910,7 @@ impl AgentRuntime {
                         }
                     };
                 }
-                Err(NanocodexError::ForkBeforeCompletedTurn) => {}
+                Err(NanocodeError::ForkBeforeCompletedTurn) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1165,7 +1165,7 @@ fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
     workspace
         .filter(|workspace| workspace.has_root())
         .ok_or_else(|| {
-            NanocodexError::InvalidRequest(
+            NanocodeError::InvalidRequest(
                 "a WASM runtime requires an absolute workspace path".into(),
             )
         })
@@ -1177,7 +1177,7 @@ fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
         Some(workspace) if workspace.is_absolute() => Ok(workspace),
         workspace => {
             let current = std::env::current_dir().map_err(|error| {
-                NanocodexError::InvalidRequest(format!(
+                NanocodeError::InvalidRequest(format!(
                     "the runtime workspace defaults to the current directory, which is unavailable: {error}"
                 ))
             })?;
@@ -1186,18 +1186,18 @@ fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn not_configured(family: HarnessFamily) -> NanocodexError {
-    NanocodexError::InvalidRequest(format!(
+fn not_configured(family: HarnessFamily) -> NanocodeError {
+    NanocodeError::InvalidRequest(format!(
         "{family} harness is not configured for this runtime"
     ))
 }
 
-fn catalog_error(error: crate::durability::Error) -> NanocodexError {
+fn catalog_error(error: crate::durability::Error) -> NanocodeError {
     match error {
         crate::durability::Error::SessionNotFound { .. } => {
-            NanocodexError::InvalidRequest(error.to_string())
+            NanocodeError::InvalidRequest(error.to_string())
         }
-        error => NanocodexError::Backend {
+        error => NanocodeError::Backend {
             backend: "durability",
             source: Arc::new(error),
         },
@@ -1332,7 +1332,7 @@ impl Ownership {
             .await;
         match outcome {
             None => Ok(()),
-            Some(error) => Err(NanocodexError::Backend {
+            Some(error) => Err(NanocodeError::Backend {
                 backend: "runtime",
                 source: Arc::clone(error) as Arc<dyn std::error::Error + Send + Sync>,
             }),
@@ -1344,7 +1344,7 @@ impl AgentOwner for Ownership {
     fn admit(&self) -> Result<()> {
         let mut state = self.lock();
         if state.closed {
-            return Err(NanocodexError::AgentStopped);
+            return Err(NanocodeError::AgentStopped);
         }
         state.in_flight += 1;
         Ok(())

@@ -1,6 +1,6 @@
 use super::{Registry, RestorationState, SubagentControl, lock_unpoisoned};
 use crate::model::{AgentId, AgentStatus};
-use nanocode_agent_core::Nanocodex;
+use nanocode_agent_core::Agent;
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -104,7 +104,7 @@ impl Registry {
 
     pub async fn deliver_completions(
         self: &Arc<Self>,
-        parent: &Nanocodex,
+        parent: &Agent,
         root_session_id: &str,
     ) -> Vec<(AgentId, std::io::Result<bool>)> {
         if self.await_restored(root_session_id).await.is_err() {
@@ -150,7 +150,7 @@ impl SubagentControl {
 
     pub async fn deliver_completions(
         &self,
-        parent: &Nanocodex,
+        parent: &Agent,
         root_session_id: &str,
     ) -> Vec<(AgentId, std::io::Result<bool>)> {
         self.registry

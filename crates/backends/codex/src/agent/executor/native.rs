@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::client::__private::ModelConfig;
 
-use crate::{NanocodexError, Result};
+use crate::{NanocodeError, Result};
 
 pub(crate) type ServiceFactory =
     Arc<dyn Fn(Arc<ModelConfig>) -> super::ResponsesClientBox + Send + Sync>;
@@ -19,7 +19,7 @@ pub(crate) fn spawn_driver(
     driver: crate::agent::execution::ExecutionFuture<'static, ()>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| NanocodexError::TokioRuntimeUnavailable)?;
+        .map_err(|_| NanocodeError::TokioRuntimeUnavailable)?;
     drop(runtime.spawn(driver));
     Ok(())
 }

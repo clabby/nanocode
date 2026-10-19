@@ -11,7 +11,7 @@ pub(super) fn build_agent(
     resume: Option<SessionSnapshot>,
     lineage: Option<Lineage>,
     service_factory: ServiceFactory,
-) -> Result<(Nanocodex, AgentEvents)> {
+) -> Result<(Agent, AgentEvents)> {
     #[cfg(not(target_family = "wasm"))]
     crate::client::transport::install_default_rustls_crypto_provider();
     let session_id = session_id.unwrap_or_default();
@@ -39,7 +39,7 @@ pub(super) fn build_agent(
             .as_deref()
             .is_some_and(|key| key != restored_cache_key.as_ref())
         {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "configured prompt cache key does not match the resumed session".to_owned(),
             ));
         }
@@ -57,7 +57,7 @@ pub(super) fn build_agent(
             path.into_os_string()
                 .into_string()
                 .map(Arc::<str>::from)
-                .map_err(|path| NanocodexError::WorkspaceNotUtf8 {
+                .map_err(|path| NanocodeError::WorkspaceNotUtf8 {
                     path: PathBuf::from(path),
                 })
         })
@@ -65,14 +65,14 @@ pub(super) fn build_agent(
     let workspace = if let Some(initial) = initial_resume.as_ref() {
         let restored = context_source.resolve_workspace(Some(initial.workspace()))?;
         if restored != initial.workspace() {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "workspace no longer resolves to the stored location".to_owned(),
             ));
         }
         if let Some(configured) = configured_workspace {
             let requested = context_source.resolve_workspace(Some(&configured))?;
             if requested != restored {
-                return Err(NanocodexError::WorkspaceChanged {
+                return Err(NanocodeError::WorkspaceChanged {
                     current: restored,
                     requested,
                 });
@@ -127,7 +127,7 @@ pub(super) fn spawn_agent_driver(
     service: ResponsesClientBox,
     initial_resume: Option<InitialResume>,
     start: crate::session::SessionStart,
-) -> Result<(Nanocodex, AgentEvents)> {
+) -> Result<(Agent, AgentEvents)> {
     let session_id_text = session_id.to_string();
     let origin = AgentOrigin {
         start,
@@ -157,8 +157,8 @@ pub(super) fn spawn_agent_driver(
     })?;
 
     if tools.exposure() == nanocode_tool_host::ToolExposure::Hidden {
-        return Err(NanocodexError::InvalidRequest(
-            "Nanocodex agents require Code Mode or direct tool exposure".to_owned(),
+        return Err(NanocodeError::InvalidRequest(
+            "Nanocode agents require Code Mode or direct tool exposure".to_owned(),
         ));
     }
     let prompt_cache_key = spawner
@@ -255,28 +255,28 @@ pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> 
     config
         .auth
         .validate()
-        .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+        .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
     if config.context_window_tokens == 0 {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "model context window must be greater than zero".to_owned(),
         ));
     }
     if matches!(config.responses_transport, ResponsesTransport::WebSocket)
         && config.websocket_url.trim().is_empty()
     {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "Responses WebSocket URL must not be empty".to_owned(),
         ));
     }
     if matches!(config.responses_transport, ResponsesTransport::Https)
         && config.api_base_url.trim().is_empty()
     {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "OpenAI API base URL must not be empty".to_owned(),
         ));
     }
     if config.auth.mode() == OpenAiAuthMode::ChatGpt && config.store_responses {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "ChatGPT subscription authentication does not support store: true".to_owned(),
         ));
     }
@@ -284,12 +284,12 @@ pub(super) fn validate(config: &ModelConfig, prompt_cache_key: Option<&str>) -> 
         && !config.store_responses
         && matches!(config.responses_history, ResponsesHistory::Incremental)
     {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "HTTPS with store: false requires full client-history replay".to_owned(),
         ));
     }
     if prompt_cache_key.is_some_and(|prompt_cache_key| prompt_cache_key.trim().is_empty()) {
-        return Err(NanocodexError::InvalidRequest(
+        return Err(NanocodeError::InvalidRequest(
             "prompt_cache_key must not be empty".to_owned(),
         ));
     }

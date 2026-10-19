@@ -4,7 +4,7 @@ use crate::{
     model::{AgentId, MessagePriority, MessagePurpose},
     platform,
 };
-use nanocode_agent_core::{NanocodexError, SideAnswer};
+use nanocode_agent_core::{NanocodeError, SideAnswer};
 use std::sync::Arc;
 
 struct SideQuestion {
@@ -81,7 +81,7 @@ impl SubagentControl {
         id: AgentId,
         question: impl Into<String>,
     ) -> nanocode_agent_core::Result<SideAnswer> {
-        let invalid = |error: std::io::Error| NanocodexError::InvalidRequest(error.to_string());
+        let invalid = |error: std::io::Error| NanocodeError::InvalidRequest(error.to_string());
         let (harness, _side_question) = self
             .lease_side_question(root_session_id, id)
             .await

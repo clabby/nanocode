@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use nanocode::{
-    Claude, ClaudeHarness, ClaudeModel, Codex, CodexHarness, Model, ModelSelection, Nanocodex,
+    Claude, ClaudeHarness, ClaudeModel, Codex, CodexHarness, Model, ModelSelection, Nanocode,
     OpenAi, Runner, RunnerServerConfig, ServiceTier, Thinking,
     agent::{Agent, AgentEvents},
     claude::ClaudeClient,
@@ -182,7 +182,7 @@ const fn kind_name(kind: GatewayArg) -> &'static str {
 #[derive(Clone)]
 pub struct Host {
     pub config: HostConfig,
-    pub runtime: Nanocodex,
+    pub runtime: Nanocode,
 }
 
 impl Host {
@@ -202,7 +202,7 @@ impl Host {
         .build()?;
         let codex = CodexHarness::new(openai);
         let claude = ClaudeHarness::new(ClaudeClient::default());
-        let mut builder = Nanocodex::builder()
+        let mut builder = Nanocode::builder()
             .openai(codex)
             .claude(claude)
             .workspace(config.workspace.clone());

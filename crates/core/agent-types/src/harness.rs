@@ -2,7 +2,7 @@ use std::{fmt, str::FromStr};
 
 use nanocode_types_core::{BackendId, Model, ReasoningMode, Thinking};
 
-use crate::{NanocodexError, ServiceTier};
+use crate::{NanocodeError, ServiceTier};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -162,7 +162,7 @@ impl ModelSelection {
 
     pub fn validate(&self) -> crate::Result<()> {
         if self.backend.as_str().trim().is_empty() || self.model.trim().is_empty() {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "backend and model identities must not be empty".into(),
             ));
         }
@@ -422,7 +422,7 @@ impl ModelCapabilities {
         if self.supports_thinking(thinking) {
             return Ok(());
         }
-        Err(NanocodexError::InvalidRequest(format!(
+        Err(NanocodeError::InvalidRequest(format!(
             "{} requires a supported thinking level{}; supported thinking: {} ({} does not support {thinking} thinking)",
             display_name(&self.model),
             self.transport_suffix(),
@@ -477,8 +477,8 @@ impl ModelCapabilities {
         }
     }
 
-    fn unsupported(&self, setting: &str, supported: &str) -> NanocodexError {
-        NanocodexError::InvalidRequest(format!(
+    fn unsupported(&self, setting: &str, supported: &str) -> NanocodeError {
+        NanocodeError::InvalidRequest(format!(
             "{} ({}) does not support {setting}{}; {supported}",
             display_name(&self.model),
             self.model,

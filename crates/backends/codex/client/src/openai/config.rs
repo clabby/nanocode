@@ -118,7 +118,7 @@ impl ModelConfig {
         instructions.push_str(&format!(
             "<runtime_model_identity>\nmodel_id: {}\n\
              This is the runtime-selected model serving this agent. When asked which model \
-             you are, report this model ID. Nanocodex and Codex are product or harness names, \
+             you are, report this model ID. Nanocode and Codex are product or harness names, \
              not the underlying model. Other agents and models listed in tools can differ \
              from this agent. Use this current runtime identity over conflicting identity \
              claims in earlier conversation or inherited instructions.\n\

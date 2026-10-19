@@ -15,7 +15,7 @@ use super::{
 };
 use futures_util::future::join_all;
 use nanocode_agent_core::{
-    AgentEvents, AgentHandle, ModelSelection, Nanocodex, NanocodexError, ReasoningMode,
+    Agent, AgentEvents, AgentHandle, ModelSelection, NanocodeError, ReasoningMode,
     Result as AgentResult, SessionCheckpoint, Thinking, TurnResult, events::AgentEventKind,
 };
 use nanocode_platform::Instant;
@@ -170,7 +170,7 @@ pub struct Registry {
     pub(super) spawn_policy: std::sync::RwLock<crate::SpawnPolicy>,
 }
 
-pub type ParentResolver = Arc<dyn Fn(&str) -> Option<Nanocodex> + Send + Sync>;
+pub type ParentResolver = Arc<dyn Fn(&str) -> Option<Agent> + Send + Sync>;
 
 pub fn completion_continuation_prompt(id: AgentId, status: &AgentStatus) -> String {
     match status {
@@ -2827,7 +2827,7 @@ impl Registry {
         root_session_id: String,
         descriptor: AgentDescriptor,
         host_context: Option<Arc<str>>,
-        agent: Nanocodex,
+        agent: Agent,
         event_task: Task<()>,
         contract: OutputContract,
     ) -> std::io::Result<()> {
@@ -3081,7 +3081,7 @@ impl Registry {
             } else {
                 match result {
                     Ok(_) => complete_session(session, submitted_output),
-                    Err(NanocodexError::TurnCancelled | NanocodexError::TurnStopped) => {
+                    Err(NanocodeError::TurnCancelled | NanocodeError::TurnStopped) => {
                         AgentStatus::Interrupted
                     }
                     Err(error) => AgentStatus::Failed {
@@ -3290,7 +3290,7 @@ impl Registry {
 
     pub async fn continue_parent(
         self: &Arc<Self>,
-        parent: &Nanocodex,
+        parent: &Agent,
         root_session_id: &str,
         id: AgentId,
         revision: u64,
@@ -3346,7 +3346,7 @@ impl Registry {
             Err(error) => {
                 if !matches!(
                     error,
-                    NanocodexError::AgentStopped | NanocodexError::TurnStopped
+                    NanocodeError::AgentStopped | NanocodeError::TurnStopped
                 ) {
                     self.retry_completion(root_session_id, id, revision);
                 }

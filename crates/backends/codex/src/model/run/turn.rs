@@ -56,7 +56,7 @@ impl ModelRun {
         let mut session = match restored {
             Some((session, ExecutionPhase::Compact)) => session,
             Some(_) => {
-                return Err(NanocodexError::InvalidExecutionPolicy(
+                return Err(NanocodeError::InvalidExecutionPolicy(
                     "invalid compaction continuation".into(),
                 ));
             }
@@ -171,7 +171,7 @@ impl ModelRun {
                 instruction_bytes: task.text_bytes(),
             },
         )?;
-        let error = NanocodexError::TurnCancelled;
+        let error = NanocodeError::TurnCancelled;
         let message = error.to_string();
         self.events
             .emit(AgentEventKind::RunError, RunError { message: &message })?;
@@ -199,7 +199,7 @@ impl ModelRun {
         workspace: Option<&str>,
         thinking: Thinking,
         service_tier: ServiceTier,
-        error: &NanocodexError,
+        error: &NanocodeError,
     ) -> Result<()> {
         if matches!(
             error.execution_policy_disposition(),
@@ -299,7 +299,7 @@ impl ModelRun {
             Ok(ModelTaskOutcome::Cancelled) => {
                 self.terminate_turn_cells().await;
                 let checkpoint = self.commit_cancelled_checkpoint().await?;
-                let error = NanocodexError::TurnCancelled;
+                let error = NanocodeError::TurnCancelled;
                 let message = error.to_string();
                 self.events
                     .emit(AgentEventKind::RunError, RunError { message: &message })?;
@@ -653,7 +653,7 @@ impl ModelRun {
             }
             ExecutionPhase::Generate => {}
             ExecutionPhase::Compact => {
-                return Err(NanocodexError::InvalidExecutionPolicy(
+                return Err(NanocodeError::InvalidExecutionPolicy(
                     "invalid turn continuation".into(),
                 ));
             }
@@ -693,7 +693,7 @@ impl ModelRun {
         let session = self
             .session
             .as_mut()
-            .ok_or(NanocodexError::InvalidAttemptState {
+            .ok_or(NanocodeError::InvalidAttemptState {
                 detail: "completed turn did not have a model session",
             })?;
         if self.stats.last_response_id.is_some() {
@@ -751,7 +751,7 @@ impl ModelRun {
         let session = self
             .session
             .as_mut()
-            .ok_or(NanocodexError::InvalidAttemptState {
+            .ok_or(NanocodeError::InvalidAttemptState {
                 detail: "interrupted turn did not have a model session",
             })?;
         session.conversation.append(aborted_outputs);
@@ -905,7 +905,7 @@ impl ModelRun {
                     usage.as_ref(),
                     server_reasoning_included,
                 )
-                .map_err(|_| NanocodexError::MalformedResponse {
+                .map_err(|_| NanocodeError::MalformedResponse {
                     detail: "completed turn did not have a response ID",
                 })?;
             session.conversation.reasoning.reconcile_history_repair(
@@ -966,7 +966,7 @@ impl ModelRun {
                         message
                     });
                 }
-                return Err(NanocodexError::MalformedResponse {
+                return Err(NanocodeError::MalformedResponse {
                     detail: "model completed without a final message or exec call",
                 });
             }
@@ -1036,7 +1036,7 @@ impl ModelRun {
             .and_then(|steer| steer.model_call_index)
             && bound < model_call_index
         {
-            return Err(NanocodexError::InvalidExecutionPolicy(format!(
+            return Err(NanocodeError::InvalidExecutionPolicy(format!(
                 "retained steer was bound to model call {bound}, reached {model_call_index}"
             )));
         }

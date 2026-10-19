@@ -191,7 +191,7 @@ pub trait AgentFactory: Send + Sync + 'static {
         parent: AgentHandle,
         options: SpawnOptions,
         host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>>;
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>>;
 
     fn ensure_available(&self, parent: AgentHandle) -> BackendFuture<Result<()>> {
         let settings = self.settings(parent);
@@ -204,12 +204,12 @@ pub trait AgentFactory: Send + Sync + 'static {
         count: usize,
         observer: Arc<dyn Fn(&str) + Send + Sync>,
         host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<Vec<(Nanocodex, AgentEvents)>>> {
+    ) -> BackendFuture<Result<Vec<(Agent, AgentEvents)>>> {
         let pending = (0..count)
             .map(|_| self.spawn(parent.clone(), SpawnOptions::new(), host_context.clone()))
             .collect::<Vec<_>>();
         Box::pin(async move {
-            let mut children: Vec<(Nanocodex, AgentEvents)> = Vec::with_capacity(count);
+            let mut children: Vec<(Agent, AgentEvents)> = Vec::with_capacity(count);
             for child in pending {
                 match child.await {
                     Ok(child) => children.push(child),
@@ -247,7 +247,7 @@ pub trait AgentFactory: Send + Sync + 'static {
         &self,
         _parent: AgentHandle,
         _request: ForkRequest,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         unsupported("fork")
     }
 
@@ -256,7 +256,7 @@ pub trait AgentFactory: Send + Sync + 'static {
         _parent: AgentHandle,
         _checkpoint: SessionCheckpoint,
         _host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         unsupported("restore")
     }
 }
@@ -269,20 +269,20 @@ impl AgentFactory for CrossHarnessOnly {
         _parent: AgentHandle,
         _options: SpawnOptions,
         _host_context: Option<Arc<str>>,
-    ) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         unsupported("same_harness_spawn")
     }
 }
 
 fn unsupported<T: 'static>(capability: &'static str) -> BackendFuture<Result<T>> {
-    Box::pin(async move { Err(NanocodexError::UnsupportedCapability { capability }) })
+    Box::pin(async move { Err(NanocodeError::UnsupportedCapability { capability }) })
 }
 
 #[doc(hidden)]
 pub trait LifecycleBackend: Send + Sync + 'static {
     fn decode_durable_prompt(&self, input: serde_json::Value) -> Result<Prompt> {
         serde_json::from_value(input)
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))
     }
 
     fn harness_family(&self) -> crate::HarnessFamily;
@@ -365,9 +365,9 @@ pub trait LifecycleBackend: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
-    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Nanocodex, AgentEvents)>>;
+    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Agent, AgentEvents)>>;
 
-    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Nanocodex, AgentEvents)>>;
+    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Agent, AgentEvents)>>;
 
     fn flush(&self) -> BackendFuture<Result<()>>;
 
@@ -433,7 +433,7 @@ impl BackendRuntime {
     }
 
     #[must_use]
-    pub fn bind<B>(self, backend: B) -> Nanocodex
+    pub fn bind<B>(self, backend: B) -> Agent
     where
         B: LifecycleBackend,
     {
@@ -442,7 +442,7 @@ impl BackendRuntime {
             family: backend.harness_family(),
             lineage: self.lineage,
         };
-        Nanocodex {
+        Agent {
             backend: Arc::new(backend),
             events: self.events,
             next_turn: Arc::new(AtomicU64::new(1)),

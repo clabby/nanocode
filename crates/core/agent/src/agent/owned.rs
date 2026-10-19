@@ -9,20 +9,20 @@ pub trait AgentOwner: Send + Sync + 'static {
 
     fn finish(&self);
 
-    fn adopt(&self, key: usize, agent: Nanocodex) -> bool;
+    fn adopt(&self, key: usize, agent: Agent) -> bool;
 
     fn release(&self, key: usize);
 }
 
 #[doc(hidden)]
-pub async fn adopt(agent: Nanocodex, owner: &Arc<dyn AgentOwner>) -> Result<Nanocodex> {
+pub async fn adopt(agent: Agent, owner: &Arc<dyn AgentOwner>) -> Result<Agent> {
     let key = Arc::as_ptr(&agent.backend).cast::<()>() as usize;
     let backend: Arc<dyn LifecycleBackend> = Arc::new(Owned {
         inner: Arc::clone(&agent.backend),
         owner: Arc::downgrade(owner),
         key,
     });
-    let owned = Nanocodex {
+    let owned = Agent {
         backend,
         events: agent.events.clone(),
         next_turn: Arc::clone(&agent.next_turn),
@@ -36,7 +36,7 @@ pub async fn adopt(agent: Nanocodex, owner: &Arc<dyn AgentOwner>) -> Result<Nano
     }
 
     agent.backend.shutdown().await?;
-    Err(NanocodexError::AgentStopped)
+    Err(NanocodeError::AgentStopped)
 }
 
 struct Admitted(Arc<dyn AgentOwner>);
@@ -49,8 +49,8 @@ impl Drop for Admitted {
 
 async fn adopt_created(
     owner: std::sync::Weak<dyn AgentOwner>,
-    create: impl FnOnce() -> BackendFuture<Result<(Nanocodex, AgentEvents)>>,
-) -> Result<(Nanocodex, AgentEvents)> {
+    create: impl FnOnce() -> BackendFuture<Result<(Agent, AgentEvents)>>,
+) -> Result<(Agent, AgentEvents)> {
     let Some(owner) = owner.upgrade() else {
         return create().await;
     };
@@ -153,13 +153,13 @@ impl LifecycleBackend for Owned {
     fn discard_initial(&self) -> BackendFuture<Result<()>> {
         self.inner.discard_initial()
     }
-    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(adopt_created(self.owner.clone(), move || {
             inner.spawn(options)
         }))
     }
-    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Nanocodex, AgentEvents)>> {
+    fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Agent, AgentEvents)>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(adopt_created(self.owner.clone(), move || {
             inner.fork(request)

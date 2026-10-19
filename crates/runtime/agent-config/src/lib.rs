@@ -1,5 +1,5 @@
 pub use nanocode_agent_core::{
-    AgentEvents, ModelSelection, Nanocodex as Agent, SessionCheckpoint, SpawnOptions, Thinking,
+    Agent, AgentEvents, ModelSelection, SessionCheckpoint, SpawnOptions, Thinking,
 };
 use nanocode_agent_core::{AgentHandle, backend::AgentFactory};
 use std::sync::Arc;

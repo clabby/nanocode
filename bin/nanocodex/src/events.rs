@@ -1072,7 +1072,7 @@ fn steps(items: &Value, key: &str) -> String {
         .join("\n")
 }
 
-pub fn runner_routes(runtime: &nanocode::Nanocodex) -> Vec<RunnerRoute> {
+pub fn runner_routes(runtime: &nanocode::Nanocode) -> Vec<RunnerRoute> {
     runtime
         .list_runners()
         .into_iter()

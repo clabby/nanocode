@@ -94,7 +94,7 @@ impl TurnControl {
 
     pub async fn steer_with_id(&self, id: String, prompt: impl Into<Prompt>) -> Result<()> {
         if id.is_empty() {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "steer identity must not be empty".into(),
             ));
         }
@@ -112,12 +112,12 @@ impl TurnControl {
     }
 }
 
-fn steer_validation_error(error: PromptValidationError) -> NanocodexError {
+fn steer_validation_error(error: PromptValidationError) -> NanocodeError {
     let message = match error {
         PromptValidationError::EmptyInstruction => "steer instruction must not be empty".to_owned(),
         error => error.to_string(),
     };
-    NanocodexError::InvalidRequest(message)
+    NanocodeError::InvalidRequest(message)
 }
 
 #[derive(Clone)]
@@ -371,7 +371,7 @@ impl SpawnOptions {
             .as_ref()
             .is_some_and(|family| family.as_str().trim().is_empty())
         {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "backend identity must not be empty".into(),
             ));
         }
@@ -381,7 +381,7 @@ impl SpawnOptions {
         if let (Some(family), Some(model)) = (self.harness.clone(), self.harness_model.clone())
             && family != model.family()
         {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "model does not belong to selected harness".into(),
             ));
         }
@@ -404,7 +404,7 @@ impl SpawnOptions {
             }
         });
         if model.family() != family {
-            return Err(NanocodexError::InvalidRequest(
+            return Err(NanocodeError::InvalidRequest(
                 "model does not belong to selected harness".into(),
             ));
         }

@@ -45,7 +45,7 @@ fn gateway(
 
     Ok(match name {
         "openrouter" => (
-            ResponsesGateway::openrouter().app_title("Nanocodex SDK example"),
+            ResponsesGateway::openrouter().app_title("Nanocode SDK example"),
             OpenAiAuth::api_key(required("OPENROUTER_API_KEY")?),
         ),
         "vercel" => (
@@ -91,7 +91,7 @@ fn gateway(
 
 #[cfg(not(target_family = "wasm"))]
 async fn run() -> support::Result<()> {
-    use nanocode::{Model, Nanocodex, OpenAi, Thinking};
+    use nanocode::{Model, Nanocode, OpenAi, Thinking};
 
     let mut args = std::env::args().skip(1);
     let Some(name) = args.next().filter(|name| name != "--help" && name != "-h") else {
@@ -133,7 +133,7 @@ async fn run() -> support::Result<()> {
     } else {
         prompt.join(" ")
     };
-    let runtime = Nanocodex::builder()
+    let runtime = Nanocode::builder()
         .openai(openai)
         .tools(support::tools()?)
         .without_cua()

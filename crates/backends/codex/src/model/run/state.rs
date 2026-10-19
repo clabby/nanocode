@@ -15,7 +15,7 @@ impl ModelSessionState {
             return Ok(());
         };
         if requested != self.workspace {
-            return Err(NanocodexError::WorkspaceChanged {
+            return Err(NanocodeError::WorkspaceChanged {
                 current: self.workspace.clone(),
                 requested: requested.to_owned(),
             });
@@ -55,7 +55,7 @@ impl ConversationState {
             .iter()
             .find(|item| item.is_user_message())
             .cloned()
-            .ok_or(NanocodexError::MalformedResponse {
+            .ok_or(NanocodeError::MalformedResponse {
                 detail: "task input did not include initial context",
             })?;
         Ok(Self {
@@ -71,13 +71,13 @@ impl ConversationState {
         history: Vec<ResponseItem>,
     ) -> Result<Self> {
         if !canonical_context.is_user_message() {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "canonical context must be a user message".to_owned(),
             ));
         }
         assign_missing_response_item_id(&mut canonical_context);
         let managed = ManagedSessionState::resume(history)
-            .map_err(|error| NanocodexError::InvalidCheckpoint(error.to_string()))?;
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
         let mut state = Self {
             canonical_context: Arc::new(canonical_context),
             managed,
@@ -189,7 +189,7 @@ impl ConversationState {
     pub(super) fn commit(&mut self) -> Result<()> {
         self.managed
             .commit()
-            .map_err(|_| NanocodexError::MalformedResponse {
+            .map_err(|_| NanocodeError::MalformedResponse {
                 detail: "completed turn did not have a response ID",
             })
     }

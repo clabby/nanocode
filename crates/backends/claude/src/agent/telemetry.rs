@@ -1,4 +1,4 @@
-use super::{ClaudeError, ContentBlock, Lineage, NanocodexError, Result, StopReason, TurnResult};
+use super::{ClaudeError, ContentBlock, Lineage, NanocodeError, Result, StopReason, TurnResult};
 use crate::MessageResponse;
 use serde::Serialize;
 use tracing::{Span, field::Empty, info_span};
@@ -192,7 +192,7 @@ pub(super) fn record_model_response(
     }
 }
 
-pub(super) fn finish_model_call(span: &Span, duration_ns: u64, error: Option<&NanocodexError>) {
+pub(super) fn finish_model_call(span: &Span, duration_ns: u64, error: Option<&NanocodeError>) {
     span.record("duration_ns", duration_ns);
     finish(span, error, "model call failed");
 }
@@ -279,10 +279,10 @@ pub(super) fn fail_attempt(
     tracing::warn!(target: "nanocodex_claude", parent: span, error = %error, "Claude Messages attempt failed");
 }
 
-fn finish(span: &Span, error: Option<&NanocodexError>, message: &'static str) {
+fn finish(span: &Span, error: Option<&NanocodeError>, message: &'static str) {
     let status = match error {
         None => "completed",
-        Some(NanocodexError::TurnCancelled) => "cancelled",
+        Some(NanocodeError::TurnCancelled) => "cancelled",
         Some(_) => "failed",
     };
     span.record("status", status);
@@ -291,7 +291,7 @@ fn finish(span: &Span, error: Option<&NanocodexError>, message: &'static str) {
         if error.is_none() { "OK" } else { "ERROR" },
     );
     if let Some(error) = error
-        && !matches!(error, NanocodexError::TurnCancelled)
+        && !matches!(error, NanocodeError::TurnCancelled)
     {
         tracing::error!(target: "nanocode", parent: span, error = %error, "{message}");
     }

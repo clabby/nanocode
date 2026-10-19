@@ -51,7 +51,7 @@ pub(super) async fn connect(cell: Cell) -> Result<Option<Computer>> {
     });
     tokio::select! {
         tools = connected => Ok(tools.clone()),
-        _ = closed.wait_for(|closed| *closed) => Err(nanocode_agent_core::NanocodexError::AgentStopped),
+        _ = closed.wait_for(|closed| *closed) => Err(nanocode_agent_core::NanocodeError::AgentStopped),
     }
 }
 

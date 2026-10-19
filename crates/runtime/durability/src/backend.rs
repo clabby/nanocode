@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use nanocode_agent_core::{
-    AgentEvents, BackendRegistration, BackendRequest, ExecutionPolicyDisposition, Nanocodex,
-    NanocodexError, Result as AgentResult, SessionInfo, backend::BackendFuture,
+    Agent, AgentEvents, BackendRegistration, BackendRequest, ExecutionPolicyDisposition,
+    NanocodeError, Result as AgentResult, SessionInfo, backend::BackendFuture,
 };
 
 use crate::{CheckpointFormat, DurableSession, Error, SessionRecord, SharedStore, StoreError};
@@ -20,9 +20,9 @@ pub trait DurableBackendRegistration: BackendRegistration {
         &self,
         _request: BackendRequest,
         _state: DurableSession,
-    ) -> BackendFuture<AgentResult<(Nanocodex, AgentEvents)>> {
+    ) -> BackendFuture<AgentResult<(Agent, AgentEvents)>> {
         Box::pin(async {
-            Err(NanocodexError::UnsupportedCapability {
+            Err(NanocodeError::UnsupportedCapability {
                 capability: "durability",
             })
         })
@@ -38,7 +38,7 @@ pub struct Branches {
 impl Branches {
     pub fn child_record(&self, child: &SessionInfo) -> AgentResult<SessionRecord> {
         let parent = self.record.as_ref().ok_or_else(|| {
-            NanocodexError::InvalidExecutionPolicy(
+            NanocodeError::InvalidExecutionPolicy(
                 "a durable session without a recorded model cannot persist forks; open it through SessionStore"
                     .to_owned(),
             )
@@ -50,12 +50,12 @@ impl Branches {
 }
 
 #[must_use]
-pub fn agent_error(error: Error) -> NanocodexError {
+pub fn agent_error(error: Error) -> NanocodeError {
     if matches!(
         error,
         Error::SteerConflict { .. } | Error::SteerWithdrawn { .. }
     ) {
-        return NanocodexError::InvalidRequest(error.to_string());
+        return NanocodeError::InvalidRequest(error.to_string());
     }
     let disposition = match &error {
         Error::Store(StoreError::NotCommitted(_))
@@ -66,5 +66,5 @@ pub fn agent_error(error: Error) -> NanocodexError {
         | Error::DriverStopped => ExecutionPolicyDisposition::Reopen,
         _ => ExecutionPolicyDisposition::Fatal,
     };
-    NanocodexError::execution_policy_with_disposition("durability", disposition, error)
+    NanocodeError::execution_policy_with_disposition("durability", disposition, error)
 }

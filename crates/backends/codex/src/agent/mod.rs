@@ -28,7 +28,7 @@ use crate::prompt_cache::{ModelPromptCache, SharedPromptCache};
 
 use crate::session::SessionSnapshot;
 use crate::{
-    NanocodexError, Result,
+    NanocodeError, Result,
     session::{
         Capabilities, ForkRequest, Lineage, Persistence, SessionCheckpoint, SessionInfo,
         TurnBoundary,
@@ -114,7 +114,7 @@ impl ToolsConfiguration {
     fn materialize(&self, agent_handle: AgentHandle) -> Result<Tools> {
         let tools = match self {
             Self::Shared(tools) => Ok(tools.clone()),
-            Self::PerAgent(factory) => factory(agent_handle).map_err(NanocodexError::from),
+            Self::PerAgent(factory) => factory(agent_handle).map_err(NanocodeError::from),
         }?;
         crate::builtin_tools::validate_tool_selection(tools).map_err(Into::into)
     }
@@ -140,14 +140,14 @@ mod turn;
 
 pub use backend::BuilderBackend;
 
-pub use builder::NanocodexBuilder;
+pub use builder::CodexBuilder;
 
 pub use context_source::ExecutionEnvironment;
 pub use nanocode_agent_core::AgentHandle;
 pub use nanocode_agent_core::AgentSessionContext;
 #[doc(hidden)]
 pub use nanocode_agent_core::backend::{AgentOwner, adopt};
-pub use nanocode_agent_core::{Nanocodex, WeakAgent};
+pub use nanocode_agent_core::{Agent, WeakAgent};
 pub use nanocode_agent_core::{
     PromptRequest, PromptRoute, SpawnOptions, Turn, TurnControl, TurnResult,
 };

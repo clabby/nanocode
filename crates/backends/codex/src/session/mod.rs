@@ -17,7 +17,7 @@ pub use crate::client::session::SessionId;
 
 use crate::model::run::ModelCheckpoint;
 
-use crate::{NanocodexError, Result};
+use crate::{NanocodeError, Result};
 
 const SESSION_SNAPSHOT_VERSION: u32 = 1;
 
@@ -369,32 +369,32 @@ impl SessionSnapshot {
 
     pub(crate) fn model(&self) -> Result<Model> {
         self.model.parse::<Model>().map_err(|error| {
-            NanocodexError::InvalidCheckpoint(format!("snapshot model is unsupported: {error}"))
+            NanocodeError::InvalidCheckpoint(format!("snapshot model is unsupported: {error}"))
         })
     }
 
     pub(crate) fn into_resume(self) -> Result<SessionResume> {
         if self.version != SESSION_SNAPSHOT_VERSION {
-            return Err(NanocodexError::InvalidCheckpoint(format!(
+            return Err(NanocodeError::InvalidCheckpoint(format!(
                 "unsupported format version {}; expected {SESSION_SNAPSHOT_VERSION}",
                 self.version
             )));
         }
         let model = self.model.parse::<Model>().map_err(|error| {
-            NanocodexError::InvalidCheckpoint(format!("snapshot model is unsupported: {error}"))
+            NanocodeError::InvalidCheckpoint(format!("snapshot model is unsupported: {error}"))
         })?;
         if self.lineage_id.trim().is_empty() {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "cache lineage must not be empty".to_owned(),
             ));
         }
         if self.prompt_cache_key.trim().is_empty() {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "prompt cache key must not be empty".to_owned(),
             ));
         }
         if self.workspace.trim().is_empty() {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "workspace must not be empty".to_owned(),
             ));
         }
@@ -413,7 +413,7 @@ impl SessionSnapshot {
                 ]
             )
         {
-            return Err(NanocodexError::InvalidCheckpoint(
+            return Err(NanocodeError::InvalidCheckpoint(
                 "request prefix does not match the supported model contract".to_owned(),
             ));
         }
@@ -438,7 +438,7 @@ impl SessionSnapshot {
                 if let Some(usage) = self.context_usage.as_ref() {
                     checkpoint.restore_context_usage(usage);
                 }
-                Ok::<_, NanocodexError>(checkpoint)
+                Ok::<_, NanocodeError>(checkpoint)
             })
             .transpose()?;
         Ok(SessionResume {
