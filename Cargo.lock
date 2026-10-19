@@ -1779,6 +1779,7 @@ version = "0.6.7"
 dependencies = [
  "arc-swap",
  "base64",
+ "flate2",
  "futures-util",
  "getrandom 0.4.3",
  "http",
@@ -1797,6 +1798,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tower",
  "tracing",

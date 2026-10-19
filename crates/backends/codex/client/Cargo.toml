@@ -41,8 +41,10 @@ getrandom.workspace = true
 nanocode-tls.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time", "rt"] }
+tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
+flate2.workspace = true
 zstd.workspace = true
 
 [lints]

@@ -8,13 +8,17 @@ use tokio::{
     net::TcpStream,
     time::{Instant, sleep_until},
 };
+use tokio_rustls::{TlsConnector, rustls::pki_types::ServerName};
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
+    MaybeTlsStream, WebSocketStream, client_async_with_config,
     tungstenite::{
         Error, Result,
+        error::TlsError,
         handshake::client::{Request, Response},
     },
 };
+
+use super::deflate::InflateStream;
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 const MAX_CONNECT_RESPONSE_SIZE: usize = 8_192;
@@ -22,22 +26,33 @@ const MAX_CONNECT_RESPONSE_SIZE: usize = 8_192;
 pub async fn connect_async(
     request: Request,
 ) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response)> {
-    let host = request
-        .uri()
+    let stream = connect_stream(request.uri()).await?;
+    client_async_with_config(request, stream, None).await
+}
+
+pub(crate) async fn connect_deflate(
+    request: Request,
+) -> Result<(
+    WebSocketStream<InflateStream<MaybeTlsStream<TcpStream>>>,
+    Response,
+)> {
+    let stream = connect_stream(request.uri()).await?;
+    client_async_with_config(request, InflateStream::new(stream), None).await
+}
+
+async fn connect_stream(uri: &Uri) -> Result<MaybeTlsStream<TcpStream>> {
+    let host = uri
         .host()
         .ok_or_else(|| invalid_input("WebSocket URL has no host"))?
         .to_owned();
-    let secure = match request.uri().scheme_str() {
+    let secure = match uri.scheme_str() {
         Some("wss") => true,
         Some("ws") => false,
         _ => return Err(invalid_input("unsupported WebSocket URL scheme")),
     };
-    let port = request
-        .uri()
-        .port_u16()
-        .unwrap_or(if secure { 443 } else { 80 });
+    let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
 
-    let proxy = ProxyConfig::from_env(request.uri(), secure)?;
+    let proxy = ProxyConfig::from_env(uri, secure)?;
     let socket = async {
         if let Some(proxy) = proxy {
             let socket = connect_happy_eyeballs(proxy.authority()).await?;
@@ -46,17 +61,24 @@ pub async fn connect_async(
             connect_happy_eyeballs(format!("{host}:{port}")).await
         }
     };
-    let connector = async {
+    let config = async {
         if secure {
-            Ok(Connector::Rustls(
-                nanocode_tls::native_client_config().await?,
-            ))
+            Ok(Some(nanocode_tls::native_client_config().await?))
         } else {
-            Ok::<_, Error>(Connector::Plain)
+            Ok::<_, Error>(None)
         }
     };
-    let (socket, connector) = tokio::try_join!(socket, connector)?;
-    client_async_tls_with_config(request, socket, None, Some(connector)).await
+    let (socket, config) = tokio::try_join!(socket, config)?;
+    let Some(config) = config else {
+        return Ok(MaybeTlsStream::Plain(socket));
+    };
+    let domain = ServerName::try_from(normalize_host(&host).to_owned())
+        .map_err(|_| Error::Tls(TlsError::InvalidDnsName))?;
+    let stream = TlsConnector::from(config)
+        .connect(domain, socket)
+        .await
+        .map_err(Error::Io)?;
+    Ok(MaybeTlsStream::Rustls(stream))
 }
 
 #[derive(Clone, Copy)]

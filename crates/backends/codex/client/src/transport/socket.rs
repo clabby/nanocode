@@ -17,12 +17,20 @@ use tokio_tungstenite::{
         client::IntoClientRequest,
         error::ProtocolError,
         http::{HeaderValue, header},
+        protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        },
     },
 };
 
 use crate::client::{
-    EncodedRequest, OpenAiAuthSnapshot, ResponsesError, connector::connect_async,
-    transport::SendOutcome,
+    EncodedRequest, OpenAiAuthSnapshot, ResponsesError,
+    connector::connect_deflate,
+    transport::{
+        SendOutcome,
+        deflate::{self, InflateStream},
+    },
 };
 use crate::client::{monotonic_now_ns, transport::wire::turn_state_from_event};
 
@@ -35,7 +43,7 @@ const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocketStream<InflateStream<MaybeTlsStream<TcpStream>>>;
 
 pub(crate) struct ConnectionMetadata {
     pub status: u16,
@@ -48,6 +56,7 @@ pub(crate) struct ConnectionMetadata {
 pub(crate) struct ResponsesSocket {
     pump: SocketPump,
     turn_state: Option<String>,
+    deflate: bool,
 }
 
 pub(crate) struct ReceivedText {
@@ -163,7 +172,11 @@ impl ResponsesSocket {
             header::USER_AGENT,
             HeaderValue::from_static(concat!("nanocode/", env!("CARGO_PKG_VERSION"))),
         );
-        let (socket, response) = timeout(CONNECT_TIMEOUT, connect_async(request))
+        request.headers_mut().insert(
+            header::SEC_WEBSOCKET_EXTENSIONS,
+            HeaderValue::from_static(deflate::OFFER),
+        );
+        let (socket, response) = timeout(CONNECT_TIMEOUT, connect_deflate(request))
             .await
             .map_err(|_| ResponsesError::HandshakeTimeout {
                 seconds: CONNECT_TIMEOUT.as_secs(),
@@ -181,6 +194,7 @@ impl ResponsesSocket {
             Self {
                 pump: SocketPump::new(socket),
                 turn_state,
+                deflate: deflate::negotiated(response.headers()),
             },
             metadata,
         ))
@@ -190,7 +204,19 @@ impl ResponsesSocket {
         &self,
         request: EncodedRequest,
     ) -> Result<SendOutcome, ResponsesError> {
-        let message = Message::Text(request.into_string().into());
+        let text = request.into_string();
+        let message = if self.deflate {
+            let payload = tokio::task::spawn_blocking(move || deflate::deflate(text.as_bytes()))
+                .await
+                .map_err(|error| deflate_error(&error))?
+                .map_err(|error| deflate_error(&error))?;
+            tracing::Span::current().record("request.deflate_bytes", payload.len());
+            let mut frame = Frame::message(payload, OpCode::Data(Data::Text), true);
+            frame.header_mut().rsv1 = true;
+            Message::Frame(frame)
+        } else {
+            Message::Text(text.into())
+        };
         timeout(SEND_TIMEOUT, self.pump.send(message))
             .await
             .map_err(|_| ResponsesError::SendTimeout {
@@ -467,6 +493,13 @@ fn handshake_rejection_detail(
         "empty response body".to_owned()
     } else {
         format!("empty response body ({})", diagnostics.join(", "))
+    }
+}
+
+fn deflate_error(error: &dyn std::error::Error) -> ResponsesError {
+    ResponsesError::Send {
+        reconnectable: false,
+        detail: format!("deflate request: {error}"),
     }
 }
 

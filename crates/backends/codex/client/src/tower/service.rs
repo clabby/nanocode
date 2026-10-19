@@ -958,6 +958,7 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 request.queue.duration_ns = tracing::field::Empty,
                 request.bytes = tracing::field::Empty,
                 request.zstd_bytes = tracing::field::Empty,
+                request.deflate_bytes = tracing::field::Empty,
                 request.encode.duration_ns = tracing::field::Empty,
                 request.send.duration_ns = tracing::field::Empty,
                 response.event.count = tracing::field::Empty,

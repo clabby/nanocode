@@ -7,6 +7,8 @@ pub(crate) mod connector;
 pub use connector::connect_async;
 #[cfg(not(target_family = "wasm"))]
 mod crypto;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod deflate;
 pub(crate) mod error;
 pub(crate) mod gateway;
 
