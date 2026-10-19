@@ -57,7 +57,6 @@ impl ModelRun {
                 service_tier,
             )
             .with_model_call_started_at(started_at);
-        let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = model_call_span(
             &self.provider_session_id,
             call_index,
@@ -65,12 +64,9 @@ impl ModelRun {
             reasoning_mode.as_str(),
             thinking.as_str(),
             previous_response_id.is_some(),
-            input_item_count,
-            input_bytes,
+            request.input_item_count(),
         );
-        if let Some(input_content) = &input_content {
-            record_span_content(&span, "model.input", input_content);
-        }
+        let request = request.with_input_trace(trace_content_enabled().then(|| span.clone()));
         let execution_steps = self.execution_steps.clone();
         let recovered = if let Some(steps) = &execution_steps {
             match steps
@@ -238,17 +234,6 @@ pub(super) fn qualified_tool_name(call: &CodeCall) -> String {
     }
 }
 
-pub(super) fn trace_model_input(request: &ResponsesAttempt) -> (usize, usize, Option<String>) {
-    let item_count = request.input_item_count();
-    if !trace_content_enabled() {
-        return (item_count, 0, None);
-    }
-    let items = request.input_items().collect::<Vec<_>>();
-    let content = serde_json::to_string(&items).ok();
-    let bytes = content.as_ref().map_or(0, String::len);
-    (item_count, bytes, content)
-}
-
 pub(super) fn trace_content_enabled() -> bool {
     tracing::enabled!(target: "nanocode", tracing::Level::INFO)
 }
@@ -372,7 +357,6 @@ pub(super) fn model_call_span(
     reasoning_effort: &str,
     previous_response: bool,
     input_item_count: usize,
-    input_bytes: usize,
 ) -> tracing::Span {
     info_span!(
         target: "nanocode",
@@ -386,7 +370,7 @@ pub(super) fn model_call_span(
         model.call_index = call_index,
         previous_response,
         model.input.item_count = input_item_count,
-        model.input.bytes = input_bytes,
+        model.input.bytes = tracing::field::Empty,
         model.response.id = tracing::field::Empty,
         model.response.status = tracing::field::Empty,
         model.response.end_turn = tracing::field::Empty,
@@ -439,7 +423,6 @@ pub(super) fn warmup_span(config: &ModelConfig, model: Model) -> tracing::Span {
 pub(super) fn compaction_span(
     after_model_call_index: u32,
     input_item_count: usize,
-    input_bytes: usize,
 ) -> tracing::Span {
     info_span!(
         target: "nanocode",
@@ -448,7 +431,7 @@ pub(super) fn compaction_span(
         otel.status_code = tracing::field::Empty,
         after_model_call_index,
         model.input.item_count = input_item_count,
-        model.input.bytes = input_bytes,
+        model.input.bytes = tracing::field::Empty,
         model.response.id = tracing::field::Empty,
         status = tracing::field::Empty,
         duration_ns = tracing::field::Empty,

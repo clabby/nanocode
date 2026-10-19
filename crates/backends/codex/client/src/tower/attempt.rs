@@ -1,8 +1,9 @@
 use std::{
+    borrow::Cow,
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -170,6 +171,14 @@ pub struct ResponsesAttempt {
     pub(crate) logical_turn: u64,
     session_transport: Arc<SessionTransport>,
     pub(crate) model_call_started_at: Option<Instant>,
+    input_trace: Option<InputTrace>,
+}
+
+#[derive(Clone)]
+struct InputTrace {
+    span: tracing::Span,
+    full_replay: bool,
+    traced: Arc<AtomicBool>,
 }
 
 impl ResponsesAttempt {
@@ -200,6 +209,7 @@ impl ResponsesAttempt {
             logical_turn: 0,
             session_transport,
             model_call_started_at: None,
+            input_trace: None,
         }
     }
 
@@ -236,6 +246,7 @@ impl ResponsesAttempt {
             logical_turn: 0,
             session_transport,
             model_call_started_at: None,
+            input_trace: None,
         }
     }
 
@@ -273,6 +284,7 @@ impl ResponsesAttempt {
             logical_turn: 0,
             session_transport,
             model_call_started_at: None,
+            input_trace: None,
         }
     }
 
@@ -280,6 +292,50 @@ impl ResponsesAttempt {
     pub const fn with_model_call_started_at(mut self, started_at: Instant) -> Self {
         self.model_call_started_at = Some(started_at);
         self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_input_trace(mut self, span: Option<tracing::Span>) -> Self {
+        self.input_trace = span.map(|span| InputTrace {
+            span,
+            full_replay: self.full_replay,
+            traced: Arc::default(),
+        });
+        self
+    }
+
+    pub(crate) fn trace_encoded_input(&self, request: &str) {
+        let Some(trace) = &self.input_trace else {
+            return;
+        };
+        if trace.traced.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let input = if trace.full_replay == self.full_replay {
+            encoded_input(request).map(Cow::Borrowed)
+        } else {
+            serde_json::to_string(&ResponsesInput::history_suffix(
+                &[],
+                &self.incremental_history,
+                self.incremental_start,
+                self.tail.as_ref(),
+            ))
+            .ok()
+            .map(Cow::Owned)
+        };
+        let Some(input) = input else {
+            return;
+        };
+        trace.span.record("model.input.bytes", input.len());
+        trace.span.in_scope(|| {
+            tracing::info!(
+                target: "nanocode",
+                content_kind = "model.input",
+                content = &*input,
+                "trace content"
+            );
+        });
     }
 
     pub(crate) fn input(&self) -> ResponsesInput<'_> {
@@ -402,6 +458,15 @@ impl ResponsesAttempt {
     pub(crate) const fn force_full_replay(&mut self) {
         self.full_replay = true;
     }
+}
+
+fn encoded_input(request: &str) -> Option<&str> {
+    const INPUT_KEY: &str = "\"input\":";
+    let start = request.find(INPUT_KEY)? + INPUT_KEY.len();
+    let mut deserializer = serde_json::Deserializer::from_str(&request[start..]);
+    <&serde_json::value::RawValue as serde::Deserialize>::deserialize(&mut deserializer)
+        .ok()
+        .map(serde_json::value::RawValue::get)
 }
 
 pub enum ResponsesOutput {

@@ -443,11 +443,8 @@ impl ModelRun {
             request_effort,
             service_tier,
         );
-        let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
-        let span = compaction_span(after_model_call_index, input_item_count, input_bytes);
-        if let Some(input_content) = &input_content {
-            record_span_content(&span, "model.input", input_content);
-        }
+        let span = compaction_span(after_model_call_index, request.input_item_count());
+        let request = request.with_input_trace(trace_content_enabled().then(|| span.clone()));
         let mut lifecycle = CompactionLifecycle {
             events: &self.events,
             stats: &mut self.stats,

@@ -47,6 +47,7 @@ pub(crate) async fn run(
         api.request = %encoded.raw().get(),
         "OpenAI Responses API request"
     );
+    request.trace_encoded_input(encoded.raw().get());
     request.observer.emit(
         AgentEventKind::ApiEvent,
         ApiEvent {

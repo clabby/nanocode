@@ -34,7 +34,7 @@ use crate::client::{
         Usage,
     },
     tower::{
-        CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt, ResponsesOutput,
+        CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesOutput,
     },
     transport::{ResponsesError, ResponsesTransport, TransportStats, TransportStatsSnapshot},
 };
