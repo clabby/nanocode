@@ -46,6 +46,13 @@ use crate::{
 pub(crate) mod reload;
 
 pub const DISPLAY_FRAME: Duration = Duration::from_micros(16_667);
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Redraw {
+    None,
+    Streaming,
+    Immediate,
+}
 pub const SPINNER_FRAME: Duration = Duration::from_millis(80);
 pub const QUIT_CONFIRMATION: Duration = Duration::from_secs(2);
 pub const AUTOSCROLL_STEP: Duration = Duration::from_millis(50);
@@ -456,7 +463,9 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
                         update @ (crate::side::SideUpdate::Event(_)
                         | crate::side::SideUpdate::Forked(_)
                         | crate::side::SideUpdate::Restored { .. }),
-                } => app.side_update(pane, update),
+                } => {
+                    app.side_update(pane, update);
+                }
                 _ => {}
             }
         }
@@ -744,15 +753,20 @@ impl App {
                 }
                 event = rx.recv() => {
                     let Some(event) = event else { break };
-                    let immediate = self.handle_app(event);
+                    let mut redraw = self.handle_app(event);
                     while !self.quit && let Ok(event) = rx.try_recv() {
-                        self.handle_app(event);
+                        redraw = redraw.max(self.handle_app(event));
                     }
-                    metrics.stream();
-                    if immediate {
-                        scheduler.request_immediate(Instant::now());
-                    } else {
-                        scheduler.request_streaming(Instant::now());
+                    match redraw {
+                        Redraw::Immediate => {
+                            metrics.stream();
+                            scheduler.request_immediate(Instant::now());
+                        }
+                        Redraw::Streaming => {
+                            metrics.stream();
+                            scheduler.request_streaming(Instant::now());
+                        }
+                        Redraw::None => {}
                     }
                 }
                 () = async {
@@ -848,25 +862,26 @@ impl App {
         )
     }
 
-    fn handle_app(&mut self, event: AppEvent) -> bool {
+    fn handle_app(&mut self, event: AppEvent) -> Redraw {
         let _span = tracing::info_span!(target: "nanocode", "nc.app_event", event.kind = event.kind(), session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         match event {
             AppEvent::Reload => {
                 self.request_reload(false);
-                true
+                Redraw::Immediate
             }
             AppEvent::Agent { generation, event } => {
                 if generation == self.generation {
-                    self.agent_event(&event);
+                    self.agent_event(&event)
+                } else {
+                    Redraw::None
                 }
-                false
             }
             AppEvent::TurnStarted {
                 generation,
                 control,
             } => {
                 if generation != self.generation {
-                    return false;
+                    return Redraw::None;
                 }
                 let since = match self.turn {
                     TurnState::Starting(since) => since,
@@ -874,11 +889,11 @@ impl App {
                 };
                 self.turn = TurnState::Running { control, since };
                 self.flush_pending_steers();
-                true
+                Redraw::Immediate
             }
             AppEvent::Files(files) => {
                 self.files_loaded(files);
-                true
+                Redraw::Immediate
             }
             AppEvent::ShellDone {
                 index,
@@ -886,14 +901,14 @@ impl App {
                 duration,
             } => {
                 self.shell_done(index, result, duration);
-                true
+                Redraw::Immediate
             }
             AppEvent::ImagePasted(result) => {
                 match result {
                     Ok(path) => self.attach(path),
                     Err(error) => self.flash(format!("image paste failed: {error}")),
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::RoutedTurn {
                 generation,
@@ -901,7 +916,7 @@ impl App {
                 control,
             } => {
                 if generation != self.generation {
-                    return false;
+                    return Redraw::None;
                 }
                 self.queue.convert(&id, QueueKind::FollowUp);
                 self.queue.set_state(&id, QueueState::Sent);
@@ -912,11 +927,11 @@ impl App {
                     since: Instant::now(),
                 };
                 self.flush_pending_steers();
-                true
+                Redraw::Immediate
             }
             AppEvent::TurnFinished { generation, result } => {
                 if generation != self.generation {
-                    return false;
+                    return Redraw::None;
                 }
                 self.turn = TurnState::Idle;
                 if std::mem::take(&mut self.resuming) && result.is_err() && !self.interrupting {
@@ -937,7 +952,7 @@ impl App {
                     _ if self.mapper.reported() => self.settle_turn(),
                     _ => self.awaiting_terminal = true,
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::PromptFailed {
                 generation,
@@ -945,14 +960,14 @@ impl App {
                 text,
             } => {
                 if generation != self.generation {
-                    return false;
+                    return Redraw::None;
                 }
                 self.turn = TurnState::Idle;
                 self.resuming = false;
                 let steers = self.queue.drain_kind(QueueKind::Steer);
                 self.remove_sent_prompt();
                 self.restore_prompt(&error, text, steers);
-                true
+                Redraw::Immediate
             }
             AppEvent::PromptBlocked {
                 generation,
@@ -962,7 +977,7 @@ impl App {
                 blocked,
             } => {
                 if generation != self.generation {
-                    return false;
+                    return Redraw::None;
                 }
                 self.turn = TurnState::Idle;
                 self.resuming = false;
@@ -972,16 +987,16 @@ impl App {
                 } else {
                     self.recover(error, durable, blocked);
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::OwnerMoved { generation } => {
                 if generation != self.generation || self.moved {
-                    return false;
+                    return Redraw::None;
                 }
                 self.moved = true;
                 self.hold_queue = true;
                 self.notice(NoticeLevel::Warning, OWNER_MOVED);
-                true
+                Redraw::Immediate
             }
             AppEvent::Recovered {
                 generation,
@@ -991,7 +1006,7 @@ impl App {
                 blocked,
             } => {
                 if generation != self.generation {
-                    return false;
+                    return Redraw::None;
                 }
                 match result {
                     Ok(pending) if pending.first().is_some_and(|turn| turn.id != blocked.id) => {
@@ -1012,7 +1027,7 @@ impl App {
                         self.restore_prompt(&error, (!durable).then_some(blocked.text), Vec::new());
                     }
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::SteerSent { id, result } => {
                 match result {
@@ -1030,11 +1045,11 @@ impl App {
                         }
                     }
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::AgentReady(ready) => {
                 self.ready(*ready);
-                true
+                Redraw::Immediate
             }
             AppEvent::AgentFailed(error) => {
                 self.starting = false;
@@ -1042,7 +1057,7 @@ impl App {
                     NoticeLevel::Error,
                     format!("failed to start agent: {error}"),
                 );
-                true
+                Redraw::Immediate
             }
             AppEvent::Sessions(result) => {
                 match result {
@@ -1067,20 +1082,14 @@ impl App {
                         }
                     }
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::Btw { id, update } => {
                 self.btw_update(id, update);
-                false
+                Redraw::Streaming
             }
-            AppEvent::Side { pane, update } => {
-                self.side_update(pane, update);
-                false
-            }
-            AppEvent::Subagent(update) => {
-                self.subagent(update);
-                false
-            }
+            AppEvent::Side { pane, update } => self.side_update(pane, update),
+            AppEvent::Subagent(update) => self.subagent(update),
             AppEvent::RunnerListening(result) => {
                 match result {
                     Ok(server) => {
@@ -1088,27 +1097,27 @@ impl App {
                     }
                     Err(error) => self.notice(NoticeLevel::Error, error),
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::Notice(level, text) => {
                 self.notice(level, text);
-                true
+                Redraw::Immediate
             }
             AppEvent::FocusReady(ready) => {
                 self.focus_ready(*ready);
-                true
+                Redraw::Immediate
             }
             AppEvent::AgentStopped { root, id, result } => {
                 if self.session_id().as_deref() == Some(root.as_str()) {
                     self.agent_stopped(id, result);
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::AgentDirectory { root, result } => {
                 if self.session_id().as_deref() == Some(root.as_str()) {
                     self.agent_directory(result);
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::AgentsListed { root, result } => {
                 if self.session_id().as_deref() == Some(root.as_str()) {
@@ -1119,7 +1128,7 @@ impl App {
                         }
                     }
                 }
-                true
+                Redraw::Immediate
             }
             AppEvent::Applied(result) => {
                 self.starting = false;
@@ -1135,7 +1144,7 @@ impl App {
                     }
                 }
                 self.after_turn();
-                true
+                Redraw::Immediate
             }
         }
     }
@@ -1327,7 +1336,7 @@ impl App {
         self.composer.set_text(restored.join("\n\n"));
     }
 
-    fn agent_event(&mut self, event: &AgentEvent) {
+    fn agent_event(&mut self, event: &AgentEvent) -> Redraw {
         let session_id = self.agent.as_ref().map(Agent::session_id);
         self.spans.event(event, session_id);
         if event.kind == AgentEventKind::ToolCall {
@@ -1335,6 +1344,16 @@ impl App {
                 .set_runners(crate::events::runner_routes(&self.host.runtime));
         }
         let mapped = self.mapper.apply(&mut self.transcript, event);
+        let shown = self.focus.and_then(|id| self.views.get(&id)).is_none();
+        let redraw = if mapped.changed && shown
+            || mapped.accepted.is_some()
+            || event.kind == AgentEventKind::RunStarted
+            || event.kind.is_terminal()
+        {
+            Redraw::Streaming
+        } else {
+            Redraw::None
+        };
         if event.kind == AgentEventKind::RunStarted
             && matches!(self.turn, TurnState::Idle)
             && !self.starting
@@ -1396,6 +1415,7 @@ impl App {
             }
             None => {}
         }
+        redraw
     }
 
     fn settle_turn(&mut self) {

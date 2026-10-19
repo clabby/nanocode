@@ -58,17 +58,21 @@ impl App {
         });
     }
 
-    pub(crate) fn subagent_event(&mut self, id: AgentId, event: &AgentEvent) {
+    pub(crate) fn subagent_event(
+        &mut self,
+        id: AgentId,
+        event: &AgentEvent,
+        payload: Option<&serde_json::Value>,
+    ) -> bool {
         let Some(view) = self.views.get_mut(&id) else {
-            return;
+            return false;
         };
         if event.kind == AgentEventKind::RunStarted
-            && let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload.get())
-            && let Some(model) = payload["model"].as_str()
+            && let Some(model) = payload.and_then(|payload| payload["model"].as_str())
         {
             view.model = Some(model.to_owned());
         }
-        drop(view.mapper.apply(&mut view.transcript, event));
+        view.mapper.apply(&mut view.transcript, event).changed
     }
 
     pub(crate) fn visible_transcript(&mut self) -> &mut Transcript {

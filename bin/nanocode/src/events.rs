@@ -1,6 +1,6 @@
-use std::{collections::HashMap, time::Duration};
+use std::{borrow::Cow, collections::HashMap, time::Duration};
 
-use nanocode::agent::events::{AgentEvent, AgentEventKind};
+use nanocode::agent::events::{AgentEvent, AgentEventKind, TextDeltaRef};
 use nanocode_tui::{
     format::{humanize_tool, shorten_home},
     transcript::{CellKind, NoticeLevel, ToolBody, ToolCell, ToolStatus, Transcript},
@@ -84,6 +84,17 @@ fn completion_agent(text: &str) -> Option<&str> {
         .map(|(agent, _)| agent)
 }
 
+pub fn text_payload(event: &AgentEvent) -> Option<TextDeltaRef<'_>> {
+    matches!(
+        event.kind,
+        AgentEventKind::AssistantDelta
+            | AgentEventKind::AssistantMessage
+            | AgentEventKind::ReasoningSummaryDelta
+    )
+    .then(|| serde_json::from_str(event.payload.get()).ok())
+    .flatten()
+}
+
 pub enum Accepted {
     Prompt { request_id: Option<String> },
     Steer { id: Option<String>, text: String },
@@ -91,6 +102,7 @@ pub enum Accepted {
 
 pub struct Mapped {
     pub accepted: Option<Accepted>,
+    pub changed: bool,
 }
 
 impl EventMapper {
@@ -192,15 +204,38 @@ impl EventMapper {
 
     pub fn apply(&mut self, transcript: &mut Transcript, event: &AgentEvent) -> Mapped {
         let _span = tracing::info_span!(target: "nanocode", "nc.transcript.apply", event.kind = ?event.kind, event.bytes = event.payload.get().len(), cells = transcript.len()).entered();
-        let mut mapped = Mapped { accepted: None };
+        let mut mapped = Mapped {
+            accepted: None,
+            changed: false,
+        };
+        if let Some(delta) = text_payload(event) {
+            mapped.changed = match event.kind {
+                AgentEventKind::ReasoningSummaryDelta => {
+                    self.reasoning(transcript, delta.model_call_index.into(), &delta.text)
+                }
+                kind => {
+                    let key = delta
+                        .item_id
+                        .unwrap_or_else(|| Cow::Owned(format!("call-{}", delta.model_call_index)));
+                    self.assistant(
+                        transcript,
+                        &key,
+                        kind == AgentEventKind::AssistantMessage,
+                        &delta.text,
+                    )
+                }
+            };
+            return mapped;
+        }
         let Ok(payload) = serde_json::from_str::<Value>(event.payload.get()) else {
             transcript.push(CellKind::Notice(
                 NoticeLevel::Error,
                 format!("undecodable {:?} event", event.kind),
             ));
+            mapped.changed = true;
             return mapped;
         };
-        match event.kind {
+        mapped.changed = match event.kind {
             AgentEventKind::InputAccepted => {
                 let text = prompt_text(&payload["input"]);
                 let text = if self.subagent {
@@ -238,12 +273,14 @@ impl EventMapper {
                         request_id: payload["request_id"].as_str().map(str::to_owned),
                     },
                 });
+                true
             }
             AgentEventKind::RunStarted => {
                 self.reset();
                 self.usage = Usage::default();
                 self.reported = false;
                 self.turn_start = transcript.len();
+                false
             }
             AgentEventKind::ModelCallCompleted => {
                 let usage = &payload["usage"];
@@ -252,62 +289,44 @@ impl EventMapper {
                 self.usage.cached += usage["input_tokens_details"]["cached_tokens"]
                     .as_u64()
                     .unwrap_or_default();
+                false
             }
             AgentEventKind::AssistantDelta | AgentEventKind::AssistantMessage => {
                 let key = payload["item_id"].as_str().map_or_else(
-                    || format!("call-{}", payload["model_call_index"]),
-                    str::to_owned,
+                    || Cow::Owned(format!("call-{}", payload["model_call_index"])),
+                    Cow::Borrowed,
                 );
-                let text = payload["text"].as_str().unwrap_or_default();
-                let final_message = event.kind == AgentEventKind::AssistantMessage;
-                match self.assistant.get(&key).copied() {
-                    Some(index) => {
-                        transcript.update(index, |cell| {
-                            if let CellKind::Assistant(existing) = cell {
-                                if final_message {
-                                    text.clone_into(existing);
-                                } else {
-                                    existing.push_str(text);
-                                }
-                            }
-                        });
-                    }
-                    None if !text.is_empty() => {
-                        let index = transcript.push(CellKind::Assistant(text.to_owned()));
-                        self.assistant.insert(key, index);
-                        self.reasoning.clear();
-                    }
-                    None => {}
-                }
+                self.assistant(
+                    transcript,
+                    &key,
+                    event.kind == AgentEventKind::AssistantMessage,
+                    payload["text"].as_str().unwrap_or_default(),
+                )
             }
-            AgentEventKind::ReasoningSummaryDelta => {
-                let call = payload["model_call_index"].as_u64().unwrap_or_default();
-                let text = payload["text"].as_str().unwrap_or_default();
-                match self.reasoning.get(&call).copied() {
-                    Some(index) if transcript.last().is_some_and(|(last, _)| last == index) => {
-                        transcript.update(index, |cell| {
-                            if let CellKind::Reasoning(existing) = cell {
-                                existing.push_str(text);
-                            }
-                        });
-                    }
-                    _ if !text.is_empty() => {
-                        let index = transcript.push(CellKind::Reasoning(text.to_owned()));
-                        self.reasoning.insert(call, index);
-                    }
-                    _ => {}
-                }
+            AgentEventKind::ReasoningSummaryDelta => self.reasoning(
+                transcript,
+                payload["model_call_index"].as_u64().unwrap_or_default(),
+                payload["text"].as_str().unwrap_or_default(),
+            ),
+            AgentEventKind::ToolCall => {
+                self.tool_call(transcript, &payload);
+                true
             }
-            AgentEventKind::ToolCall => self.tool_call(transcript, &payload),
-            AgentEventKind::ToolResult => self.tool_result(transcript, &payload),
+            AgentEventKind::ToolResult => {
+                self.tool_result(transcript, &payload);
+                true
+            }
             AgentEventKind::RunError => {
                 let message = payload["message"]
                     .as_str()
                     .unwrap_or("run error")
                     .to_owned();
-                if !transcript.has_notice_since(self.turn_start, NoticeLevel::Error, &message) {
+                let fresh =
+                    !transcript.has_notice_since(self.turn_start, NoticeLevel::Error, &message);
+                if fresh {
                     transcript.push(CellKind::Notice(NoticeLevel::Error, message));
                 }
+                fresh
             }
             AgentEventKind::ModelCallFailed => {
                 transcript.push(CellKind::Notice(
@@ -317,6 +336,7 @@ impl EventMapper {
                         payload["error"].as_str().unwrap_or_default()
                     ),
                 ));
+                true
             }
             AgentEventKind::ModelAttemptRetrying => {
                 let attempt = payload["attempt"].as_u64().unwrap_or_default();
@@ -327,12 +347,14 @@ impl EventMapper {
                         .trim()
                         .to_owned(),
                 ));
+                true
             }
             AgentEventKind::ModelCompactionStarted => {
                 transcript.push(CellKind::Notice(
                     NoticeLevel::Info,
                     "compacting context…".into(),
                 ));
+                true
             }
             AgentEventKind::ModelCompactionFailed => {
                 transcript.push(CellKind::Notice(
@@ -342,6 +364,7 @@ impl EventMapper {
                         payload["error"].as_str().unwrap_or_default()
                     ),
                 ));
+                true
             }
             AgentEventKind::RunCompleted | AgentEventKind::RunFailed => {
                 let status = payload["status"].as_str().unwrap_or("failed");
@@ -360,10 +383,56 @@ impl EventMapper {
                 self.session.turns += 1;
                 self.reported = true;
                 self.reset();
+                true
             }
-            _ => {}
-        }
+            _ => false,
+        };
         mapped
+    }
+
+    fn assistant(
+        &mut self,
+        transcript: &mut Transcript,
+        key: &str,
+        final_message: bool,
+        text: &str,
+    ) -> bool {
+        match self.assistant.get(key).copied() {
+            Some(_) if text.is_empty() && !final_message => false,
+            Some(index) if !final_message => transcript.append(index, text),
+            Some(index) => match transcript.get(index) {
+                Some(CellKind::Assistant(existing)) if text.starts_with(existing.as_str()) => {
+                    let start = existing.len();
+                    start < text.len() && transcript.append(index, &text[start..])
+                }
+                _ => transcript.update(index, |cell| {
+                    if let CellKind::Assistant(existing) = cell {
+                        text.clone_into(existing);
+                    }
+                }),
+            },
+            None if !text.is_empty() => {
+                let index = transcript.push(CellKind::Assistant(text.to_owned()));
+                self.assistant.insert(key.to_owned(), index);
+                self.reasoning.clear();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn reasoning(&mut self, transcript: &mut Transcript, call: u64, text: &str) -> bool {
+        match self.reasoning.get(&call).copied() {
+            Some(index) if transcript.last().is_some_and(|(last, _)| last == index) => {
+                !text.is_empty() && transcript.append(index, text)
+            }
+            _ if !text.is_empty() => {
+                let index = transcript.push(CellKind::Reasoning(text.to_owned()));
+                self.reasoning.insert(call, index);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn tool_call(&mut self, transcript: &mut Transcript, payload: &Value) {

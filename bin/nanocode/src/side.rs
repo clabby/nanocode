@@ -17,7 +17,7 @@ use nanocode_tui::{
 
 use crate::{
     app::{
-        App, AppEvent, BtwUpdate, DIFF_PREVIEW_LINES, PendingTurn, QUIT_CONFIRMATION,
+        App, AppEvent, BtwUpdate, DIFF_PREVIEW_LINES, PendingTurn, QUIT_CONFIRMATION, Redraw,
         TOOL_PREVIEW_LINES,
     },
     events::EventMapper,
@@ -617,16 +617,17 @@ impl App {
         self.side_next();
     }
 
-    pub(crate) fn side_update(&mut self, pane: u64, update: SideUpdate) {
+    pub(crate) fn side_update(&mut self, pane: u64, update: SideUpdate) -> Redraw {
         let native = self
             .agent
             .as_ref()
             .is_some_and(|agent| agent.capabilities().side_question);
+        let shown = self.panes.active || !self.panes.zoomed;
         let Some(side) = self.panes.side.as_mut().filter(|side| side.id == pane) else {
             if let SideUpdate::Forked(agent) = update {
                 tokio::spawn(async move { drop(agent.shutdown().await) });
             }
-            return;
+            return Redraw::None;
         };
         match update {
             SideUpdate::Restored {
@@ -677,7 +678,9 @@ impl App {
                 {
                     side.exchanges.push((false, text.to_owned()));
                 }
-                drop(side.mapper.apply(&mut side.transcript, &event));
+                if !side.mapper.apply(&mut side.transcript, &event).changed || !shown {
+                    return Redraw::None;
+                }
             }
             SideUpdate::Started(control) => side.control = Some(control),
             SideUpdate::Finished(result) => {
@@ -710,6 +713,7 @@ impl App {
                 self.side_next();
             }
         }
+        Redraw::Streaming
     }
 
     pub(crate) fn side_submit(&mut self, text: String) {

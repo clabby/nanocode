@@ -8,7 +8,7 @@ use nanocode_tui::{
 };
 
 use crate::app::{
-    App, AppEvent, BtwUpdate, Ready, TurnState, apply_tier, family_label, open_session,
+    App, AppEvent, BtwUpdate, Ready, Redraw, TurnState, apply_tier, family_label, open_session,
     subagent_status,
 };
 
@@ -161,31 +161,48 @@ impl App {
         let Some(transcript) = self.side_transcript_mut() else {
             return;
         };
-        transcript.update(cell, |kind| {
-            if let CellKind::Btw { answer, done, .. } = kind {
-                match update {
-                    BtwUpdate::Message(text) => *answer = text,
-                    BtwUpdate::Done => *done = true,
-                    BtwUpdate::Failed(error) => {
-                        *done = true;
-                        answer.push_str(&format!("\n\n*side question failed: {error}*"));
-                    }
+        let extended = match (&update, transcript.get(cell)) {
+            (BtwUpdate::Message(text), Some(CellKind::Btw { answer, .. }))
+                if text.starts_with(answer.as_str()) =>
+            {
+                Some(answer.len())
+            }
+            _ => None,
+        };
+        match (extended, &update) {
+            (Some(start), BtwUpdate::Message(text)) => {
+                if start < text.len() {
+                    transcript.append(cell, &text[start..]);
                 }
             }
-        });
+            _ => {
+                transcript.update(cell, |kind| {
+                    if let CellKind::Btw { answer, done, .. } = kind {
+                        match update {
+                            BtwUpdate::Message(text) => *answer = text,
+                            BtwUpdate::Done => *done = true,
+                            BtwUpdate::Failed(error) => {
+                                *done = true;
+                                answer.push_str(&format!("\n\n*side question failed: {error}*"));
+                            }
+                        }
+                    }
+                });
+            }
+        }
         if finished {
             self.btw.remove(&id);
             self.side_answered(id, cell, failed);
         }
     }
 
-    pub(crate) fn subagent(&mut self, scoped: ScopedAgentUpdate) {
+    pub(crate) fn subagent(&mut self, scoped: ScopedAgentUpdate) -> Redraw {
         if self
             .agent
             .as_ref()
             .is_some_and(|agent| agent.session_id() != scoped.root_session_id)
         {
-            return;
+            return Redraw::None;
         }
         match scoped.update {
             AgentUpdate::Added(descriptor) => {
@@ -213,6 +230,7 @@ impl App {
                         .to_owned(),
                     status,
                 });
+                Redraw::Streaming
             }
             AgentUpdate::Status { id, status } => {
                 if matches!(status, AgentStatus::Interrupted) {
@@ -227,6 +245,7 @@ impl App {
                         node.detail = detail;
                     }
                 });
+                Redraw::Streaming
             }
             AgentUpdate::Completion { id, status, .. } => {
                 if matches!(status, AgentStatus::Interrupted) {
@@ -242,10 +261,23 @@ impl App {
                         node.detail = detail;
                     }
                 });
+                Redraw::Streaming
             }
             AgentUpdate::Event { id, event } => {
-                self.subagent_event(id, &event);
-                let payload = serde_json::from_str::<serde_json::Value>(event.payload.get()).ok();
+                let payload = matches!(
+                    event.kind,
+                    AgentEventKind::RunStarted
+                        | AgentEventKind::ToolCall
+                        | AgentEventKind::AssistantMessage
+                )
+                .then(|| serde_json::from_str::<serde_json::Value>(event.payload.get()).ok())
+                .flatten();
+                let changed = self.subagent_event(id, &event, payload.as_ref());
+                let mut redraw = if changed && self.focus == Some(id) {
+                    Redraw::Streaming
+                } else {
+                    Redraw::None
+                };
                 let key = id.to_string();
                 if event.kind == AgentEventKind::RunStarted
                     && let Some(model) = payload
@@ -262,6 +294,7 @@ impl App {
                             .to_owned();
                         node.label = format!("{role} · {model}");
                     });
+                    redraw = Redraw::Streaming;
                 }
                 let detail = payload.and_then(|payload| match event.kind {
                     AgentEventKind::ToolCall => payload["tool"].as_str().map(|tool| {
@@ -283,9 +316,11 @@ impl App {
                             node.status = NodeStatus::Running;
                         }
                     });
+                    redraw = Redraw::Streaming;
                 }
+                redraw
             }
-            AgentUpdate::Message(_) => {}
+            AgentUpdate::Message(_) => Redraw::None,
         }
     }
 
