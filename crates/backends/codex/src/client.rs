@@ -224,10 +224,15 @@ impl<F> OpenAiBuilder<F> {
             self.config.websocket_url = websocket_url;
         }
         self.config.model_id_prefix = gateway.model_id_prefix().map(Arc::from);
+        let store = gateway.supports_stored_responses();
         self.config.responses_gateway = Some(Arc::new(gateway));
         self.config.responses_transport = ResponsesTransport::Https;
-        self.config.responses_history = ResponsesHistory::FullReplay;
-        self.config.store_responses = false;
+        self.config.responses_history = if store {
+            ResponsesHistory::Incremental
+        } else {
+            ResponsesHistory::FullReplay
+        };
+        self.config.store_responses = store;
         self.config.websocket_warmup = false;
         self
     }

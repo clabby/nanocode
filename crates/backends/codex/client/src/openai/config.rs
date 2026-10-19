@@ -168,7 +168,7 @@ impl ModelConfig {
             websocket_warmup: false,
             raw_api_events: true,
             responses_history: ResponsesHistory::default(),
-            store_responses: false,
+            store_responses: true,
             strict_json_schema: None,
             websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
             api_base_url: "https://api.openai.com/v1".to_owned(),

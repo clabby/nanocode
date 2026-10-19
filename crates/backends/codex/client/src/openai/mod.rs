@@ -138,7 +138,7 @@ pub enum OpenAiError {
 
 #[doc(hidden)]
 pub fn apply_mode_defaults(config: &mut ModelConfig, mode: OpenAiAuthMode) {
-    config.store_responses = false;
+    config.store_responses = mode.supports_stored_responses();
     config.responses_history = ResponsesHistory::Incremental;
     mode.default_websocket_url()
         .clone_into(&mut config.websocket_url);
@@ -177,10 +177,10 @@ fn validate_responses_gateway(
             detail: "this gateway documents the Responses API over HTTPS only",
         });
     }
-    if config.store_responses && !gateway.supports_stored_responses() {
-        return Err(OpenAiError::InvalidConfiguration {
-            detail: "OpenRouter's Responses API is stateless and rejects store: true",
-        });
+    if config.store_responses
+        && let Some(detail) = gateway.stored_responses_rejection()
+    {
+        return Err(OpenAiError::InvalidConfiguration { detail });
     }
     Ok(())
 }

@@ -276,7 +276,19 @@ impl ResponsesGateway {
 
     #[must_use]
     pub const fn supports_stored_responses(&self) -> bool {
-        !matches!(self.provider, Provider::OpenRouter)
+        self.stored_responses_rejection().is_none()
+    }
+
+    pub(crate) const fn stored_responses_rejection(&self) -> Option<&'static str> {
+        match self.provider {
+            Provider::OpenRouter => {
+                Some("OpenRouter's Responses API is stateless and rejects store: true")
+            }
+            Provider::Cloudflare => Some(
+                "Cloudflare's unified Responses API replaces response IDs, so previous_response_id cannot continue them; use store: false",
+            ),
+            Provider::Vercel | Provider::CloudflareGateway => None,
+        }
     }
 
     #[must_use]
