@@ -55,6 +55,9 @@ fn estimate_text_tokens(text: &str) -> u64 {
 }
 
 const TOOL_RESULT_TOKEN_LIMIT: u64 = 12_000;
+const RETRY_BASE_MS: u64 = 500;
+const RETRY_CAP_MS: u64 = 32_000;
+const RETRY_JITTER_PERCENT: u64 = 25;
 
 fn truncate_middle(text: &str, max_tokens: u64) -> String {
     let total = estimate_text_tokens(text);
@@ -4471,8 +4474,11 @@ impl State {
                 ClaudeError::Http { retry_after, .. } => *retry_after,
                 _ => None,
             };
-            let jitter = 90 + (u64::from(index) * 31 + u64::from(attempt) * 17) % 21;
-            let backoff = Duration::from_millis(1_000 * 2_u64.pow(attempt - 1) * jitter / 100);
+            let jitter = 100
+                + (u64::from(index) * 31 + u64::from(attempt) * 17) % (RETRY_JITTER_PERCENT + 1);
+            let backoff = Duration::from_millis(
+                (RETRY_BASE_MS * 2_u64.pow(attempt - 1)).min(RETRY_CAP_MS) * jitter / 100,
+            );
             let delay = retry_after.map_or(backoff, |delay| delay.max(backoff));
 
             if attempt >= max_attempts
