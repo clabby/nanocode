@@ -201,6 +201,7 @@ struct Point {
 struct Selection {
     anchor: (Point, Point),
     head: Option<(Point, Point)>,
+    under: Option<Point>,
     pointer: Option<u16>,
 }
 
@@ -484,20 +485,31 @@ impl Transcript {
         self.selection = Some(Selection {
             anchor,
             head: None,
+            under: None,
             pointer: None,
         });
         true
     }
 
     pub fn select_to(&mut self, row: u16) -> bool {
-        let Some(mut selection) = self.selection else {
+        let Some(previous) = self.selection.map(|selection| selection.bounds()) else {
             return false;
         };
-        let previous = selection.bounds();
+        self.point_to(row);
+        self.selection.and_then(|selection| selection.bounds()) != previous
+    }
+
+    fn point_to(&mut self, row: u16) {
+        let under = self.point_at(row);
+        let Some(mut selection) = self.selection else {
+            return;
+        };
         selection.pointer = Some(row);
-        selection.head = self.point_at(row).map(|point| self.segment(point));
+        if selection.under != under {
+            selection.under = under;
+            selection.head = under.map(|point| self.segment(point));
+        }
         self.selection = Some(selection);
-        selection.bounds() != previous
     }
 
     pub fn autoscroll(&mut self) -> bool {
@@ -815,7 +827,6 @@ impl Transcript {
         });
         self.area = area.intersection(buffer.area);
         self.screen.clear();
-        let mut drawn = Vec::new();
         'layouts: for (index, offset) in visible {
             let layout = self.layout(index, width, theme);
             let count = layout.lines.len();
@@ -831,20 +842,19 @@ impl Transcript {
                     render_line(&layout.lines[row], row_area, buffer);
                 }
                 self.screen.push(Point { cell: index, row });
-                drawn.push(row_area);
             }
         }
-        if let Some(mut selection) = self.selection {
-            if let Some(pointer) = selection.pointer {
-                selection.head = self.point_at(pointer).map(|point| self.segment(point));
-                self.selection = Some(selection);
-            }
-            if let Some((first, last)) = selection.bounds() {
-                for (point, row_area) in self.screen.iter().zip(drawn) {
-                    if (first..=last).contains(point) {
-                        buffer
-                            .set_style(row_area, Style::default().add_modifier(Modifier::REVERSED));
-                    }
+        if let Some(pointer) = self.selection.and_then(|selection| selection.pointer) {
+            self.point_to(pointer);
+        }
+        if let Some((first, last)) = self.selection.and_then(|selection| selection.bounds()) {
+            let area = self.area;
+            for (y, point) in (area.y..).zip(&self.screen) {
+                if (first..=last).contains(point) {
+                    buffer.set_style(
+                        Rect::new(area.x, y, area.width, 1),
+                        Style::default().add_modifier(Modifier::REVERSED),
+                    );
                 }
             }
         }
@@ -939,18 +949,15 @@ impl Output {
 }
 
 fn plain(text: &str, width: u16, style: Style, preserve_whitespace: bool, part: &Part) -> Vec<Row> {
-    markdown::wrap_plain_rows(text, width, style, preserve_whitespace)
-        .into_iter()
-        .map(|(line, index)| {
-            (
-                line,
-                Some(Source {
-                    part: part.clone(),
-                    extent: Extent::Line(index),
-                }),
-            )
-        })
-        .collect()
+    markdown::wrap_plain_rows(text, width, style, preserve_whitespace, |line, index| {
+        (
+            line,
+            Some(Source {
+                part: part.clone(),
+                extent: Extent::Line(index),
+            }),
+        )
+    })
 }
 
 fn rendered(layout: markdown::Layout, part: &Part) -> Vec<Row> {

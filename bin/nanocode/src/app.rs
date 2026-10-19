@@ -680,6 +680,7 @@ impl App {
             if self.autoscroll_at.is_some_and(|at| at <= now) {
                 self.autoscroll_at = None;
                 if self.autoscroll() {
+                    self.autoscroll_at = Some(now + AUTOSCROLL_STEP);
                     scheduler.request_immediate(now);
                 }
             }
@@ -702,9 +703,6 @@ impl App {
                         scheduler.request_at(expiry);
                     }
                 }
-            }
-            if self.autoscroll_at.is_none() && self.autoscrolling() {
-                self.autoscroll_at = Some(Instant::now() + AUTOSCROLL_STEP);
             }
             if let Some(at) = self.autoscroll_at {
                 scheduler.request_at(at);
@@ -1846,7 +1844,12 @@ impl App {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let side = self.dragging?;
-                Some(self.pane_transcript(side).select_to(mouse.row))
+                let transcript = self.pane_transcript(side);
+                let changed = transcript.select_to(mouse.row);
+                if transcript.autoscrolling() && self.autoscroll_at.is_none() {
+                    self.autoscroll_at = Some(Instant::now() + AUTOSCROLL_STEP);
+                }
+                Some(changed)
             }
             MouseEventKind::Up(_) => {
                 let side = self.dragging.take()?;
@@ -1875,11 +1878,6 @@ impl App {
     fn autoscroll(&mut self) -> bool {
         self.dragging
             .is_some_and(|side| self.pane_transcript(side).autoscroll())
-    }
-
-    fn autoscrolling(&mut self) -> bool {
-        self.dragging
-            .is_some_and(|side| self.pane_transcript(side).autoscrolling())
     }
 
     fn handle_key(&mut self, key: KeyEvent, terminal: &mut TerminalSession) {

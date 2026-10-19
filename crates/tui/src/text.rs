@@ -101,13 +101,16 @@ pub(crate) fn ascii_rows(
     width: usize,
     prefer_words: bool,
     preserve_whitespace: bool,
-) -> Vec<Range<usize>> {
+) -> Vec<(Range<usize>, usize)> {
     let bytes = text.as_bytes();
     let mut rows = Vec::new();
     let mut line_start = 0;
-    for line_end in memchr::memchr_iter(b'\n', bytes).chain(std::iter::once(bytes.len())) {
+    for (line, line_end) in memchr::memchr_iter(b'\n', bytes)
+        .chain(std::iter::once(bytes.len()))
+        .enumerate()
+    {
         if line_start == line_end {
-            rows.push(line_start..line_end);
+            rows.push((line_start..line_end, line));
         }
         let mut start = line_start;
         while start < line_end {
@@ -146,7 +149,7 @@ pub(crate) fn ascii_rows(
             } else {
                 start + bytes[start..split].trim_ascii_end().len()
             };
-            rows.push(start..rendered);
+            rows.push((start..rendered, line));
             start = split;
         }
         line_start = line_end + 1;

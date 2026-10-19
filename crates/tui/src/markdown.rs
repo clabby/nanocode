@@ -152,20 +152,18 @@ fn wrap_plain_with_whitespace(
     style: Style,
     preserve_whitespace: bool,
 ) -> Vec<Line<'static>> {
-    wrap_plain_rows(text, width, style, preserve_whitespace)
-        .into_iter()
-        .map(|(line, _)| line)
-        .collect()
+    wrap_plain_rows(text, width, style, preserve_whitespace, |line, _| line)
 }
 
-pub(crate) fn wrap_plain_rows(
+pub(crate) fn wrap_plain_rows<T>(
     text: &str,
     width: u16,
     style: Style,
     preserve_whitespace: bool,
-) -> Vec<(Line<'static>, usize)> {
+    mut row: impl FnMut(Line<'static>, usize) -> T,
+) -> Vec<T> {
     if width == 0 {
-        return vec![(Line::default(), 0)];
+        return vec![row(Line::default(), 0)];
     }
     let logical = sanitize_terminal_text(text);
     if let Some(rows) = wrap_ascii_spans(
@@ -175,17 +173,11 @@ pub(crate) fn wrap_plain_rows(
         preserve_whitespace,
     ) {
         if rows.is_empty() {
-            return vec![(Line::default(), 0)];
+            return vec![row(Line::default(), 0)];
         }
-        let (mut index, mut counted) = (0, 0);
         return rows
             .into_iter()
-            .map(|(line, _, range)| {
-                index +=
-                    memchr::memchr_iter(b'\n', &logical.as_bytes()[counted..range.start]).count();
-                counted = range.start;
-                (line, index)
-            })
+            .map(|(line, _, index)| row(line, index))
             .collect();
     }
     let mut lines = Vec::new();
@@ -194,11 +186,11 @@ pub(crate) fn wrap_plain_rows(
         lines.extend(
             wrap_spans_with_whitespace(&spans, width, true, preserve_whitespace)
                 .into_iter()
-                .map(|wrapped| (wrapped, index)),
+                .map(|wrapped| row(wrapped, index)),
         );
     }
     if lines.is_empty() {
-        lines.push((Line::default(), 0));
+        lines.push(row(Line::default(), 0));
     }
     lines
 }
@@ -1186,7 +1178,7 @@ fn graphemes_to_line(
     (Line::from(spans), links)
 }
 
-type AsciiRow = (Line<'static>, Vec<LinkSpan>, Range<usize>);
+type AsciiRow = (Line<'static>, Vec<LinkSpan>, usize);
 
 fn wrap_ascii_spans<'a>(
     spans: impl Iterator<Item = (&'a str, Style, Option<&'a Arc<str>>)>,
@@ -1214,7 +1206,7 @@ fn wrap_ascii_spans<'a>(
     let mut index = 0;
     let mut offset = 0;
     let mut lines = Vec::new();
-    for range in
+    for (range, line) in
         crate::text::ascii_rows(&text, usize::from(width), prefer_words, preserve_whitespace)
     {
         while index < spans.len() && offset + spans[index].0.len() <= range.start {
@@ -1257,7 +1249,7 @@ fn wrap_ascii_spans<'a>(
                 index += 1;
             }
         }
-        lines.push((Line::from(rendered), links, range));
+        lines.push((Line::from(rendered), links, line));
     }
     Some(lines)
 }
