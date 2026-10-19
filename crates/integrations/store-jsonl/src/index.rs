@@ -342,6 +342,7 @@ impl Journal {
             && index.offset >= self.index.offset
         {
             tracing::debug!("retaining a current JSONL index saved by another store");
+            self.persisted_offset = Some(index.offset);
             return;
         }
         match self.write_index() {
