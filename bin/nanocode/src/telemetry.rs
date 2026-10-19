@@ -269,7 +269,7 @@ impl FrameMetrics {
     }
 
     pub fn frame(&mut self, session: Option<&str>) -> Span {
-        let span = tracing::info_span!(target: "nanocode", "nc.frame", session.id = session, frame.input = self.input.is_some(), frame.stream = self.stream.is_some(), frame.resize = self.resize.is_some(), thread.cpu_ns = Empty, otel.status_code = Empty);
+        let span = tracing::info_span!(target: "nanocode", "nc.frame", session.id = session, frame.input = self.input.is_some(), frame.stream = self.stream.is_some(), frame.resize = self.resize.is_some(), frame.input_ms = Empty, frame.stream_ms = Empty, frame.resize_ms = Empty, thread.cpu_ns = Empty, otel.status_code = Empty);
         if let Some(context) = self.input_context.take() {
             span.add_link(context.span().span_context().clone());
         }
@@ -280,7 +280,7 @@ impl FrameMetrics {
         self.enabled.then(Instant::now)
     }
 
-    pub fn presented(&mut self, started: Option<Instant>) {
+    pub fn presented(&mut self, started: Option<Instant>, span: &Span) {
         let Some(started) = started else {
             return;
         };
@@ -290,13 +290,19 @@ impl FrameMetrics {
             monotonic_counter.nc.frames = 1_u64,
         });
         if let Some(at) = self.input.take() {
-            tracing::event!(target: METRICS_TARGET, Level::INFO, { histogram.nc.input_to_frame_ms = millis(at, now) });
+            let latency = millis(at, now);
+            span.record("frame.input_ms", latency);
+            tracing::event!(target: METRICS_TARGET, Level::INFO, { histogram.nc.input_to_frame_ms = latency });
         }
         if let Some(at) = self.stream.take() {
-            tracing::event!(target: METRICS_TARGET, Level::INFO, { histogram.nc.stream_to_frame_ms = millis(at, now) });
+            let latency = millis(at, now);
+            span.record("frame.stream_ms", latency);
+            tracing::event!(target: METRICS_TARGET, Level::INFO, { histogram.nc.stream_to_frame_ms = latency });
         }
         if let Some(at) = self.resize.take() {
-            tracing::event!(target: METRICS_TARGET, Level::INFO, { histogram.nc.resize_to_frame_ms = millis(at, now) });
+            let latency = millis(at, now);
+            span.record("frame.resize_ms", latency);
+            tracing::event!(target: METRICS_TARGET, Level::INFO, { histogram.nc.resize_to_frame_ms = latency });
         }
     }
 }

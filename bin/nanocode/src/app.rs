@@ -709,7 +709,7 @@ impl App {
                     return Err(error.into());
                 }
                 crate::telemetry::record_frame_cpu(&span, cpu_started);
-                metrics.presented(frame_started);
+                metrics.presented(frame_started, &span);
                 scheduler.presented(Instant::now());
                 if self.animating() {
                     scheduler.request_at(self.spinner.next_deadline(Instant::now()));

@@ -189,7 +189,8 @@ function openDb(file) {
     DROP VIEW IF EXISTS frames;
     CREATE VIEW frames AS
       SELECT s.id, s.start_us, s.dur_ms, json_extract(s.attrs, '$."thread.cpu_ns"') / 1e6 AS cpu_ms, s.session_id,
-        json_extract(s.attrs, '$."frame.input"') AS input,
+        json_extract(s.attrs, '$."frame.input_ms"') AS input_ms, json_extract(s.attrs, '$."frame.stream_ms"') AS stream_ms,
+        json_extract(s.attrs, '$."frame.resize_ms"') AS resize_ms, json_extract(s.attrs, '$."frame.input"') AS input,
         json_extract(s.attrs, '$."frame.stream"') AS stream, json_extract(s.attrs, '$."frame.resize"') AS resize,
         s.pid, s.trace_id, s.span_id
       FROM spans s WHERE s.name = 'nc.frame';

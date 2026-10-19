@@ -217,7 +217,10 @@ impl ObservabilityBuilder {
             Some(provider) => Some(
                 tracing_opentelemetry::layer()
                     .with_tracer(provider.tracer(self.service_name.clone()))
-                    .with_filter(EnvFilter::try_new(self.otel_filter.as_str())?),
+                    .with_filter(EnvFilter::try_new(self.otel_filter.as_str())?)
+                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                        metadata.target() != METRICS_TARGET
+                    })),
             ),
             None => None,
         };
