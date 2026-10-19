@@ -309,8 +309,10 @@ impl ClaudeAuthProvider for HomeFirst {
         &self,
     ) -> ClaudeAuthFuture<'_, Result<http::header::HeaderMap, ClaudeAuthUnavailable>> {
         Box::pin(async move {
-            if let Some(home) = self.signed_in().await {
-                return home.headers().await;
+            if let Some(home) = &self.home
+                && let Some(headers) = home.ready_headers().await
+            {
+                return headers.map_err(|error| ClaudeAuthUnavailable::new(error.to_string()));
             }
             self.fallback.headers().await.map_err(|error| {
                 ClaudeAuthUnavailable::new(format!(

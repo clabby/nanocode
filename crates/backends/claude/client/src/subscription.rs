@@ -764,8 +764,24 @@ impl ClaudeSubscription {
 
     async fn resolve_headers(&self) -> Result<HeaderMap> {
         let _guard = self.inner.gate.lock().await;
+        self.resolve_loaded(None).await
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) async fn ready_headers(&self) -> Option<Result<HeaderMap>> {
+        let _guard = self.inner.gate.lock().await;
+        match self.load().await {
+            Ok(loaded @ (_, State::Ready { .. })) => Some(self.resolve_loaded(Some(loaded)).await),
+            _ => None,
+        }
+    }
+
+    async fn resolve_loaded(&self, mut loaded: Option<(u64, State)>) -> Result<HeaderMap> {
         for _ in 0..RETRIES {
-            let (revision, state) = self.load().await?;
+            let (revision, state) = match loaded.take() {
+                Some(loaded) => loaded,
+                None => self.load().await?,
+            };
             match state {
                 State::Ready { token, identity } => {
                     if token.expires_at.saturating_sub(now())
