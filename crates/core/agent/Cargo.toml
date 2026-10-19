@@ -12,6 +12,7 @@ description = "Backend-independent agent lifecycle, handles and session contract
 arc-swap.workspace = true
 nanocode-agent-types.workspace = true
 nanocode-platform.workspace = true
+nanocode-sync.workspace = true
 nanocode-home.workspace = true
 nanocode-types.workspace = true
 nanocode-tool-contracts.workspace = true

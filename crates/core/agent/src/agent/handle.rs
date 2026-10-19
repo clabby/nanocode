@@ -46,28 +46,7 @@ impl Interrupted {
 #[derive(Default)]
 pub(super) struct Requests(ArcSwap<std::collections::HashMap<String, Arc<Signal>>>);
 
-pub(super) struct Signal {
-    finish: ArcSwapOption<tokio::sync::oneshot::Sender<()>>,
-    finished: futures_util::future::Shared<tokio::sync::oneshot::Receiver<()>>,
-}
-
-impl Signal {
-    pub(super) fn new() -> Arc<Self> {
-        let (finish, finished) = tokio::sync::oneshot::channel();
-        Arc::new(Self {
-            finish: ArcSwapOption::from_pointee(finish),
-            finished: futures_util::FutureExt::shared(finished),
-        })
-    }
-
-    pub(super) fn fire(&self) {
-        drop(self.finish.swap(None));
-    }
-
-    pub(super) async fn wait(&self) {
-        let _ = self.finished.clone().await;
-    }
-}
+pub(super) use nanocode_sync::Signal;
 
 struct RequestClaim {
     requests: Arc<Requests>,
@@ -104,7 +83,7 @@ impl Resumption {
         Arc::new(Self {
             turns,
             claimed: AtomicBool::new(false),
-            done: Signal::new(),
+            done: Arc::new(Signal::new()),
         })
     }
 }
@@ -658,7 +637,7 @@ impl Agent {
 
     async fn claim_request(&self, id: &str) -> RequestClaim {
         loop {
-            let signal = Signal::new();
+            let signal = Arc::new(Signal::new());
             let previous = self.requests.0.rcu(|requests| {
                 let mut requests = std::collections::HashMap::clone(requests);
                 requests

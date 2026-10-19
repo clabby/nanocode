@@ -1,6 +1,7 @@
 use super::{AgentRuntime, catalog_error};
 use crate::{
-    Agent, ExecutionPolicyDisposition, NanocodeError, durability::TurnStatus, input::Prompt,
+    Agent, ExecutionPolicyDisposition, NanocodeError, PromptRequest, durability::TurnStatus,
+    input::Prompt,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +44,10 @@ impl AgentRuntime {
             .await
             .map(|turn| turn.map(|turn| turn.status))
         {
+            Ok(Some(TurnStatus::Completed)) => self
+                .recorded(session_id, request_id)
+                .await
+                .map_or(DurableOutcome::Interrupted, DurableOutcome::Completed),
             Ok(Some(TurnStatus::Failed)) => DurableOutcome::Failed(error.to_string()),
             Ok(Some(TurnStatus::Cancelled)) => DurableOutcome::Cancelled,
             Ok(Some(TurnStatus::Pending) | None) if blocked => DurableOutcome::Waiting,
@@ -51,6 +56,18 @@ impl AgentRuntime {
             }
             _ => DurableOutcome::Interrupted,
         }
+    }
+
+    async fn recorded(&self, session_id: &str, request_id: &str) -> Result<String, NanocodeError> {
+        let (agent, _events) = self.open_session(session_id).await?;
+        let prompt = self
+            .durable_prompt(&agent, request_id)
+            .await?
+            .ok_or(NanocodeError::ReplayedCheckpointUnavailable)?;
+        let turn = agent
+            .prompt(PromptRequest::new(prompt).request_id(request_id))
+            .await?;
+        Ok(turn.result().await?.final_message().to_owned())
     }
 
     pub async fn pending_turns(&self, session_id: &str) -> Result<Vec<String>, NanocodeError> {

@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::{
-    DurableState, EncodedPayload, Error, OperationStatus, OwnerId, OwnerToken, Result,
+    Committed, DurableState, EncodedPayload, Error, OperationStatus, OwnerId, OwnerToken, Result,
     SessionRecord, StateCommit, StateStore, SteerState, StepStatus, StoreError, StoreEvent,
     StoreReplacement, StoredState, SummaryUpdate, Transition,
     catalog::{is_listed, prompt_text, summarize},
@@ -488,6 +488,12 @@ impl From<Command> for CommandRequest {
     }
 }
 
+enum Resolution {
+    Committed(Committed),
+    Absent,
+    Unknown,
+}
+
 struct Driver {
     store: Box<dyn StateStore>,
     state_id: Arc<str>,
@@ -506,6 +512,7 @@ struct Driver {
     batch: Option<u64>,
 
     committed_records: HashSet<String>,
+    next_event: Option<u64>,
     commands: mpsc::Receiver<CommandRequest>,
     releases: mpsc::UnboundedReceiver<ReleaseSignal>,
 }
@@ -1186,6 +1193,7 @@ impl Driver {
         self.pending_record = None;
         self.state = state;
         self.committed_records.clear();
+        self.next_event = None;
         Ok(committed.load(Ordering::Acquire))
     }
 
@@ -1879,32 +1887,59 @@ impl Driver {
         } else {
             SummaryUpdate::Unchanged
         };
-        let Some(owner) = &self.owner else {
+        let Some(owner) = self.owner.clone() else {
             return Err(Error::InvalidState(format!(
                 "state {} was persisted before its owner was acquired",
                 self.state_id
             )));
         };
-        let committed = match self
-            .store
-            .commit(
-                &self.state_id,
-                owner,
-                self.state.revision(),
-                StateCommit {
-                    payload: &payload,
-                    records: &records,
-                    events: &events,
-                    summary: &summary,
-                },
-            )
-            .await
-        {
-            Ok(committed) => committed,
-            Err(error @ StoreError::NotCommitted(_)) => return Err(error.into()),
-            Err(error) => {
-                self.poisoned = true;
-                return Err(error.into());
+        let mut retried = false;
+        let committed = loop {
+            let error = match self
+                .store
+                .commit(
+                    &self.state_id,
+                    &owner,
+                    self.state.revision(),
+                    StateCommit {
+                        payload: &payload,
+                        records: &records,
+                        events: &events,
+                        summary: &summary,
+                    },
+                )
+                .await
+            {
+                Ok(committed) => break committed,
+                Err(error @ StoreError::NotCommitted(_)) => return Err(error.into()),
+                Err(error) => error,
+            };
+            match self
+                .resolve_commit(expected_revision, &payload, events.len())
+                .await
+            {
+                Resolution::Committed(committed) => {
+                    tracing::warn!(
+                        state_id = &*self.state_id,
+                        revision = expected_revision,
+                        %error,
+                        "durability commit reported an error but the store holds its payload; treating it as committed"
+                    );
+                    break committed;
+                }
+                Resolution::Absent if !retried && !matches!(error, StoreError::Fenced) => {
+                    tracing::warn!(
+                        state_id = &*self.state_id,
+                        revision = expected_revision,
+                        %error,
+                        "durability commit reported an error and the store still holds the previous revision; retrying the same conditional commit"
+                    );
+                    retried = true;
+                }
+                Resolution::Absent | Resolution::Unknown => {
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
             }
         };
         if committed.revision != expected_revision {
@@ -1930,6 +1965,9 @@ impl Driver {
         };
         self.committed_records
             .extend(records.into_iter().map(|record| record.key));
+        if !assigned.is_empty() {
+            self.next_event = Some(assigned.end);
+        }
         self.staged.clear();
         self.state = next;
         Ok(SessionReceipt {
@@ -1937,6 +1975,29 @@ impl Driver {
             events: assigned,
             record: self.state.session().cloned(),
         })
+    }
+
+    async fn resolve_commit(&mut self, revision: u64, payload: &str, events: usize) -> Resolution {
+        let Ok(stored) = self.store.peek(&self.state_id).await else {
+            return Resolution::Unknown;
+        };
+        if stored.revision == self.state.revision() {
+            return Resolution::Absent;
+        }
+        if stored.revision != revision || stored.payload.as_deref() != Some(payload) {
+            return Resolution::Unknown;
+        }
+        match (events, self.next_event) {
+            (0, _) => Resolution::Committed(Committed {
+                revision,
+                first_event: None,
+            }),
+            (_, Some(next)) => Resolution::Committed(Committed {
+                revision,
+                first_event: Some(next),
+            }),
+            (_, None) => Resolution::Unknown,
+        }
     }
 
     async fn describe(
@@ -2277,6 +2338,7 @@ impl DurableSession {
             preview: None,
             batch: None,
             committed_records: HashSet::new(),
+            next_event: None,
             commands: receiver,
             releases: release_receiver,
         })?;

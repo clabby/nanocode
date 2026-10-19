@@ -1611,6 +1611,7 @@ dependencies = [
  "nanocode-agent-types",
  "nanocode-home",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-types",
  "serde",

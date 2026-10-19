@@ -123,6 +123,18 @@ impl Shared {
             && !prompt.events.turn_is_terminal()
     }
 
+    fn stale(&self) -> bool {
+        self.stopped.load(Ordering::Acquire) && !self.closed.load(Ordering::Acquire)
+    }
+
+    async fn healed(&self, retry: &mut BackendPrompt) -> Arc<dyn LifecycleBackend> {
+        let backend = self.backend();
+        let events = retry.events.clone();
+        self.heal(&backend, &events, Some(retry))
+            .await
+            .unwrap_or(backend)
+    }
+
     async fn heal(
         &self,
         failed: &Arc<dyn LifecycleBackend>,
@@ -134,7 +146,7 @@ impl Shared {
             if !Arc::ptr_eq(&current, failed) {
                 return Ok(current);
             }
-            let signal = Signal::new();
+            let signal = Arc::new(Signal::new());
             let previous = self
                 .healing
                 .rcu(|healing| healing.clone().or_else(|| Some(Arc::clone(&signal))));
@@ -266,9 +278,17 @@ impl LifecycleBackend for Owned {
         let shared = Arc::clone(&self.0);
         let mut retry = prompt.clone();
         let backend = shared.backend();
-        let submitted = backend.submit(prompt);
+        let eager = (!shared.stale()).then(|| backend.submit(prompt));
         Box::pin(async move {
-            let turn = match submitted.await {
+            let (backend, submitted) = match eager {
+                Some(submitted) => (backend, submitted.await),
+                None => {
+                    let backend = shared.healed(&mut retry).await;
+                    let submitted = backend.submit(retry.clone()).await;
+                    (backend, submitted)
+                }
+            };
+            let turn = match submitted {
                 Err(error) if shared.heals(&error, &retry) => {
                     let events = retry.events.clone();
                     match shared.heal(&backend, &events, Some(&mut retry)).await {
@@ -285,9 +305,17 @@ impl LifecycleBackend for Owned {
         let shared = Arc::clone(&self.0);
         let mut retry = prompt.clone();
         let backend = shared.backend();
-        let routed = backend.route(prompt);
+        let eager = (!shared.stale()).then(|| backend.route(prompt));
         Box::pin(async move {
-            let route = match routed.await {
+            let (backend, routed) = match eager {
+                Some(routed) => (backend, routed.await),
+                None => {
+                    let backend = shared.healed(&mut retry).await;
+                    let routed = backend.route(retry.clone()).await;
+                    (backend, routed)
+                }
+            };
+            let route = match routed {
                 Err(error) if shared.heals(&error, &retry) => {
                     let events = retry.events.clone();
                     match shared.heal(&backend, &events, Some(&mut retry)).await {
