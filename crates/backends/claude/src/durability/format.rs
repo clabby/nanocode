@@ -31,17 +31,35 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
             else {
                 return Ok(None);
             };
+            let base = continuation.get("pending_base").and_then(Value::as_u64);
             if let (Some(pending), Some(conversation)) = (
-                continuation
-                    .get_mut("pending")
-                    .and_then(Value::as_array_mut)
-                    .filter(|pending| !pending.is_empty()),
+                continuation.get_mut("pending").and_then(Value::as_array_mut),
                 snapshot
                     .get_mut("conversation")
                     .and_then(Value::as_object_mut),
             ) {
-                conversation.insert("messages".into(), Value::Array(std::mem::take(pending)));
-                conversation.insert("summary".into(), Value::String(String::new()));
+                let mut pending = std::mem::take(pending);
+                if let Some(base) = base {
+                    let prefix = usize::try_from(base)
+                        .ok()
+                        .and_then(|base| {
+                            conversation
+                                .get("messages")
+                                .and_then(Value::as_array)
+                                .and_then(|messages| messages.get(..base))
+                        })
+                        .ok_or_else(|| {
+                            Error::InvalidState(
+                                "Claude continuation pending prefix exceeds its conversation"
+                                    .to_owned(),
+                            )
+                        })?;
+                    pending.splice(0..0, prefix.iter().cloned());
+                }
+                if !pending.is_empty() {
+                    conversation.insert("messages".into(), Value::Array(pending));
+                    conversation.insert("summary".into(), Value::String(String::new()));
+                }
             }
             Ok(Some(snapshot))
         })
