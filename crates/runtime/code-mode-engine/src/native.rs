@@ -330,12 +330,15 @@ fn run_execution_in_context<'js>(
         .map_err(|error| format!("failed to initialize embedded QuickJS bootstrap: {error}"))?;
     remove_native_globals(ctx)?;
 
-    let tools = serde_json::to_string(&start.tools)
+    let (tools, schemas) = split_schemas(start.tools);
+    let tools = serde_json::to_string(&tools)
         .map_err(|error| format!("failed to encode QuickJS tool metadata: {error}"))?;
+    let schemas = serde_json::to_string(&schemas)
+        .map_err(|error| format!("failed to encode QuickJS tool schemas: {error}"))?;
     let stored = serde_json::to_string(&start.stored)
         .map_err(|error| format!("failed to encode QuickJS stored values: {error}"))?;
     let promise = run_cell
-        .call::<_, Promise<'js>>((start.source, tools, stored))
+        .call::<_, Promise<'js>>((start.source, tools, schemas, stored))
         .catch(ctx)
         .map_err(|error| format!("embedded QuickJS execution failed to start: {error}"))?;
     drain_jobs(ctx);
@@ -372,6 +375,20 @@ fn run_execution_in_context<'js>(
     state.pending_tools.clear();
     state.pending_timeouts.clear();
     result
+}
+
+fn split_schemas(mut tools: Vec<Value>) -> (Vec<Value>, Vec<[Value; 2]>) {
+    let schemas = tools
+        .iter_mut()
+        .map(|tool| match tool {
+            Value::Object(fields) => [
+                fields.remove("input_schema").unwrap_or(Value::Null),
+                fields.remove("output_schema").unwrap_or(Value::Null),
+            ],
+            _ => [Value::Null, Value::Null],
+        })
+        .collect();
+    (tools, schemas)
 }
 
 #[allow(clippy::too_many_lines)]

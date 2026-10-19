@@ -33,8 +33,9 @@
     }
   }
 
-  return async function runCell(source, definitionsJson, initialStoredJson) {
+  return async function runCell(source, definitionsJson, schemasJson, initialStoredJson) {
     const definitions = jsonParse(definitionsJson);
+    let schemas;
     const initialStored = jsonParse(initialStoredJson);
     const stored = new Map(Object.entries(initialStored));
     const storedWrites = new Map();
@@ -108,13 +109,15 @@
       if (typeof name !== "string" || !name) {
         throw "toolSchema expects a non-empty tool name";
       }
-      const definition = definitions.find((tool) =>
+      const index = definitions.findIndex((tool) =>
         tool.name === name || tool.tool_name === name
       );
-      if (!definition) return undefined;
+      if (index < 0) return undefined;
+      schemas ??= jsonParse(schemasJson);
+      const [inputSchema, outputSchema] = schemas[index];
       return cloneValue({
-        inputSchema: definition.input_schema ?? null,
-        outputSchema: definition.output_schema ?? null,
+        inputSchema: inputSchema ?? null,
+        outputSchema: outputSchema ?? null,
       });
     }
     try {
