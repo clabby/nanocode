@@ -56,6 +56,8 @@ Commands:
                          tool calls and the terminal's tool calls), durable store writes and other (the agent
                          loop itself), per session (--by model or --by none to aggregate)
   builds                 Executables that produced telemetry (path and build time), with processes, sessions and spans
+  prune                  Delete raw telemetry directories older than --older-than whose process has exited and
+                         whose files are fully ingested; their spans stay in the cache (--dry-run lists them)
   report                 Write an HTML report with tail (CCDF) plots, latency-over-time scatter plots and outliers
 
 Options:
@@ -88,7 +90,7 @@ function parseArgs(argv) {
       continue;
     }
     const [key, inline] = arg.slice(2).split(/=(.*)/s, 2);
-    if (['hist', 'json', 'full', 'no-ingest', 'help'].includes(key)) {
+    if (['hist', 'json', 'full', 'no-ingest', 'help', 'dry-run'].includes(key)) {
       options[key] = true;
     } else if (inline !== undefined) {
       options[key] = inline;
@@ -877,6 +879,49 @@ function trace(db, options) {
   if (tree.length > limit + 1) console.log(`  … ${tree.length - limit - 1} more (raise --limit)`);
 }
 
+function prune(db, options) {
+  if (options['older-than'] === undefined) fail('prune needs --older-than, for example --older-than 2d');
+  const cutoff = sinceMicros(options['older-than']) / 1000;
+  const root = path.join(homeDir(options), 'log', 'otel');
+  const offsets = new Map(db.prepare('SELECT path, offset FROM sources').all().map((row) => [row.path, row.offset]));
+  let freed = 0;
+  let removed = 0;
+  const kept = [];
+  const names = fs.readdirSync(root).sort();
+  const newest = new Map();
+  for (const name of names) {
+    const match = /^(\d+)-(\d+)$/.exec(name);
+    if (match && (newest.get(match[2]) ?? '') < name) newest.set(match[2], name);
+  }
+  for (const name of names) {
+    const directory = path.join(root, name);
+    const pid = Number(/-(\d+)$/.exec(name)?.[1]);
+    const files = fs.readdirSync(directory).map((file) => path.join(directory, file));
+    const stats = files.map((file) => fs.statSync(file));
+    const modified = Math.max(0, ...stats.map((stat) => stat.mtimeMs));
+    const bytes = stats.reduce((sum, stat) => sum + stat.size, 0);
+    let running = false;
+    if (pid > 0 && newest.get(String(pid)) === name) {
+      try {
+        process.kill(pid, 0);
+        running = true;
+      } catch (error) {
+        running = error.code === 'EPERM';
+      }
+    }
+    const ingested = files.every((file, index) => !file.endsWith('.jsonl') || offsets.get(file) === stats[index].size);
+    if (running || modified > cutoff || !ingested) {
+      if (modified <= cutoff) kept.push(`${name} (${running ? 'process running' : 'not fully ingested'})`);
+      continue;
+    }
+    if (!options['dry-run']) fs.rmSync(directory, { recursive: true, force: true });
+    freed += bytes;
+    removed++;
+  }
+  console.log(`${options['dry-run'] ? 'would remove' : 'removed'} ${removed} telemetry directories, ${(freed / 1e9).toFixed(2)} GB; their spans stay in the cache`);
+  if (kept.length) console.log('kept: ' + kept.join(', '));
+}
+
 function breakdown(db, options) {
   const since = sinceMicros(options.since);
   const turns = db.prepare(`SELECT id, session_id, model, start_us, end_us FROM spans
@@ -1216,7 +1261,7 @@ if (!command || options.help || command === 'help') {
   console.log(HELP);
   process.exit(command ? 0 : 1);
 }
-const commands = { ingest: null, schema, sql, tails, outliers, trace, sessions, builds, breakdown, report };
+const commands = { ingest: null, schema, sql, tails, outliers, trace, sessions, builds, breakdown, prune, report };
 if (!(command in commands)) fail('unknown command ' + command + '\n\n' + HELP);
 const db = openDb(path.resolve(options.db ?? path.join(REPO, 'output', 'telemetry', 'telemetry.sqlite')));
 if (command === 'ingest' || !options['no-ingest']) {
