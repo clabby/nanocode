@@ -66,9 +66,17 @@ impl ComputerConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(&home).join(".codex"));
         let base = PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/cua_node");
-        let mut config = Self::new(base.join("bin/node_repl"));
+        let launcher = base.join("lib/node_modules/@oai/cua-repl/bin/cua-repl.mjs");
+        let node_repl = base.join("bin/node_repl");
+        let mut config = Self::new(base.join("bin/node"));
+        config.args = vec![launcher.clone().into_os_string()];
         let service = codex_home.join("computer-use/Codex Computer Use.app");
         config.environment = [
+            (
+                "CUA_REPL_NODE_REPL_PATH",
+                node_repl.clone().into_os_string(),
+            ),
+            ("CUA_REPL_ENABLED_SURFACES", OsString::from("computer")),
             (
                 "NODE_REPL_NODE_PATH",
                 base.join("bin/node").into_os_string(),
@@ -81,17 +89,13 @@ impl ComputerConfig {
                 "NODE_REPL_TRUSTED_CODE_PATHS",
                 base.join("lib/node_modules").into_os_string(),
             ),
-            (
-                "NODE_REPL_TRUSTED_SERVICES",
-                OsString::from(r#"{"sky":"@oai/sky/service"}"#),
-            ),
             ("SKY_CUA_SERVICE_PATH", service.clone().into_os_string()),
             ("CODEX_HOME", codex_home.clone().into_os_string()),
         ]
         .into_iter()
         .map(|(key, value)| (OsString::from(key), value))
         .collect();
-        config.required = vec![config.executable.clone(), service];
+        config.required = vec![config.executable.clone(), launcher, node_repl, service];
         config.provider_catalog = Some(serde_json::from_str(PINNED_CATALOG)?);
         Ok(config)
     }
