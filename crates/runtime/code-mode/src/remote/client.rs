@@ -91,6 +91,11 @@ fn origin(call_id: &str) -> &str {
 
 impl RemoteActivity {
     #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
+    }
+
+    #[must_use]
     pub fn busy(&self) -> bool {
         self.0.upgrade().is_some_and(|client| {
             !lock(&client.running).is_empty()

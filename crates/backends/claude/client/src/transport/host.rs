@@ -22,6 +22,25 @@ pub struct HttpRequest {
     pub body: String,
 }
 
+pub struct SenderTransport<S>(pub S);
+
+impl<S: nanocode_http::layer::Sender + 'static> HttpTransport for SenderTransport<S> {
+    fn post(&self, request: HttpRequest) -> HttpFuture<'_, Result<HttpResponse, HttpError>> {
+        Box::pin(async move {
+            let response = self
+                .0
+                .send(nanocode_http::layer::Request {
+                    method: http::Method::POST,
+                    url: request.endpoint,
+                    headers: request.headers,
+                    body: request.body.into_bytes(),
+                })
+                .await?;
+            Ok(HttpResponse::from_layer(response))
+        })
+    }
+}
+
 #[cfg(target_family = "wasm")]
 #[derive(Clone)]
 pub struct HttpClient(pub(super) std::sync::Arc<dyn HttpTransport>);

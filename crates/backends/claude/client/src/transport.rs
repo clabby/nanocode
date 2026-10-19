@@ -1,6 +1,8 @@
 pub mod host;
 
-pub use host::{HttpBody, HttpError, HttpFuture, HttpRequest, HttpResponse, HttpTransport};
+pub use host::{
+    HttpBody, HttpError, HttpFuture, HttpRequest, HttpResponse, HttpTransport, SenderTransport,
+};
 pub use nanocode_http::layer::{self, Layer};
 
 #[cfg(not(target_family = "wasm"))]

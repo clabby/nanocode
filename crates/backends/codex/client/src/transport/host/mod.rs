@@ -1,7 +1,16 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
+use futures_util::StreamExt;
+use http::{HeaderMap, HeaderName, HeaderValue, header};
+use nanocode_http::layer;
+
 #[cfg(target_family = "wasm")]
 pub(crate) mod socket;
+
+const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
+const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const USER_AGENT: &str = concat!("nanocode/", env!("CARGO_PKG_VERSION"));
 
 #[cfg(not(target_family = "wasm"))]
 pub type HostFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -24,6 +33,57 @@ pub trait HostTransport: Send + Sync + 'static {
     }
 
     fn sleep<'a>(&'a self, session_id: &'a str, duration: Duration) -> HostFuture<'a, ()>;
+}
+
+pub async fn send_http(
+    sender: &dyn layer::Sender,
+    request: HostConnectRequest<'_>,
+    body: &str,
+) -> Result<HostHttpResponse, HostError> {
+    let response = sender
+        .send(layer::Request {
+            method: http::Method::POST,
+            url: request.endpoint().to_owned(),
+            headers: request.http_headers()?,
+            body: body.as_bytes().to_vec(),
+        })
+        .await
+        .map_err(|error| HostError::new(error.detail()).with_reconnectable(error.is_retryable()))?;
+    let (status, headers, mut stream, _) = response.into_parts();
+    if !status.is_success() {
+        let mut rejected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            rejected.extend(chunk.map_err(|error| HostError::new(error.detail()))?);
+        }
+        return Err(HostError::rejected(
+            status.as_u16(),
+            &headers,
+            String::from_utf8_lossy(&rejected),
+        ));
+    }
+    Ok(HostHttpResponse {
+        body: Box::new(LayerBody(stream)),
+        metadata: HostConnectionMetadata::from_response(status.as_u16(), &headers),
+    })
+}
+
+struct LayerBody(layer::Body);
+
+impl HostHttpBody for LayerBody {
+    fn next(&mut self) -> HostFuture<'_, Result<Option<Vec<u8>>, HostError>> {
+        Box::pin(async move {
+            self.0
+                .next()
+                .await
+                .transpose()
+                .map_err(|error| HostError::new(error.detail()))
+        })
+    }
+}
+
+fn header_value(name: &str, value: &str) -> Result<HeaderValue, HostError> {
+    HeaderValue::from_str(value)
+        .map_err(|error| HostError::new(format!("invalid {name} header: {error}")))
 }
 
 pub trait HostConnection: Send + 'static {
@@ -141,6 +201,70 @@ impl<'a> HostConnectRequest<'a> {
     pub const fn turn_state(&self) -> Option<&'a str> {
         self.turn_state
     }
+
+    fn common_headers(&self) -> Result<HeaderMap, HostError> {
+        let mut headers = HeaderMap::new();
+        if self.sends_bearer_token() {
+            let mut bearer =
+                header_value("authorization", &format!("Bearer {}", self.bearer_token))?;
+            bearer.set_sensitive(true);
+            headers.insert(header::AUTHORIZATION, bearer);
+        }
+        if let Some(account_id) = self.account_id {
+            headers.insert(
+                "chatgpt-account-id",
+                header_value("chatgpt-account-id", account_id)?,
+            );
+        }
+        if self.fedramp {
+            headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
+        }
+        headers.insert(RESPONSES_LITE_HEADER, HeaderValue::from_static("true"));
+        headers.insert("session-id", header_value("session-id", self.session_id)?);
+        let thread = header_value("thread-id", self.thread_id)?;
+        headers.insert("thread-id", thread.clone());
+        headers.insert("x-client-request-id", thread);
+        if let Some(turn_state) = self
+            .turn_state
+            .and_then(|state| HeaderValue::from_str(state).ok())
+        {
+            headers.insert(TURN_STATE_HEADER, turn_state);
+        }
+        headers.insert(header::USER_AGENT, HeaderValue::from_static(USER_AGENT));
+        Ok(headers)
+    }
+
+    pub fn http_headers(&self) -> Result<HeaderMap, HostError> {
+        let mut headers = self.common_headers()?;
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        for gateway in self.headers {
+            let name = HeaderName::from_static(gateway.name());
+            let mut value = header_value(gateway.name(), gateway.value())?;
+            value.set_sensitive(gateway.secret_value().is_some());
+            headers.insert(name, value);
+        }
+        Ok(headers)
+    }
+
+    pub fn socket_headers(&self) -> Result<HeaderMap, HostError> {
+        let mut headers = self.common_headers()?;
+        headers.insert(
+            "openai-beta",
+            HeaderValue::from_static(RESPONSES_WEBSOCKETS_BETA),
+        );
+        headers.insert(
+            "x-responsesapi-include-timing-metrics",
+            HeaderValue::from_static("true"),
+        );
+        Ok(headers)
+    }
 }
 
 pub struct ConnectedHost {
@@ -181,6 +305,23 @@ impl HostConnectionMetadata {
             server_model: None,
             reasoning_included: false,
             turn_state: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_response(status: u16, headers: &HeaderMap) -> Self {
+        let text = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        Self {
+            status,
+            request_id: text("x-request-id"),
+            server_model: text("openai-model"),
+            reasoning_included: headers.contains_key("x-reasoning-included"),
+            turn_state: text(TURN_STATE_HEADER),
         }
     }
 
@@ -281,6 +422,18 @@ impl HostError {
     }
 
     #[must_use]
+    pub fn rejected(status: u16, headers: &HeaderMap, body: impl Into<String>) -> Self {
+        Self::handshake_rejected(
+            status,
+            body,
+            headers
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(super::RetryAfter::from_header),
+        )
+    }
+
+    #[must_use]
     pub fn with_reconnectable(self, reconnectable: bool) -> Self {
         match self {
             Self::Transport { detail, .. } => Self::Transport {
@@ -317,6 +470,12 @@ pub struct HostHttpResponse {
     pub metadata: HostConnectionMetadata,
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub trait HostHttpBody: Send + 'static {
+    fn next(&mut self) -> HostFuture<'_, Result<Option<Vec<u8>>, HostError>>;
+}
+
+#[cfg(target_family = "wasm")]
+pub trait HostHttpBody: 'static {
     fn next(&mut self) -> HostFuture<'_, Result<Option<Vec<u8>>, HostError>>;
 }
