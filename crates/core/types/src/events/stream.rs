@@ -1,17 +1,20 @@
 use std::{
+    borrow::Cow,
     io::Write,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 use futures_util::Stream;
 use nanocode_platform::Instant;
+use nanocode_types_core::responses::MessagePhase;
 use serde::Serialize;
-use serde_json::value::to_raw_value;
+use serde_json::value::{RawValue, to_raw_value};
 use tokio::sync::mpsc;
 
+use nanocode_types_core::events::TextDeltaRef;
 pub use nanocode_types_core::events::{
     AGENT_EVENT_PROTOCOL_VERSION, AgentEvent, AgentEventKind, EventError,
 };
@@ -122,6 +125,61 @@ struct EventChannel {
     session: mpsc::UnboundedSender<TimedAgentEvent>,
     turn: Option<mpsc::UnboundedSender<TimedAgentEvent>>,
     turn_admission: Option<Arc<AtomicU64>>,
+    pending: Arc<Mutex<PendingDelta>>,
+}
+
+struct DeltaKey {
+    kind: AgentEventKind,
+    turn_id: Option<Arc<str>>,
+    model_call_index: u32,
+    phase: Option<MessagePhase>,
+    model_elapsed_ns: Option<u64>,
+    source_received_ns: Option<u64>,
+}
+
+#[derive(Default)]
+struct PendingDelta {
+    key: Option<DeltaKey>,
+    item_id: Option<String>,
+    text: String,
+}
+
+impl PendingDelta {
+    fn extends(
+        &self,
+        kind: AgentEventKind,
+        turn_id: Option<&Arc<str>>,
+        delta: &TextDeltaRef<'_>,
+    ) -> bool {
+        self.key.as_ref().is_some_and(|key| {
+            key.kind == kind
+                && key.turn_id.as_ref() == turn_id
+                && key.model_call_index == delta.model_call_index
+                && key.phase == delta.phase
+        }) && self.item_id.as_deref() == delta.item_id.as_deref()
+    }
+
+    fn start(
+        &mut self,
+        kind: AgentEventKind,
+        turn_id: Option<&Arc<str>>,
+        delta: &TextDeltaRef<'_>,
+        source_received_ns: Option<u64>,
+    ) {
+        self.key = Some(DeltaKey {
+            kind,
+            turn_id: turn_id.cloned(),
+            model_call_index: delta.model_call_index,
+            phase: delta.phase,
+            model_elapsed_ns: delta.model_elapsed_ns,
+            source_received_ns,
+        });
+        if self.item_id.as_deref() != delta.item_id.as_deref() {
+            self.item_id = delta.item_id.as_deref().map(str::to_owned);
+        }
+        self.text.clear();
+        self.text.push_str(&delta.text);
+    }
 }
 
 const TURN_COMMITTED: u64 = 1 << 63;
@@ -170,6 +228,7 @@ impl EventChannel {
                 session,
                 turn: None,
                 turn_admission: None,
+                pending: Arc::default(),
             },
             AgentEvents {
                 request_id,
@@ -187,6 +246,7 @@ impl EventChannel {
                 session: self.session.clone(),
                 turn: Some(turn),
                 turn_admission: Some(Arc::new(AtomicU64::new(0))),
+                pending: Arc::default(),
             },
             AgentEvents {
                 request_id: Arc::clone(&self.request_id),
@@ -272,23 +332,30 @@ impl EventChannel {
 
     fn reserve_publisher_event(
         &self,
-        event: &AgentEvent,
-    ) -> Result<Option<TurnAdmission<'_>>, EventError> {
-        let terminal_claim = if event.kind.is_terminal() {
+        kind: AgentEventKind,
+        seq: Option<u64>,
+    ) -> Result<(u64, Option<TurnAdmission<'_>>), EventError> {
+        let terminal_claim = if kind.is_terminal() {
             self.claim_terminal()?
         } else {
             None
         };
-        let admission = if terminal_claim.is_none() && !event.kind.is_terminal() {
+        let admission = if terminal_claim.is_none() && !kind.is_terminal() {
             self.admit_non_terminal()?
         } else {
             None
         };
-        self.reserve_exact_sequence(event.seq)?;
+        let seq = match seq {
+            Some(seq) => {
+                self.reserve_exact_sequence(seq)?;
+                seq
+            }
+            None => self.allocate_sequence()?,
+        };
         if let Some(claim) = terminal_claim {
             claim.commit();
         }
-        Ok(admission)
+        Ok((seq, admission))
     }
 
     fn reserve_exact_sequence(&self, seq: u64) -> Result<(), EventError> {
@@ -332,6 +399,88 @@ impl EventChannel {
             drop(turn.send(event));
         }
     }
+
+    fn lock_pending(&self) -> MutexGuard<'_, PendingDelta> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn publish_pending(&self, pending: &mut PendingDelta) -> Result<(), EventError> {
+        let Some(key) = pending.key.take() else {
+            return Ok(());
+        };
+        if self.receivers_are_closed() {
+            return Ok(());
+        }
+        let payload = encode_payload(
+            key.kind,
+            key.turn_id.as_deref(),
+            &TextDeltaRef {
+                model_call_index: key.model_call_index,
+                item_id: pending.item_id.as_deref().map(Cow::Borrowed),
+                phase: key.phase,
+                text: Cow::Borrowed(&pending.text),
+                model_elapsed_ns: key.model_elapsed_ns,
+            },
+        )?;
+        let seq = self.allocate_sequence()?;
+        self.publish(TimedAgentEvent {
+            event: AgentEvent {
+                protocol_version: AGENT_EVENT_PROTOCOL_VERSION,
+                request_id: Arc::clone(&self.request_id),
+                seq,
+                kind: key.kind,
+                payload,
+            },
+            timing: AgentEventTiming {
+                emitted_ns: monotonic_now_ns(),
+                source_received_ns: key.source_received_ns,
+            },
+        });
+        Ok(())
+    }
+
+    fn emit_text_delta(
+        &self,
+        kind: AgentEventKind,
+        turn_id: Option<&Arc<str>>,
+        delta: &TextDeltaRef<'_>,
+        source_received_ns: Option<u64>,
+    ) -> Result<(), EventError> {
+        if self.receivers_are_closed() {
+            return Ok(());
+        }
+        let mut pending = self.lock_pending();
+        if pending.extends(kind, turn_id, delta) {
+            pending.text.push_str(&delta.text);
+            return Ok(());
+        }
+        self.publish_pending(&mut pending)?;
+        pending.start(kind, turn_id, delta, source_received_ns);
+        Ok(())
+    }
+
+    fn flush_deltas(&self) -> Result<(), EventError> {
+        self.publish_pending(&mut self.lock_pending())
+    }
+}
+
+fn encode_payload<P: Serialize>(
+    kind: AgentEventKind,
+    turn_id: Option<&str>,
+    payload: &P,
+) -> Result<Arc<RawValue>, EventError> {
+    let encoded = if let Some(turn_id) = turn_id.filter(|_| kind != AgentEventKind::InputAccepted) {
+        #[derive(Serialize)]
+        struct TurnPayload<'a, P> {
+            #[serde(flatten)]
+            payload: &'a P,
+            turn_id: &'a str,
+        }
+        to_raw_value(&TurnPayload { payload, turn_id })
+    } else {
+        to_raw_value(payload)
+    };
+    encoded.map(Arc::from).map_err(EventError::Encode)
 }
 
 fn wait_for_terminal_claim(state: &AtomicU64, observed: u64) {
@@ -401,6 +550,11 @@ impl AgentEventPublisher {
         )
     }
 
+    #[must_use]
+    pub fn has_receivers(&self) -> bool {
+        !self.channel.receivers_are_closed()
+    }
+
     pub fn publish(&self, event: AgentEvent) -> Result<(), EventError> {
         self.publish_timed(TimedAgentEvent {
             event,
@@ -411,10 +565,57 @@ impl AgentEventPublisher {
         })
     }
 
+    pub fn publish_next(
+        &self,
+        kind: AgentEventKind,
+        payload: Arc<RawValue>,
+    ) -> Result<u64, EventError> {
+        let mut pending = self.channel.lock_pending();
+        self.channel.publish_pending(&mut pending)?;
+        let (seq, admission) = self.channel.reserve_publisher_event(kind, None)?;
+        if !self.channel.receivers_are_closed() {
+            self.channel.publish(TimedAgentEvent {
+                event: AgentEvent {
+                    protocol_version: AGENT_EVENT_PROTOCOL_VERSION,
+                    request_id: Arc::clone(&self.channel.request_id),
+                    seq,
+                    kind,
+                    payload,
+                },
+                timing: AgentEventTiming {
+                    emitted_ns: monotonic_now_ns(),
+                    source_received_ns: None,
+                },
+            });
+        }
+        drop(admission);
+        Ok(seq)
+    }
+
+    pub fn emit_text_delta(
+        &self,
+        kind: AgentEventKind,
+        delta: TextDeltaRef<'_>,
+        source_received_ns: Option<u64>,
+    ) -> Result<(), EventError> {
+        self.channel
+            .emit_text_delta(kind, self.turn_id.as_ref(), &delta, source_received_ns)
+    }
+
+    pub fn flush_deltas(&self) -> Result<(), EventError> {
+        self.channel.flush_deltas()
+    }
+
     fn publish_timed(&self, event: TimedAgentEvent) -> Result<(), EventError> {
         self.validate(&event.event)?;
-        let admission = self.channel.reserve_publisher_event(&event.event)?;
-        self.channel.publish(event);
+        let mut pending = self.channel.lock_pending();
+        self.channel.publish_pending(&mut pending)?;
+        let (_, admission) = self
+            .channel
+            .reserve_publisher_event(event.event.kind, Some(event.event.seq))?;
+        if !self.channel.receivers_are_closed() {
+            self.channel.publish(event);
+        }
         drop(admission);
         Ok(())
     }
@@ -489,41 +690,23 @@ impl EventSink {
         payload: P,
         source_received_ns: Option<u64>,
     ) -> Result<u64, EventError> {
+        let channel = &self.publisher.channel;
         if (kind == AgentEventKind::ApiEvent && !self.raw_api_events)
-            || self.publisher.channel.receivers_are_closed()
+            || channel.receivers_are_closed()
         {
-            let seq = self.publisher.channel.allocate_sequence()?;
-            self.publisher.channel.record_local_terminal(kind);
+            let seq = channel.allocate_sequence()?;
+            channel.record_local_terminal(kind);
             return Ok(seq);
         }
 
-        let payload = if let Some(turn_id) = self
-            .publisher
-            .turn_id
-            .as_deref()
-            .filter(|_| kind != AgentEventKind::InputAccepted)
-        {
-            #[derive(Serialize)]
-            struct TurnPayload<'a, P> {
-                #[serde(flatten)]
-                payload: &'a P,
-                turn_id: &'a str,
-            }
-            Arc::from(
-                to_raw_value(&TurnPayload {
-                    payload: &payload,
-                    turn_id,
-                })
-                .map_err(EventError::Encode)?,
-            )
-        } else {
-            Arc::from(to_raw_value(&payload).map_err(EventError::Encode)?)
-        };
-        let seq = self.publisher.channel.allocate_sequence()?;
-        let event = TimedAgentEvent {
+        let payload = encode_payload(kind, self.publisher.turn_id.as_deref(), &payload)?;
+        let mut pending = channel.lock_pending();
+        channel.publish_pending(&mut pending)?;
+        let seq = channel.allocate_sequence()?;
+        channel.publish(TimedAgentEvent {
             event: AgentEvent {
                 protocol_version: AGENT_EVENT_PROTOCOL_VERSION,
-                request_id: Arc::clone(&self.publisher.channel.request_id),
+                request_id: Arc::clone(&channel.request_id),
                 seq,
                 kind,
                 payload,
@@ -532,10 +715,29 @@ impl EventSink {
                 emitted_ns: monotonic_now_ns(),
                 source_received_ns,
             },
-        };
-        self.publisher.channel.publish(event);
-        self.publisher.channel.record_local_terminal(kind);
+        });
+        channel.record_local_terminal(kind);
+        drop(pending);
         Ok(seq)
+    }
+
+    pub fn emit_text_delta(
+        &self,
+        kind: AgentEventKind,
+        delta: TextDeltaRef<'_>,
+        source_received_ns: Option<u64>,
+    ) -> Result<(), EventError> {
+        self.publisher
+            .emit_text_delta(kind, delta, source_received_ns)
+    }
+
+    pub fn flush_deltas(&self) -> Result<(), EventError> {
+        self.publisher.flush_deltas()
+    }
+
+    #[must_use]
+    pub fn has_receivers(&self) -> bool {
+        self.publisher.has_receivers()
     }
 
     #[must_use]

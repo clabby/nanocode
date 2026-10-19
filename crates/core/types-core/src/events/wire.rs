@@ -204,6 +204,14 @@ impl AgentEvent {
         })
     }
 
+    pub fn text_delta(&self) -> Option<Result<super::TextDeltaRef<'_>, serde_json::Error>> {
+        matches!(
+            self.kind,
+            AgentEventKind::AssistantDelta | AgentEventKind::ReasoningSummaryDelta
+        )
+        .then(|| serde_json::from_str(self.payload.get()))
+    }
+
     pub fn decode_payload<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_str(self.payload.get())
     }

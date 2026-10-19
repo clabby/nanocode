@@ -13,6 +13,6 @@ pub use data::{
     ModelCallCompleted, ModelCallFailed, ModelCallPipeline, ModelCallStarted, ModelCallTiming,
     ModelEvent, ModelWarmupCompleted, ModelWarmupFailed, ModelWarmupStarted, ReasoningEvent,
     ReasoningSummaryDelta, RunError, RunEvent, RunMetrics, RunStarted, RunStatus, RunSteered,
-    RunTerminal, ToolCall, ToolEvent, ToolResultEvent, ToolStatus, TransportEvent,
+    RunTerminal, TextDeltaRef, ToolCall, ToolEvent, ToolResultEvent, ToolStatus, TransportEvent,
 };
 pub use wire::{AGENT_EVENT_PROTOCOL_VERSION, AgentEvent, AgentEventKind};

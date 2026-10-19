@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 
 use super::wire::AgentEventKind;
@@ -101,6 +101,37 @@ pub struct ReasoningSummaryDelta {
     pub model_call_index: u32,
 
     pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TextDeltaRef<'a> {
+    pub model_call_index: u32,
+
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "borrowed_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub item_id: Option<Cow<'a, str>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<MessagePhase>,
+
+    #[serde(borrow)]
+    pub text: Cow<'a, str>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_elapsed_ns: Option<u64>,
+}
+
+fn borrowed_option<'de: 'a, 'a, D>(deserializer: D) -> Result<Option<Cow<'a, str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Borrowed<'a>(#[serde(borrow)] Cow<'a, str>);
+    Option::<Borrowed<'a>>::deserialize(deserializer).map(|value| value.map(|value| value.0))
 }
 
 #[derive(Clone, Debug)]
