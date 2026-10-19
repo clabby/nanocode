@@ -1,4 +1,3 @@
-mod agents;
 mod fs_util;
 mod instructions;
 mod project;
@@ -15,12 +14,9 @@ use std::{
 
 use serde::Serialize;
 
-pub use agents::{
-    AgentProfileFile, AgentProfileRoot, AgentProfileSet, ProfileFormat, resolve_agent_profiles,
-};
 pub use instructions::{
     GlobalInstructions, InstructionKind, InstructionSource, MAX_INSTRUCTION_FILE_BYTES,
-    PROJECT_DOC_SEPARATOR, combine_instructions,
+    PROJECT_DOC_SEPARATOR, combine_instructions, global_instructions,
 };
 pub use project::{InstructionFile, ProjectHome, ProjectInstructions};
 pub use session_environment::SessionEnvironment;
@@ -42,14 +38,6 @@ pub enum Scope {
     User,
 
     Project,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Convention {
-    Codex,
-
-    Claude,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

@@ -22,21 +22,9 @@ pub use web::{
 pub use workspace_files::ClaudeWorkspaceFiles;
 
 #[cfg(not(target_family = "wasm"))]
-mod context;
-#[cfg(not(target_family = "wasm"))]
-pub mod skills;
-#[cfg(not(target_family = "wasm"))]
-pub use skills::{ClaudeSkills, SkillCatalog, SkillDefinition, SkillExpansion, SkillInvocation};
-
-#[cfg(not(target_family = "wasm"))]
 pub mod media;
 #[cfg(not(target_family = "wasm"))]
 pub use media::MediaReadOptions;
-
-#[cfg(not(target_family = "wasm"))]
-pub mod profiles;
-#[cfg(not(target_family = "wasm"))]
-pub use profiles::{AgentProfile, AgentProfileCatalog, ClaudeAgentProfiles};
 
 pub use nanocode_tools::tool;
 

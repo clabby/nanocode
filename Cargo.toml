@@ -148,7 +148,6 @@ rquickjs = "0.12.1"
 schemars = "0.8.22"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
-serde_yaml_ng = "0.10.0"
 sha1 = "0.11.0"
 sha2 = { version = "0.11.0", default-features = false }
 simd-json = "=0.15.1"

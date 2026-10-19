@@ -10,7 +10,6 @@ use nanocode_home::combine_instructions;
 #[derive(Clone, Default)]
 pub(crate) struct ContextSourceConfig {
     nanocode_home: Option<PathBuf>,
-    claude_home: Option<PathBuf>,
     execution_environment: Option<super::ExecutionEnvironment>,
 }
 
@@ -23,10 +22,6 @@ impl ContextSourceConfig {
         self.nanocode_home.as_deref()
     }
 
-    pub(crate) fn set_claude_home(&mut self, claude_home: PathBuf) {
-        self.claude_home = Some(claude_home);
-    }
-
     pub(crate) fn set_execution_environment(&mut self, environment: super::ExecutionEnvironment) {
         self.execution_environment = Some(environment);
     }
@@ -37,10 +32,7 @@ impl ContextSourceConfig {
 
     pub(crate) fn build(&self) -> ContextSource {
         ContextSource {
-            global_instructions: load_global_instructions(
-                self.nanocode_home(),
-                self.claude_home.as_deref(),
-            ),
+            global_instructions: load_global_instructions(self.nanocode_home()),
             execution_environment: self.execution_environment.clone(),
         }
     }

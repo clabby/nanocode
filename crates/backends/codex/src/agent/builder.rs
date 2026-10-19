@@ -274,13 +274,6 @@ impl<F> CodexBuilder<F> {
         self
     }
 
-    #[cfg(not(target_family = "wasm"))]
-    #[must_use]
-    pub fn claude_home(mut self, claude_home: impl Into<PathBuf>) -> Self {
-        self.codex.context.set_claude_home(claude_home.into());
-        self
-    }
-
     #[doc(hidden)]
     #[must_use]
     pub fn resume_native_snapshot(mut self, snapshot: SessionSnapshot) -> Self {

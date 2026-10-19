@@ -6,12 +6,10 @@ use std::{
 use serde::Serialize;
 
 use crate::{
-    Convention, Diagnostic, Scope,
-    agents::{AgentProfileRoot, ProfileFormat},
+    Diagnostic, Scope,
     fs_util::{PathState, path_state},
     instructions::{
-        InstructionKind, InstructionSource, Loaded, collect_rules, combine, load_candidate,
-        push_unique,
+        InstructionKind, InstructionSource, Loaded, combine, load_candidate, push_unique,
     },
     skills::SkillRoot,
 };
@@ -29,7 +27,6 @@ pub struct InstructionFile {
 
     pub directory: PathBuf,
     pub kind: InstructionKind,
-    pub convention: Convention,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -90,59 +87,37 @@ impl ProjectHome {
         let mut files: Vec<InstructionFile> = Vec::new();
         let mut diagnostics = Vec::new();
         for directory in self.directories() {
-            let mut candidates = Vec::new();
             let override_path = directory.join("AGENTS.override.md");
-            let codex = match path_state(&override_path) {
+            let (path, kind) = match path_state(&override_path) {
                 Ok(PathState::File { .. }) => (override_path, InstructionKind::AgentsOverride),
                 _ => (directory.join("AGENTS.md"), InstructionKind::Agents),
             };
-            candidates.push(codex);
-            candidates.push((directory.join("CLAUDE.md"), InstructionKind::Claude));
-            candidates.push((
-                directory.join("CLAUDE.local.md"),
-                InstructionKind::ClaudeLocal,
-            ));
-            candidates.push((
-                directory.join(".claude/CLAUDE.md"),
-                InstructionKind::ClaudeDir,
-            ));
-            let mut rules = Vec::new();
-            collect_rules(
-                &directory.join(".claude/rules"),
-                &mut rules,
-                &mut diagnostics,
-            );
-            candidates.extend(rules.into_iter().map(|rule| (rule, InstructionKind::Rule)));
-            for (path, kind) in candidates {
-                let canonical_path = match path_state(&path) {
-                    Ok(PathState::File { canonical }) => canonical,
-                    Ok(PathState::Absent) => continue,
-                    Ok(PathState::Dangling) => {
-                        diagnostics.push(Diagnostic::warning(&path, "dangling symlink ignored"));
-                        continue;
-                    }
-                    Ok(_) => continue,
-                    Err(error) => {
-                        diagnostics
-                            .push(Diagnostic::warning(&path, format!("unreadable: {error}")));
-                        continue;
-                    }
-                };
-                if let Some(first) = files.iter().find(|f| f.canonical_path == canonical_path) {
-                    diagnostics.push(Diagnostic::info(
-                        &path,
-                        format!("same file as {}; listed once", first.path.display()),
-                    ));
+            let canonical_path = match path_state(&path) {
+                Ok(PathState::File { canonical }) => canonical,
+                Ok(PathState::Absent) => continue,
+                Ok(PathState::Dangling) => {
+                    diagnostics.push(Diagnostic::warning(&path, "dangling symlink ignored"));
                     continue;
                 }
-                files.push(InstructionFile {
-                    path,
-                    canonical_path,
-                    directory: directory.clone(),
-                    kind,
-                    convention: kind.convention(),
-                });
+                Ok(_) => continue,
+                Err(error) => {
+                    diagnostics.push(Diagnostic::warning(&path, format!("unreadable: {error}")));
+                    continue;
+                }
+            };
+            if let Some(first) = files.iter().find(|f| f.canonical_path == canonical_path) {
+                diagnostics.push(Diagnostic::info(
+                    &path,
+                    format!("same file as {}; listed once", first.path.display()),
+                ));
+                continue;
             }
+            files.push(InstructionFile {
+                path,
+                canonical_path,
+                directory,
+                kind,
+            });
         }
         (files, diagnostics)
     }
@@ -150,10 +125,7 @@ impl ProjectHome {
     pub fn read_instructions(&self) -> ProjectInstructions {
         let (files, mut diagnostics) = self.instruction_files();
         let mut sources = Vec::new();
-        for file in files
-            .into_iter()
-            .filter(|f| f.kind != InstructionKind::Rule)
-        {
+        for file in files {
             if let Loaded::Source(source) = load_candidate(
                 &file.path,
                 Scope::Project,
@@ -174,34 +146,9 @@ impl ProjectHome {
         let mut roots = Vec::new();
         for directory in self.directories().into_iter().rev() {
             roots.push(SkillRoot::new(
-                directory.join(".claude/skills"),
-                Scope::Project,
-                Convention::Claude,
-            ));
-            roots.push(SkillRoot::new(
                 directory.join(".agents/skills"),
                 Scope::Project,
-                Convention::Codex,
             ));
-        }
-        roots
-    }
-
-    pub fn agent_profile_roots(&self) -> Vec<AgentProfileRoot> {
-        let mut roots = Vec::new();
-        for directory in self.directories().into_iter().rev() {
-            roots.push(AgentProfileRoot {
-                path: directory.join(".claude/agents"),
-                scope: Scope::Project,
-                convention: Convention::Claude,
-                format: ProfileFormat::ClaudeMarkdown,
-            });
-            roots.push(AgentProfileRoot {
-                path: directory.join(".nanocode/agents"),
-                scope: Scope::Project,
-                convention: Convention::Codex,
-                format: ProfileFormat::CodexToml,
-            });
         }
         roots
     }

@@ -34,4 +34,4 @@
 - Keep logs, traces, and benchmark artifacts in ignored output/. Never commit credentials or personal test data.
 - Prefer simple code and small changes. Preserve unrelated work. Use subagents only when explicitly requested.
 - Avoid magic constants, arbitrary caps, and speculative defensive checks. Limits must come from a real protocol constraint, measured resource requirement, or explicit caller policy; document their source. Surface invalid states instead of hiding them with silent truncation, clamping, or fallback values.
-- Work in the main checkout by default. Use a worktree only for an actual conflict or an explicit request; unrelated dirty or untracked files alone are not a reason.
+- Work in the main checkout on master and push each completed change directly to master. Never create worktrees or feature branches. Commit only your own changes and leave other dirty or untracked files alone; if a push is rejected, rebase onto origin/master, resolve conflicts and push again.

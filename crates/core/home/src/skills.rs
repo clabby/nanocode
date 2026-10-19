@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use serde::Serialize;
 
 use crate::{
-    AgentHome, Convention, Diagnostic, Scope,
+    AgentHome, Diagnostic, Scope,
     fs_util::{PathState, path_state, sorted_visible_entries},
     project::ProjectHome,
 };
@@ -14,16 +14,11 @@ const MAX_SKILLS_PER_ROOT: usize = 512;
 pub struct SkillRoot {
     pub path: PathBuf,
     pub scope: Scope,
-    pub convention: Convention,
 }
 
 impl SkillRoot {
-    pub(crate) const fn new(path: PathBuf, scope: Scope, convention: Convention) -> Self {
-        Self {
-            path,
-            scope,
-            convention,
-        }
+    pub(crate) const fn new(path: PathBuf, scope: Scope) -> Self {
+        Self { path, scope }
     }
 }
 
@@ -166,23 +161,14 @@ pub(crate) fn scan_root(root: &SkillRoot, diagnostics: &mut Vec<Diagnostic>) -> 
 }
 
 pub(crate) fn user_skill_roots(home: &AgentHome) -> Vec<SkillRoot> {
-    let mut roots = vec![
-        SkillRoot::new(
-            home.nanocode_home().join("skills"),
-            Scope::User,
-            Convention::Codex,
-        ),
-        SkillRoot::new(
-            home.claude_home().join("skills"),
-            Scope::User,
-            Convention::Claude,
-        ),
-    ];
+    let mut roots = vec![SkillRoot::new(
+        home.nanocode_home().join("skills"),
+        Scope::User,
+    )];
     if let Some(user) = home.user_home() {
         roots.push(SkillRoot::new(
             user.join(".agents").join("skills"),
             Scope::User,
-            Convention::Codex,
         ));
     }
     roots

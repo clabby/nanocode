@@ -3,12 +3,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::{
-    AgentHome, Convention, Diagnostic, Scope,
-    fs_util::{PathState, path_state, read_bounded, sorted_visible_entries},
+    AgentHome, Diagnostic, Scope,
+    fs_util::{PathState, path_state, read_bounded},
 };
 
 pub const MAX_INSTRUCTION_FILE_BYTES: usize = 32 * 1024;
-const MAX_RULE_FILES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,23 +15,6 @@ pub enum InstructionKind {
     AgentsOverride,
 
     Agents,
-
-    Claude,
-
-    ClaudeLocal,
-
-    ClaudeDir,
-
-    Rule,
-}
-
-impl InstructionKind {
-    pub(crate) const fn convention(self) -> Convention {
-        match self {
-            Self::AgentsOverride | Self::Agents => Convention::Codex,
-            _ => Convention::Claude,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -40,7 +22,6 @@ pub struct InstructionSource {
     pub path: PathBuf,
     pub canonical_path: PathBuf,
     pub scope: Scope,
-    pub convention: Convention,
     pub kind: InstructionKind,
 
     pub text: String,
@@ -50,8 +31,6 @@ pub struct InstructionSource {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct GlobalInstructions {
     pub sources: Vec<InstructionSource>,
-
-    pub rule_files: Vec<PathBuf>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -128,7 +107,6 @@ pub(crate) fn load_candidate(
                 path: path.to_path_buf(),
                 canonical_path: canonical,
                 scope,
-                convention: kind.convention(),
                 kind,
                 text: text.to_owned(),
                 truncated,
@@ -167,87 +145,31 @@ pub(crate) fn push_unique(
     true
 }
 
-pub(crate) fn collect_rules(
-    dir: &Path,
-    files: &mut Vec<PathBuf>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let mut pending = vec![(dir.to_path_buf(), 0usize)];
-    while let Some((directory, depth)) = pending.pop() {
-        if !matches!(path_state(&directory), Ok(PathState::Dir { .. })) {
-            continue;
-        }
-        let entries = match sorted_visible_entries(&directory, MAX_RULE_FILES) {
-            Ok((entries, truncated)) => {
-                if truncated {
-                    diagnostics.push(Diagnostic::warning(&directory, "rule discovery truncated"));
-                }
-                entries
+pub fn global_instructions(nanocode_home: &Path) -> GlobalInstructions {
+    let mut result = GlobalInstructions::default();
+    for (name, kind) in [
+        ("AGENTS.override.md", InstructionKind::AgentsOverride),
+        ("AGENTS.md", InstructionKind::Agents),
+    ] {
+        match load_candidate(
+            &nanocode_home.join(name),
+            Scope::User,
+            kind,
+            MAX_INSTRUCTION_FILE_BYTES,
+            &mut result.diagnostics,
+        ) {
+            Loaded::Source(source) => {
+                push_unique(&mut result.sources, source, &mut result.diagnostics);
+                break;
             }
-            Err(error) => {
-                diagnostics.push(Diagnostic::warning(
-                    &directory,
-                    format!("unreadable: {error}"),
-                ));
-                continue;
-            }
-        };
-        for entry in entries {
-            match path_state(&entry) {
-                Ok(PathState::Dir { .. }) if depth < 8 => pending.push((entry, depth + 1)),
-                Ok(PathState::File { .. }) if entry.extension().is_some_and(|e| e == "md") => {
-                    if files.len() < MAX_RULE_FILES {
-                        files.push(entry);
-                    }
-                }
-                Ok(PathState::Dangling) => {
-                    diagnostics.push(Diagnostic::warning(&entry, "dangling symlink ignored"));
-                }
-                _ => {}
-            }
+            Loaded::Empty | Loaded::Missing => {}
         }
     }
-    files.sort();
+    result
 }
 
 impl AgentHome {
     pub fn global_instructions(&self) -> GlobalInstructions {
-        let mut result = GlobalInstructions::default();
-        let diagnostics = &mut result.diagnostics;
-        for (name, kind) in [
-            ("AGENTS.override.md", InstructionKind::AgentsOverride),
-            ("AGENTS.md", InstructionKind::Agents),
-        ] {
-            let path = self.nanocode_home().join(name);
-            match load_candidate(
-                &path,
-                Scope::User,
-                kind,
-                MAX_INSTRUCTION_FILE_BYTES,
-                diagnostics,
-            ) {
-                Loaded::Source(source) => {
-                    push_unique(&mut result.sources, source, diagnostics);
-                    break;
-                }
-                Loaded::Empty | Loaded::Missing => {}
-            }
-        }
-        let path = self.claude_home().join("CLAUDE.md");
-        if let Loaded::Source(source) = load_candidate(
-            &path,
-            Scope::User,
-            InstructionKind::Claude,
-            MAX_INSTRUCTION_FILE_BYTES,
-            diagnostics,
-        ) {
-            push_unique(&mut result.sources, source, diagnostics);
-        }
-        collect_rules(
-            &self.claude_home().join("rules"),
-            &mut result.rule_files,
-            diagnostics,
-        );
-        result
+        global_instructions(self.nanocode_home())
     }
 }

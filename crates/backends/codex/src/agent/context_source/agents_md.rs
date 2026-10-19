@@ -1,30 +1,12 @@
 use std::{path::Path, sync::Arc};
 
-use nanocode_home::{AgentHome, Convention, Diagnostic, Level, ProjectHome, combine_instructions};
+use nanocode_home::{Diagnostic, Level, ProjectHome, combine_instructions};
 use tracing::warn;
 
-pub(crate) fn load_global_instructions(
-    nanocode_home: Option<&Path>,
-    claude_home: Option<&Path>,
-) -> Option<Arc<str>> {
-    let (nanocode, claude) = match (nanocode_home, claude_home) {
-        (None, None) => return None,
-        (Some(nanocode), Some(claude)) => (nanocode, claude),
-        (Some(home), None) | (None, Some(home)) => (home, home),
-    };
-    let global = AgentHome::new(nanocode, claude).global_instructions();
+pub(crate) fn load_global_instructions(nanocode_home: Option<&Path>) -> Option<Arc<str>> {
+    let global = nanocode_home::global_instructions(nanocode_home?);
     report(&global.diagnostics);
-
-    let texts = global
-        .sources
-        .iter()
-        .filter(|source| match source.convention {
-            Convention::Codex => nanocode_home.is_some(),
-            Convention::Claude => claude_home.is_some(),
-        })
-        .map(|source| source.text.as_str())
-        .collect::<Vec<_>>();
-    (!texts.is_empty()).then(|| Arc::from(texts.join("\n\n")))
+    global.combined().map(Arc::from)
 }
 
 pub(super) fn load_instructions(
