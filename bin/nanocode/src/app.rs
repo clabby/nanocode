@@ -720,6 +720,7 @@ impl App {
             }
             let deadline = scheduler.deadline().map(tokio::time::Instant::from_std);
             tokio::select! {
+                biased;
                 event = input.next() => {
                     match event {
                         Some(Ok(event)) => {
@@ -753,8 +754,12 @@ impl App {
                 }
                 event = rx.recv() => {
                     let Some(event) = event else { break };
+                    let until = scheduler.next_frame_at(Instant::now());
                     let mut redraw = self.handle_app(event);
-                    while !self.quit && let Ok(event) = rx.try_recv() {
+                    while !self.quit
+                        && Instant::now() < until
+                        && let Ok(event) = rx.try_recv()
+                    {
                         redraw = redraw.max(self.handle_app(event));
                     }
                     match redraw {

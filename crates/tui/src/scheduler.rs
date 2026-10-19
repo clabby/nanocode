@@ -44,6 +44,14 @@ impl RenderScheduler {
     }
 
     #[must_use]
+    pub fn next_frame_at(&self, now: Instant) -> Instant {
+        self.last_presented
+            .map(|presented| presented + self.frame_interval)
+            .filter(|next| *next > now)
+            .unwrap_or(now + self.frame_interval)
+    }
+
+    #[must_use]
     pub fn is_due(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|deadline| deadline <= now)
     }
