@@ -3137,6 +3137,7 @@ async fn defer_turn(
     resolution: crate::prompt::ImageResolution,
     id: String,
     order: u64,
+    automatic: bool,
 ) -> BackendTurn {
     state.waiters.lock().expect("waiters lock").insert(order);
     let key = request.key;
@@ -3215,6 +3216,7 @@ async fn defer_turn(
                 order,
                 error,
                 begun,
+                automatic,
             )
             .await),
         };
@@ -3238,13 +3240,18 @@ async fn abandon_deferred(
     order: u64,
     error: NanocodeError,
     begun: bool,
+    automatic: bool,
 ) -> NanocodeError {
     state.waiters.lock().expect("waiters lock").remove(&order);
+    let cancelled = matches!(error, NanocodeError::TurnCancelled);
     if !begun {
-        retire_unstarted(policy, id).await;
+        if automatic || cancelled {
+            retire_unstarted(policy, id).await;
+        } else {
+            let _ = policy.release(id).await;
+        }
     }
     state.cancellations.lock().await.remove(&key);
-    let cancelled = matches!(error, NanocodeError::TurnCancelled);
     if !cancelled {
         state.emit(
             events,
@@ -6467,7 +6474,7 @@ impl LifecycleBackend for Driver {
                                     && policy.cancel_unstarted(id.clone()).await.unwrap_or(false)
                                 {
                                     terminal = Some(Err(NanocodeError::TurnCancelled));
-                                } else if blocked && automatic && state.local_blocker(order) {
+                                } else if blocked && state.local_blocker(order) {
                                     return Ok(defer_turn(
                                         state.clone(),
                                         policy,
@@ -6475,6 +6482,7 @@ impl LifecycleBackend for Driver {
                                         resolution,
                                         id,
                                         order,
+                                        automatic,
                                     )
                                     .await);
                                 } else {
