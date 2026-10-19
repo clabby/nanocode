@@ -216,9 +216,15 @@ function openDb(file) {
 }
 
 function ensureIndexes(db) {
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'spans_span'").get()) {
+    console.error('otel: replacing the span id indexes with agent-only ones (once per cache)');
+  }
   db.exec(`
-    CREATE INDEX IF NOT EXISTS spans_span ON spans(span_id);
-    CREATE INDEX IF NOT EXISTS spans_parent ON spans(parent_id);
+    DROP INDEX IF EXISTS spans_span;
+    DROP INDEX IF EXISTS spans_parent;
+    CREATE INDEX IF NOT EXISTS spans_agent_span ON spans(span_id) WHERE ui = 0;
+    CREATE INDEX IF NOT EXISTS spans_agent_parent ON spans(parent_id) WHERE ui = 0;
+    CREATE INDEX IF NOT EXISTS spans_ui_end ON spans(source, end_us) WHERE ui = 1;
     CREATE INDEX IF NOT EXISTS spans_name ON spans(name, start_us);
     DROP INDEX IF EXISTS spans_session;
     CREATE INDEX IF NOT EXISTS spans_agent_session ON spans(session_id, name) WHERE session_id IS NOT NULL AND ui = 0;
@@ -446,7 +452,7 @@ function inheritSessions(db, mark) {
   const fromParent = db.prepare(`UPDATE spans INDEXED BY spans_unresolved
     SET session_id = parent.session_id, session_from = 'parent'
     FROM spans AS parent
-    WHERE spans.session_id IS NULL AND spans.ui = 0 AND parent.span_id = spans.parent_id
+    WHERE spans.session_id IS NULL AND spans.ui = 0 AND parent.ui = 0 AND parent.span_id = spans.parent_id
       AND parent.trace_id = spans.trace_id AND parent.session_id IS NOT NULL`);
   const fromTrace = db.prepare(`UPDATE spans SET session_id = trace.session_id, session_from = 'trace'
     FROM (
@@ -815,7 +821,10 @@ function outliers(db, options) {
 
 function resolveSpan(db, id) {
   if (/^\d+$/.test(id)) return db.prepare('SELECT * FROM spans WHERE id = ?').get(Number(id));
-  if (/^[0-9a-f]{16}$/.test(id)) return db.prepare('SELECT * FROM spans WHERE span_id = ? ORDER BY id DESC').get(id);
+  if (/^[0-9a-f]{16}$/.test(id)) {
+    return db.prepare('SELECT * FROM spans WHERE span_id = ? AND ui = 0 ORDER BY id DESC').get(id)
+      ?? db.prepare('SELECT * FROM spans WHERE span_id = ? AND ui = 1 ORDER BY id DESC').get(id);
+  }
   return db.prepare(`SELECT * FROM spans WHERE call_id = ?
     ORDER BY name = 'tool.execute' DESC, name = 'code_mode.cell' DESC, name = 'tool.call' DESC, id DESC`).get(id);
 }
@@ -833,10 +842,14 @@ function trace(db, options) {
   if (!id) fail('trace needs a span row id, span id or tool call id');
   const span = resolveSpan(db, id);
   if (!span) fail('no span matches ' + id);
-  const parent = db.prepare('SELECT * FROM spans WHERE trace_id = ? AND span_id = ? ORDER BY id DESC');
+  const agentParent = db.prepare('SELECT * FROM spans WHERE trace_id = ? AND span_id = ? AND ui = 0 ORDER BY id DESC');
+  const uiParent = db.prepare(`SELECT * FROM spans INDEXED BY spans_ui_end
+    WHERE source = ? AND ui = 1 AND end_us >= ? AND trace_id = ? AND span_id = ? ORDER BY end_us LIMIT 1`);
   const ancestors = [];
   for (let current = span; current.parent_id;) {
-    const next = parent.get(current.trace_id, current.parent_id);
+    const next = current.ui
+      ? uiParent.get(current.source, current.end_us, current.trace_id, current.parent_id)
+      : agentParent.get(current.trace_id, current.parent_id);
     if (!next) {
       ancestors.push({ missing: current.parent_id });
       break;
@@ -861,12 +874,12 @@ function trace(db, options) {
       }
     }
   }
-  const tree = db.prepare(`WITH RECURSIVE tree(id, depth, path) AS (
+  const tree = span.ui ? uiTree(db, span) : db.prepare(`WITH RECURSIVE tree(id, depth, path) AS (
       SELECT id, 0, printf('%020d', start_us) FROM spans WHERE id = ?
       UNION ALL
       SELECT child.id, tree.depth + 1, tree.path || '/' || printf('%020d', child.start_us)
       FROM tree JOIN spans AS node ON node.id = tree.id
-      JOIN spans AS child ON child.parent_id = node.span_id AND child.trace_id = node.trace_id
+      JOIN spans AS child ON child.parent_id = node.span_id AND child.trace_id = node.trace_id AND child.ui = 0
     )
     SELECT s.id, tree.depth, s.name, s.tool, s.model, s.status, s.start_us, s.dur_ms, s.span_ms, s.call_id,
       s.thread_name, s.thread_id, s.parent_id, s.span_id
@@ -885,6 +898,25 @@ function trace(db, options) {
     console.log(`  ${('+' + fmtMs((node.start_us - span.start_us) / 1000)).padStart(9)} ${fmtMs(node.dur_ms).padStart(8)} self ${fmtMs(self).padStart(8)}  ${'  '.repeat(node.depth)}${spanSummary(node)}${detail} [${node.id}]`);
   }
   if (tree.length > limit + 1) console.log(`  … ${tree.length - limit - 1} more (raise --limit)`);
+}
+
+function uiTree(db, span) {
+  const nodes = db.prepare(`SELECT id, name, tool, model, status, start_us, dur_ms, span_ms, call_id, thread_name,
+      thread_id, parent_id, span_id FROM spans INDEXED BY spans_ui_end
+    WHERE source = ? AND ui = 1 AND end_us BETWEEN ? AND ? AND trace_id = ?`).all(span.source, span.start_us, span.end_us,
+    span.trace_id);
+  const children = new Map();
+  for (const node of nodes) {
+    if (!children.has(node.parent_id)) children.set(node.parent_id, []);
+    children.get(node.parent_id).push(node);
+  }
+  const tree = [];
+  const visit = (node, depth) => {
+    tree.push({ ...node, depth });
+    for (const child of (children.get(node.span_id) ?? []).sort((a, b) => a.start_us - b.start_us)) visit(child, depth + 1);
+  };
+  visit(nodes.find((node) => node.id === span.id) ?? { ...span }, 0);
+  return tree;
 }
 
 function prune(db, options) {
