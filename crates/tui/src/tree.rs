@@ -3,7 +3,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::{format::sanitize_terminal_text_inline, theme::Theme};
+use crate::{format::sanitize_terminal_text_inline, spinner::SPINNER_SLOT, theme::Theme};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeStatus {
@@ -155,12 +155,7 @@ impl AgentTree {
     }
 
     #[must_use]
-    pub fn lines(
-        &self,
-        theme: &Theme,
-        spinner: &str,
-        selected: Option<usize>,
-    ) -> Vec<Line<'static>> {
+    pub fn lines(&self, theme: &Theme, selected: Option<usize>) -> Vec<Line<'static>> {
         let _span = tracing::info_span!("tui.tree.layout", nodes = self.nodes.len()).entered();
         self.ordered()
             .into_iter()
@@ -175,7 +170,7 @@ impl AgentTree {
                     }
                 }
                 let (icon, color) = match node.status {
-                    NodeStatus::Pending | NodeStatus::Running => (spinner, theme.accent()),
+                    NodeStatus::Pending | NodeStatus::Running => (SPINNER_SLOT, theme.accent()),
                     NodeStatus::Idle => ("○", theme.muted()),
                     NodeStatus::Completed => ("✓", theme.thinking_low()),
                     NodeStatus::Failed | NodeStatus::Unrecoverable => ("✗", theme.thinking_max()),
@@ -187,7 +182,8 @@ impl AgentTree {
                 }
                 let mut spans = vec![
                     Span::styled(prefix, Style::default().fg(theme.border())),
-                    Span::styled(format!("{icon} "), Style::default().fg(color)),
+                    Span::styled(icon, Style::default().fg(color)),
+                    Span::styled(" ", Style::default().fg(color)),
                     Span::styled(
                         sanitize_terminal_text_inline(&node.label).into_owned(),
                         label_style,

@@ -5,14 +5,15 @@ use nanocode_tui::{
     keybindings::{self, Binding},
     ratatui::{
         buffer::Buffer,
-        layout::{Constraint, Layout, Rect},
+        layout::{Constraint, Layout, Position, Rect},
         style::{Modifier, Style},
         text::{Line, Span},
         widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget},
     },
-    spinner::elapsed_label,
+    spinner::{self, SPINNER_SLOT, elapsed_label, elapsed_label_deadline},
     terminal::Canvas,
     theme::Theme,
+    transcript::Transcript,
 };
 
 use crate::app::{App, Overlay, TurnState};
@@ -158,12 +159,45 @@ pub const BINDINGS: [Binding; 34] = [
     },
 ];
 
+struct Animation {
+    spinner: &'static str,
+    cells: Vec<Position>,
+    until: Option<Instant>,
+}
+
+impl Animation {
+    fn line(&mut self, mut line: Line<'static>, area: Rect) -> Line<'static> {
+        spinner::animate(&mut line, area, self.spinner, &mut self.cells);
+        line
+    }
+
+    fn clock(&mut self, started_at: Instant, now: Instant) {
+        self.until(Some(elapsed_label_deadline(started_at, now)));
+    }
+
+    fn until(&mut self, at: Option<Instant>) {
+        if let Some(at) = at {
+            self.until = Some(self.until.map_or(at, |until| until.min(at)));
+        }
+    }
+
+    fn transcript(&mut self, transcript: &Transcript) {
+        self.cells.extend_from_slice(transcript.spinner_cells());
+        self.until(transcript.clock_deadline());
+    }
+}
+
 pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
     let area = frame.area();
     let _span = tracing::info_span!(target: TUI_TARGET, "nc.view", width = area.width, height = area.height).entered();
     let layout = tracing::info_span!(target: TUI_TARGET, "nc.view.layout").entered();
     let now = Instant::now();
     let spinner = app.spinner.frame(now);
+    let mut animation = Animation {
+        spinner,
+        cells: Vec::new(),
+        until: None,
+    };
     let theme = app.theme.clone();
     let width = area.width;
     let composer_height = app
@@ -198,7 +232,7 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
                 .iter()
                 .position(|(_, _, node)| node.id == key)
         });
-        app.tree.lines(&theme, spinner, selected)
+        app.tree.lines(&theme, selected)
     } else {
         Vec::new()
     };
@@ -243,7 +277,7 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
     };
     drop(layout);
     let buffer = frame.buffer_mut();
-    transcripts(app, transcript_area, buffer, &theme, spinner);
+    transcripts(app, transcript_area, buffer, &theme, &mut animation);
     if tree_height > 0 {
         let finished = match app.tree.finished() {
             0 => String::new(),
@@ -262,11 +296,29 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
                 .fg(theme.muted())
                 .add_modifier(Modifier::BOLD),
         )];
-        lines.extend(tree_lines);
+        lines.extend(
+            tree_lines
+                .into_iter()
+                .zip(tree_area.y + 1..)
+                .map(|(line, y)| {
+                    animation.line(
+                        line,
+                        Rect {
+                            y,
+                            height: 1,
+                            ..tree_area
+                        }
+                        .intersection(tree_area),
+                    )
+                }),
+        );
         Paragraph::new(lines).render(tree_area, buffer);
     }
     Paragraph::new(queue_lines).render(queue_area, buffer);
-    status_line(app, spinner, now).render(status_area, buffer);
+    let status = status_line(app, now, &mut animation);
+    animation
+        .line(status, status_area)
+        .render(status_area, buffer);
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_type(BorderType::Rounded)
@@ -293,6 +345,16 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
         Some(Overlay::Dial { dial, .. }) => dial.render(area, frame.buffer_mut(), &theme),
         None => frame.selectable(inner),
     }
+    let buffer = frame.buffer_mut();
+    animation.cells.retain(|position| {
+        buffer
+            .cell(*position)
+            .is_some_and(|cell| cell.symbol() == spinner)
+    });
+    for position in animation.cells {
+        frame.spinner(position);
+    }
+    app.clock_deadline = animation.until;
 }
 
 fn stack<const N: usize>(area: Rect, heights: [u16; N]) -> [Rect; N] {
@@ -304,21 +366,31 @@ fn stack<const N: usize>(area: Rect, heights: [u16; N]) -> [Rect; N] {
     })
 }
 
-fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, spinner: &str) {
+fn transcripts(
+    app: &mut App,
+    area: Rect,
+    buffer: &mut Buffer,
+    theme: &Theme,
+    animation: &mut Animation,
+) {
     let _span = tracing::info_span!(target: TUI_TARGET, "nc.panes.render", side = app.panes.side.is_some(), active_side = app.panes.active, zoomed = app.panes.zoomed).entered();
+    let spinner = animation.spinner;
     app.panes.main_area = Rect::default();
     app.panes.side_area = Rect::default();
     if app.panes.side.is_none() {
         let _pane =
             tracing::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "main").entered();
         app.panes.main_area = area;
-        app.visible_transcript()
-            .render(area, buffer, theme, spinner);
+        let transcript = app.visible_transcript();
+        transcript.render(area, buffer, theme, spinner);
+        animation.transcript(transcript);
         return;
     }
     let tabs = area.height.min(1);
     let [tabs, body] = stack(area, [tabs, area.height - tabs]);
-    tab_line(app, theme, spinner).render(tabs, buffer);
+    animation
+        .line(tab_line(app, theme), tabs)
+        .render(tabs, buffer);
     if app.panes.zoomed {
         let _pane = tracing::info_span!(target: TUI_TARGET, "nc.pane.render", pane = if app.panes.active { "side" } else { "main" }).entered();
         if app.panes.active {
@@ -326,7 +398,9 @@ fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, sp
         } else {
             app.panes.main_area = body;
         }
-        app.active_transcript().render(body, buffer, theme, spinner);
+        let transcript = app.active_transcript();
+        transcript.render(body, buffer, theme, spinner);
+        animation.transcript(transcript);
         return;
     }
     let divider = body.x + body.width.saturating_sub(1) / 2;
@@ -341,12 +415,14 @@ fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, sp
     };
     let (main, side) = (app.panes.main_area, app.panes.side_area);
     tracing::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "main").in_scope(|| {
-        app.pane_transcript(false)
-            .render(main, buffer, theme, spinner)
+        let transcript = app.pane_transcript(false);
+        transcript.render(main, buffer, theme, spinner);
+        animation.transcript(transcript);
     });
     tracing::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "side").in_scope(|| {
-        app.pane_transcript(true)
-            .render(side, buffer, theme, spinner)
+        let transcript = app.pane_transcript(true);
+        transcript.render(side, buffer, theme, spinner);
+        animation.transcript(transcript);
     });
     Block::default()
         .borders(Borders::LEFT)
@@ -361,19 +437,17 @@ fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, sp
         );
 }
 
-fn tab_line(app: &App, theme: &Theme, spinner: &str) -> Line<'static> {
-    let tab = |active: bool, label: String| {
+fn tab_line(app: &App, theme: &Theme) -> Line<'static> {
+    let style = |active: bool| {
         if active {
-            Span::styled(
-                format!(" › {label} "),
-                Style::default()
-                    .fg(theme.accent())
-                    .add_modifier(Modifier::BOLD),
-            )
+            Style::default()
+                .fg(theme.accent())
+                .add_modifier(Modifier::BOLD)
         } else {
-            Span::styled(format!("   {label} "), Style::default().fg(theme.muted()))
+            Style::default().fg(theme.muted())
         }
     };
+    let marker = |active: bool| if active { " › " } else { "   " };
     let chat = match app
         .focus
         .and_then(|id| app.views.get(&id).map(|view| (id, view)))
@@ -381,29 +455,39 @@ fn tab_line(app: &App, theme: &Theme, spinner: &str) -> Line<'static> {
         Some((id, view)) => format!("Chat · #{id} {}", view.role),
         None => "Chat".to_owned(),
     };
-    let side = app.panes.side.as_ref().map_or_else(String::new, |side| {
-        format!(
-            "BTW · {} · {}{}",
-            side.label(),
-            side.kind(),
-            if side.busy() {
-                format!(" {spinner}")
-            } else {
-                String::new()
-            }
-        )
-    });
-    Line::from(vec![
-        tab(!app.panes.active, chat),
-        tab(app.panes.active, side),
+    let side = app.panes.side.as_ref();
+    let side_style = style(app.panes.active);
+    let mut spans = vec![
+        Span::styled(
+            format!("{}{chat} ", marker(!app.panes.active)),
+            style(!app.panes.active),
+        ),
         Span::styled(
             format!(
-                "  tab/click: pane · /zoom{} · /collapse · /split · /close · ctrl+c×2 closes",
-                if app.panes.zoomed { ": restore" } else { "" }
+                "{}{}",
+                marker(app.panes.active),
+                side.map_or_else(String::new, |side| format!(
+                    "BTW · {} · {}",
+                    side.label(),
+                    side.kind()
+                ))
             ),
-            Style::default().fg(theme.muted()),
+            side_style,
         ),
-    ])
+    ];
+    if side.is_some_and(|side| side.busy()) {
+        spans.push(Span::styled(" ", side_style));
+        spans.push(Span::styled(SPINNER_SLOT, side_style));
+    }
+    spans.push(Span::styled(" ", side_style));
+    spans.push(Span::styled(
+        format!(
+            "  tab/click: pane · /zoom{} · /collapse · /split · /close · ctrl+c×2 closes",
+            if app.panes.zoomed { ": restore" } else { "" }
+        ),
+        Style::default().fg(theme.muted()),
+    ));
+    Line::from(spans)
 }
 
 pub const FINDER_ROWS: usize = 8;
@@ -495,7 +579,17 @@ fn command_popup(app: &App, composer_area: Rect, transcript_area: Rect, frame: &
     Paragraph::new(all).render(popup, buffer);
 }
 
-fn status_line(app: &App, spinner: &str, now: Instant) -> Line<'static> {
+fn spinning(style: Style, rest: impl IntoIterator<Item = Span<'static>>) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(" ", style),
+        Span::styled(SPINNER_SLOT, style),
+        Span::styled(" ", style),
+    ];
+    spans.extend(rest);
+    Line::from(spans)
+}
+
+fn status_line(app: &App, now: Instant, animation: &mut Animation) -> Line<'static> {
     let _span = tracing::info_span!(target: TUI_TARGET, "nc.status.render").entered();
     let theme = &app.theme;
     if let Some((text, at)) = &app.status
@@ -510,25 +604,20 @@ fn status_line(app: &App, spinner: &str, now: Instant) -> Line<'static> {
         && let Some(side) = &app.panes.side
     {
         let state = match side.since() {
-            Some(since) if side.busy() => format!(
-                " · answering {} · esc esc cancels",
-                elapsed_label(now.duration_since(since))
-            ),
+            Some(since) if side.busy() => {
+                animation.clock(since, now);
+                format!(
+                    " · answering {} · esc esc cancels",
+                    elapsed_label(now.duration_since(since))
+                )
+            }
             _ => String::new(),
         };
         let waiting = match side.waiting() {
             0 => String::new(),
             count => format!(" · {count} queued"),
         };
-        return Line::from(vec![
-            Span::styled(
-                if side.busy() {
-                    format!(" {spinner} ")
-                } else {
-                    " ▸ ".to_owned()
-                },
-                Style::default().fg(theme.accent()),
-            ),
+        let rest = [
             Span::styled(
                 format!("btw · {}", side.label()),
                 Style::default()
@@ -542,7 +631,15 @@ fn status_line(app: &App, spinner: &str, now: Instant) -> Line<'static> {
                 ),
                 Style::default().fg(theme.muted()),
             ),
-        ]);
+        ];
+        let style = Style::default().fg(theme.accent());
+        return if side.busy() {
+            spinning(style, rest)
+        } else {
+            let mut spans = vec![Span::styled(" ▸ ", style)];
+            spans.extend(rest);
+            Line::from(spans)
+        };
     }
     if let Some(id) = app.focus
         && let Some(view) = app.views.get(&id)
@@ -581,42 +678,50 @@ fn status_line(app: &App, spinner: &str, now: Instant) -> Line<'static> {
         ]);
     }
     if app.interrupting && !matches!(app.turn, TurnState::Idle) {
-        return Line::from(vec![
-            Span::styled(
-                format!(" {spinner} "),
-                Style::default().fg(theme.thinking_max()),
-            ),
-            Span::styled("interrupting…", Style::default().fg(theme.text())),
-        ]);
+        return spinning(
+            Style::default().fg(theme.thinking_max()),
+            [Span::styled(
+                "interrupting…",
+                Style::default().fg(theme.text()),
+            )],
+        );
     }
     match &app.turn {
         TurnState::Running { since, .. }
         | TurnState::Starting(since)
-        | TurnState::External(since) => Line::from(vec![
-            Span::styled(format!(" {spinner} "), Style::default().fg(theme.accent())),
-            Span::styled(
-                "Working",
-                Style::default()
-                    .fg(theme.text())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    " ({} · {} · enter steers · tab queues)",
-                    elapsed_label(now.duration_since(*since)),
-                    if matches!(app.turn, TurnState::External(_)) {
-                        "woken by a finished subagent · esc esc to interrupt"
-                    } else {
-                        "esc esc to interrupt"
-                    }
-                ),
+        | TurnState::External(since) => {
+            animation.clock(*since, now);
+            spinning(
+                Style::default().fg(theme.accent()),
+                [
+                    Span::styled(
+                        "Working",
+                        Style::default()
+                            .fg(theme.text())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            " ({} · {} · enter steers · tab queues)",
+                            elapsed_label(now.duration_since(*since)),
+                            if matches!(app.turn, TurnState::External(_)) {
+                                "woken by a finished subagent · esc esc to interrupt"
+                            } else {
+                                "esc esc to interrupt"
+                            }
+                        ),
+                        Style::default().fg(theme.muted()),
+                    ),
+                ],
+            )
+        }
+        TurnState::Idle if app.starting => spinning(
+            Style::default().fg(theme.accent()),
+            [Span::styled(
+                "connecting…",
                 Style::default().fg(theme.muted()),
-            ),
-        ]),
-        TurnState::Idle if app.starting => Line::from(vec![
-            Span::styled(format!(" {spinner} "), Style::default().fg(theme.accent())),
-            Span::styled("connecting…", Style::default().fg(theme.muted())),
-        ]),
+            )],
+        ),
         TurnState::Idle => Line::styled(
             " F1 for keys · / for commands",
             Style::default().fg(theme.muted()),

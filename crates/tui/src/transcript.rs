@@ -24,7 +24,7 @@ use crate::{
         strip_terminal_controls,
     },
     highlight, markdown,
-    spinner::elapsed_label,
+    spinner::{SPINNER_SLOT, elapsed_label, elapsed_label_deadline},
     theme::Theme,
 };
 
@@ -176,8 +176,6 @@ struct Cell {
     appended: bool,
 }
 
-const SPINNER_SLOT: &str = "\u{0}";
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CacheKey {
     width: u16,
@@ -266,6 +264,14 @@ impl Rows {
         (0..self.len()).filter_map(|row| self.source(row))
     }
 
+    fn clocks(&self, row: usize) -> impl Iterator<Item = Instant> + '_ {
+        let (part, row) = self.part(row);
+        part.clocks
+            .iter()
+            .filter(move |(slot, ..)| *slot == row)
+            .map(|&(_, _, started_at)| started_at)
+    }
+
     fn animated(&self, row: usize, spinner: &str) -> Line<'static> {
         let mut line = self.line(row).clone();
         for (_, span) in self.spinners.iter().filter(|(slot, _)| *slot == row) {
@@ -305,6 +311,8 @@ pub struct Transcript {
     area: Rect,
     screen: Vec<Point>,
     selection: Option<Selection>,
+    spinner_cells: Vec<Position>,
+    clock_deadline: Option<Instant>,
 }
 
 impl Transcript {
@@ -327,6 +335,8 @@ impl Transcript {
             area: Rect::ZERO,
             screen: Vec::new(),
             selection: None,
+            spinner_cells: Vec::new(),
+            clock_deadline: None,
         }
     }
 
@@ -821,6 +831,16 @@ impl Transcript {
         }
     }
 
+    #[must_use]
+    pub fn spinner_cells(&self) -> &[Position] {
+        &self.spinner_cells
+    }
+
+    #[must_use]
+    pub const fn clock_deadline(&self) -> Option<Instant> {
+        self.clock_deadline
+    }
+
     pub fn render(&mut self, area: Rect, buffer: &mut Buffer, theme: &Theme, spinner: &str) {
         let span = tracing::info_span!(
             "tui.transcript.render",
@@ -833,6 +853,8 @@ impl Transcript {
             layout.visited_cells = tracing::field::Empty
         );
         let _entered = span.enter();
+        self.spinner_cells.clear();
+        self.clock_deadline = None;
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -927,9 +949,27 @@ impl Transcript {
                     break 'layouts;
                 };
                 if layout.spinners.iter().any(|(slot, _)| *slot == row) {
-                    render_line(&layout.animated(row, spinner), row_area, buffer);
+                    let now = Instant::now();
+                    for started_at in layout.clocks(row) {
+                        let deadline = elapsed_label_deadline(started_at, now);
+                        self.clock_deadline = Some(
+                            self.clock_deadline
+                                .map_or(deadline, |current| current.min(deadline)),
+                        );
+                    }
+                    let cells = &mut self.spinner_cells;
+                    render_line(
+                        &layout.animated(row, spinner),
+                        row_area,
+                        buffer,
+                        |span, x| {
+                            if x < row_area.right() && layout.spinners.contains(&(row, span)) {
+                                cells.push(Position::new(x, row_area.y));
+                            }
+                        },
+                    );
                 } else {
-                    render_line(layout.line(row), row_area, buffer);
+                    render_line(layout.line(row), row_area, buffer, |_, _| {});
                 }
                 self.screen.push(Point { cell: index, row });
             }
@@ -1753,7 +1793,7 @@ fn code_lines(
     (lines, total)
 }
 
-fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer) {
+fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer, mut at: impl FnMut(usize, u16)) {
     if line
         .alignment
         .is_some_and(|alignment| alignment != Alignment::Left)
@@ -1764,7 +1804,10 @@ fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer) {
     let start = buffer.index_of(area.x, area.y);
     let cells = &mut buffer.content[start..start + usize::from(area.width)];
     let mut used = 0;
-    for span in &line.spans {
+    for (index, span) in line.spans.iter().enumerate() {
+        if let Ok(column) = u16::try_from(used) {
+            at(index, area.x.saturating_add(column));
+        }
         let style = line.style.patch(span.style);
         let content = span.content.as_ref();
         if content.bytes().all(|byte| matches!(byte, b' '..=b'~')) {

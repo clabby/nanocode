@@ -30,7 +30,7 @@ use nanocode_tui::{
     picker::{Picker, PickerAction, PickerItem},
     queue::{Queue, QueueKind, QueueState, QueuedPrompt},
     scheduler::RenderScheduler,
-    spinner::Spinner,
+    spinner::{LABEL_TICK, Spinner},
     terminal::{SelectionEvent, TerminalSession},
     theme::Theme,
     transcript::{CellKind, NoticeLevel, ToolStatus, Transcript, TranscriptPolicy},
@@ -303,6 +303,7 @@ pub struct App {
     stashed_draft: Option<String>,
     dragging: Option<bool>,
     autoscroll_at: Option<Instant>,
+    pub(crate) clock_deadline: Option<Instant>,
     pub(crate) btw: HashMap<u64, (Option<nanocode::subagents::AgentId>, usize)>,
     pub(crate) next_btw: u64,
     next_local: u64,
@@ -375,6 +376,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         stashed_draft: None,
         dragging: None,
         autoscroll_at: None,
+        clock_deadline: None,
         btw: HashMap::new(),
         next_btw: 0,
         next_local: 0,
@@ -685,6 +687,8 @@ impl App {
         let mut input = EventStream::new();
         let mut scheduler = RenderScheduler::new(DISPLAY_FRAME, Instant::now());
         let mut metrics = crate::telemetry::FrameMetrics::new();
+        let mut dirty = true;
+        let mut full_at: Option<Instant> = None;
         while !self.quit {
             while let Some(result) = self.submissions.try_join_next() {
                 if let Err(error) = result {
@@ -697,6 +701,7 @@ impl App {
                 self.autoscroll_at = None;
                 if self.autoscroll() {
                     self.autoscroll_at = Some(now + AUTOSCROLL_STEP);
+                    dirty = true;
                     scheduler.request_immediate(now);
                 }
             }
@@ -705,15 +710,38 @@ impl App {
                 let _frame = span.enter();
                 let frame_started = metrics.begin();
                 let cpu_started = crate::telemetry::frame_cpu(&span);
-                if let Err(error) = terminal.draw(|frame| view::draw(self, frame)) {
-                    span.record("otel.status_code", "ERROR");
-                    return Err(error.into());
+                let animated = !dirty
+                    && self.animating()
+                    && full_at.is_some_and(|at| now < at)
+                    && match terminal.animate(self.spinner.frame(now)) {
+                        Ok(animated) => animated,
+                        Err(error) => {
+                            span.record("otel.status_code", "ERROR");
+                            return Err(error.into());
+                        }
+                    };
+                if !animated {
+                    if let Err(error) = terminal.draw(|frame| view::draw(self, frame)) {
+                        span.record("otel.status_code", "ERROR");
+                        return Err(error.into());
+                    }
+                    dirty = false;
+                    let at = self
+                        .clock_deadline
+                        .map_or(now + LABEL_TICK, |at| at.min(now + LABEL_TICK));
+                    full_at = Some(match &self.status {
+                        Some((_, shown)) => at.min(*shown + view::STATUS_VISIBLE),
+                        None => at,
+                    });
                 }
                 crate::telemetry::record_frame_cpu(&span, cpu_started);
                 metrics.presented(frame_started, &span);
                 scheduler.presented(Instant::now());
                 if self.animating() {
                     scheduler.request_at(self.spinner.next_deadline(Instant::now()));
+                    if let Some(at) = full_at {
+                        scheduler.request_at(at);
+                    }
                 }
                 if let Some((_, at)) = &self.status {
                     let expiry = *at + view::STATUS_VISIBLE;
@@ -742,6 +770,7 @@ impl App {
                                     metrics.input(resize, &span);
                                     scheduler.request_immediate(Instant::now());
                                 }
+                                dirty |= changed;
                                 match std::future::poll_fn(|context| {
                                     Poll::Ready(input.poll_next_unpin(context))
                                 })
@@ -772,10 +801,12 @@ impl App {
                     match redraw {
                         Redraw::Immediate => {
                             metrics.stream();
+                            dirty = true;
                             scheduler.request_immediate(Instant::now());
                         }
                         Redraw::Streaming => {
                             metrics.stream();
+                            dirty = true;
                             scheduler.request_streaming(Instant::now());
                         }
                         Redraw::None => {}

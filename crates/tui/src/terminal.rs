@@ -57,6 +57,7 @@ pub struct Canvas<'a> {
     buffer: &'a mut Buffer,
     cursor: Option<Position>,
     regions: &'a mut Vec<Rect>,
+    spinners: &'a mut Vec<Position>,
 }
 
 impl Canvas<'_> {
@@ -75,6 +76,12 @@ impl Canvas<'_> {
 
     pub fn selectable(&mut self, area: Rect) {
         self.regions.push(area.intersection(self.area));
+    }
+
+    pub fn spinner(&mut self, position: Position) {
+        if self.area.contains(position) {
+            self.spinners.push(position);
+        }
     }
 }
 
@@ -107,6 +114,7 @@ pub struct TerminalSession {
     options: TerminalOptions,
     active: bool,
     regions: Vec<Rect>,
+    spinners: Vec<Position>,
     selection: Option<Selection>,
 }
 
@@ -132,6 +140,7 @@ impl TerminalSession {
             options,
             active: true,
             regions: Vec::new(),
+            spinners: Vec::new(),
             selection: None,
         })
     }
@@ -159,11 +168,13 @@ impl TerminalSession {
         self.current.reset();
         self.regions.clear();
         self.regions.push(area);
+        self.spinners.clear();
         let mut canvas = Canvas {
             area,
             buffer: &mut self.current,
             cursor: None,
             regions: &mut self.regions,
+            spinners: &mut self.spinners,
         };
         render(&mut canvas);
         let cursor = canvas.cursor.filter(|position| area.contains(*position));
@@ -229,6 +240,50 @@ impl TerminalSession {
         self.cursor = cursor;
         std::mem::swap(&mut self.previous, &mut self.current);
         Ok(())
+    }
+
+    pub fn animate(&mut self, spinner: &str) -> io::Result<bool> {
+        if self.stale || !self.active || self.spinners.is_empty() {
+            return Ok(false);
+        }
+        let (columns, rows) = crossterm::terminal::size()?;
+        if Rect::new(0, 0, columns, rows) != self.previous.area {
+            return Ok(false);
+        }
+        let span = tracing::info_span!(
+            "tui.terminal.animate",
+            cells = self.spinners.len(),
+            frame.bytes = tracing::field::Empty
+        );
+        let _entered = span.enter();
+        for position in &self.spinners {
+            if let Some(cell) = self.previous.cell_mut(*position) {
+                cell.set_symbol(spinner);
+            }
+        }
+        self.bytes.clear();
+        queue!(self.bytes, BeginSynchronizedUpdate)?;
+        if self.cursor.is_some() {
+            queue!(self.bytes, Hide)?;
+        }
+        let previous = &self.previous;
+        CrosstermBackend::new(&mut self.bytes).draw(self.spinners.iter().filter_map(
+            |position| {
+                previous
+                    .cell(*position)
+                    .map(|cell| (position.x, position.y, cell))
+            },
+        ))?;
+        if let Some(position) = self.cursor {
+            queue!(self.bytes, MoveTo(position.x, position.y), Show)?;
+        }
+        queue!(self.bytes, EndSynchronizedUpdate)?;
+        span.record("frame.bytes", self.bytes.len());
+        self.output.write_all(&self.bytes)?;
+        self.output.flush()?;
+        self.stats.frames += 1;
+        self.stats.bytes += self.bytes.len() as u64;
+        Ok(true)
     }
 
     #[must_use]
