@@ -18,6 +18,12 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "nanocode-grep"
+path = "src/bin/nanocode-grep.rs"
+test = false
+bench = false
+
 [lib]
 path = "src/lib.rs"
 test = false

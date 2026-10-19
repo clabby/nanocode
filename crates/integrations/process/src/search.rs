@@ -18,10 +18,10 @@ const CLASS_ESCAPES: &str = "dDwWsSbBnt";
 static SHIMS: OnceLock<PathBuf> = OnceLock::new();
 
 #[cfg(unix)]
-pub fn install(directory: &Path) -> io::Result<()> {
+pub fn install(directory: &Path, executable: &Path) -> io::Result<()> {
     use std::hash::{Hash, Hasher};
 
-    let executable = fs::canonicalize(env::current_exe()?)?;
+    let executable = fs::canonicalize(executable)?;
     let mut hasher = std::hash::DefaultHasher::new();
     executable.hash(&mut hasher);
     let shims = directory.join(format!("{:016x}", hasher.finish()));
@@ -45,7 +45,7 @@ pub fn install(directory: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn install(_directory: &Path) -> io::Result<()> {
+pub fn install(_directory: &Path, _executable: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "search shims need symbolic links",
@@ -466,7 +466,7 @@ impl Translation {
             arguments.push("--include-zero".into());
         }
         if !self.recursive {
-            arguments.push("--max-depth=0".into());
+            arguments.extend(["--max-depth=0".into(), "--threads=1".into()]);
         }
         arguments.append(&mut self.flags);
         for pattern in self.patterns.iter().flat_map(|pattern| pattern.split('\n')) {

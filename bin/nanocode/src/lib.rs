@@ -45,6 +45,17 @@ fn cli_home(cli: &Cli) -> Result<PathBuf> {
     host::home_dir(explicit_home)
 }
 
+fn install_search_shims(home: &Path) -> std::io::Result<()> {
+    let current = std::fs::canonicalize(std::env::current_exe()?)?;
+    let companion = current.with_file_name("nanocode-grep");
+    let shim = if companion.is_file() {
+        companion
+    } else {
+        current
+    };
+    nanocode::runners::search::install(&home.join("shims"), &shim)
+}
+
 fn install_telemetry(
     cli: &Cli,
     home: &Path,
@@ -88,7 +99,7 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = nanocode::runners::search::install(&home.join("shims")) {
+    if let Err(error) = install_search_shims(&home) {
         eprintln!("nanocode: grep stays unshimmed: {error}");
     }
     let telemetry_started = std::time::Instant::now();
