@@ -580,7 +580,6 @@ impl ModelRun {
                 conversation,
                 context,
                 preserve_inherited_delta: false,
-                exec_history: None,
             };
             session
                 .conversation

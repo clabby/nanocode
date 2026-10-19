@@ -7,26 +7,22 @@ pub(super) struct ModelSessionState {
     pub(super) conversation: ConversationState,
     pub(super) context: ContextState,
     pub(super) preserve_inherited_delta: bool,
-    pub(super) exec_history: Option<(ResponseHistory, Arc<Vec<ResponseItem>>)>,
+}
+
+struct ExecHistory(ResponseHistory);
+
+impl HistorySource for ExecHistory {
+    fn items(&self) -> Vec<ResponseItem> {
+        self.0.iter().cloned().collect()
+    }
 }
 
 impl ModelSessionState {
-    pub(super) fn exec_history(&mut self) -> (Arc<Vec<ResponseItem>>, usize) {
+    pub(super) fn exec_history(&mut self) -> Arc<SharedHistory> {
         self.conversation.commit_tail();
-        let live = self.conversation.shared_history();
-        if let Some((cached, snapshot)) = &mut self.exec_history
-            && cached.shared_prefix_len(&live) == snapshot.len()
-            && let Some(items) = Arc::get_mut(snapshot)
-        {
-            let copied = live.len() - items.len();
-            items.extend(live.iter_from(items.len()).cloned());
-            *cached = live;
-            return (Arc::clone(snapshot), copied);
-        }
-        let snapshot = Arc::new(live.iter().cloned().collect::<Vec<_>>());
-        let copied = snapshot.len();
-        self.exec_history = Some((live, Arc::clone(&snapshot)));
-        (snapshot, copied)
+        Arc::new(SharedHistory::from_source(ExecHistory(
+            self.conversation.shared_history(),
+        )))
     }
 
     pub(super) fn validate_workspace(&self, requested: Option<&str>) -> Result<()> {

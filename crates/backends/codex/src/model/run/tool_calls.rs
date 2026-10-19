@@ -451,21 +451,15 @@ impl ModelRun {
         conversation: &mut ConversationState,
         call_index: u32,
         calls: Vec<CodeCall>,
-        history: Option<(Arc<Vec<ResponseItem>>, usize)>,
+        history: Option<Arc<SharedHistory>>,
         turn_id: String,
     ) -> Result<()> {
         self.active_tool_batch_started_at = Some(Instant::now());
         let mut prepared = Vec::with_capacity(calls.len());
         for call in calls {
             let active = self.prepare_model_tool_call(call_index, &call)?;
-            if call.name == "exec"
-                && let Some((_, copied)) = &history
-            {
-                active.span.record("history.snapshot.items_copied", copied);
-            }
             prepared.push((call, active));
         }
-        let history = history.map(|(history, _)| history);
 
         let events = self.events.clone();
         let tool_call_indices = self.tool_call_indices.clone();
@@ -812,7 +806,7 @@ impl ModelRun {
         tool_call_indices: &HashMap<Box<str>, u32>,
         call_index: u32,
         call: CodeCall,
-        history: Option<Arc<Vec<ResponseItem>>>,
+        history: Option<Arc<SharedHistory>>,
         session_id: &str,
         turn_id: &str,
         model: Model,
@@ -926,17 +920,20 @@ impl ModelRun {
             });
         }
         if matches!(call.kind, CodeCallKind::ToolSearch) {
-            let search_history = history.as_deref().map_or(&[][..], Vec::as_slice);
-            let context = ToolContext::new(
+            let mut context = ToolContext::new(
                 model.as_str(),
                 session_id,
                 &call.call_id,
-                search_history,
+                &[],
                 DEFAULT_TOOL_OUTPUT_TOKENS,
-            )
-            .with_instruction_revision(instruction_revision)
-            .with_host_context(host_context)
-            .with_turn_id(Some(turn_id));
+            );
+            if let Some(history) = &history {
+                context = context.with_shared_history(history);
+            }
+            let context = context
+                .with_instruction_revision(instruction_revision)
+                .with_host_context(host_context)
+                .with_turn_id(Some(turn_id));
             let execution = if tools.is_code_only() {
                 ToolOutput::error(
                     "Tool discovery requires Code Mode; call tools.tool_search inside exec. No direct discovery was executed.",

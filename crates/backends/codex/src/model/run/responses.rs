@@ -336,11 +336,7 @@ pub(super) fn panic_payload(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-pub(super) fn model_tool_span(
-    session_id: &str,
-    call: &CodeCall,
-    call_index: u32,
-) -> tracing::Span {
+pub(super) fn model_tool_span(session_id: &str, call: &CodeCall, call_index: u32) -> tracing::Span {
     let qualified_name = qualified_tool_name(call);
     info_span!(
         target: "nanocode",
@@ -352,7 +348,6 @@ pub(super) fn model_tool_span(
         tool.call_id = %call.call_id,
         tool.arguments.bytes = call.input.len(),
         model.call_index = call_index,
-        history.snapshot.items_copied = tracing::field::Empty,
         status = tracing::field::Empty,
         duration_ns = tracing::field::Empty,
     )
@@ -360,7 +355,7 @@ pub(super) fn model_tool_span(
 
 pub(super) fn owned_code_context(
     call: &CodeCall,
-    history: Option<Arc<Vec<ResponseItem>>>,
+    history: Option<Arc<SharedHistory>>,
     session_id: &str,
     turn_id: &str,
     model: Model,
@@ -378,9 +373,10 @@ pub(super) fn owned_code_context(
             model.as_str(),
             session_id,
             &call.call_id,
-            history,
+            Arc::default(),
             DEFAULT_TOOL_OUTPUT_TOKENS,
         )
+        .with_history(history)
         .with_instruction_revision(instruction_revision)
         .with_host_context(host_context.map(Arc::from))
         .with_turn_id(Some(Arc::from(turn_id))),

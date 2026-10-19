@@ -65,6 +65,7 @@ use crate::{
     prompt_cache::ModelPromptCache,
     usage::TurnUsage,
 };
+use nanocode_code_mode::contract::{HistorySource, SharedHistory};
 use nanocode_tool_host::{
     ToolContext, Tools,
     code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate},
@@ -378,7 +379,6 @@ impl ModelRun {
                 conversation: checkpoint.conversation,
                 context,
                 preserve_inherited_delta: checkpoint.preserve_inherited_delta,
-                exec_history: None,
             }),
             active_tools: Some(active_tools),
             active_tool_calls: Vec::new(),
@@ -569,7 +569,6 @@ impl ModelRun {
             conversation: ConversationState::empty(canonical_context),
             context,
             preserve_inherited_delta: false,
-            exec_history: None,
         })
     }
 
