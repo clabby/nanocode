@@ -20,7 +20,7 @@ mod view;
 
 use std::{
     io::{IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
@@ -35,15 +35,21 @@ use crate::{
 
 const TELEMETRY_SHUTDOWN: std::time::Duration = std::time::Duration::from_millis(500);
 
-fn install_telemetry(cli: &Cli) -> Result<Option<nanocode_observability::ObservabilityGuard>> {
-    let args = &cli.observability;
+fn cli_home(cli: &Cli) -> Result<PathBuf> {
     let explicit_home = match &cli.command {
         Some(Command::Exec(args)) => args.home.as_deref(),
         Some(Command::Sessions(args)) => args.home.as_deref(),
         _ => None,
     }
     .or(cli.session.home.as_deref());
-    let home = host::home_dir(explicit_home)?;
+    host::home_dir(explicit_home)
+}
+
+fn install_telemetry(
+    cli: &Cli,
+    home: &Path,
+) -> Result<Option<nanocode_observability::ObservabilityGuard>> {
+    let args = &cli.observability;
     let interactive = !matches!(
         cli.command,
         Some(Command::Exec(_) | Command::Hand(_) | Command::Sessions(_) | Command::Models)
@@ -65,10 +71,28 @@ fn install_telemetry(cli: &Cli) -> Result<Option<nanocode_observability::Observa
 
 pub fn main() -> ExitCode {
     let entered = std::time::Instant::now();
+    let mut arguments = std::env::args_os();
+    if let Some(name) = arguments
+        .next()
+        .as_deref()
+        .and_then(nanocode::runners::search::shimmed)
+    {
+        return nanocode::runners::search::run(name, arguments.collect());
+    }
     let cli = Cli::parse();
     let parsed = entered.elapsed();
+    let home = match cli_home(&cli) {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("nanocode: failed to resolve the home directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = nanocode::runners::search::install(&home.join("shims")) {
+        eprintln!("nanocode: grep stays unshimmed: {error}");
+    }
     let telemetry_started = std::time::Instant::now();
-    let telemetry = match install_telemetry(&cli) {
+    let telemetry = match install_telemetry(&cli, &home) {
         Ok(telemetry) => telemetry,
         Err(error) => {
             eprintln!("nanocode: failed to start telemetry: {error}");

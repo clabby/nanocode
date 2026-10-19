@@ -21,8 +21,6 @@ impl CodeModeToolPolicy for ClaudeToolPolicy {
             "Read",
             "Write",
             "Edit",
-            "Glob",
-            "Grep",
             HostTool::TaskOutput.name(),
             HostTool::TaskStop.name(),
         ]

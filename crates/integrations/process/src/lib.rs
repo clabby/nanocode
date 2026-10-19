@@ -6,6 +6,7 @@ mod foreground;
 pub use foreground::{ForegroundOutput, run_bash};
 mod output;
 mod process;
+pub mod search;
 use nanocode_home::shell as selection;
 
 pub use process::ProcessGroupGuard;

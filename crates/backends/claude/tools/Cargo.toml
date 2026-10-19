@@ -21,9 +21,6 @@ serde_json.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 image.workspace = true
 tokio = { workspace = true, features = ["rt"] }
-regex.workspace = true
-ignore.workspace = true
-globset = "0.4.19"
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
