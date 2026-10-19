@@ -1035,8 +1035,25 @@ impl ResponsesService {
                 if matches!(request.kind, ResponsesAttemptKind::Connect) {
                     if matches!(transport, ResponsesTransport::WebSocket)
                         && connection.socket.is_none()
+                        && let Err(error) = service.connect(connection, &request).await
                     {
-                        service.connect(connection, &request).await?;
+                        if matches!(
+                            error.responses_error(),
+                            Some(ResponsesError::HandshakeRejected { status: 426, .. })
+                        ) && request.activate_https_fallback()
+                        {
+                            tracing::warn!(
+                                target: "nanocode_codex",
+                                previous_transport = "responses_websocket_v2",
+                                next_transport = "responses_https_sse",
+                                reason = "upgrade_required",
+                                phase = request.kind.phase(),
+                                model.call_index = request.call_index,
+                                attempt = request.attempt,
+                                "falling back from WebSocket to HTTPS Responses transport"
+                            );
+                        }
+                        return Err(error);
                     }
                     return Ok(ResponsesServiceResponse {
                         output: ResponsesOutput::Connected,
