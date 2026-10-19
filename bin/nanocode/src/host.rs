@@ -14,6 +14,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
 type WarmUp = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+pub(crate) type Notices = std::pin::Pin<Box<dyn futures_util::Stream<Item = String> + Send>>;
 
 #[derive(Clone, Default)]
 pub struct ModelClients {
@@ -21,6 +22,7 @@ pub struct ModelClients {
     claude: Option<std::sync::Arc<dyn Fn() -> ClaudeClient + Send + Sync>>,
     warm_up: Option<std::sync::Arc<dyn Fn() -> WarmUp + Send + Sync>>,
     status: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+    notices: Option<std::sync::Arc<dyn Fn() -> Notices + Send + Sync>>,
 }
 
 impl ModelClients {
@@ -89,6 +91,19 @@ impl ModelClients {
     pub fn status(mut self, status: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
         self.status = Some(std::sync::Arc::new(status));
         self
+    }
+
+    #[must_use]
+    pub fn notices<S>(mut self, notices: impl Fn() -> S + Send + Sync + 'static) -> Self
+    where
+        S: futures_util::Stream<Item = String> + Send + 'static,
+    {
+        self.notices = Some(std::sync::Arc::new(move || Box::pin(notices()) as Notices));
+        self
+    }
+
+    pub(crate) fn notifying(&self) -> Option<Notices> {
+        self.notices.as_ref().map(|notices| notices())
     }
 
     pub(crate) fn describe(&self) -> Option<String> {

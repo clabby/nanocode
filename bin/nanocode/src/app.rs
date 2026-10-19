@@ -394,6 +394,9 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         app.notice(NoticeLevel::Info, listener_notice(&server));
     }
     forward_runners(&app.host.runtime, app.tx.clone());
+    if let Some(notices) = app.host.config.clients.notifying() {
+        forward_notices(notices, app.tx.clone());
+    }
     if let Some(updates) = app.host.runtime.take_subagent_updates() {
         forward_subagents(updates, app.tx.clone());
     }
@@ -656,6 +659,19 @@ fn forward_runners(runtime: &nanocode::Nanocode, tx: UnboundedSender<AppEvent>) 
                 }
             };
             if tx.send(AppEvent::Notice(level, message)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn forward_notices(mut notices: crate::host::Notices, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        while let Some(notice) = notices.next().await {
+            if tx
+                .send(AppEvent::Notice(NoticeLevel::Info, notice))
+                .is_err()
+            {
                 break;
             }
         }

@@ -403,6 +403,13 @@ async fn exec(args: SessionArgs, clients: ModelClients) -> Result<()> {
         eprintln!("nanocode: computer use unavailable, continuing without it: {reason}");
     }
     tokio::spawn(async move { while events.recv().await.is_some() {} });
+    if let Some(mut notices) = host.config.clients.notifying() {
+        tokio::spawn(async move {
+            while let Some(notice) = notices.next().await {
+                eprintln!("{notice}");
+            }
+        });
+    }
     let outcome: Result<()> = async {
         for pending in pending {
             eprintln!("nanocode: resuming interrupted turn {}", pending.id);
