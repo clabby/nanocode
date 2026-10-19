@@ -203,12 +203,11 @@ pub(super) fn spawn(
     tty: bool,
     environment: &[(OsString, OsString)],
 ) -> io::Result<SpawnedProcess> {
-    let script = crate::search::wrap(script, shell);
     if tty {
-        return spawn_pty(&script, workspace, shell, login, environment);
+        return spawn_pty(script, workspace, shell, login, environment);
     }
 
-    spawn_pipes(&script, workspace, shell, login, environment)
+    spawn_pipes(script, workspace, shell, login, environment)
 }
 
 fn spawn_pipes(

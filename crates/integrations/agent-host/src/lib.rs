@@ -13,8 +13,6 @@ use nanocode_agent_core::{NanocodeError, WeakAgent};
 #[cfg(not(target_family = "wasm"))]
 pub use nanocode_cua::{ComputerConfig, ComputerTools};
 #[cfg(not(target_family = "wasm"))]
-pub use nanocode_process::search;
-#[cfg(not(target_family = "wasm"))]
 pub use nanocode_tool_runtime::attachment::{
     AttachmentError, Runner, RunnerEvent, RunnerHandle, RunnerInfo, RunnerPool, RunnerProtocol,
     RunnerServer, RunnerServerConfig, RunnerSpec, RunnerStatus,

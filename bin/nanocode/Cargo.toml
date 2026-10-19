@@ -18,12 +18,6 @@ path = "src/main.rs"
 test = false
 bench = false
 
-[[bin]]
-name = "nanocode-grep"
-path = "src/bin/nanocode-grep.rs"
-test = false
-bench = false
-
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 clap.workspace = true
 futures-util.workspace = true
