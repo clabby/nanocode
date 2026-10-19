@@ -9,8 +9,7 @@ pub fn runtime(tools: Tools) -> Result<nanocode::NanocodeBuilder> {
                 .transport(nanocode::oai::transport::ResponsesTransport::Https)
                 .websocket_warmup(false)
                 .build()?,
-            ClaudeClient::new(
-                Default::default(),
+            ClaudeClient::with_api_key(
                 format!("{}/messages", base.trim_end_matches('/')),
                 std::env::var("ANTHROPIC_API_KEY")?,
             ),

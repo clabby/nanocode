@@ -480,6 +480,13 @@ fn unavailable(reason: &str) -> ClaudeAuthUnavailable {
     ClaudeAuthUnavailable::new(reason.to_owned())
 }
 
+impl ClaudeClient {
+    pub fn with_api_key(endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
+        nanocode_tls::install_default_rustls_crypto_provider();
+        Self::new(reqwest::Client::new(), endpoint, api_key)
+    }
+}
+
 impl Default for ClaudeClient {
     fn default() -> Self {
         nanocode_tls::install_default_rustls_crypto_provider();
