@@ -13,23 +13,52 @@ use crate::cli::{GatewayArg, GatewayArgs, RemoteArgs, RunnerModeArg};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub type WarmUp = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+type WarmUp = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ModelClients {
-    pub openai: std::sync::Arc<dyn Fn() -> nanocode::codex::OpenAiBuilder + Send + Sync>,
-    pub claude: std::sync::Arc<dyn Fn() -> ClaudeClient + Send + Sync>,
-    pub warm_up: Option<std::sync::Arc<dyn Fn() -> WarmUp + Send + Sync>>,
+    openai: Option<std::sync::Arc<dyn Fn() -> nanocode::codex::OpenAiBuilder + Send + Sync>>,
+    claude: Option<std::sync::Arc<dyn Fn() -> ClaudeClient + Send + Sync>>,
+    warm_up: Option<std::sync::Arc<dyn Fn() -> WarmUp + Send + Sync>>,
 }
 
-static MODEL_CLIENTS: std::sync::OnceLock<ModelClients> = std::sync::OnceLock::new();
+impl ModelClients {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-pub fn set_model_clients(clients: ModelClients) -> bool {
-    MODEL_CLIENTS.set(clients).is_ok()
-}
+    #[must_use]
+    pub fn openai(
+        mut self,
+        openai: impl Fn() -> nanocode::codex::OpenAiBuilder + Send + Sync + 'static,
+    ) -> Self {
+        self.openai = Some(std::sync::Arc::new(openai));
+        self
+    }
 
-pub fn model_clients() -> Option<&'static ModelClients> {
-    MODEL_CLIENTS.get()
+    #[must_use]
+    pub fn claude(mut self, claude: impl Fn() -> ClaudeClient + Send + Sync + 'static) -> Self {
+        self.claude = Some(std::sync::Arc::new(claude));
+        self
+    }
+
+    #[must_use]
+    pub fn warm_up<F>(mut self, warm_up: impl Fn() -> F + Send + Sync + 'static) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.warm_up = Some(std::sync::Arc::new(move || Box::pin(warm_up()) as WarmUp));
+        self
+    }
+
+    pub(crate) fn warming(&self) -> Option<WarmUp> {
+        self.warm_up.as_ref().map(|warm_up| warm_up())
+    }
+
+    pub(crate) const fn supplies_openai(&self) -> bool {
+        self.openai.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -40,6 +69,7 @@ pub struct HostConfig {
     pub runners: Vec<Runner>,
     pub runner_servers: Vec<RunnerServerConfig>,
     pub gateway: Option<Gateway>,
+    pub clients: ModelClients,
 }
 
 #[derive(Clone)]
@@ -210,9 +240,8 @@ impl Host {
         model: &ModelSelection,
         thinking: Thinking,
     ) -> Result<Self> {
-        let clients = model_clients();
-        let openai = match (clients, &config.gateway) {
-            (Some(clients), _) => (clients.openai)(),
+        let openai = match (&config.clients.openai, &config.gateway) {
+            (Some(openai), _) => openai(),
             (None, Some(gateway)) => {
                 gateway.check(model)?;
                 OpenAi::builder(gateway.auth.clone()).responses_gateway(gateway.route.clone())
@@ -223,7 +252,11 @@ impl Host {
         .build()?;
         let codex = CodexHarness::new(openai);
         let claude = ClaudeHarness::new(
-            clients.map_or_else(ClaudeClient::default, |clients| (clients.claude)()),
+            config
+                .clients
+                .claude
+                .as_ref()
+                .map_or_else(ClaudeClient::default, |claude| claude()),
         );
         let mut builder = Nanocode::builder()
             .openai(codex)

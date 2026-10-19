@@ -28,6 +28,7 @@ impl ServicePlatform {
                 config.host_transport.clone(),
                 config.chat_gateway.clone(),
                 config.responses_gateway.clone(),
+                config.http_layer.clone(),
             ),
         }
     }

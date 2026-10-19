@@ -128,6 +128,9 @@ pub use nanocode_backend_codex::client as oai;
 
 pub use nanocode_backend_codex::client as codex;
 
+#[doc(inline)]
+pub use nanocode_backend_codex::client::transport::layer as http;
+
 pub mod tools;
 
 #[doc(inline)]

@@ -4470,11 +4470,10 @@ impl State {
             };
 
             let uncertain = accepted
+                || matches!(&error, ClaudeError::Transport(error) if !error.is_unsent())
                 || matches!(
                     &error,
-                    ClaudeError::Transport(_)
-                        | ClaudeError::StreamError { .. }
-                        | ClaudeError::IncompleteStream
+                    ClaudeError::StreamError { .. } | ClaudeError::IncompleteStream
                 )
                 || matches!(&error, ClaudeError::Http { status, .. } if *status >= 500);
             let retry_after = match &error {

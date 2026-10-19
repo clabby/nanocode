@@ -1798,6 +1798,7 @@ dependencies = [
  "nanocode-agent-types",
  "nanocode-audio",
  "nanocode-home",
+ "nanocode-http",
  "nanocode-platform",
  "nanocode-sync",
  "nanocode-tls",

@@ -1,6 +1,7 @@
 pub mod host;
 
 pub use host::{HttpBody, HttpError, HttpFuture, HttpRequest, HttpResponse, HttpTransport};
+pub use nanocode_http::layer::{self, Layer};
 
 #[cfg(not(target_family = "wasm"))]
 pub type HttpClient = reqwest::Client;
@@ -29,9 +30,8 @@ pub(crate) async fn post(
     mut headers: http::HeaderMap,
     body: String,
     gzip: bool,
+    layer: Option<&dyn Layer>,
 ) -> Result<HttpResponse, HttpError> {
-    use futures_util::TryStreamExt;
-
     headers
         .entry(http::header::ACCEPT_ENCODING)
         .or_insert(http::HeaderValue::from_static("gzip, br, deflate, zstd"));
@@ -52,28 +52,85 @@ pub(crate) async fn post(
     } else {
         reqwest::Body::from(body)
     };
-    let mut response = client
+    let request = client
         .post(endpoint)
         .header("anthropic-version", crate::ANTHROPIC_VERSION)
         .headers(headers)
         .header("content-type", "application/json")
         .body(body)
-        .send()
+        .build()
+        .map_err(reqwest_error)?;
+    let Some(layer) = layer else {
+        return send_reqwest(client, request)
+            .await
+            .map(HttpResponse::from_layer)
+            .map_err(HttpError::from);
+    };
+    let request = layer::Request {
+        method: request.method().clone(),
+        url: request.url().to_string(),
+        headers: request.headers().clone(),
+        body: request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default(),
+    };
+    layer
+        .send(request, layer::Next::new(&ReqwestSender { client }))
+        .await
+        .map(HttpResponse::from_layer)
+        .map_err(HttpError::from)
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn send_reqwest(
+    client: &HttpClient,
+    request: reqwest::Request,
+) -> Result<layer::Response, layer::Error> {
+    use futures_util::TryStreamExt;
+
+    let mut response = client
+        .execute(request)
         .await
         .map(nanocode_http::decode_response)
-        .map_err(reqwest_error)?;
+        .map_err(|error| layer::Error::from(reqwest_error(error)))?;
     let status = response.status();
     let headers = std::mem::take(response.headers_mut());
-    Ok(HttpResponse::new(
+    Ok(layer::Response::new(
         status,
         headers,
         Box::pin(
             response
                 .bytes_stream()
                 .map_ok(Vec::from)
-                .map_err(reqwest_error),
+                .map_err(|error| layer::Error::from(reqwest_error(error))),
         ),
     ))
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct ReqwestSender<'a> {
+    client: &'a HttpClient,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl layer::Sender for ReqwestSender<'_> {
+    fn send(
+        &self,
+        request: layer::Request,
+    ) -> layer::BoxFuture<'_, Result<layer::Response, layer::Error>> {
+        Box::pin(async move {
+            let request = self
+                .client
+                .request(request.method, request.url)
+                .headers(request.headers)
+                .body(request.body)
+                .build()
+                .map_err(|error| layer::Error::from(reqwest_error(error)))?;
+            send_reqwest(self.client, request).await
+        })
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -96,6 +153,7 @@ fn encode_error(error: &dyn std::error::Error) -> HttpError {
     HttpError::Transport {
         retryable: false,
         timeout: false,
+        unsent: true,
         detail: format!("gzip request body: {error}"),
     }
 }
@@ -112,6 +170,7 @@ fn reqwest_error(error: reqwest::Error) -> HttpError {
     HttpError::Transport {
         retryable: error.is_request() || error.is_body(),
         timeout: error.is_timeout(),
+        unsent: error.is_connect() || error.is_builder(),
         detail,
     }
 }
@@ -123,8 +182,9 @@ pub(crate) async fn post(
     headers: http::HeaderMap,
     body: String,
     _gzip: bool,
+    layer: Option<&dyn Layer>,
 ) -> Result<HttpResponse, HttpError> {
-    post_with(client.0.as_ref(), endpoint, headers, body).await
+    post_with(client.0.as_ref(), endpoint, headers, body, layer).await
 }
 
 pub(crate) async fn post_with(
@@ -132,6 +192,7 @@ pub(crate) async fn post_with(
     endpoint: &str,
     mut headers: http::HeaderMap,
     body: String,
+    layer: Option<&dyn Layer>,
 ) -> Result<HttpResponse, HttpError> {
     headers
         .entry("anthropic-version")
@@ -140,11 +201,49 @@ pub(crate) async fn post_with(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
-    transport
-        .post(HttpRequest {
-            endpoint: endpoint.to_owned(),
-            headers,
-            body,
-        })
+    let Some(layer) = layer else {
+        return transport
+            .post(HttpRequest {
+                endpoint: endpoint.to_owned(),
+                headers,
+                body,
+            })
+            .await;
+    };
+    let request = layer::Request {
+        method: http::Method::POST,
+        url: endpoint.to_owned(),
+        headers,
+        body: body.into_bytes(),
+    };
+    layer
+        .send(request, layer::Next::new(&TransportSender { transport }))
         .await
+        .map(HttpResponse::from_layer)
+        .map_err(HttpError::from)
+}
+
+struct TransportSender<'a> {
+    transport: &'a dyn HttpTransport,
+}
+
+impl layer::Sender for TransportSender<'_> {
+    fn send(
+        &self,
+        request: layer::Request,
+    ) -> layer::BoxFuture<'_, Result<layer::Response, layer::Error>> {
+        Box::pin(async move {
+            let body = String::from_utf8(request.body)
+                .map_err(|_| layer::Error::new("Messages request body is not UTF-8").unsent(true))?;
+            self.transport
+                .post(HttpRequest {
+                    endpoint: request.url,
+                    headers: request.headers,
+                    body,
+                })
+                .await
+                .map(HttpResponse::into_layer)
+                .map_err(layer::Error::from)
+        })
+    }
 }

@@ -6,16 +6,18 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Native HTTP content coding adapters"
+description = "Provider-neutral HTTP layer contracts and native content coding adapters"
 autotests = false
 autobenches = false
 
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
+[dependencies]
 futures-util.workspace = true
+http.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 nanocode-zstd.workspace = true
 brotli-decompressor.workspace = true
 flate2.workspace = true
-http.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 
 [lints]

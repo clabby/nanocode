@@ -241,6 +241,15 @@ impl<F> OpenAiBuilder<F> {
         self
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn http_layer(mut self, layer: impl crate::client::transport::layer::Layer) -> Self {
+        self.config.http_layer = Some(Arc::new(layer));
+        self.config.responses_transport = ResponsesTransport::Https;
+        self.config.websocket_warmup = false;
+        self
+    }
+
     #[must_use]
     pub fn layer<L>(self, layer: L) -> OpenAiBuilder<LayeredServiceFactory<F, L>> {
         OpenAiBuilder {

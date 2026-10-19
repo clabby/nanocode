@@ -50,6 +50,9 @@ pub struct ModelConfig {
     #[cfg(not(target_family = "wasm"))]
     pub chat_gateway: Option<Arc<crate::client::transport::ChatGateway>>,
 
+    #[cfg(not(target_family = "wasm"))]
+    pub http_layer: Option<Arc<dyn nanocode_http::layer::Layer>>,
+
     pub responses_gateway: Option<Arc<crate::client::transport::ResponsesGateway>>,
 
     pub system_prompt: Option<Arc<str>>,
@@ -172,6 +175,8 @@ impl ModelConfig {
             host_transport: None,
             #[cfg(not(target_family = "wasm"))]
             chat_gateway: None,
+            #[cfg(not(target_family = "wasm"))]
+            http_layer: None,
             responses_gateway: None,
             system_prompt: None,
             additional_instructions: None,

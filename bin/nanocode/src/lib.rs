@@ -33,15 +33,7 @@ use crate::{
     host::{Host, HostConfig, Result},
 };
 
-pub use host::{ModelClients, WarmUp};
-
-pub fn run_with(clients: ModelClients) -> ExitCode {
-    if !host::set_model_clients(clients) {
-        eprintln!("nanocode: model clients were already set");
-        return ExitCode::FAILURE;
-    }
-    run()
-}
+pub use host::ModelClients;
 
 const TELEMETRY_SHUTDOWN: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -80,6 +72,10 @@ fn install_telemetry(
 }
 
 pub fn run() -> ExitCode {
+    run_with(ModelClients::default())
+}
+
+pub fn run_with(clients: ModelClients) -> ExitCode {
     let entered = std::time::Instant::now();
     let cli = Cli::parse();
     let parsed = entered.elapsed();
@@ -127,9 +123,9 @@ pub fn run() -> ExitCode {
     if matches!(
         cli.command,
         None | Some(Command::Exec(_) | Command::Resume { .. })
-    ) && let Some(warm_up) = host::model_clients().and_then(|clients| clients.warm_up.clone())
+    ) && let Some(warming) = clients.warming()
     {
-        runtime.spawn(warm_up());
+        runtime.spawn(warming);
     }
     let outcome = runtime.block_on(async move {
         match cli.command {
@@ -138,7 +134,7 @@ pub fn run() -> ExitCode {
                 args.home = args.home.or(cli.session.home);
                 list_sessions(args).await
             }
-            Some(Command::Exec(args)) => exec(args.or(cli.session)).await,
+            Some(Command::Exec(args)) => exec(args.or(cli.session), clients).await,
             Some(Command::Models) => {
                 print_models();
                 Ok(())
@@ -146,9 +142,9 @@ pub fn run() -> ExitCode {
             Some(Command::Resume { id }) => {
                 let mut args = cli.session;
                 args.resume = Some(id.unwrap_or_default());
-                interactive(args).await
+                interactive(args, clients).await
             }
-            None => interactive(cli.session).await,
+            None => interactive(cli.session, clients).await,
         }
     });
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
@@ -170,7 +166,11 @@ struct Prepared {
     home: PathBuf,
 }
 
-async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Prepared> {
+async fn prepare(
+    args: &SessionArgs,
+    clients: ModelClients,
+    notify: &mut dyn FnMut(&str),
+) -> Result<Prepared> {
     let workspace = match &args.workspace {
         Some(path) => std::fs::canonicalize(path)
             .map_err(|error| format!("workspace {}: {error}", path.display()))?,
@@ -178,6 +178,9 @@ async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Pre
     };
     let home = host::home_dir(args.home.as_deref())?;
     let gateway = host::gateway(&args.gateway)?;
+    if gateway.is_some() && clients.supplies_openai() {
+        return Err("this binary supplies its own Codex client; --gateway is unavailable".into());
+    }
     let model = match (&args.model, args.harness) {
         (Some(model), harness) => {
             let model = host::parse_model(model)?;
@@ -228,6 +231,7 @@ async fn prepare(args: &SessionArgs, notify: &mut dyn FnMut(&str)) -> Result<Pre
         runners,
         runner_servers,
         gateway,
+        clients,
     };
     let host = tracing::Instrument::instrument(
         Host::build(config, &model, thinking),
@@ -262,7 +266,7 @@ const fn family(harness: HarnessArg) -> nanocode::HarnessFamily {
     }
 }
 
-async fn interactive(mut args: SessionArgs) -> Result<()> {
+async fn interactive(mut args: SessionArgs, clients: ModelClients) -> Result<()> {
     let reload = match &args.reload_state {
         Some(path) => Some(app::reload::read(path).await?),
         None => None,
@@ -292,7 +296,7 @@ async fn interactive(mut args: SessionArgs) -> Result<()> {
             keyboard_enhancement: true,
         })?;
     nanocode_tui::highlight::prewarm();
-    let prepared = prepare(&args, &mut |_| {}).await;
+    let prepared = prepare(&args, clients, &mut |_| {}).await;
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -359,13 +363,16 @@ async fn latest_session(host: &Host) -> Result<String> {
         .ok_or_else(|| "no saved session for this workspace".into())
 }
 
-async fn exec(args: SessionArgs) -> Result<()> {
+async fn exec(args: SessionArgs, clients: ModelClients) -> Result<()> {
     let prompt = args
         .prompt
         .clone()
         .filter(|prompt| !prompt.trim().is_empty())
         .ok_or("exec requires a prompt")?;
-    let prepared = prepare(&args, &mut |message| eprintln!("nanocode: {message}")).await?;
+    let prepared = prepare(&args, clients, &mut |message| {
+        eprintln!("nanocode: {message}");
+    })
+    .await?;
     let host = prepared.host;
     let resume = match (&args.resume, args.continue_last) {
         (Some(id), _) if !id.is_empty() => Some(id.clone()),

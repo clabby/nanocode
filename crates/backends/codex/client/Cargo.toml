@@ -26,6 +26,7 @@ nanocode-types.workspace = true
 base64.workspace = true
 futures-util.workspace = true
 http.workspace = true
+nanocode-http.workspace = true
 httpdate.workspace = true
 image.workspace = true
 serde.workspace = true

@@ -40,15 +40,52 @@ pub enum HttpError {
         detail: String,
         retryable: bool,
         timeout: bool,
+        unsent: bool,
     },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+impl HttpError {
+    #[must_use]
+    pub const fn is_unsent(&self) -> bool {
+        matches!(self, Self::Transport { unsent: true, .. })
+    }
+}
+
+impl From<nanocode_http::layer::Error> for HttpError {
+    fn from(error: nanocode_http::layer::Error) -> Self {
+        Self::Transport {
+            retryable: error.is_retryable(),
+            timeout: error.is_timeout(),
+            unsent: error.is_unsent(),
+            detail: error.detail().to_owned(),
+        }
+    }
+}
+
+impl From<HttpError> for nanocode_http::layer::Error {
+    fn from(error: HttpError) -> Self {
+        match error {
+            HttpError::Transport {
+                detail,
+                retryable,
+                timeout,
+                unsent,
+            } => Self::new(detail)
+                .retryable(retryable)
+                .timeout(timeout)
+                .unsent(unsent),
+            HttpError::Json(error) => Self::new(error.to_string()),
+        }
+    }
 }
 
 pub struct HttpResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: HttpBody,
+    events: Option<Box<dyn nanocode_http::layer::EventHook>>,
 }
 
 impl HttpResponse {
@@ -57,7 +94,30 @@ impl HttpResponse {
             status,
             headers,
             body,
+            events: None,
         }
+    }
+
+    pub(crate) fn from_layer(response: nanocode_http::layer::Response) -> Self {
+        let (status, headers, body, events) = response.into_parts();
+        Self {
+            status,
+            headers,
+            body: Box::pin(body.map_err(HttpError::from)),
+            events,
+        }
+    }
+
+    pub(crate) fn into_layer(self) -> nanocode_http::layer::Response {
+        nanocode_http::layer::Response::new(
+            self.status,
+            self.headers,
+            Box::pin(self.body.map_err(nanocode_http::layer::Error::from)),
+        )
+    }
+
+    pub(crate) fn take_events(&mut self) -> Option<Box<dyn nanocode_http::layer::EventHook>> {
+        self.events.take()
     }
 
     pub const fn status(&self) -> StatusCode {

@@ -23,6 +23,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 url.workspace = true
 futures-util.workspace = true
 httpdate = "1.0.3"
+nanocode-http.workspace = true
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
 uuid.workspace = true
 http.workspace = true
@@ -33,7 +34,6 @@ tracing.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 reqwest = { workspace = true, features = ["stream", "gzip", "deflate"] }
-nanocode-http.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt-multi-thread"] }
 nanocode-tls.workspace = true
 unicode-normalization = "0.1.25"

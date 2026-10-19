@@ -1141,6 +1141,7 @@ pub struct ClaudeClient {
 
     subscription_cache_tail: bool,
     gzip_rejected: Arc<std::sync::atomic::AtomicBool>,
+    http_layer: Option<Arc<dyn transport::Layer>>,
 }
 
 impl ClaudeClient {
@@ -1154,6 +1155,7 @@ impl ClaudeClient {
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
             gzip_rejected: Arc::default(),
+            http_layer: None,
         }
     }
 
@@ -1171,6 +1173,7 @@ impl ClaudeClient {
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
             gzip_rejected: Arc::default(),
+            http_layer: None,
         }
     }
 
@@ -1188,12 +1191,19 @@ impl ClaudeClient {
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
             gzip_rejected: Arc::default(),
+            http_layer: None,
         }
     }
 
     #[must_use]
     pub fn with_transport(mut self, transport: impl transport::HttpTransport) -> Self {
         self.http = HttpConnection::Transport(Arc::new(transport));
+        self
+    }
+
+    #[must_use]
+    pub fn with_http_layer(mut self, layer: impl transport::Layer) -> Self {
+        self.http_layer = Some(Arc::new(layer));
         self
     }
 
@@ -1535,10 +1545,18 @@ impl ClaudeClient {
                 }
             }
             let gzip = self.gzip_request_body(wire.body.len());
+            let layer = self.http_layer.as_deref();
             let response = match &self.http {
                 HttpConnection::Client(client) => {
-                    transport::post(client, &self.endpoint, headers, wire.body.clone(), gzip)
-                        .await?
+                    transport::post(
+                        client,
+                        &self.endpoint,
+                        headers,
+                        wire.body.clone(),
+                        gzip,
+                        layer,
+                    )
+                    .await?
                 }
                 HttpConnection::Transport(transport) => {
                     transport::post_with(
@@ -1546,6 +1564,7 @@ impl ClaudeClient {
                         &self.endpoint,
                         headers,
                         wire.body.clone(),
+                        layer,
                     )
                     .await?
                 }
@@ -1623,7 +1642,8 @@ impl ClaudeClient {
 
     #[doc(hidden)]
     pub async fn stream_prepared(&self, wire: &PreparedWire) -> Result<ClaudeStream, ClaudeError> {
-        let (response, credentials) = self.post(wire).await?;
+        let (mut response, credentials) = self.post(wire).await?;
+        let events = response.take_events();
 
         let is_sse = response
             .headers()
@@ -1639,7 +1659,7 @@ impl ClaudeClient {
         let response = response.bytes_stream();
         let decode_subscription = self.subscription_compatibility;
         Ok(Box::pin(stream::unfold(
-            SseState::new(response, credentials),
+            SseState::new(response, credentials, events),
             move |mut state| async move {
                 if state.done {
                     return None;
@@ -1653,6 +1673,20 @@ impl ClaudeClient {
                         }
                     };
                     if let Some(frame) = frame {
+                        let handled = match state.handled_event(&frame) {
+                            Ok(handled) => handled,
+                            Err(error) => {
+                                state.done = true;
+                                return Some((Err(redact_error(error, &state.credentials)), state));
+                            }
+                        };
+                        if let Some(handled) = handled {
+                            if let Err(error) = handled.await {
+                                state.done = true;
+                                return Some((Err(ClaudeError::Transport(error.into())), state));
+                            }
+                            continue;
+                        }
                         let parsed = state.decode(&frame);
                         let event = match parsed {
                             Ok(StreamEvent::Error { error }) => Err(ClaudeError::StreamError {
@@ -1933,6 +1967,7 @@ fn redact_error(error: ClaudeError, credentials: &[String]) -> ClaudeError {
 struct SseState {
     credentials: Vec<String>,
     response: ResponseBytes,
+    events: Option<Box<dyn transport::layer::EventHook>>,
     bytes: Vec<u8>,
     data: Option<std::ops::Range<usize>>,
     joined: Option<String>,
@@ -1957,10 +1992,15 @@ struct Frame {
 }
 
 impl SseState {
-    const fn new(response: ResponseBytes, credentials: Vec<String>) -> Self {
+    fn new(
+        response: ResponseBytes,
+        credentials: Vec<String>,
+        events: Option<Box<dyn transport::layer::EventHook>>,
+    ) -> Self {
         Self {
             credentials,
             response,
+            events,
             bytes: Vec::new(),
             data: None,
             joined: None,
@@ -1980,12 +2020,35 @@ impl SseState {
             .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))
     }
 
+    fn handled_event(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<
+        Option<transport::layer::BoxFuture<'static, Result<(), transport::layer::Error>>>,
+        ClaudeError,
+    > {
+        let Some(events) = self.events.as_mut() else {
+            return Ok(None);
+        };
+        let text = |range: std::ops::Range<usize>| {
+            std::str::from_utf8(&self.bytes[range])
+                .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))
+        };
+        let name = frame.event_name.clone().map(text).transpose()?;
+        let data = match &frame.data {
+            FrameData::Line(range) => text(range.clone())?,
+            FrameData::Joined(data) => data,
+        };
+        Ok(events.event(transport::layer::Event { name, data }))
+    }
+
     fn decode(&self, frame: &Frame) -> Result<StreamEvent, ClaudeError> {
         let event_name = frame
             .event_name
             .clone()
             .map(|range| self.text(range))
-            .transpose()?;
+            .transpose()?
+            .filter(|name| *name != "message");
         match &frame.data {
             FrameData::Line(range) => decode_stream_event(self.text(range.clone())?, event_name),
             FrameData::Joined(data) => decode_stream_event(data, event_name),

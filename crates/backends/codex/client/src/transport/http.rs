@@ -5,6 +5,8 @@ use crate::client::{
     transport::host::{HostConnectRequest, HostError, HostHttpBody, HostTransport},
 };
 use http::header;
+#[cfg(not(target_family = "wasm"))]
+use nanocode_http::layer;
 
 #[cfg(not(target_family = "wasm"))]
 use crate::client::RetryAfter;
@@ -24,6 +26,8 @@ pub(crate) struct ResponsesHttp {
 
     #[cfg(not(target_family = "wasm"))]
     chat_gateway: Option<(std::sync::Arc<super::chat::ChatGateway>, reqwest::Client)>,
+    #[cfg(not(target_family = "wasm"))]
+    layer: Option<std::sync::Arc<dyn layer::Layer>>,
     host: Option<std::sync::Arc<dyn HostTransport>>,
     gateway: Option<std::sync::Arc<super::ResponsesGateway>>,
 }
@@ -36,10 +40,19 @@ pub(crate) struct ResponsesHttpStream {
     chat: Option<Box<super::chat::ChatStream>>,
     #[cfg(not(target_family = "wasm"))]
     host: Option<Box<dyn HostHttpBody>>,
+    #[cfg(not(target_family = "wasm"))]
+    layered: Option<LayeredBody>,
     #[cfg(target_family = "wasm")]
     response: Box<dyn HostHttpBody>,
     decoder: SseDecoder,
     ended: bool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct LayeredBody {
+    body: layer::Body,
+    events: Option<Box<dyn layer::EventHook>>,
+    pending: Option<layer::BoxFuture<'static, Result<(), layer::Error>>>,
 }
 
 pub(crate) struct HttpMetadata {
@@ -54,11 +67,13 @@ impl ResponsesHttp {
         host: Option<std::sync::Arc<dyn HostTransport>>,
         chat_gateway: Option<std::sync::Arc<super::chat::ChatGateway>>,
         gateway: Option<std::sync::Arc<super::ResponsesGateway>>,
+        layer: Option<std::sync::Arc<dyn layer::Layer>>,
     ) -> Self {
         Self {
             client,
             chat_gateway: chat_gateway
                 .map(|gateway| (gateway, super::chat::ChatGateway::http_client())),
+            layer,
             host,
             gateway,
         }
@@ -140,7 +155,15 @@ impl ResponsesHttp {
         {
             builder = builder.header(TURN_STATE_HEADER, turn_state);
         }
-        let response = builder.send().await.map_err(map_http_error)?;
+        let request = builder.build().map_err(map_http_error)?;
+        if let Some(layer) = &self.layer {
+            return self.send_layered(layer.as_ref(), request).await;
+        }
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(map_http_error)?;
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(response.headers());
@@ -171,11 +194,146 @@ impl ResponsesHttp {
                 response: Some(response),
                 chat: None,
                 host: None,
+                layered: None,
                 decoder: SseDecoder::default(),
                 ended: false,
             },
             metadata,
         ))
+    }
+
+    async fn send_layered(
+        &self,
+        layer: &dyn layer::Layer,
+        request: reqwest::Request,
+    ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
+        let request = layer::Request {
+            method: request.method().clone(),
+            url: request.url().to_string(),
+            headers: request.headers().clone(),
+            body: request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+        };
+        let sender = ReqwestSender {
+            client: &self.client,
+        };
+        let response = layer
+            .send(request, layer::Next::new(&sender))
+            .await
+            .map_err(map_layer_error)?;
+        let (status, headers, body, events) = response.into_parts();
+        if !status.is_success() {
+            let retry_after = retry_after(&headers);
+            let body = collect_layered(body).await.unwrap_or_default();
+            return Err(ResponsesError::http_rejected(
+                status.as_u16(),
+                body,
+                retry_after,
+            ));
+        }
+        let metadata = HttpMetadata {
+            reasoning_included: headers.contains_key("x-reasoning-included"),
+            turn_state: headers
+                .get(TURN_STATE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        };
+        let decoder = if events.is_some() {
+            SseDecoder::tracking_events()
+        } else {
+            SseDecoder::default()
+        };
+        Ok((
+            ResponsesHttpStream {
+                response: None,
+                chat: None,
+                host: None,
+                layered: Some(LayeredBody {
+                    body,
+                    events,
+                    pending: None,
+                }),
+                decoder,
+                ended: false,
+            },
+            metadata,
+        ))
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct ReqwestSender<'a> {
+    client: &'a reqwest::Client,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl layer::Sender for ReqwestSender<'_> {
+    fn send(
+        &self,
+        request: layer::Request,
+    ) -> layer::BoxFuture<'_, Result<layer::Response, layer::Error>> {
+        Box::pin(async move {
+            use futures_util::TryStreamExt;
+
+            let response = self
+                .client
+                .request(request.method, request.url)
+                .headers(request.headers)
+                .body(request.body)
+                .send()
+                .await
+                .map_err(reqwest_layer_error)?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            Ok(layer::Response::new(
+                status,
+                headers,
+                Box::pin(
+                    response
+                        .bytes_stream()
+                        .map_ok(Vec::from)
+                        .map_err(reqwest_layer_error),
+                ),
+            ))
+        })
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn reqwest_layer_error(error: reqwest::Error) -> layer::Error {
+    let mut detail = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    layer::Error::new(detail)
+        .retryable(error.is_connect() || error.is_body() || error.is_request())
+        .timeout(error.is_timeout())
+        .unsent(error.is_connect() || error.is_builder())
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn collect_layered(mut body: layer::Body) -> Result<String, layer::Error> {
+    use futures_util::StreamExt;
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        bytes.extend(chunk?);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn map_layer_error(error: layer::Error) -> ResponsesError {
+    ResponsesError::HttpRequest {
+        retryable: error.is_retryable(),
+        timeout: error.is_timeout(),
+        detail: error.detail().to_owned(),
     }
 }
 
@@ -186,6 +344,7 @@ impl ResponsesHttpStream {
             response: None,
             chat: Some(Box::new(stream)),
             host: None,
+            layered: None,
             decoder: SseDecoder::default(),
             ended: true,
         }
@@ -197,6 +356,7 @@ impl ResponsesHttpStream {
             response: None,
             chat: None,
             host: Some(body),
+            layered: None,
             decoder: SseDecoder::default(),
             ended: false,
         };
@@ -214,8 +374,24 @@ impl ResponsesHttpStream {
             return chat.next_text().await;
         }
         loop {
+            #[cfg(not(target_family = "wasm"))]
+            if let Some(pending) = self
+                .layered
+                .as_mut()
+                .and_then(|layered| layered.pending.take())
+            {
+                pending.await.map_err(map_layer_error)?;
+            }
             if let Some(text) = self.buffered_text()? {
                 return Ok(text);
+            }
+            #[cfg(not(target_family = "wasm"))]
+            if self
+                .layered
+                .as_ref()
+                .is_some_and(|layered| layered.pending.is_some())
+            {
+                continue;
             }
             if self.ended {
                 return Err(ResponsesError::UnexpectedEnd);
@@ -225,6 +401,16 @@ impl ResponsesHttpStream {
                 host.next()
                     .await
                     .map_err(map_host_error)?
+                    .map(|chunk| self.decoder.push(&chunk))
+            } else if let Some(layered) = self.layered.as_mut() {
+                use futures_util::StreamExt;
+
+                layered
+                    .body
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(map_layer_error)?
                     .map(|chunk| self.decoder.push(&chunk))
             } else if let Some(response) = self.response.as_mut() {
                 response
@@ -261,6 +447,17 @@ impl ResponsesHttpStream {
         let Some(text) = self.decoder.next()? else {
             return Ok(None);
         };
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(layered) = self.layered.as_mut()
+            && let Some(events) = layered.events.as_mut()
+            && let Some(pending) = events.event(layer::Event {
+                name: self.decoder.event_name(),
+                data: &text,
+            })
+        {
+            layered.pending = Some(pending);
+            return Ok(None);
+        }
         let (received_ns, retry_receipt) = self
             .decoder
             .received
@@ -284,9 +481,25 @@ pub(crate) struct SseDecoder {
     data: Vec<String>,
     finished: bool,
     received: Option<(u64, super::RetryReceipt)>,
+    track_events: bool,
+    event: Option<String>,
+    dispatched_event: Option<String>,
 }
 
 impl SseDecoder {
+    #[cfg(not(target_family = "wasm"))]
+    fn tracking_events() -> Self {
+        Self {
+            track_events: true,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn event_name(&self) -> Option<&str> {
+        self.dispatched_event.as_deref()
+    }
+
     pub(crate) fn push(&mut self, chunk: &[u8]) {
         self.received = Some((monotonic_now_ns(), super::RetryReceipt::now()));
         self.compact();
@@ -324,6 +537,7 @@ impl SseDecoder {
                 }
             })?;
             if line.is_empty() {
+                let name = self.event.take();
                 if self.data.is_empty() {
                     if self.finished && self.cursor == self.bytes.len() {
                         return Ok(None);
@@ -340,11 +554,16 @@ impl SseDecoder {
                 if event == "[DONE]" {
                     continue;
                 }
+                self.dispatched_event = name;
                 return Ok(Some(event));
             }
             if let Some(data) = line.strip_prefix("data:") {
                 self.data
                     .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
+            } else if self.track_events
+                && let Some(name) = line.strip_prefix("event:")
+            {
+                self.event = Some(name.strip_prefix(' ').unwrap_or(name).to_owned());
             }
         }
     }
