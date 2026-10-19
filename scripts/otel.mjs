@@ -50,6 +50,7 @@ Commands:
   outliers               Spans slower than their group's percentile threshold, with session, thread and arguments
   trace <id>             Ancestors and descendant tree of a span (row id, span id or tool call id) with self time
   sessions               Sessions (threads) with turn, model and tool totals
+  builds                 Executables that produced telemetry (path and build time), with processes, sessions and spans
   report                 Write an HTML report with tail (CCDF) plots, latency-over-time scatter plots and outliers
 
 Options:
@@ -57,7 +58,8 @@ Options:
   --db <file>            Cache database (default output/telemetry/telemetry.sqlite in this repository)
   --span <name>          Span name or SQL LIKE pattern such as 'tool.%' (default tool.execute)
   --by <keys>            Comma-separated group keys: span columns (tool, model, session_id, thread_name, status,
-                         name, pid) or attribute keys such as tool.hand or operation; 'none' disables grouping
+                         name, pid), build (executable and build time) or attribute keys such as tool.hand or
+                         operation; 'none' disables grouping
   --since <age|time>     Only spans that started within 30m, 6h, 2d, or after an ISO timestamp
   --session <prefix>     Only spans whose session id starts with this prefix
   --where <sql>          Extra SQL condition on the spans table (alias s), e.g. "s.dur_ms > 1000"
@@ -184,6 +186,9 @@ function openDb(file) {
         s.pid, s.trace_id, s.span_id
       FROM spans s WHERE s.name = 'nc.frame';
   `);
+  const sourceColumns = new Set(db.prepare("SELECT name FROM pragma_table_info('sources')").all().map((row) => row.name));
+  if (!sourceColumns.has('executable')) db.exec('ALTER TABLE sources ADD COLUMN executable TEXT');
+  if (!sourceColumns.has('built_us')) db.exec('ALTER TABLE sources ADD COLUMN built_us INTEGER');
   return db;
 }
 
@@ -269,6 +274,8 @@ function ingest(db, home, quiet) {
   const addSource = db.prepare('INSERT INTO sources(path, kind, pid, started_us) VALUES (?, ?, ?, ?) RETURNING id');
   const setOffset = db.prepare(
     'UPDATE sources SET offset = ?, service_version = coalesce(?, service_version) WHERE id = ?');
+  const setBuild = db.prepare(
+    'UPDATE sources SET executable = coalesce(executable, ?), built_us = coalesce(built_us, ?) WHERE id = ?');
   const addSpan = db.prepare(`INSERT INTO spans(source, pid, trace_id, span_id, parent_id, name, kind, start_us,
     end_us, dur_ms, span_ms, busy_ms, status, error, thread_id, thread_name, session_id, session_from, tool, call_id,
     model, callsite, ui, attrs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -368,7 +375,12 @@ function ingest(db, home, quiet) {
       }
       if (request && kind === 'traces') {
         for (const resourceSpans of request.resourceSpans ?? []) {
-          version ??= attributes(resourceSpans.resource?.attributes)['service.version'] ?? null;
+          if (version === null) {
+            const resource = attributes(resourceSpans.resource?.attributes);
+            version = resource['service.version'] ?? null;
+            setBuild.run(resource['process.executable.path'] ?? null, resource['nanocode.executable.modified'] ?? null,
+              source.id);
+          }
           for (const scopeSpans of resourceSpans.scopeSpans ?? []) {
             for (const span of scopeSpans.spans ?? []) {
               insertSpan(span, source.id, info.pid);
@@ -475,6 +487,11 @@ function sinceMicros(value) {
 function keySql(key) {
   const alias = { session: 'session_id', thread: 'thread_name', process: 'pid' }[key] ?? key;
   if (COLUMNS.has(alias)) return 's.' + alias;
+  if (alias === 'build') {
+    return `(SELECT coalesce(replace(src.executable, rtrim(src.executable, replace(src.executable, '/', '')), ''), '-')
+      || ' @ ' || coalesce(strftime('%m-%d %H:%M:%S', src.built_us / 1e6, 'unixepoch', 'localtime'), '-')
+      FROM sources src WHERE src.id = s.source)`;
+  }
   return `json_extract(s.attrs, '$."${alias.replaceAll('"', '""').replaceAll("'", "''")}"')`;
 }
 
@@ -839,6 +856,29 @@ function trace(db, options) {
   if (tree.length > limit + 1) console.log(`  … ${tree.length - limit - 1} more (raise --limit)`);
 }
 
+function builds(db, options) {
+  const since = sinceMicros(options.since);
+  const rows = db.prepare(`SELECT coalesce(src.executable, '-') AS executable, src.built_us,
+      count(DISTINCT src.pid) AS processes, min(src.started_us) AS first_us, max(src.started_us) AS last_us,
+      group_concat(src.id) AS ids
+    FROM sources src WHERE src.kind = 'traces' AND (? IS NULL OR src.started_us >= ?)
+    GROUP BY src.executable, src.built_us ORDER BY last_us DESC LIMIT ?`).all(since, since, Number(options.limit ?? 25));
+  const counts = db.prepare(`SELECT count(*) AS spans, count(DISTINCT session_id) AS sessions FROM spans
+    WHERE source IN (SELECT value FROM json_each(?))`);
+  printTable(rows.map((row) => {
+    const { spans, sessions: sessionCount } = counts.get(JSON.stringify(row.ids.split(',').map(Number)));
+    return {
+      executable: row.executable,
+      built: row.built_us ? fmtTime(row.built_us) : '-',
+      processes: row.processes,
+      first: fmtTime(row.first_us),
+      last: fmtTime(row.last_us),
+      sessions: sessionCount,
+      spans,
+    };
+  }), options);
+}
+
 function sessions(db, options) {
   const since = sinceMicros(options.since);
   const rows = db.prepare(`SELECT session_id, model, effort, origin, depth, parent_session_id, first_us, last_us, turns,
@@ -1104,7 +1144,7 @@ if (!command || options.help || command === 'help') {
   console.log(HELP);
   process.exit(command ? 0 : 1);
 }
-const commands = { ingest: null, schema, sql, tails, outliers, trace, sessions, report };
+const commands = { ingest: null, schema, sql, tails, outliers, trace, sessions, builds, report };
 if (!(command in commands)) fail('unknown command ' + command + '\n\n' + HELP);
 const db = openDb(path.resolve(options.db ?? path.join(REPO, 'output', 'telemetry', 'telemetry.sqlite')));
 if (command === 'ingest' || !options['no-ingest']) {

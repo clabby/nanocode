@@ -31,6 +31,9 @@ pub const DEFAULT_FILTER: &str = "warn,nanocode=info,nanocode_backend_codex=info
 pub const METRICS_TARGET: &str = "nc_metrics";
 
 const DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";
+const PROCESS_PID: &str = "process.pid";
+const PROCESS_EXECUTABLE_PATH: &str = "process.executable.path";
+const EXECUTABLE_MODIFIED: &str = "nanocode.executable.modified";
 const LOCAL_LOG_BUFFERED_LINES_LIMIT: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -262,20 +265,31 @@ impl ObservabilityBuilder {
         } else {
             builder.with_service_name(self.service_name.clone())
         };
-        builder
-            .with_schema_url(
-                [
-                    opentelemetry::KeyValue::new(SERVICE_VERSION, self.service_version.clone()),
-                    opentelemetry::KeyValue::new(
-                        DEPLOYMENT_ENVIRONMENT_NAME,
-                        self.environment
-                            .clone()
-                            .unwrap_or_else(|| "development".to_owned()),
-                    ),
-                ],
-                SCHEMA_URL,
-            )
-            .build()
+        let mut attributes = vec![
+            opentelemetry::KeyValue::new(SERVICE_VERSION, self.service_version.clone()),
+            opentelemetry::KeyValue::new(
+                DEPLOYMENT_ENVIRONMENT_NAME,
+                self.environment
+                    .clone()
+                    .unwrap_or_else(|| "development".to_owned()),
+            ),
+            opentelemetry::KeyValue::new(PROCESS_PID, i64::from(std::process::id())),
+        ];
+        if let Ok(executable) = std::env::current_exe().and_then(std::fs::canonicalize) {
+            if let Some(modified) = std::fs::metadata(&executable)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|modified| i64::try_from(modified.as_micros()).ok())
+            {
+                attributes.push(opentelemetry::KeyValue::new(EXECUTABLE_MODIFIED, modified));
+            }
+            attributes.push(opentelemetry::KeyValue::new(
+                PROCESS_EXECUTABLE_PATH,
+                executable.to_string_lossy().into_owned(),
+            ));
+        }
+        builder.with_schema_url(attributes, SCHEMA_URL).build()
     }
 }
 
