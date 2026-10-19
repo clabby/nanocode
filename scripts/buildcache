@@ -12,7 +12,7 @@ case $1 in
   *rustc)
     mkdir -p "$cache/bin" || exec "$@"
     if [ -d "$helper.lock" ]; then
-      read -r builder < "$helper.lock/pid" 2>/dev/null
+      { read -r builder < "$helper.lock/pid"; } 2>/dev/null
       kill -0 "${builder:-0}" 2>/dev/null || rm -rf "$helper.lock"
     fi
     if mkdir "$helper.lock" 2>/dev/null; then
