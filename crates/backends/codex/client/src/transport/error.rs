@@ -246,6 +246,9 @@ impl ResponsesError {
             }
             Self::HttpRequest { timeout: true, .. } => "https_timeout",
             Self::HttpRequest { .. } => "https_transport",
+            Self::HttpRejected { body, .. } if api_error_is_checkpoint_missing(body) => {
+                "checkpoint_missing"
+            }
             Self::HttpRejected { body, .. }
                 if api_error_has_code(body, "misalignment_policy_violation") =>
             {
@@ -261,7 +264,11 @@ impl ResponsesError {
 
     #[must_use]
     pub fn is_checkpoint_missing(&self) -> bool {
-        matches!(self, Self::Api { event, .. } if api_error_is_checkpoint_missing(event))
+        match self {
+            Self::Api { event, .. } => api_error_is_checkpoint_missing(event),
+            Self::HttpRejected { body, .. } => api_error_is_checkpoint_missing(body),
+            _ => false,
+        }
     }
 
     pub(crate) fn is_connection_expired(&self) -> bool {
