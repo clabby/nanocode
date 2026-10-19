@@ -206,7 +206,8 @@ function ensureIndexes(db) {
     CREATE INDEX IF NOT EXISTS spans_span ON spans(span_id);
     CREATE INDEX IF NOT EXISTS spans_parent ON spans(parent_id);
     CREATE INDEX IF NOT EXISTS spans_name ON spans(name, start_us);
-    CREATE INDEX IF NOT EXISTS spans_session ON spans(session_id, name) WHERE session_id IS NOT NULL;
+    DROP INDEX IF EXISTS spans_session;
+    CREATE INDEX IF NOT EXISTS spans_agent_session ON spans(session_id, name) WHERE session_id IS NOT NULL AND ui = 0;
     CREATE INDEX IF NOT EXISTS spans_unresolved ON spans(id) WHERE session_id IS NULL AND ui = 0;
     CREATE INDEX IF NOT EXISTS spans_trace ON spans(trace_id) WHERE ui = 0;
     CREATE INDEX IF NOT EXISTS spans_call ON spans(call_id) WHERE call_id IS NOT NULL;
@@ -471,11 +472,13 @@ function rebuildSessions(db, mark) {
         json_extract(attrs, '$."parent.session.id"') AS parent, json_extract(attrs, '$."agent.origin"') AS origin,
         json_extract(attrs, '$."agent.depth"') AS depth, model, json_extract(attrs, '$."reasoning.effort"') AS effort,
         max(start_us)
-      FROM spans WHERE name = 'agent.turn' AND session_id IN (SELECT session_id FROM touched) GROUP BY session_id
+      FROM spans WHERE ui = 0 AND name = 'agent.turn' AND session_id IN (SELECT session_id FROM touched)
+      GROUP BY session_id
     ) AS t WHERE t.session_id = sessions.session_id;
     UPDATE sessions SET model = m.model, effort = coalesce(sessions.effort, m.effort) FROM (
       SELECT session_id, model, json_extract(attrs, '$."reasoning.effort"') AS effort, max(start_us)
-      FROM spans WHERE name = 'model.call' AND session_id IN (SELECT session_id FROM touched) GROUP BY session_id
+      FROM spans WHERE ui = 0 AND name = 'model.call' AND session_id IN (SELECT session_id FROM touched)
+      GROUP BY session_id
     ) AS m WHERE sessions.model IS NULL AND m.session_id = sessions.session_id;
   `);
   db.exec('COMMIT');
@@ -900,7 +903,7 @@ function sessions(db, options) {
     FROM sessions WHERE (? IS NULL OR last_us >= ?) AND (? IS NULL OR session_id LIKE ? || '%')
     ORDER BY last_us DESC LIMIT ?`).all(since, since, options.session ?? null, options.session ?? null,
     Number(options.limit ?? 25));
-  const slowest = db.prepare(`SELECT tool, dur_ms, id FROM spans WHERE session_id = ? AND name = 'tool.execute'
+  const slowest = db.prepare(`SELECT tool, dur_ms, id FROM spans WHERE ui = 0 AND session_id = ? AND name = 'tool.execute'
     ORDER BY dur_ms DESC LIMIT 1`);
   printTable(rows.map((row) => {
     const top = slowest.get(row.session_id);
@@ -934,14 +937,15 @@ function schema(db, options) {
   const filter = spanFilter(options, null);
   const names = db.prepare(`SELECT s.name, count(*) AS n, min(s.start_us) AS first_us, max(s.start_us) AS last_us
     FROM spans s WHERE ${filter.where} GROUP BY s.name ORDER BY n DESC`).all(...filter.params);
-  const attributed = new Map(db.prepare(`SELECT name, count(*) AS n FROM spans INDEXED BY spans_session
-    WHERE session_id IS NOT NULL GROUP BY name`).all().map((row) => [row.name, row.n]));
+  const attributed = new Map(db.prepare(`SELECT name, count(*) AS n FROM spans INDEXED BY spans_agent_session
+    WHERE session_id IS NOT NULL AND ui = 0 GROUP BY name`).all().map((row) => [row.name, row.n]));
   const sample = db.prepare('SELECT attrs FROM spans WHERE name = ? ORDER BY id DESC LIMIT 200');
-  console.log('\nspans (name, count, with session, attribute keys from recent spans):');
+  console.log('\nspans (name, count, agent spans with a session or ui, attribute keys from recent spans):');
   for (const row of names) {
     const keys = new Set();
     for (const { attrs } of sample.all(row.name)) for (const key of Object.keys(JSON.parse(attrs))) keys.add(key);
-    console.log(`  ${row.name} n=${row.n} session=${attributed.get(row.name) ?? 0} ${fmtTime(row.first_us)} .. ${fmtTime(row.last_us)}`);
+    const session = isUi(row.name) ? 'ui' : attributed.get(row.name) ?? 0;
+    console.log(`  ${row.name} n=${row.n} session=${session} ${fmtTime(row.first_us)} .. ${fmtTime(row.last_us)}`);
     console.log('    ' + [...keys].join(', '));
   }
   const kinds = db.prepare('SELECT kind, count(*) AS n FROM events GROUP BY kind ORDER BY n DESC').all();
