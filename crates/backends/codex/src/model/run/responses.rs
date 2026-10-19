@@ -89,6 +89,7 @@ impl ModelRun {
         let previous_response_id = request_history.previous_response_id();
         let started_at = Instant::now();
         self.stats.model_calls += 1;
+        self.prompt_cache.publish_request(thinking, service_tier);
         self.events.emit(
             AgentEventKind::ModelCallStarted,
             ModelCallStarted {

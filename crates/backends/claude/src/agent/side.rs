@@ -1,8 +1,9 @@
 use super::{
-    Cancellation, ContentBlock, CostStatus, HistoryMessage, Message, NanocodeError,
-    ReportedTurnUsage, ResponseContext, Result, Role, State, TurnUsage, provider_error,
+    Cancellation, ContentBlock, CostStatus, HistoryMessage, Message, MessagesRequest,
+    NanocodeError, ReportedTurnUsage, ResponseContext, Result, Role, State, TurnUsage,
+    provider_error,
 };
-use crate::ToolResultContent;
+use crate::{FrozenWireProfile, ToolResultContent};
 use nanocode_agent_core::{
     SideAnswer,
     backend::{TranscriptBuilder, side_question_prompt},
@@ -78,6 +79,8 @@ pub(super) fn claude_transcript(messages: &[HistoryMessage]) -> Vec<PromptMessag
     transcript.finish()
 }
 
+pub(super) type SideRequest = (MessagesRequest, Option<FrozenWireProfile>);
+
 const RUNNING_TOOL_RESULT: &str =
     "This tool call is still running in the main conversation; its result is not available yet.";
 
@@ -137,6 +140,34 @@ impl State {
         *self.side_view.write().expect("side view lock poisoned") = messages;
     }
 
+    pub(super) fn publish_side_request(
+        &self,
+        template: &MessagesRequest,
+        wire_profile: Option<&FrozenWireProfile>,
+    ) {
+        *self
+            .side_request
+            .write()
+            .expect("side request lock poisoned") =
+            Some(Arc::new((template.clone(), wire_profile.cloned())));
+    }
+
+    fn side_template(&self) -> SideRequest {
+        let latest = self
+            .side_request
+            .read()
+            .expect("side request lock poisoned")
+            .clone();
+        if let Some(latest) = latest {
+            return SideRequest::clone(&latest);
+        }
+        let template = self.request_template(self.speed());
+        let wire_profile = self
+            .client
+            .freeze_wire_profile(template.cache_control.is_some());
+        (template, Some(wire_profile))
+    }
+
     async fn side_transcript(&self) -> Result<Vec<HistoryMessage>> {
         let live = self.conversation.try_lock().is_err().then(|| {
             self.side_view
@@ -156,11 +187,21 @@ impl State {
         if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(NanocodeError::AgentStopped);
         }
-        let messages = side_messages(self.side_transcript().await?, &question);
-        let template = self.request_template(self.speed());
-        let wire_profile = self
-            .client
-            .freeze_wire_profile(template.cache_control.is_some());
+        let transcript = self.side_transcript().await?;
+        let (mut template, wire_profile) = self.side_template();
+        let breakpoint = crate::cache_tail(&transcript);
+        let mut messages = side_messages(transcript, &question);
+        if let (Some(control), Some((message, block))) =
+            (template.cache_control.clone(), breakpoint)
+        {
+            template
+                .cache_system_prefix_with(&messages)
+                .map_err(provider_error)?;
+            template.cache_control = None;
+            messages[message].make_mut().content[block]
+                .set_cache_control(&control)
+                .map_err(provider_error)?;
+        }
         let response = self
             .response(
                 &messages,
@@ -174,7 +215,7 @@ impl State {
                     container: None,
                     previous_message_id: None,
                     template: Some(&template),
-                    wire_profile: Some(&wire_profile),
+                    wire_profile: wire_profile.as_ref(),
                     effect: None,
                     journal: None,
                 },

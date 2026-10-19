@@ -543,6 +543,7 @@ pub struct ClaudeBuilder {
     restored: Option<Snapshot>,
     lineage: Option<Lineage>,
     conversation_id: Option<String>,
+    system_context: Option<(String, Option<String>)>,
     #[cfg(not(target_family = "wasm"))]
     task_board: Option<Arc<crate::tools::tasks::ClaudeTasks>>,
     initial_developer_notices: Vec<(String, String)>,
@@ -610,6 +611,7 @@ impl ClaudeBuilder {
             restored: None,
             lineage: None,
             conversation_id: None,
+            system_context: None,
             #[cfg(not(target_family = "wasm"))]
             task_board: None,
             initial_developer_notices: Vec::new(),
@@ -1163,6 +1165,7 @@ impl ClaudeBuilder {
         recipe.initial_developer_notices = Vec::new();
         recipe.lineage = None;
         recipe.conversation_id = None;
+        recipe.system_context = None;
 
         recipe.policy = None;
         recipe.child_journal = None;
@@ -1486,6 +1489,10 @@ impl ClaudeBuilder {
                 .is_empty()
                 .then(|| crate::instructions::default_system_blocks(self.code_only))
         });
+        let (environment, project_instructions) = self.system_context.map_or_else(
+            || (std::sync::OnceLock::new(), std::sync::OnceLock::new()),
+            |(environment, instructions)| (environment.into(), instructions.into()),
+        );
         let state = Arc::new(State {
             subagent_type: self.subagent_type,
             subagent_type_resolver: self.subagent_type_resolver,
@@ -1535,8 +1542,9 @@ impl ClaudeBuilder {
             conversation: Mutex::new(restored.conversation),
             round_boundary: std::sync::RwLock::new(round_boundary),
             side_view: std::sync::RwLock::new(None),
-            environment: std::sync::OnceLock::new(),
-            project_instructions: std::sync::OnceLock::new(),
+            side_request: std::sync::RwLock::new(None),
+            environment,
+            project_instructions,
             boundary_stale: AtomicBool::new(false),
             policy: self.policy,
             admission: Mutex::new(()),
@@ -2536,6 +2544,7 @@ impl AgentFactory for ClaudeNativeFactory {
             recipe.lineage = Some(lineage);
             recipe.conversation_id = Some(state.conversation_id.clone());
             state.initialize_child_workspace(&mut recipe)?;
+            state.share_system_context(&mut recipe);
             Agent::persist_created(recipe.build()).await
         })
     }
@@ -2750,6 +2759,7 @@ struct State {
     round_boundary: std::sync::RwLock<Arc<Snapshot>>,
 
     side_view: std::sync::RwLock<Option<Arc<[HistoryMessage]>>>,
+    side_request: std::sync::RwLock<Option<Arc<side::SideRequest>>>,
 
     environment: std::sync::OnceLock<String>,
     project_instructions: std::sync::OnceLock<Option<String>>,
@@ -3697,13 +3707,27 @@ impl State {
         }
         Ok(())
     }
+    fn system_context(&self) -> (&str, Option<&str>) {
+        (
+            self.environment
+                .get_or_init(|| crate::environment::environment_section(&self.workspace())),
+            self.project_instructions
+                .get_or_init(|| crate::environment::project_instructions(&self.workspace()))
+                .as_deref(),
+        )
+    }
+    fn share_system_context(&self, recipe: &mut ClaudeBuilder) {
+        let workspace = match (&recipe.workspace_resolver, &recipe.session_id) {
+            (Some(resolve), Some(child)) => resolve(child),
+            _ => recipe.workspace.clone(),
+        };
+        if workspace == self.workspace() {
+            let (environment, instructions) = self.system_context();
+            recipe.system_context = Some((environment.to_owned(), instructions.map(str::to_owned)));
+        }
+    }
     fn current_system(&self) -> Option<Value> {
-        let environment = self
-            .environment
-            .get_or_init(|| crate::environment::environment_section(&self.workspace()));
-        let instructions = self
-            .project_instructions
-            .get_or_init(|| crate::environment::project_instructions(&self.workspace()));
+        let (environment, instructions) = self.system_context();
         if let Some(blocks) = &self.system_blocks
             && self.system_resolver.is_none()
         {
@@ -3716,7 +3740,7 @@ impl State {
         }
         let context = match instructions {
             Some(instructions) => format!("{environment}\n\n{instructions}"),
-            None => environment.clone(),
+            None => environment.to_owned(),
         };
         if let Some(resolve) = &self.system_resolver {
             return Some(json!(format!("{}\n\n{context}", resolve(&self.session_id))));
@@ -5563,6 +5587,7 @@ impl State {
                 turn.model_call_index = index.saturating_add(cursor.model_step_offset).max(1);
             }
             self.publish_side_view(Some(pending.as_slice().into()));
+            self.publish_side_request(&cursor.template, cursor.wire_profile.as_ref());
             let response = self
                 .response(
                     &pending,

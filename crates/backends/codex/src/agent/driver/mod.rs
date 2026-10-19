@@ -581,7 +581,8 @@ impl AgentDriver {
                                 model: thread_model,
                                 thinking: default_thinking,
                                 service_tier: default_service_tier,
-                            },
+                            }
+                            .latest_request(&prompt_cache),
                             session_id.as_str(),
                             self.workspace.clone(),
                             &self.execution,
@@ -896,7 +897,23 @@ impl AgentDriver {
                                     Some(Command::SteerWithId { result, .. } | Command::Steer { result, .. }) => {
                                         drop(result.send(Err(NanocodeError::TurnNotSteerable)));
                                     }
-                                    Some(command @ (Command::ChildSnapshot { .. } | Command::Fork { .. } | Command::Spawn { .. } | Command::SpawnBatch { .. } | Command::SideQuestion { .. })) => {
+                                    Some(command @ Command::SideQuestion { .. }) => {
+                                        handle_idle_command(
+                                            command,
+                                            latest_fork_checkpoint.as_ref(),
+                                            &self.spawner,
+                                            TurnDefaults {
+                                                model: thread_model,
+                                                thinking: default_thinking,
+                                                service_tier: default_service_tier,
+                                            }
+                                            .latest_request(&prompt_cache),
+                                            session_id.as_str(),
+                                            self.workspace.clone(),
+                                            &self.execution,
+                                        );
+                                    }
+                                    Some(command @ (Command::ChildSnapshot { .. } | Command::Fork { .. } | Command::Spawn { .. } | Command::SpawnBatch { .. })) => {
                                         handle_idle_command(
                                             command,
                                             latest_fork_checkpoint.as_ref(),
@@ -1676,7 +1693,8 @@ impl AgentDriver {
                                         model: thread_model,
                                         thinking: default_thinking,
                                         service_tier: default_service_tier,
-                                    },
+                                    }
+                                    .latest_request(&prompt_cache),
                                     session_id.as_str(),
                                     self.workspace.clone(),
                                     &self.execution,

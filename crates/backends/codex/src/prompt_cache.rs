@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::client::{Model, responses::RequestProfile};
+use crate::client::{Model, Thinking, pricing::ServiceTier, responses::RequestProfile};
 use crate::model::run::ModelCheckpoint;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OnceCell};
@@ -16,6 +16,7 @@ pub(crate) struct ModelPromptCache {
     key: Arc<str>,
     shared: Option<SharedPromptCache>,
     live: Arc<std::sync::Mutex<Option<ModelCheckpoint>>>,
+    request: Arc<std::sync::Mutex<Option<(Thinking, ServiceTier)>>>,
 }
 
 #[derive(Clone, Default)]
@@ -29,7 +30,17 @@ impl ModelPromptCache {
             key,
             shared,
             live: Arc::default(),
+            request: Arc::default(),
         }
+    }
+
+    pub(crate) fn publish_request(&self, thinking: Thinking, service_tier: ServiceTier) {
+        *self.request.lock().expect("request settings lock poisoned") =
+            Some((thinking, service_tier));
+    }
+
+    pub(crate) fn request(&self) -> Option<(Thinking, ServiceTier)> {
+        *self.request.lock().expect("request settings lock poisoned")
     }
 
     pub(crate) fn publish_live(&self, checkpoint: Option<ModelCheckpoint>) {

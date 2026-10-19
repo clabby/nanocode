@@ -374,6 +374,19 @@ pub(super) struct TurnDefaults {
     pub(super) service_tier: ServiceTier,
 }
 
+impl TurnDefaults {
+    pub(super) fn latest_request(self, prompt_cache: &ModelPromptCache) -> Self {
+        let (thinking, service_tier) = prompt_cache
+            .request()
+            .unwrap_or((self.thinking, self.service_tier));
+        Self {
+            thinking,
+            service_tier,
+            ..self
+        }
+    }
+}
+
 pub(super) fn handle_idle_command(
     command: Command,
     latest: Option<&Arc<CommittedSession>>,

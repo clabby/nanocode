@@ -619,7 +619,8 @@ fn validate_cache_layout<'a>(
     layout.validate(automatic)
 }
 
-fn cache_tail<M: WireMessage>(messages: &[M]) -> Option<(usize, usize)> {
+#[doc(hidden)]
+pub fn cache_tail<M: WireMessage>(messages: &[M]) -> Option<(usize, usize)> {
     messages
         .iter()
         .enumerate()
@@ -777,6 +778,13 @@ impl MessagesRequest {
 }
 
 impl ContentBlock {
+    #[doc(hidden)]
+    pub fn set_cache_control(&mut self, control: &CacheControl) -> Result<(), ClaudeError> {
+        self.extra_mut()
+            .insert("cache_control".to_owned(), serde_json::to_value(control)?);
+        Ok(())
+    }
+
     fn cache_slot(&self) -> (Option<&Value>, bool) {
         match self {
             Self::Text { text, extra } => (extra.get("cache_control"), !text.is_empty()),
