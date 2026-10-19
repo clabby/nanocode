@@ -107,14 +107,14 @@ impl Snapshot {
 pub(super) struct Cursor {
     #[serde(skip)]
     pub(super) recovered_code_index: Option<u32>,
+    pub(super) snapshot: Snapshot,
+    pub(super) template: MessagesRequest,
     #[serde(default)]
     pub(super) lifecycle_turn_id: String,
     #[serde(default)]
     pub(super) stop_hook_active: bool,
     #[serde(default)]
     pub(super) instruction_revision: Option<u64>,
-    pub(super) snapshot: Snapshot,
-    pub(super) template: MessagesRequest,
 
     #[serde(default)]
     pub(super) dynamic_tool_names: HashSet<String>,
