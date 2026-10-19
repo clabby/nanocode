@@ -1,1 +1,0 @@
-Own shared SDK values, serialization and event wire definitions. Keep channels, publishers, clocks, executors and platform dependencies out so these values compile independently of Tokio. Preserve nanocode-types public paths through compatibility reexports and keep event serialization unchanged.

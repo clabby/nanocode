@@ -1,5 +1,0 @@
-Own native default storage, CUA lifecycle, runner attachment and durable process routing. Receive provider defaults through generic contracts without depending on backends. Explicit remote Code Mode must not initialize local machine tools. Preserve native/WASM adapters and the facade runner APIs.
-
-On macOS, native defaults may overlap the first user database lookup with runtime construction. Keep the ordinary shell lookup authoritative and skip warming when explicit remote Code Mode disables local machine tools. Measure startup and total CPU together; do not extend this warmup to other platforms without measurements.
-
-Runner registration summaries use conditional developer notices through the generic lifecycle contract. Providers check the latest effective notice and commit changes inside their existing serialization; unchanged summaries must not replace checkpoints, while status and failure events remain unconditional. Preserve checks after restart and Claude notice consumption, and never treat a failed write as a delivered notice. Custom backends may retain unconditional append through the default contract.

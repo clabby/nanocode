@@ -1,1 +1,0 @@
-Own image decoding, prompt resizing and Exif/ICC preservation here. Keep the public nanocode-media::image re-export compatible. Preserve the existing allocation and prompt size limits, supported formats and native/WASM behavior. Use the ignored image compatibility probe for changes to codec versions. Do not introduce color management dependencies for unused image APIs.

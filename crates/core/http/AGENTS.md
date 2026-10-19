@@ -1,9 +1,0 @@
-Keep native HTTP decoding independent of providers, tools and runtimes. This crate is a native adapter; WASM networking supplies decoded bodies through the existing host HTTP interfaces. Keep the crate and its dependencies behind native target gates. Do not add project features or code comments.
-
-Feed the decoder at frame and block boundaries so one upstream chunk containing many RLE blocks cannot expand into the whole response before the consumer polls again. BlockHeader and FrameHeader come from the codec; do not duplicate their protocol parsing. A Zstandard content checksum occupies one u32 as specified in RFC 8878 section 3.1.1. Use the codec's default 128 MiB window limit, matching libzstd's ZSTD_WINDOWLOG_LIMIT_DEFAULT of 27. Keep total decoded size caller-controlled rather than adding an arbitrary cap.
-
-Preserve partial input, early output before EOF, concatenated and skippable frames, checksum and truncation errors, backpressure and cancellation on stream drop. The stream decoder must accept streams that are not Send. Native response adaptation must retain status, headers, URL, HTTP version and extensions, while removing compressed Content-Encoding and Content-Length.
-
-The native Brotli adapter uses brotli-decompressor directly so HTTP decoding does not compile the Brotli encoder. Its 4096-byte output chunk matches tokio-util ReaderStream's default capacity used by the previous tower-http response adapter. This is an output chunk size, not a response-size limit. Brotli completes at its first stream boundary, matching the previous BrotliDecoder; Zstandard continues across frames, matching the previous multiple_members(true) configuration.
-
-Response adaptation decodes exactly one supported br or zstd content coding. Preserve bodies and headers unchanged for combined or repeated Content-Encoding values, so decoding one layer never strips metadata for remaining layers.

@@ -1,1 +1,0 @@
-Own the lightweight provider construction, host service and delegation interfaces consumed by runtime/agent and both backends. Keep implementation dependencies on agent orchestration and subagent registries out of this crate so providers compile in parallel with them. Keep native adapters behind interfaces and preserve WASM-local futures.

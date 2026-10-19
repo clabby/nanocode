@@ -1,1 +1,0 @@
-Own injectable process execution contracts. Keep native spawning, PTYs, environment sanitation and cleanup in integrations/process. Preserve process results and native Send versus WASM-local future behavior. Keep provider tool schemas and handlers in their backends.
