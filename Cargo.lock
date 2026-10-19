@@ -2170,6 +2170,7 @@ dependencies = [
  "arc-swap",
  "futures-util",
  "nanocode-platform",
+ "sync_wrapper",
  "tokio",
 ]
 

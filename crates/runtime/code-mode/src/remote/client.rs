@@ -3,12 +3,14 @@ use std::{
     future::{Future, poll_fn},
     pin::pin,
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError, Weak,
-        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::Poll,
     time::Duration,
 };
+
+use nanocode_sync::{Atom, Slot};
 
 use futures_util::{
     FutureExt, StreamExt,
@@ -47,23 +49,50 @@ pub trait RemoteLink: Send + Sync + 'static {
     fn changed(&self) {}
 }
 
+#[derive(Default)]
+struct Observer {
+    attached: AtomicBool,
+    current: Slot<Box<dyn CodeModeObserver>>,
+}
+
+impl Observer {
+    fn attach(&self, observer: Box<dyn CodeModeObserver>) {
+        self.current.put(observer);
+        self.attached.store(true, Ordering::SeqCst);
+    }
+
+    fn deliver(&self, update: Value) -> Result<(), CodeModeHostError> {
+        let Some(mut observer) = self.current.take() else {
+            return Ok(());
+        };
+        let delivered = deliver_update(observer.as_mut(), update);
+        if let Some(newer) = self.current.put(observer) {
+            self.current.put(newer);
+        }
+        delivered
+    }
+}
+
+#[derive(Clone)]
 struct CallbackState {
     tools: Vec<Arc<dyn Tool>>,
     context: RemoteContext,
     generation: u64,
-    observer: Option<Box<dyn CodeModeObserver>>,
+    observer: Arc<Observer>,
 }
+
+type Callbacks = HashMap<(String, String), CallbackState>;
 
 struct Client {
     outgoing: mpsc::UnboundedSender<(Frame, RemoteDelivery)>,
-    pending: Mutex<HashMap<u64, mpsc::UnboundedSender<Frame>>>,
-    callbacks: Mutex<HashMap<(String, String), CallbackState>>,
-    running: Mutex<HashMap<u64, (String, AbortHandle)>>,
+    pending: Atom<HashMap<u64, mpsc::UnboundedSender<Frame>>>,
+    callbacks: Atom<Callbacks>,
+    running: Atom<HashMap<u64, (String, AbortHandle)>>,
     next: AtomicU64,
-    turns: Mutex<HashMap<String, u64>>,
+    turns: Atom<HashMap<String, u64>>,
     operation_timeout: Option<Duration>,
-    failure: Mutex<Option<String>>,
-    hands: Mutex<Option<Arc<dyn HandCalls>>>,
+    failure: Atom<Option<String>>,
+    hands: Atom<Option<Arc<dyn HandCalls>>>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -74,10 +103,6 @@ pub struct RemoteClient {
 
 #[derive(Clone)]
 pub struct RemoteActivity(Weak<Client>);
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 fn error(value: impl std::fmt::Display) -> CodeModeHostError {
     CodeModeHostError::new(value.to_string())
@@ -98,10 +123,12 @@ impl RemoteActivity {
     #[must_use]
     pub fn busy(&self) -> bool {
         self.0.upgrade().is_some_and(|client| {
-            !lock(&client.running).is_empty()
-                || lock(&client.callbacks)
-                    .values()
-                    .any(|state| state.observer.is_some())
+            !client.running.read(HashMap::is_empty)
+                || client.callbacks.read(|callbacks| {
+                    callbacks
+                        .values()
+                        .any(|state| state.observer.attached.load(Ordering::SeqCst))
+                })
         })
     }
 }
@@ -115,14 +142,14 @@ impl RemoteClient {
         let (stop, stopped) = oneshot::channel();
         let client = Arc::new(Client {
             outgoing,
-            pending: Mutex::default(),
-            callbacks: Mutex::default(),
-            running: Mutex::default(),
+            pending: Atom::default(),
+            callbacks: Atom::default(),
+            running: Atom::default(),
             next: AtomicU64::new(0),
-            turns: Mutex::default(),
+            turns: Atom::default(),
             operation_timeout,
-            failure: Mutex::default(),
-            hands: Mutex::default(),
+            failure: Atom::default(),
+            hands: Atom::default(),
             _stop: stop,
         });
         let driver = Box::pin(drive(Arc::downgrade(&client), link, frames, stopped));
@@ -136,7 +163,7 @@ impl RemoteClient {
 
     #[must_use]
     pub fn failure(&self) -> Option<String> {
-        lock(&self.client.failure).clone()
+        Option::clone(&self.client.failure.get())
     }
 
     #[must_use]
@@ -152,16 +179,25 @@ impl Client {
             ..
         } = &frame
         {
-            lock(&self.callbacks).retain(|(session, _), _| session != session_id);
-            lock(&self.turns).remove(session_id);
-            lock(&self.running).retain(|_, (session, abort)| {
-                if session == session_id {
-                    abort.abort();
-                    false
-                } else {
-                    true
-                }
+            self.callbacks
+                .update(|callbacks| callbacks.retain(|(session, _), _| session != session_id));
+            self.turns.update(|turns| {
+                turns.remove(session_id);
             });
+            let cancelled = self.running.update(|running| {
+                let cancelled = running
+                    .iter()
+                    .filter(|(_, (session, _))| session == session_id)
+                    .map(|(id, (_, abort))| (*id, abort.clone()))
+                    .collect::<Vec<_>>();
+                for (id, _) in &cancelled {
+                    running.remove(id);
+                }
+                cancelled
+            });
+            for (_, abort) in cancelled {
+                abort.abort();
+            }
         }
         self.outgoing.send((frame, delivery)).map_err(error)
     }
@@ -172,12 +208,12 @@ impl Client {
     ) -> Result<Option<HostFuture<'static, ()>>, CodeModeHostError> {
         match frame {
             Frame::Reply { id, .. } | Frame::Update { id, .. } => {
-                if let Some(channel) = lock(&self.pending).get(&id) {
+                if let Some(channel) = self.pending.read(|pending| pending.get(&id).cloned()) {
                     let _ = channel.send(frame);
                 }
             }
             Frame::CallbackCancel { id } => {
-                if let Some((_, abort)) = lock(&self.running).remove(&id) {
+                if let Some((_, abort)) = self.running.update(|running| running.remove(&id)) {
                     abort.abort();
                 }
             }
@@ -186,18 +222,22 @@ impl Client {
                 origin_call_id,
                 update,
             } => {
-                if let Some(observer) = lock(&self.callbacks)
-                    .get_mut(&(session_id, origin_call_id))
-                    .and_then(|state| state.observer.as_deref_mut())
+                let key = (session_id, origin_call_id);
+                if let Some(observer) = self
+                    .callbacks
+                    .read(|callbacks| callbacks.get(&key).map(|state| Arc::clone(&state.observer)))
                 {
-                    deliver_update(observer, update)?;
+                    observer.deliver(update)?;
                 }
             }
             Frame::DetachedComplete {
                 session_id,
                 origin_call_id,
             } => {
-                lock(&self.callbacks).remove(&(session_id, origin_call_id));
+                let key = (session_id, origin_call_id);
+                self.callbacks.update(|callbacks| {
+                    callbacks.remove(&key);
+                });
             }
             Frame::Callback {
                 id,
@@ -206,7 +246,11 @@ impl Client {
                 freeform,
                 context,
                 hand,
-            } => return Ok(Some(self.callback(id, name, input, freeform, context, hand))),
+            } => {
+                return Ok(Some(
+                    self.callback(id, name, input, freeform, context, hand),
+                ));
+            }
             _ => return Err(error("unexpected runner frame")),
         }
         Ok(None)
@@ -221,12 +265,12 @@ impl Client {
         context: RemoteContext,
         hand: Option<String>,
     ) -> HostFuture<'static, ()> {
-        let local = lock(&self.callbacks)
-            .get(&(
-                context.session_id.clone(),
-                origin(&context.call_id).to_owned(),
-            ))
-            .map(|state| {
+        let key = (
+            context.session_id.clone(),
+            origin(&context.call_id).to_owned(),
+        );
+        let local = self.callbacks.read(|callbacks| {
+            callbacks.get(&key).map(|state| {
                 (
                     state
                         .tools
@@ -235,15 +279,18 @@ impl Client {
                         .cloned(),
                     state.context.clone(),
                 )
-            });
-        let hands = lock(&self.hands).clone();
+            })
+        });
+        let hands = Option::clone(&self.hands.get());
         let delivery = if hand.is_some() {
             RemoteDelivery::Immediate
         } else {
             RemoteDelivery::Durable
         };
         let (abort, registration) = AbortHandle::new_pair();
-        lock(&self.running).insert(id, (context.session_id.clone(), abort));
+        self.running.update(|running| {
+            running.insert(id, (context.session_id.clone(), abort.clone()));
+        });
         let outgoing = self.outgoing.clone();
         let client = Arc::downgrade(self);
         Box::pin(async move {
@@ -297,21 +344,23 @@ impl Client {
                 ));
             }
             if let Some(client) = client.upgrade() {
-                lock(&client.running).remove(&id);
+                client.running.update(|running| {
+                    running.remove(&id);
+                });
             }
         })
     }
 
     fn terminate(&self, message: &str) {
-        for (_, (_, abort)) in lock(&self.running).drain() {
+        for (_, (_, abort)) in self.running.update(std::mem::take) {
             abort.abort();
         }
-        lock(&self.callbacks).clear();
+        self.callbacks.set(HashMap::new());
         let uncertain = format!(
             "{message}; the dispatched operation has an unknown outcome and was not retried"
         );
-        *lock(&self.failure) = Some(message.to_owned());
-        for (id, channel) in lock(&self.pending).drain() {
+        self.failure.set(Some(message.to_owned()));
+        for (id, channel) in self.pending.update(std::mem::take) {
             let _ = channel.send(Frame::Reply {
                 id,
                 result: Err(uncertain.clone()),
@@ -320,7 +369,7 @@ impl Client {
     }
 
     fn not_dispatched(&self) -> Result<(), CodeModeHostError> {
-        match lock(&self.failure).clone() {
+        match Option::clone(&self.failure.get()) {
             Some(failure) => Err(error(format!(
                 "{failure}; the operation was not dispatched"
             ))),
@@ -435,10 +484,14 @@ struct Pending {
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        lock(&self.client.pending).remove(&self.id);
+        self.client.pending.update(|pending| {
+            pending.remove(&self.id);
+        });
         if !self.complete {
             if let Some(origin) = self.origin.take() {
-                lock(&self.client.callbacks).remove(&origin);
+                self.client.callbacks.update(|callbacks| {
+                    callbacks.remove(&origin);
+                });
             }
             if let Some(session_id) = self.session_id.take() {
                 let id = self.client.next.fetch_add(1, Ordering::Relaxed);
@@ -470,23 +523,24 @@ impl RemoteTransport for RemoteClient {
             };
             let session_id = match &operation {
                 RemoteOperation::Execute { context, .. } => {
-                    let generation = *lock(&client.turns)
-                        .get(&context.session_id)
-                        .unwrap_or(&0);
-                    let mut callbacks = lock(&client.callbacks);
+                    let generation = client
+                        .turns
+                        .read(|turns| turns.get(&context.session_id).copied())
+                        .unwrap_or(0);
                     let key = (context.session_id.clone(), context.call_id.clone());
-                    if callbacks.contains_key(&key) {
-                        return Err(error("callback origin is already active"));
-                    }
-                    callbacks.insert(
-                        key,
-                        CallbackState {
-                            tools,
-                            context: context.clone(),
-                            generation,
-                            observer: None,
-                        },
-                    );
+                    let state = CallbackState {
+                        tools,
+                        context: context.clone(),
+                        generation,
+                        observer: Arc::default(),
+                    };
+                    client.callbacks.modify(|callbacks| {
+                        if callbacks.contains_key(&key) {
+                            return Err(error("callback origin is already active"));
+                        }
+                        callbacks.insert(key.clone(), state.clone());
+                        Ok(())
+                    })?;
                     Some(context.session_id.clone())
                 }
                 RemoteOperation::Wait { context, .. } => Some(context.session_id.clone()),
@@ -494,7 +548,9 @@ impl RemoteTransport for RemoteClient {
             };
             let id = client.next.fetch_add(1, Ordering::Relaxed);
             let (sender, mut replies) = mpsc::unbounded_channel();
-            lock(&client.pending).insert(id, sender);
+            client.pending.update(|pending| {
+                pending.insert(id, sender.clone());
+            });
             let mut guard = Pending {
                 client: Arc::clone(client),
                 id,
@@ -537,10 +593,17 @@ impl RemoteTransport for RemoteClient {
                 .await?;
             if let (Some(session), Ok(Some(execution))) = (&session_id, &result)
                 && let Some(cell) = execution.cell.as_ref().filter(|cell| cell.running)
-                && let Some(state) =
-                    lock(&client.callbacks).get_mut(&(session.clone(), cell.origin_call_id.clone()))
             {
-                state.generation = *lock(&client.turns).get(session).unwrap_or(&0);
+                let generation = client
+                    .turns
+                    .read(|turns| turns.get(session).copied())
+                    .unwrap_or(0);
+                let key = (session.clone(), cell.origin_call_id.clone());
+                client.callbacks.update(|callbacks| {
+                    if let Some(state) = callbacks.get_mut(&key) {
+                        state.generation = generation;
+                    }
+                });
             }
             if let Some(session_id) = session_id {
                 let completed = match &result {
@@ -553,7 +616,10 @@ impl RemoteTransport for RemoteClient {
                     Ok(None) => None,
                 };
                 if let Some(origin) = completed {
-                    lock(&client.callbacks).remove(&(session_id, origin));
+                    let key = (session_id, origin);
+                    client.callbacks.update(|callbacks| {
+                        callbacks.remove(&key);
+                    });
                 }
             }
             guard.complete = true;
@@ -567,7 +633,9 @@ impl RemoteTransport for RemoteClient {
             client.not_dispatched()?;
             let id = client.next.fetch_add(1, Ordering::Relaxed);
             let (sender, mut replies) = mpsc::unbounded_channel();
-            lock(&client.pending).insert(id, sender);
+            client.pending.update(|pending| {
+                pending.insert(id, sender.clone());
+            });
             let mut guard = Pending {
                 client: Arc::clone(client),
                 id,
@@ -606,16 +674,16 @@ impl RemoteTransport for RemoteClient {
     }
 
     fn route_hands(&self, hands: Arc<dyn HandCalls>) {
-        *lock(&self.client.hands) = Some(hands);
+        self.client.hands.set(Some(hands));
     }
 
     fn notify(&self, operation: RemoteOperation) -> Result<(), CodeModeHostError> {
         if let RemoteOperation::BeginTurn { session_id } = &operation {
-            *lock(&self.client.turns)
-                .entry(session_id.clone())
-                .or_default() += 1;
+            self.client.turns.update(|turns| {
+                *turns.entry(session_id.clone()).or_default() += 1;
+            });
         }
-        if let Some(failure) = lock(&self.client.failure).clone() {
+        if let Some(failure) = Option::clone(&self.client.failure.get()) {
             return Err(error(failure));
         }
         self.client.dispatch(
@@ -632,10 +700,15 @@ impl RemoteTransport for RemoteClient {
         session_id: &str,
         factory: &mut (dyn FnMut(&str) -> Box<dyn CodeModeObserver> + Send),
     ) -> Result<(), CodeModeHostError> {
-        let generation = *lock(&self.client.turns).get(session_id).unwrap_or(&0);
-        for ((session, origin), state) in lock(&self.client.callbacks).iter_mut() {
+        let generation = self
+            .client
+            .turns
+            .read(|turns| turns.get(session_id).copied())
+            .unwrap_or(0);
+        let callbacks = self.client.callbacks.get();
+        for ((session, origin), state) in callbacks.iter() {
             if session == session_id && state.generation == generation {
-                state.observer = Some(factory(origin));
+                state.observer.attach(factory(origin));
             }
         }
         self.notify(RemoteOperation::DetachTurn {

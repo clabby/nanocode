@@ -2,6 +2,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use futures_util::future::{FutureExt, Shared};
+use sync_wrapper::SyncWrapper;
 use tokio::sync::{mpsc, oneshot};
 
 pub struct Signal {
@@ -104,7 +105,7 @@ impl<T: Clone> Atom<T> {
     }
 }
 
-pub struct Slot<T>(ArcSwapOption<T>);
+pub struct Slot<T>(ArcSwapOption<SyncWrapper<T>>);
 
 impl<T> Default for Slot<T> {
     fn default() -> Self {
@@ -115,19 +116,23 @@ impl<T> Default for Slot<T> {
 impl<T> Slot<T> {
     #[must_use]
     pub fn new(value: Option<T>) -> Self {
-        Self(ArcSwapOption::from(value.map(Arc::new)))
+        Self(ArcSwapOption::from(
+            value.map(|value| Arc::new(SyncWrapper::new(value))),
+        ))
     }
 
     pub fn put(&self, value: T) -> Option<T> {
         self.0
-            .swap(Some(Arc::new(value)))
+            .swap(Some(Arc::new(SyncWrapper::new(value))))
             .and_then(|previous| Arc::try_unwrap(previous).ok())
+            .map(SyncWrapper::into_inner)
     }
 
     pub fn take(&self) -> Option<T> {
         self.0
             .swap(None)
             .and_then(|value| Arc::try_unwrap(value).ok())
+            .map(SyncWrapper::into_inner)
     }
 
     #[must_use]
