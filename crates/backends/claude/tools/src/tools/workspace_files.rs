@@ -313,9 +313,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
         tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("create temp file: {e}"))?;
     file.write_all(content.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
-    file.as_file()
-        .sync_all()
-        .map_err(|e| format!("sync: {e}"))?;
+    flush_to_disk(file.as_file()).map_err(|e| format!("sync: {e}"))?;
     if let Ok(meta) = fs::metadata(path) {
         file.as_file()
             .set_permissions(meta.permissions())
@@ -323,4 +321,14 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     }
     file.persist(path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn flush_to_disk(file: &fs::File) -> std::io::Result<()> {
+    nix::unistd::fsync(file).map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn flush_to_disk(file: &fs::File) -> std::io::Result<()> {
+    file.sync_all()
 }
