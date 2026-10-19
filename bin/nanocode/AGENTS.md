@@ -1,3 +1,5 @@
+The package builds one `nanocode` binary, so build and profile it with `--bin nanocode`. `nc` is a symlink alias to it (`ln -sf nanocode ~/.cargo/bin/nc`); reload resolves whichever name started the window.
+
 Interactive `/reload` and `/restart` broadcast to the current user's nc windows registered in the native temporary directory, across workspaces and configured session homes. Unix windows stop through runtime shutdown, never explicit turn cancellation, then exec the newest matching program on PATH and resume durable operation IDs. Ephemeral windows report that reload requires durability and remain open.
 
 The reload handoff retains drafts, attachments, queued request IDs, side conversations, focus, settings and executor selection in a private synced file. Wait for submissions to settle before saving it, preserve durable steer acknowledgements, and do not start queued work during shutdown. Resuming an interrupted tool reports its uncertain outcome instead of replaying dispatched effects. Keep the handoff flag hidden and exclude old positional prompts and prior handoff flags from restart arguments.
