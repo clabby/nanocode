@@ -15,32 +15,30 @@ pub(super) struct MessageThreads {
 }
 
 impl MessageThreads {
-    pub(super) fn persist(
+    pub(super) fn snapshot(
         &self,
-        records: &mut Vec<(std::sync::Arc<str>, std::sync::Arc<str>)>,
-    ) -> std::io::Result<super::durable::PersistedMessages> {
+        cache: &super::durable::JournalCache,
+    ) -> (
+        u64,
+        Vec<(MessageId, super::durable::MessageEntry)>,
+        Vec<MessageId>,
+    ) {
         let mut messages = self
             .threads
             .values()
             .flat_map(|thread| &thread.messages)
+            .map(|message| {
+                let entry = match cache.message(message.id) {
+                    Some(key) => super::durable::MessageEntry::Cached(std::sync::Arc::clone(key)),
+                    None => super::durable::MessageEntry::New(message.clone()),
+                };
+                (message.id, entry)
+            })
             .collect::<Vec<_>>();
-        messages.sort_by_key(|message| message.id);
-        let mut keys = Vec::with_capacity(messages.len());
-        for message in messages {
-            let json: std::sync::Arc<str> = serde_json::to_string(message)
-                .map_err(std::io::Error::other)?
-                .into();
-            let key = super::durable::checkpoint_key(&json);
-            records.push((key.clone().into(), json));
-            keys.push(key);
-        }
+        messages.sort_by_key(|(id, _)| *id);
         let mut pending = self.pending.iter().copied().collect::<Vec<_>>();
         pending.sort_unstable();
-        Ok(super::durable::PersistedMessages {
-            next_message_id: self.next_message_id,
-            records: keys,
-            pending,
-        })
+        (self.next_message_id, messages, pending)
     }
 
     pub(super) fn restore(

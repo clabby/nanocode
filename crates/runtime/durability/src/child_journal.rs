@@ -177,6 +177,10 @@ impl ChildJournalStore for SharedJournal {
         })
     }
 
+    fn records_children(&self) -> bool {
+        false
+    }
+
     fn load_record(&self, key: String) -> BackendFuture<std::io::Result<String>> {
         let inner = Arc::clone(&self.0);
         Box::pin(async move {

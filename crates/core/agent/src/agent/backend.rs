@@ -154,6 +154,10 @@ pub trait ChildJournalStore: Send + Sync + 'static {
     fn record_child(&self, _checkpoint: SessionCheckpoint) -> BackendFuture<std::io::Result<()>> {
         Box::pin(async { Ok(()) })
     }
+
+    fn records_children(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone)]

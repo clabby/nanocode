@@ -46,6 +46,10 @@ pub trait SubagentStore: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    fn records_sessions(&self) -> bool {
+        true
+    }
+
     fn load_record<'a>(
         &'a self,
         root_session_id: &'a str,
@@ -161,7 +165,11 @@ impl SubagentStore for MemorySubagentStore {
     }
 }
 
-pub(super) const JOURNAL_VERSION: u32 = 3;
+pub(super) const JOURNAL_VERSION: u32 = 4;
+
+pub(super) const LAZY_CHECKPOINT_VERSION: u32 = 3;
+
+const PAGE_MESSAGES: usize = 64;
 
 pub(super) const MIN_JOURNAL_VERSION: u32 = 1;
 
@@ -187,14 +195,12 @@ pub(super) struct JournalCheckpoint {
 }
 
 impl JournalCheckpoint {
-    pub(super) fn encode(checkpoint: &SessionCheckpoint) -> std::io::Result<Self> {
-        let json: Arc<str> = serde_json::to_string(checkpoint)
-            .map_err(std::io::Error::other)?
-            .into();
+    pub(super) fn encode(checkpoint: SessionCheckpoint, retain: bool) -> std::io::Result<Self> {
+        let (key, json) = encoded(&checkpoint)?;
         Ok(Self {
-            key: checkpoint_key(&json).into(),
+            key,
             pending: Some(json),
-            checkpoint: Some(checkpoint.clone()),
+            checkpoint: retain.then_some(checkpoint),
         })
     }
 
@@ -205,6 +211,27 @@ impl JournalCheckpoint {
             checkpoint,
         }
     }
+}
+
+pub(super) fn encoded<T: Serialize>(value: &T) -> std::io::Result<(Arc<str>, Arc<str>)> {
+    let json: Arc<str> = serde_json::to_string(value)
+        .map_err(std::io::Error::other)?
+        .into();
+    Ok((checkpoint_key(&json).into(), json))
+}
+
+pub(super) async fn load_verified(
+    store: &dyn SubagentStore,
+    root_session_id: &str,
+    key: &str,
+) -> std::io::Result<String> {
+    let json = store.load_record(root_session_id, key).await?;
+    if checkpoint_key(&json) != key {
+        return Err(std::io::Error::other(format!(
+            "subagent journal record {key} does not match its content"
+        )));
+    }
+    Ok(json)
 }
 
 pub(super) fn decode_checkpoint(json: &str, key: &str) -> std::io::Result<SessionCheckpoint> {
@@ -232,7 +259,10 @@ struct LegacyCheckpointRecord {
 #[derive(Serialize, Deserialize)]
 pub(super) struct PersistedScope {
     pub(super) version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) agents: Vec<PersistedAgent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) agent_records: Vec<(AgentId, Arc<str>)>,
     #[serde(default)]
     pub(super) messages: PersistedMessages,
 }
@@ -240,8 +270,18 @@ pub(super) struct PersistedScope {
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct PersistedMessages {
     pub(super) next_message_id: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) records: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) tail: Option<Arc<str>>,
     pub(super) pending: Vec<super::model::MessageId>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessagePage {
+    previous: Option<Arc<str>>,
+    messages: Vec<Arc<str>>,
 }
 
 impl PersistedMessages {
@@ -250,17 +290,295 @@ impl PersistedMessages {
         store: &dyn SubagentStore,
         root_session_id: &str,
     ) -> std::io::Result<super::message::MessageThreads> {
-        let mut messages = Vec::with_capacity(self.records.len());
-        for key in self.records {
-            let json = store.load_record(root_session_id, &key).await?;
-            if checkpoint_key(&json) != key {
-                return Err(std::io::Error::other(
-                    "persisted message record does not match its key",
-                ));
-            }
+        let mut keys: Vec<Arc<str>> = self.records.into_iter().map(Arc::from).collect();
+        let mut pages = Vec::new();
+        let mut next = self.tail;
+        while let Some(key) = next {
+            let json = load_verified(store, root_session_id, &key).await?;
+            let page: MessagePage = serde_json::from_str(&json).map_err(std::io::Error::other)?;
+            next = page.previous;
+            pages.push(page.messages);
+        }
+        keys.extend(pages.into_iter().rev().flatten());
+        let mut messages = Vec::with_capacity(keys.len());
+        for key in keys {
+            let json = load_verified(store, root_session_id, &key).await?;
             messages.push(serde_json::from_str(&json).map_err(std::io::Error::other)?);
         }
         super::message::MessageThreads::restore(self.next_message_id, messages, self.pending)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct JournalCache {
+    agents: HashMap<AgentId, CachedAgent>,
+    messages: HashMap<super::model::MessageId, Arc<str>>,
+    pages: Vec<Arc<str>>,
+    paged: Vec<Arc<str>>,
+}
+
+struct CachedAgent {
+    generation: u64,
+    checkpoint: Option<Arc<str>>,
+    key: Arc<str>,
+}
+
+pub(super) enum AgentEntry {
+    Cached(Arc<str>),
+    Changed {
+        generation: u64,
+        checkpoint: Option<Arc<str>>,
+        agent: Box<PersistedAgent>,
+    },
+}
+
+pub(super) enum MessageEntry {
+    Cached(Arc<str>),
+    New(super::model::AgentMessage),
+}
+
+pub(super) struct JournalSnapshot {
+    pub(super) agents: Vec<(AgentId, AgentEntry)>,
+    pub(super) messages: Vec<(super::model::MessageId, MessageEntry)>,
+    pub(super) next_message_id: u64,
+    pub(super) pending: Vec<super::model::MessageId>,
+    pub(super) records: Vec<(Arc<str>, Arc<str>)>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentProfile {
+    descriptor: AgentDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding_task: Option<String>,
+    output_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_context: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRecord {
+    profile: Arc<str>,
+    status: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_output: Option<Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    output_in_status: bool,
+    #[serde(default)]
+    next_instruction_revision: u64,
+    #[serde(default)]
+    turn_in_flight: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    resume_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    in_flight_calls: Vec<InFlightCall>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    in_flight_omitted: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_completion: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_revision: Option<u64>,
+}
+
+fn encode_agent(
+    agent: PersistedAgent,
+    records: &mut Vec<(Arc<str>, Arc<str>)>,
+) -> std::io::Result<Arc<str>> {
+    let (profile, json) = encoded(&AgentProfile {
+        descriptor: agent.descriptor,
+        binding_task: agent.binding_task,
+        output_schema: agent.output_schema,
+        host_context: agent.host_context,
+    })?;
+    records.push((Arc::clone(&profile), json));
+    let (key, json) = encoded(&AgentRecord {
+        profile,
+        status: agent.status,
+        last_output: agent.last_output,
+        output_in_status: agent.output_in_status,
+        next_instruction_revision: agent.next_instruction_revision,
+        turn_in_flight: agent.turn_in_flight,
+        resume_attempts: agent.resume_attempts,
+        checkpoint_ref: agent.checkpoint_ref,
+        in_flight_calls: agent.in_flight_calls,
+        in_flight_omitted: agent.in_flight_omitted,
+        accepted_output: agent.accepted_output,
+        accepted_revision: agent.accepted_revision,
+        pending_completion: agent.pending_completion,
+        settled_revision: agent.settled_revision,
+    })?;
+    records.push((Arc::clone(&key), json));
+    Ok(key)
+}
+
+pub(super) async fn load_agent(
+    store: &dyn SubagentStore,
+    root_session_id: &str,
+    id: AgentId,
+    key: &str,
+) -> std::io::Result<PersistedAgent> {
+    let invalid = |error: serde_json::Error| {
+        std::io::Error::other(format!("invalid subagent journal record {key}: {error}"))
+    };
+    let record: AgentRecord =
+        serde_json::from_str(&load_verified(store, root_session_id, key).await?)
+            .map_err(invalid)?;
+    let profile: AgentProfile =
+        serde_json::from_str(&load_verified(store, root_session_id, &record.profile).await?)
+            .map_err(invalid)?;
+    if profile.descriptor.id != id {
+        return Err(std::io::Error::other(format!(
+            "subagent journal record {key} does not describe agent {id}"
+        )));
+    }
+    let mut agent = PersistedAgent {
+        descriptor: profile.descriptor,
+        binding_task: profile.binding_task,
+        status: record.status,
+        output_schema: profile.output_schema,
+        host_context: profile.host_context,
+        last_output: record.last_output,
+        output_in_status: record.output_in_status,
+        next_instruction_revision: record.next_instruction_revision,
+        turn_in_flight: record.turn_in_flight,
+        resume_attempts: record.resume_attempts,
+        checkpoint: None,
+        native_checkpoint: None,
+        checkpoint_ref: record.checkpoint_ref,
+        in_flight_calls: record.in_flight_calls,
+        in_flight_omitted: record.in_flight_omitted,
+        accepted_output: record.accepted_output,
+        accepted_revision: record.accepted_revision,
+        pending_completion: record.pending_completion,
+        settled_revision: record.settled_revision,
+    };
+    agent.expand();
+    Ok(agent)
+}
+
+pub(super) struct EncodedJournal {
+    pub(super) payload: String,
+    pub(super) records: Vec<(Arc<str>, Arc<str>)>,
+    update: JournalCache,
+}
+
+impl JournalCache {
+    pub(super) fn agent(
+        &self,
+        id: AgentId,
+        generation: u64,
+        checkpoint: Option<&Arc<str>>,
+    ) -> Option<&Arc<str>> {
+        self.agents
+            .get(&id)
+            .filter(|cached| {
+                cached.generation == generation && cached.checkpoint.as_ref() == checkpoint
+            })
+            .map(|cached| &cached.key)
+    }
+
+    pub(super) fn message(&self, id: super::model::MessageId) -> Option<&Arc<str>> {
+        self.messages.get(&id)
+    }
+
+    pub(super) fn committed(&mut self, encoded: EncodedJournal) {
+        *self = encoded.update;
+    }
+}
+
+impl JournalSnapshot {
+    pub(super) fn encode(self, cache: &JournalCache) -> std::io::Result<EncodedJournal> {
+        let mut records = self.records;
+        let mut update = JournalCache::default();
+        let mut agent_records = Vec::with_capacity(self.agents.len());
+        for (id, entry) in self.agents {
+            let key = match entry {
+                AgentEntry::Cached(key) => {
+                    if let Some(cached) = cache.agents.get(&id) {
+                        update.agents.insert(
+                            id,
+                            CachedAgent {
+                                generation: cached.generation,
+                                checkpoint: cached.checkpoint.clone(),
+                                key: Arc::clone(&key),
+                            },
+                        );
+                    }
+                    key
+                }
+                AgentEntry::Changed {
+                    generation,
+                    checkpoint,
+                    agent,
+                } => {
+                    let key = encode_agent(*agent, &mut records)?;
+                    update.agents.insert(
+                        id,
+                        CachedAgent {
+                            generation,
+                            checkpoint,
+                            key: Arc::clone(&key),
+                        },
+                    );
+                    key
+                }
+            };
+            agent_records.push((id, key));
+        }
+        let mut keys = Vec::with_capacity(self.messages.len());
+        for (id, entry) in self.messages {
+            let key = match entry {
+                MessageEntry::Cached(key) => key,
+                MessageEntry::New(message) => {
+                    let (key, json) = encoded(&message)?;
+                    records.push((Arc::clone(&key), json));
+                    key
+                }
+            };
+            update.messages.insert(id, Arc::clone(&key));
+            keys.push(key);
+        }
+        let shared = keys
+            .iter()
+            .zip(&cache.paged)
+            .take_while(|(current, cached)| current == cached)
+            .count();
+        let reused = (shared / PAGE_MESSAGES).min(cache.pages.len());
+        update.pages = cache.pages[..reused].to_vec();
+        for chunk in keys[reused * PAGE_MESSAGES..].chunks(PAGE_MESSAGES) {
+            let (key, json) = encoded(&MessagePage {
+                previous: update.pages.last().cloned(),
+                messages: chunk.to_vec(),
+            })?;
+            records.push((Arc::clone(&key), json));
+            update.pages.push(key);
+        }
+        let tail = update.pages.last().cloned();
+        update.paged = keys;
+        let payload = serde_json::to_string(&PersistedScope {
+            version: JOURNAL_VERSION,
+            agents: Vec::new(),
+            agent_records,
+            messages: PersistedMessages {
+                next_message_id: self.next_message_id,
+                records: Vec::new(),
+                tail,
+                pending: self.pending,
+            },
+        })
+        .map_err(std::io::Error::other)?;
+        Ok(EncodedJournal {
+            payload,
+            records,
+            update,
+        })
     }
 }
 
@@ -275,6 +593,8 @@ pub(super) struct PersistedAgent {
     pub(super) host_context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) last_output: Option<Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) output_in_status: bool,
     #[serde(default)]
     pub(super) next_instruction_revision: u64,
 
@@ -604,6 +924,10 @@ impl SubagentStore for JournalStore {
     ) -> SubagentStoreFuture<'a, std::io::Result<()>> {
         self.0.record_child(checkpoint)
     }
+
+    fn records_sessions(&self) -> bool {
+        self.0.records_children()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -629,23 +953,35 @@ pub(super) fn persist_agent(
     checkpoint: Option<&JournalCheckpoint>,
     records: &mut Vec<(Arc<str>, Arc<str>)>,
 ) -> std::io::Result<PersistedAgent> {
-    let fallback = match (checkpoint, &session.stored_runtime) {
-        (None, Some(snapshot)) => Some(JournalCheckpoint::encode(snapshot)?),
-        _ => None,
-    };
-    let checkpoint_ref = checkpoint.or(fallback.as_ref()).map(|checkpoint| {
-        if let Some(json) = &checkpoint.pending {
-            records.push((Arc::clone(&checkpoint.key), Arc::clone(json)));
+    let checkpoint_ref = match (checkpoint, &session.stored_runtime) {
+        (Some(checkpoint), _) => {
+            if let Some(json) = &checkpoint.pending {
+                records.push((Arc::clone(&checkpoint.key), Arc::clone(json)));
+            }
+            Some(checkpoint.key.to_string())
         }
-        checkpoint.key.to_string()
-    });
+        (None, Some(snapshot)) => {
+            let (key, json) = encoded(snapshot)?;
+            records.push((Arc::clone(&key), json));
+            Some(key.to_string())
+        }
+        (None, None) => None,
+    };
+    let output_in_status = matches!(
+        &session.status,
+        AgentStatus::Completed { output } if session.last_output.as_ref() == Some(output)
+    );
     Ok(PersistedAgent {
         descriptor: session.descriptor.clone(),
-        binding_task: Some(session.binding_task.clone()),
+        binding_task: (session.binding_task != session.descriptor.task)
+            .then(|| session.binding_task.clone()),
         status: session.status.clone(),
         output_schema: session.output_schema.clone(),
         host_context: session.host_context.as_deref().map(str::to_owned),
-        last_output: session.last_output.clone(),
+        last_output: (!output_in_status)
+            .then(|| session.last_output.clone())
+            .flatten(),
+        output_in_status,
         next_instruction_revision: session.next_instruction_revision,
         turn_in_flight: session.active || matches!(session.status, AgentStatus::Running),
         resume_attempts: session.resume_attempts,
@@ -667,6 +1003,14 @@ pub(super) fn persist_agent(
 }
 
 impl PersistedAgent {
+    pub(super) fn expand(&mut self) {
+        if std::mem::take(&mut self.output_in_status)
+            && let AgentStatus::Completed { output } = &self.status
+        {
+            self.last_output = Some(output.clone());
+        }
+    }
+
     pub(super) async fn hydrate(
         &mut self,
         store: &dyn SubagentStore,

@@ -74,6 +74,58 @@ pub(super) struct ChildSession {
     pub(super) in_flight_progress: durable::OmittedProgress,
 
     announce: bool,
+
+    journal_generation: u64,
+}
+
+static JOURNAL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    JOURNAL_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Default)]
+pub(super) struct Sessions(HashMap<AgentId, ChildSession>);
+
+impl Sessions {
+    pub(super) fn get(&self, id: &AgentId) -> Option<&ChildSession> {
+        self.0.get(id)
+    }
+
+    pub(super) fn get_mut(&mut self, id: &AgentId) -> Option<&mut ChildSession> {
+        let session = self.0.get_mut(id)?;
+        session.journal_generation = next_generation();
+        Some(session)
+    }
+
+    fn insert(&mut self, id: AgentId, mut session: ChildSession) {
+        session.journal_generation = next_generation();
+        self.0.insert(id, session);
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&AgentId, &ChildSession)> {
+        self.0.iter()
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = &AgentId> {
+        self.0.keys()
+    }
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &ChildSession> {
+        self.0.values()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::ops::Index<&AgentId> for Sessions {
+    type Output = ChildSession;
+
+    fn index(&self, id: &AgentId) -> &ChildSession {
+        &self.0[id]
+    }
 }
 
 pub(super) struct OutputContract {
@@ -217,7 +269,7 @@ pub(super) struct RegistryState {
 #[derive(Default)]
 struct AgentScope {
     topology: TaskTree,
-    sessions: HashMap<AgentId, ChildSession>,
+    sessions: Sessions,
     messages: MessageThreads,
     closing: bool,
 
@@ -285,6 +337,7 @@ async fn journal_writer(
 ) {
     let mut saved = None;
     let mut recorded = HashMap::new();
+    let mut cache = durable::JournalCache::default();
     let mut pending = Vec::new();
     let mut failures = 0_u32;
     loop {
@@ -302,6 +355,7 @@ async fn journal_writer(
                 std::mem::take(&mut pending),
                 &mut saved,
                 &mut recorded,
+                &mut cache,
             )
             .await;
         failures = if failed {
@@ -343,11 +397,12 @@ async fn journal_writer(
 }
 
 impl AgentScope {
-    fn journal_payload(
+    fn journal_snapshot(
         &self,
         root_session_id: &str,
         checkpoints: &HashMap<(String, AgentId), durable::JournalCheckpoint>,
-    ) -> std::io::Result<JournalWrite> {
+        cache: &durable::JournalCache,
+    ) -> std::io::Result<durable::JournalSnapshot> {
         let mut ids = self.sessions.keys().copied().collect::<Vec<_>>();
         ids.sort_unstable();
         let mut records = Vec::new();
@@ -357,15 +412,47 @@ impl AgentScope {
                 continue;
             };
             let checkpoint = checkpoints.get(&(root_session_id.to_owned(), id));
-            agents.push(durable::persist_agent(session, checkpoint, &mut records)?);
+            let checkpoint_key = checkpoint.map(|checkpoint| &checkpoint.key);
+            let entry = match cache.agent(id, session.journal_generation, checkpoint_key) {
+                Some(key) => {
+                    if let Some(checkpoint) = checkpoint
+                        && let Some(json) = &checkpoint.pending
+                    {
+                        records.push((Arc::clone(&checkpoint.key), Arc::clone(json)));
+                    }
+                    durable::AgentEntry::Cached(Arc::clone(key))
+                }
+                None => durable::AgentEntry::Changed {
+                    generation: session.journal_generation,
+                    checkpoint: checkpoint_key.cloned(),
+                    agent: Box::new(durable::persist_agent(session, checkpoint, &mut records)?),
+                },
+            };
+            agents.push((id, entry));
         }
-        let payload = serde_json::to_string(&durable::PersistedScope {
-            version: durable::JOURNAL_VERSION,
+        let (next_message_id, messages, pending) = self.messages.snapshot(cache);
+        Ok(durable::JournalSnapshot {
             agents,
-            messages: self.messages.persist(&mut records)?,
+            messages,
+            next_message_id,
+            pending,
+            records,
         })
-        .map_err(std::io::Error::other)?;
-        Ok(JournalWrite { payload, records })
+    }
+
+    fn journal_payload(
+        &self,
+        root_session_id: &str,
+        checkpoints: &HashMap<(String, AgentId), durable::JournalCheckpoint>,
+    ) -> std::io::Result<JournalWrite> {
+        let cache = durable::JournalCache::default();
+        let encoded = self
+            .journal_snapshot(root_session_id, checkpoints, &cache)?
+            .encode(&cache)?;
+        Ok(JournalWrite {
+            payload: encoded.payload,
+            records: encoded.records,
+        })
     }
 }
 
@@ -1662,6 +1749,7 @@ impl Registry {
         requests: Vec<JournalRequest>,
         saved: &mut Option<String>,
         recorded: &mut HashMap<String, Arc<str>>,
+        cache: &mut durable::JournalCache,
     ) -> (bool, bool) {
         let (restoring, background) = {
             let restored = self
@@ -1707,12 +1795,17 @@ impl Registry {
                 "subagent journal is frozen for shutdown",
             ))
         };
-        let (payload, finished) = {
+        let (snapshot, finished) = {
             let state = self.state.lock().await;
             let checkpoints = self
                 .checkpoints
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _collect = tracing::info_span!(
+                "subagent.journal.collect",
+                session.root_id = root_session_id
+            )
+            .entered();
             match state.scopes.get(root_session_id) {
                 None => {
                     for (scope, done) in waiters.drain(..) {
@@ -1731,20 +1824,33 @@ impl Registry {
                     }
                     let write = !waiters.is_empty() || (background && !scope.journal_frozen);
                     (
-                        write.then(|| scope.journal_payload(root_session_id, &checkpoints)),
+                        write.then(|| scope.journal_snapshot(root_session_id, &checkpoints, cache)),
                         scope.journal_frozen,
                     )
                 }
             }
         };
-        let result = match payload {
+        let encoded = snapshot.map(|snapshot| {
+            snapshot.and_then(|snapshot| {
+                let _encode = tracing::info_span!(
+                    "subagent.journal.encode",
+                    session.root_id = root_session_id
+                )
+                .entered();
+                snapshot.encode(cache)
+            })
+        });
+        let result = match encoded {
             None => Ok(()),
             Some(Err(error)) => Err(error),
-            Some(Ok(JournalWrite { payload, records })) => {
-                if waiters.is_empty() && saved.as_ref() == Some(&payload) {
-                    self.acknowledge(root_session_id, &records);
+            Some(Ok(encoded)) => {
+                let records = &encoded.records;
+                if waiters.is_empty() && saved.as_deref() == Some(encoded.payload.as_str()) {
+                    self.acknowledge(root_session_id, records);
+                    cache.committed(encoded);
                     Ok(())
                 } else {
+                    let payload = encoded.payload.clone();
                     let contents = records.iter().map(|(_, json)| Arc::clone(json)).collect();
                     let result = store
                         .save(root_session_id, payload.clone(), contents)
@@ -1753,14 +1859,19 @@ impl Registry {
                             session.root_id = root_session_id,
                             payload.bytes = payload.len(),
                             record.count = records.len(),
+                            record.bytes =
+                                records.iter().map(|(_, json)| json.len()).sum::<usize>(),
                             request.count = waiters.len()
                         ))
                         .await;
                     match result {
                         Ok(()) => {
-                            self.acknowledge(root_session_id, &records);
-                            self.record_children(root_session_id, store.as_ref(), recorded)
-                                .await;
+                            self.acknowledge(root_session_id, &encoded.records);
+                            cache.committed(encoded);
+                            if store.records_sessions() {
+                                self.record_children(root_session_id, store.as_ref(), recorded)
+                                    .await;
+                            }
                             *saved = Some(payload);
                             Ok(())
                         }
@@ -1832,7 +1943,8 @@ impl Registry {
                 let checkpoint = match checkpoints.get(&(root_session_id.to_owned(), id)) {
                     Some(checkpoint) => checkpoint.clone(),
                     None => durable::JournalCheckpoint::encode(
-                        scope.sessions.get(&id)?.stored_runtime.as_ref()?,
+                        scope.sessions.get(&id)?.stored_runtime.clone()?,
+                        true,
                     )
                     .ok()?,
                 };
@@ -1841,13 +1953,41 @@ impl Registry {
             .collect()
     }
 
+    fn records_sessions(&self, root_session_id: &str) -> bool {
+        self.store_for(root_session_id)
+            .is_some_and(|store| store.records_sessions())
+    }
+
     fn record_checkpoint(
         &self,
         root_session_id: &str,
         id: AgentId,
         snapshot: SessionCheckpoint,
     ) -> bool {
-        match durable::JournalCheckpoint::encode(&snapshot) {
+        let encoded =
+            durable::JournalCheckpoint::encode(snapshot, self.records_sessions(root_session_id));
+        self.insert_encoded(root_session_id, id, encoded)
+    }
+
+    async fn record_checkpoint_off_thread(
+        &self,
+        root_session_id: &str,
+        id: AgentId,
+        snapshot: SessionCheckpoint,
+    ) -> bool {
+        let retain = self.records_sessions(root_session_id);
+        let encoded =
+            platform::blocking(move || durable::JournalCheckpoint::encode(snapshot, retain)).await;
+        self.insert_encoded(root_session_id, id, encoded)
+    }
+
+    fn insert_encoded(
+        &self,
+        root_session_id: &str,
+        id: AgentId,
+        encoded: std::io::Result<durable::JournalCheckpoint>,
+    ) -> bool {
+        match encoded {
             Ok(checkpoint) => {
                 self.insert_checkpoint(root_session_id, id, checkpoint);
                 true
@@ -1987,7 +2127,9 @@ impl Registry {
                     && let Ok(snapshot) = harness.snapshot().await
                     && registry.running_harness(&key.0, key.1).await.is_some()
                 {
-                    if registry.record_checkpoint(&key.0, key.1, snapshot)
+                    if registry
+                        .record_checkpoint_off_thread(&key.0, key.1, snapshot)
+                        .await
                         && let Some(commits) = commits
                     {
                         registry.retire_committed(&key.0, key.1, commits).await;
@@ -2112,7 +2254,7 @@ impl Registry {
             #[serde(default)]
             tool: String,
             #[serde(default)]
-            arguments: Option<Value>,
+            arguments: Option<Box<serde_json::value::RawValue>>,
             #[serde(default)]
             parent_call_id: Option<String>,
 
@@ -2120,24 +2262,44 @@ impl Registry {
             cell: Option<Cell>,
 
             #[serde(default)]
-            metadata: Option<Value>,
+            metadata: Option<Metadata>,
         }
         #[derive(serde::Deserialize)]
         struct Cell {
             origin_call_id: String,
             running: bool,
         }
+        #[derive(serde::Deserialize)]
+        struct Metadata {
+            #[serde(default, rename = "_nanocode_code")]
+            code: Option<Code>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Code {
+            #[serde(default)]
+            origin_call_id: Option<Value>,
+            #[serde(default)]
+            running: Option<Value>,
+        }
         impl Call {
             fn cell(&self) -> Option<(&str, bool)> {
                 if let Some(cell) = &self.cell {
                     return Some((cell.origin_call_id.as_str(), cell.running));
                 }
-                let code = self.metadata.as_ref()?.get("_nanocode_code")?;
-                let origin = code.get("origin_call_id")?.as_str()?;
+                let code = self.metadata.as_ref()?.code.as_ref()?;
+                let origin = code.origin_call_id.as_ref()?.as_str()?;
                 Some((
                     origin,
-                    code.get("running").and_then(Value::as_bool) != Some(false),
+                    code.running.as_ref().and_then(Value::as_bool) != Some(false),
                 ))
+            }
+
+            fn arguments(&self) -> Option<Value> {
+                let raw = self.arguments.as_ref()?.get();
+                match serde_json::from_str::<String>(raw) {
+                    Ok(text) => Some(Value::String(text)),
+                    Err(_) => serde_json::from_str(raw).ok(),
+                }
             }
         }
         let Some(call) = payload
@@ -2162,7 +2324,7 @@ impl Registry {
                         durable::InFlightCall::new(
                             &call.call_id,
                             &call.tool,
-                            call.arguments.as_ref(),
+                            call.arguments().as_ref(),
                             parent_call(&call.call_id, call.parent_call_id.as_deref()),
                         ),
                     );
@@ -2261,9 +2423,12 @@ impl Registry {
             .hydrate(store.as_ref(), root_session_id)
             .await?;
         let mut agents = journal.agents;
+        for (id, key) in journal.agent_records {
+            agents.push(durable::load_agent(store.as_ref(), root_session_id, id, &key).await?);
+        }
         agents.sort_by_key(|agent| agent.descriptor.id);
 
-        let lazy = journal.version == durable::JOURNAL_VERSION;
+        let lazy = journal.version >= durable::LAZY_CHECKPOINT_VERSION;
         let mut stored = HashMap::new();
         for agent in &mut agents {
             if lazy {
@@ -2306,7 +2471,10 @@ impl Registry {
                     self.insert_checkpoint(
                         root_session_id,
                         id,
-                        durable::JournalCheckpoint::encode(snapshot)?,
+                        durable::JournalCheckpoint::encode(
+                            snapshot.clone(),
+                            store.records_sessions(),
+                        )?,
                     );
                 }
                 (None, None) => {}
@@ -2899,6 +3067,7 @@ impl Registry {
                 settled_revision: None,
                 in_flight_progress: durable::OmittedProgress::default(),
                 announce: false,
+                journal_generation: 0,
             },
         )?;
         drop(state);
@@ -4385,6 +4554,7 @@ impl ChildSession {
             settled_revision: None,
             in_flight_progress: durable::OmittedProgress::default(),
             announce: true,
+            journal_generation: 0,
         }
     }
 
