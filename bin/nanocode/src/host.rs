@@ -53,15 +53,23 @@ impl Panel {
 
     pub(crate) fn aligned(&self) -> Vec<Vec<String>> {
         let widths = self.widths();
+        let numeric: Vec<bool> = (0..widths.len())
+            .map(|column| {
+                self.rows
+                    .iter()
+                    .filter_map(|row| row.get(column))
+                    .filter(|cell| !cell.is_empty())
+                    .all(|cell| cell.starts_with(|first: char| first.is_ascii_digit()))
+            })
+            .collect();
         self.rows
             .iter()
             .map(|row| {
                 row.iter()
-                    .zip(&widths)
-                    .enumerate()
-                    .map(|(column, (cell, width))| match column {
-                        0 => format!("{cell:<width$}"),
-                        _ => format!("{cell:>width$}"),
+                    .zip(widths.iter().zip(&numeric))
+                    .map(|(cell, (width, numeric))| match numeric {
+                        true => format!("{cell:>width$}"),
+                        false => format!("{cell:<width$}"),
                     })
                     .collect()
             })
