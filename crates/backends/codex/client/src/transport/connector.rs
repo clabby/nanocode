@@ -9,7 +9,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
+    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::{
         Error, Result,
         handshake::client::{Request, Response},
@@ -37,14 +37,26 @@ pub async fn connect_async(
         .port_u16()
         .unwrap_or(if secure { 443 } else { 80 });
 
-    let socket = if let Some(proxy) = ProxyConfig::from_env(request.uri(), secure)? {
-        let socket = connect_happy_eyeballs(proxy.authority()).await?;
-        connect_via_proxy(socket, &proxy, &host, port).await?
-    } else {
-        connect_happy_eyeballs(format!("{host}:{port}")).await?
+    let proxy = ProxyConfig::from_env(request.uri(), secure)?;
+    let socket = async {
+        if let Some(proxy) = proxy {
+            let socket = connect_happy_eyeballs(proxy.authority()).await?;
+            connect_via_proxy(socket, &proxy, &host, port).await
+        } else {
+            connect_happy_eyeballs(format!("{host}:{port}")).await
+        }
     };
-
-    client_async_tls_with_config(request, socket, None, None).await
+    let connector = async {
+        if secure {
+            Ok(Connector::Rustls(
+                nanocode_tls::native_client_config().await?,
+            ))
+        } else {
+            Ok::<_, Error>(Connector::Plain)
+        }
+    };
+    let (socket, connector) = tokio::try_join!(socket, connector)?;
+    client_async_tls_with_config(request, socket, None, Some(connector)).await
 }
 
 #[derive(Clone, Copy)]
