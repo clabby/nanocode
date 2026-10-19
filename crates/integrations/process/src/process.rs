@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     path::Path,
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -15,6 +15,7 @@ use nix::{
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::process::{ChildStderr, ChildStdout, Command};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::selection::Shell;
@@ -62,13 +63,16 @@ pub(super) struct ProcessChild {
 impl ProcessChild {
     fn new(
         mut try_wait: impl FnMut() -> io::Result<Option<i32>> + Send + 'static,
-        process_group: SharedProcessGroup,
+        pid: u32,
         io_driver_available: bool,
     ) -> Self {
         #[cfg(not(unix))]
         let _ = io_driver_available;
-        let group = process_group.clone();
+        let (commands, mut received) = mpsc::unbounded_channel();
+        let process_group = SharedProcessGroup(commands);
+        let mut guard = ProcessGroupGuard::new(pid);
         let wait = tokio::spawn(async move {
+            let mut listening = true;
             #[cfg(unix)]
             let mut exited = if io_driver_available {
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()) {
@@ -82,33 +86,45 @@ impl ProcessChild {
                 None
             };
             loop {
-                {
-                    let mut guard = group.0.lock().unwrap_or_else(|e| e.into_inner());
+                while let Ok(command) = received.try_recv() {
+                    command.apply(&mut guard);
+                }
+                let ready = guard.prepare_to_reap();
+                match ready.and_then(|ready| if ready { try_wait() } else { Ok(None) }) {
+                    Ok(None) => {}
+                    Ok(Some(status)) => {
+                        guard.disarm();
+                        return Ok(status);
+                    }
 
-                    let ready = guard.prepare_to_reap();
-                    match ready.and_then(|ready| if ready { try_wait() } else { Ok(None) }) {
-                        Ok(None) => {}
-                        Ok(Some(status)) => {
-                            guard.disarm();
-                            return Ok(status);
-                        }
-
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            guard.disarm();
-                            return Err(error);
-                        }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        guard.disarm();
+                        return Err(error);
                     }
                 }
-                #[cfg(unix)]
-                if let Some(signal) = exited.as_mut() {
-                    if signal.recv().await.is_none() {
-                        exited = None;
+                let exit = async {
+                    #[cfg(unix)]
+                    if let Some(signal) = exited.as_mut() {
+                        return signal.recv().await.is_some();
                     }
-                    continue;
+                    tokio::time::sleep(REAP_POLL_INTERVAL).await;
+                    true
+                };
+                tokio::select! {
+                    command = received.recv(), if listening => match command {
+                        Some(command) => command.apply(&mut guard),
+                        None => listening = false,
+                    },
+                    notified = exit => {
+                        #[cfg(unix)]
+                        if !notified {
+                            exited = None;
+                        }
+                        #[cfg(not(unix))]
+                        let _ = notified;
+                    }
                 }
-
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         });
         Self {
@@ -139,49 +155,85 @@ impl ProcessChild {
 
 impl Drop for ProcessChild {
     fn drop(&mut self) {
-        let _ = self.process_group.terminate_and_disarm();
+        self.process_group.terminate_and_disarm();
+    }
+}
+
+const REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+type Reply = oneshot::Sender<io::Result<()>>;
+
+enum GroupCommand {
+    Interrupt(Reply),
+    Terminate(Option<Reply>),
+}
+
+impl GroupCommand {
+    fn apply(self, guard: &mut ProcessGroupGuard) {
+        match self {
+            Self::Interrupt(reply) => drop(reply.send(guard.interrupt())),
+            Self::Terminate(reply) => {
+                let result = guard.terminate_and_disarm();
+                if let Some(reply) = reply {
+                    drop(reply.send(result));
+                }
+            }
+        }
     }
 }
 
 #[derive(Clone)]
-pub(super) struct SharedProcessGroup(Arc<StdMutex<ProcessGroupGuard>>);
+pub(super) struct SharedProcessGroup(mpsc::UnboundedSender<GroupCommand>);
 
 impl SharedProcessGroup {
-    fn new(pid: u32) -> Self {
-        Self(Arc::new(StdMutex::new(ProcessGroupGuard::new(pid))))
+    async fn request(&self, command: impl FnOnce(Reply) -> GroupCommand) -> io::Result<()> {
+        let (reply, response) = oneshot::channel();
+        if self.0.send(command(reply)).is_err() {
+            return Ok(());
+        }
+        response.await.unwrap_or(Ok(()))
     }
 
-    pub(super) fn interrupt(&self) -> io::Result<()> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).interrupt()
+    pub(super) async fn interrupt(&self) -> io::Result<()> {
+        self.request(GroupCommand::Interrupt).await
     }
 
-    pub(super) fn terminate_and_disarm(&self) -> io::Result<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .terminate_and_disarm()
+    pub(super) async fn terminate(&self) -> io::Result<()> {
+        self.request(|reply| GroupCommand::Terminate(Some(reply)))
+            .await
+    }
+
+    pub(super) fn terminate_and_disarm(&self) {
+        let _ = self.0.send(GroupCommand::Terminate(None));
     }
 }
 
+type PtyWrite = (Vec<u8>, oneshot::Sender<io::Result<()>>);
+
 pub(super) enum ProcessStdin {
-    Pty(Arc<StdMutex<Box<dyn Write + Send>>>),
+    Pty(mpsc::UnboundedSender<PtyWrite>),
 }
 
 impl ProcessStdin {
+    fn pty(mut writer: Box<dyn Write + Send>) -> Self {
+        let (sender, mut writes) = mpsc::unbounded_channel::<PtyWrite>();
+        drop(tokio::task::spawn_blocking(move || {
+            while let Some((bytes, reply)) = writes.blocking_recv() {
+                drop(reply.send(writer.write_all(&bytes).and_then(|()| writer.flush())));
+            }
+        }));
+        Self::Pty(sender)
+    }
+
     pub(super) async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
             Self::Pty(writer) => {
-                let writer = Arc::clone(writer);
-                let bytes = bytes.to_vec();
-                tokio::task::spawn_blocking(move || {
-                    let mut writer = writer
-                        .lock()
-                        .map_err(|_| io::Error::other("PTY writer lock poisoned"))?;
-                    writer.write_all(&bytes)?;
-                    writer.flush()
-                })
-                .await
-                .map_err(|error| io::Error::other(format!("PTY write task failed: {error}")))?
+                let stopped = || io::Error::new(io::ErrorKind::BrokenPipe, "PTY writer stopped");
+                let (reply, written) = oneshot::channel();
+                writer
+                    .send((bytes.to_vec(), reply))
+                    .map_err(|_| stopped())?;
+                written.await.map_err(|_| stopped())?
             }
         }
     }
@@ -234,19 +286,20 @@ fn spawn_pipes(
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("spawned shell without a process identifier"))?;
-    let process_group = SharedProcessGroup::new(pid);
+    let output = ProcessOutput::Pipes {
+        stdout: child.stdout.take(),
+        stderr: child.stderr.take(),
+    };
+    let child = ProcessChild::new(
+        move || child.try_wait().map(|status| status.map(exit_code)),
+        pid,
+        true,
+    );
     Ok(SpawnedProcess {
         stdin: None,
-        output: ProcessOutput::Pipes {
-            stdout: child.stdout.take(),
-            stderr: child.stderr.take(),
-        },
-        child: ProcessChild::new(
-            move || child.try_wait().map(|status| status.map(exit_code)),
-            process_group.clone(),
-            true,
-        ),
-        process_group,
+        output,
+        process_group: child.process_group.clone(),
+        child,
     })
 }
 
@@ -282,22 +335,21 @@ fn spawn_pty(
     let pid = child
         .process_id()
         .ok_or_else(|| io::Error::other("spawned PTY command without a process identifier"))?;
-    let process_group = SharedProcessGroup::new(pid);
     let child = ProcessChild::new(
         move || {
             child.try_wait().map(|status| {
                 status.map(|status| i32::try_from(status.exit_code()).unwrap_or(i32::MAX))
             })
         },
-        process_group.clone(),
+        pid,
         false,
     );
 
     Ok(SpawnedProcess {
+        process_group: child.process_group.clone(),
         child,
-        stdin: Some(ProcessStdin::Pty(Arc::new(StdMutex::new(writer)))),
+        stdin: Some(ProcessStdin::pty(writer)),
         output: ProcessOutput::Pty(reader),
-        process_group,
     })
 }
 

@@ -335,7 +335,10 @@ impl<S: 'static> Actor<S> {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    pub async fn run<R, F>(&self, job: F) -> Result<R, Stopped>
+    pub fn run<R, F>(
+        &self,
+        job: F,
+    ) -> impl Future<Output = Result<R, Stopped>> + Send + use<R, F, S>
     where
         S: Send,
         R: Send + 'static,
@@ -359,12 +362,17 @@ impl<S: 'static> Actor<S> {
                 }
             })
         });
-        self.jobs.send(job).map_err(|_| Stopped)?;
-        receiver.await.map_err(|_| Stopped)
+        let sent = self.jobs.send(job).is_ok();
+        async move {
+            if !sent {
+                return Err(Stopped);
+            }
+            receiver.await.map_err(|_| Stopped)
+        }
     }
 
     #[cfg(target_family = "wasm")]
-    pub async fn run<R, F>(&self, job: F) -> Result<R, Stopped>
+    pub fn run<R, F>(&self, job: F) -> impl Future<Output = Result<R, Stopped>> + use<R, F, S>
     where
         R: 'static,
         F: for<'a> FnOnce(&'a mut S) -> Pin<Box<dyn Future<Output = R> + 'a>> + 'static,
@@ -385,8 +393,13 @@ impl<S: 'static> Actor<S> {
                 }
             })
         });
-        self.jobs.send(job).map_err(|_| Stopped)?;
-        receiver.await.map_err(|_| Stopped)
+        let sent = self.jobs.send(job).is_ok();
+        async move {
+            if !sent {
+                return Err(Stopped);
+            }
+            receiver.await.map_err(|_| Stopped)
+        }
     }
 
     #[must_use]

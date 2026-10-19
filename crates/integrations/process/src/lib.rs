@@ -18,12 +18,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
+use nanocode_sync::{Actor, Atom};
+use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
 
 pub use nanocode_process_contracts::{
     DEFAULT_EXEC_YIELD_MS, DEFAULT_POLL_YIELD_MS, DEFAULT_WRITE_YIELD_MS, MAX_EXEC_YIELD_MS,
@@ -48,9 +49,11 @@ impl ProcessExecutors for NativeProcessExecutors {
     }
 }
 
+type Sessions = Arc<Atom<HashMap<i64, Arc<Session>>>>;
+
 pub struct ShellSessions {
-    lifecycle: Mutex<()>,
-    sessions: Arc<Mutex<HashMap<i64, Arc<Session>>>>,
+    terminations: AtomicU64,
+    sessions: Sessions,
     next_session_id: AtomicI64,
     default_shell: selection::Shell,
     environment: Arc<Vec<(OsString, OsString)>>,
@@ -59,8 +62,8 @@ pub struct ShellSessions {
 impl ShellSessions {
     pub fn with_environment(environment: Arc<Vec<(OsString, OsString)>>) -> Self {
         Self {
-            lifecycle: Mutex::new(()),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            terminations: AtomicU64::new(0),
+            sessions: Arc::default(),
             next_session_id: AtomicI64::new(1),
             default_shell: selection::default_user_shell(),
             environment,
@@ -87,7 +90,7 @@ impl ShellSessions {
             );
             let (environment, secrets) = process::sanitized_environment(&self.environment);
 
-            let lifecycle_guard = self.lifecycle.lock().await;
+            let terminations = self.terminations.load(Ordering::SeqCst);
             let spawned = match process::spawn(
                 &command.script,
                 &workdir,
@@ -108,30 +111,43 @@ impl ShellSessions {
                     );
                 }
             };
-            let session = Session::new(session_id, spawned, secrets);
+            let session = match Session::new(session_id, spawned, secrets) {
+                Ok(session) => session,
+                Err(error) => {
+                    return ExecCommandResult::failed(
+                        started_at.elapsed(),
+                        format!("exec_command failed for `{}`: {error}", command.script),
+                    );
+                }
+            };
             let mut cancellation = CancelExecution {
                 session: Some(Arc::clone(&session)),
                 sessions: Arc::clone(&self.sessions),
             };
-            let _interaction_guard = session.interaction.lock().await;
-            self.sessions
-                .lock()
-                .await
-                .insert(session_id, Arc::clone(&session));
-            drop(lifecycle_guard);
-
             let yield_time = duration_ms(
                 command.yield_time_ms,
                 DEFAULT_EXEC_YIELD_MS,
                 250,
                 MAX_EXEC_YIELD_MS,
             );
-            let result = session
-                .wait_for_output(yield_time, command.max_output_tokens, started_at)
-                .await;
+            let max_output_tokens = command.max_output_tokens;
+            let initial = session.owner.run(move |state| {
+                Box::pin(state.wait_for_output(yield_time, max_output_tokens, started_at))
+            });
+            self.sessions.update(|sessions| {
+                sessions.insert(session_id, Arc::clone(&session));
+            });
+            if self.terminations.load(Ordering::SeqCst) != terminations {
+                self.forget(session_id);
+                session.process_group.terminate_and_disarm();
+            }
+
+            let result = initial
+                .await
+                .unwrap_or_else(|_| session.stopped(started_at));
             cancellation.session = None;
             if result.exit_code.is_some() {
-                self.sessions.lock().await.remove(&session_id);
+                self.forget(session_id);
             }
             result
         })
@@ -145,7 +161,9 @@ impl ShellSessions {
         Box::pin(async move {
             let started_at = Instant::now();
             let session_id = i64::from(request.session_id);
-            let session = self.sessions.lock().await.get(&session_id).cloned();
+            let session = self
+                .sessions
+                .read(|sessions| sessions.get(&session_id).cloned());
             let Some(session) = session else {
                 return ExecCommandResult::failed(
                     started_at.elapsed(),
@@ -156,27 +174,12 @@ impl ShellSessions {
                 );
             };
 
-            let _interaction_guard = session.interaction.lock().await;
-            if !request.chars.is_empty() {
-                let written = if !session.tty {
-                    if request.chars == "\u{3}" {
-                        session.interrupt().await
-                    } else {
-                        return ExecCommandResult::failed(
-                        started_at.elapsed(),
-                        "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"
-                            .to_owned(),
-                    );
-                    }
-                } else {
-                    session.write(&request.chars).await
-                };
-                if let Err(error) = written {
-                    return ExecCommandResult::failed(
-                        started_at.elapsed(),
-                        format!("write_stdin failed: {error}"),
-                    );
-                }
+            if !request.chars.is_empty() && !session.tty && request.chars != "\u{3}" {
+                return ExecCommandResult::failed(
+                    started_at.elapsed(),
+                    "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"
+                        .to_owned(),
+                );
             }
             let (default, minimum, maximum) = if request.chars.is_empty() {
                 (DEFAULT_POLL_YIELD_MS, 5_000, MAX_POLL_YIELD_MS)
@@ -184,11 +187,34 @@ impl ShellSessions {
                 (DEFAULT_WRITE_YIELD_MS, 250, MAX_EXEC_YIELD_MS)
             };
             let yield_time = duration_ms(request.yield_time_ms, default, minimum, maximum);
+            let max_output_tokens = request.max_output_tokens;
+            let chars = request.chars;
             let result = session
-                .wait_for_output(yield_time, request.max_output_tokens, started_at)
-                .await;
+                .owner
+                .run(move |state| {
+                    Box::pin(async move {
+                        if !chars.is_empty() {
+                            let written = if state.tty {
+                                state.write(&chars).await
+                            } else {
+                                state.process_group.interrupt().await
+                            };
+                            if let Err(error) = written {
+                                return ExecCommandResult::failed(
+                                    started_at.elapsed(),
+                                    format!("write_stdin failed: {error}"),
+                                );
+                            }
+                        }
+                        state
+                            .wait_for_output(yield_time, max_output_tokens, started_at)
+                            .await
+                    })
+                })
+                .await
+                .unwrap_or_else(|_| session.stopped(started_at));
             if result.exit_code.is_some() {
-                self.sessions.lock().await.remove(&session_id);
+                self.forget(session_id);
             }
             result
         })
@@ -198,74 +224,98 @@ impl ShellSessions {
         &'call self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'call>> {
         Box::pin(async move {
-            let _lifecycle_guard = self.lifecycle.lock().await;
-            let sessions = {
-                let mut store = self.sessions.lock().await;
-                store
-                    .drain()
-                    .map(|(_, session)| session)
-                    .collect::<Vec<_>>()
-            };
-            for session in sessions {
+            self.terminations.fetch_add(1, Ordering::SeqCst);
+            let sessions = self.sessions.update(std::mem::take);
+            for session in sessions.into_values() {
                 session.terminate().await;
             }
         })
+    }
+
+    fn forget(&self, session_id: i64) {
+        self.sessions.update(|sessions| {
+            sessions.remove(&session_id);
+        });
     }
 }
 
 struct Session {
     id: i64,
     tty: bool,
-    interaction: Mutex<()>,
-    child: Mutex<process::ProcessChild>,
-    stdin: Mutex<Option<process::ProcessStdin>>,
     process_group: process::SharedProcessGroup,
-    drains: Mutex<Option<Vec<JoinHandle<()>>>>,
-    captured: Arc<Mutex<CapturedOutput>>,
+    owner: Actor<SessionState>,
+}
+
+struct SessionState {
+    id: i64,
+    tty: bool,
+    child: process::ProcessChild,
+    stdin: Option<process::ProcessStdin>,
+    process_group: process::SharedProcessGroup,
+    drains: Option<Vec<JoinHandle<()>>>,
+    output: mpsc::UnboundedReceiver<Vec<u8>>,
+    captured: CapturedOutput,
     secrets: Vec<String>,
 }
 
 impl Session {
-    fn new(id: i64, spawned: process::SpawnedProcess, secrets: Vec<String>) -> Arc<Self> {
+    fn new(
+        id: i64,
+        spawned: process::SpawnedProcess,
+        secrets: Vec<String>,
+    ) -> std::io::Result<Arc<Self>> {
         let tty = matches!(spawned.stdin.as_ref(), Some(process::ProcessStdin::Pty(_)));
-        let captured = Arc::new(Mutex::new(CapturedOutput::default()));
+        let (chunks, output) = mpsc::unbounded_channel();
         let drains = match spawned.output {
             process::ProcessOutput::Pipes { stdout, stderr } => vec![
-                tokio::spawn(output::drain(stdout, Arc::clone(&captured), usize::MAX)),
-                tokio::spawn(output::drain(stderr, Arc::clone(&captured), usize::MAX)),
+                tokio::spawn(output::drain(stdout, chunks.clone())),
+                tokio::spawn(output::drain(stderr, chunks)),
             ],
-            process::ProcessOutput::Pty(reader) => vec![output::drain_blocking(
-                reader,
-                Arc::clone(&captured),
-                usize::MAX,
-            )],
+            process::ProcessOutput::Pty(reader) => vec![output::drain_blocking(reader, chunks)],
         };
-        Arc::new(Self {
+        let process_group = spawned.process_group;
+        let owner = Actor::spawn(SessionState {
             id,
             tty,
-            interaction: Mutex::new(()),
-            child: Mutex::new(spawned.child),
-            stdin: Mutex::new(spawned.stdin),
-            process_group: spawned.process_group,
-            drains: Mutex::new(Some(drains)),
-            captured,
+            child: spawned.child,
+            stdin: spawned.stdin,
+            process_group: process_group.clone(),
+            drains: Some(drains),
+            output,
+            captured: CapturedOutput::default(),
             secrets,
-        })
+        })?;
+        Ok(Arc::new(Self {
+            id,
+            tty,
+            process_group,
+            owner,
+        }))
+    }
+
+    fn stopped(&self, started_at: Instant) -> ExecCommandResult {
+        ExecCommandResult::failed(
+            started_at.elapsed(),
+            format!("shell session {} stopped", self.id),
+        )
     }
 
     async fn terminate(&self) {
-        if let Err(error) = self.process_group.terminate_and_disarm() {
+        if let Err(error) = self.process_group.terminate().await {
             tracing::warn!(
                 shell.session.id = self.id,
                 %error,
                 "failed to terminate shell process group"
             );
         }
+        let _ = self.owner.run(|state| Box::pin(state.close())).await;
+    }
+}
 
-        let _interaction = self.interaction.lock().await;
-
-        self.stdin.lock().await.take();
-        if let Err(error) = self.child.lock().await.wait().await {
+impl SessionState {
+    async fn close(&mut self) {
+        self.stdin.take();
+        if let Err(error) = self.child.wait().await {
             tracing::warn!(
                 shell.session.id = self.id,
                 %error,
@@ -275,46 +325,36 @@ impl Session {
         self.finish_drains().await;
     }
 
-    async fn interrupt(&self) -> std::io::Result<()> {
-        self.process_group.interrupt()
-    }
-
-    async fn write(&self, chars: &str) -> std::io::Result<()> {
-        let mut stdin = self.stdin.lock().await;
-        let stdin = stdin.as_mut().ok_or_else(|| {
+    async fn write(&mut self, chars: &str) -> std::io::Result<()> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin is closed")
         })?;
         stdin.write(chars.as_bytes()).await
     }
 
     async fn wait_for_output(
-        &self,
+        &mut self,
         yield_time: Duration,
         max_output_tokens: Option<usize>,
         started_at: Instant,
     ) -> ExecCommandResult {
-        let status = {
-            let mut child = self.child.lock().await;
-            timeout(yield_time, child.wait()).await
-        };
+        let status = timeout(yield_time, self.child.wait()).await;
         let exit_code = match status {
             Ok(Ok(exit_code)) => {
-                let _ = self.process_group.terminate_and_disarm();
+                self.process_group.terminate_and_disarm();
                 self.finish_drains().await;
                 Some(exit_code)
             }
             Ok(Err(error)) => {
-                let _ = self.process_group.terminate_and_disarm();
+                self.process_group.terminate_and_disarm();
                 let message = format!("failed to wait for shell command: {error}");
-                self.captured
-                    .lock()
-                    .await
-                    .push(message.as_bytes(), usize::MAX);
+                self.collect();
+                self.captured.push(message.as_bytes(), usize::MAX);
                 Some(1)
             }
             Err(_) => None,
         };
-        let (output, original_token_count) = self.take_output(max_output_tokens).await;
+        let (output, original_token_count) = self.take_output(max_output_tokens);
         let chunk_id = match generate_chunk_id() {
             Ok(chunk_id) => Some(chunk_id),
             Err(error) => {
@@ -333,9 +373,8 @@ impl Session {
         }
     }
 
-    async fn finish_drains(&self) {
-        let handles = self.drains.lock().await.take();
-        let Some(handles) = handles else {
+    async fn finish_drains(&mut self) {
+        let Some(handles) = self.drains.take() else {
             return;
         };
         let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
@@ -350,8 +389,15 @@ impl Session {
         }
     }
 
-    async fn take_output(&self, max_output_tokens: Option<usize>) -> (String, Option<usize>) {
-        let captured = self.captured.lock().await.take();
+    fn collect(&mut self) {
+        while let Ok(chunk) = self.output.try_recv() {
+            self.captured.push(&chunk, usize::MAX);
+        }
+    }
+
+    fn take_output(&mut self, max_output_tokens: Option<usize>) -> (String, Option<usize>) {
+        self.collect();
+        let captured = self.captured.take();
         let raw = String::from_utf8_lossy(&captured.with_omission_marker()).into_owned();
         let limit = output::effective_token_limit(max_output_tokens);
         let (output, _) = output::redact_and_limit(raw, &self.secrets, limit);
@@ -475,14 +521,15 @@ fn generate_chunk_id() -> Result<String, getrandom::Error> {
 
 struct CancelExecution {
     session: Option<Arc<Session>>,
-    sessions: Arc<Mutex<HashMap<i64, Arc<Session>>>>,
+    sessions: Sessions,
 }
 impl Drop for CancelExecution {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
-            let sessions = Arc::clone(&self.sessions);
+            self.sessions.update(|sessions| {
+                sessions.remove(&session.id);
+            });
             tokio::spawn(async move {
-                sessions.lock().await.remove(&session.id);
                 session.terminate().await;
             });
         }

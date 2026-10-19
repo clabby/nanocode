@@ -1,11 +1,9 @@
-use std::{io::Read, sync::Arc};
+use std::io::Read;
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    sync::Mutex,
+    sync::mpsc::UnboundedSender,
 };
-
-use super::CapturedOutput;
 
 const BYTES_PER_TOKEN: usize = 4;
 const READ_BUFFER_LENGTH: usize = 8 * 1024;
@@ -17,8 +15,7 @@ pub(super) fn effective_token_limit(requested: Option<usize>) -> usize {
 
 pub(super) async fn drain(
     mut pipe: Option<impl AsyncRead + Unpin>,
-    captured: Arc<Mutex<CapturedOutput>>,
-    capture_limit: usize,
+    chunks: UnboundedSender<Vec<u8>>,
 ) {
     let Some(mut pipe) = pipe.take() else {
         return;
@@ -27,12 +24,13 @@ pub(super) async fn drain(
     loop {
         match pipe.read(&mut buffer).await {
             Ok(0) => return,
-            Ok(length) => captured.lock().await.push(&buffer[..length], capture_limit),
+            Ok(length) => {
+                if chunks.send(buffer[..length].to_vec()).is_err() {
+                    return;
+                }
+            }
             Err(error) => {
-                captured.lock().await.push(
-                    format!("failed to read command output: {error}").as_bytes(),
-                    capture_limit,
-                );
+                let _ = chunks.send(format!("failed to read command output: {error}").into_bytes());
                 return;
             }
         }
@@ -41,17 +39,18 @@ pub(super) async fn drain(
 
 pub(super) fn drain_blocking(
     mut pipe: Box<dyn Read + Send>,
-    captured: Arc<Mutex<CapturedOutput>>,
-    capture_limit: usize,
+    chunks: UnboundedSender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut buffer = [0_u8; READ_BUFFER_LENGTH];
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => return,
-                Ok(length) => captured
-                    .blocking_lock()
-                    .push(&buffer[..length], capture_limit),
+                Ok(length) => {
+                    if chunks.send(buffer[..length].to_vec()).is_err() {
+                        return;
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
 
                 Err(_) => return,

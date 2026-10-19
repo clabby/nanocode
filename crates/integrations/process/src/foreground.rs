@@ -25,7 +25,7 @@ pub fn run_bash<'call>(
         struct Cleanup(process::SharedProcessGroup);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let _ = self.0.terminate_and_disarm();
+                self.0.terminate_and_disarm();
             }
         }
         let cleanup = Cleanup(spawned.process_group);
