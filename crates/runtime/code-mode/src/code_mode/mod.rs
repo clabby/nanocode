@@ -1632,7 +1632,8 @@ async fn execute_nested_call(
     let started_after_ns =
         u64::try_from(started_at.duration_since(cell_started_at).as_nanos()).unwrap_or(u64::MAX);
     let call_id = format!("{}/code-{id}", context.call_id);
-    let context = context.as_context();
+    let owned = context;
+    let context = owned.as_context();
     let context = ToolContext::new(
         context.model(),
         context.session_id(),
@@ -1640,6 +1641,7 @@ async fn execute_nested_call(
         context.history(),
         context.output_token_budget(),
     )
+    .with_shared_history(&owned.history)
     .with_instruction_revision(context.instruction_revision())
     .with_host_context(context.host_context())
     .with_turn_id(context.turn_id());

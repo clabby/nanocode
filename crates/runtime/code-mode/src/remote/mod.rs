@@ -63,7 +63,9 @@ impl RemoteContext {
             session_id: context.session_id().into(),
             call_id: context.call_id().into(),
             turn_id: context.turn_id().map(Into::into),
-            history: Arc::new(context.history().to_vec()),
+            history: context
+                .shared_history()
+                .map_or_else(|| Arc::new(context.history().to_vec()), Arc::clone),
             output_token_budget: context.output_token_budget(),
             instruction_revision: context.instruction_revision(),
             host_context: context.host_context().map(Into::into),

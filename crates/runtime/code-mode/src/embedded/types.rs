@@ -43,7 +43,9 @@ impl OwnedToolContext {
             context.model(),
             context.session_id(),
             context.call_id(),
-            Arc::new(context.history().to_vec()),
+            context
+                .shared_history()
+                .map_or_else(|| Arc::new(context.history().to_vec()), Arc::clone),
             context.output_token_budget(),
         )
         .with_instruction_revision(context.instruction_revision())
@@ -60,6 +62,7 @@ impl OwnedToolContext {
             self.history.as_slice(),
             self.output_token_budget,
         )
+        .with_shared_history(&self.history)
         .with_instruction_revision(self.instruction_revision)
         .with_host_context(self.host_context.as_deref())
         .with_turn_id(self.turn_id.as_deref())
