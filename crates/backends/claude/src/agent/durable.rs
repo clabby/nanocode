@@ -74,7 +74,7 @@ impl Snapshot {
                         Role::User => MessageRole::User,
                         Role::Assistant => MessageRole::Assistant,
                     },
-                    message.content.into_iter().filter_map(|block| match block {
+                    message.into_message().content.into_iter().filter_map(|block| match block {
                         ContentBlock::Text { text, .. } => Some(ContentItem::InputText {
                             text: text.into_boxed_str(),
                         }),
@@ -126,7 +126,9 @@ pub(super) struct Cursor {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) frozen_prompt: Option<Prompt>,
-    pub(super) pending: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) pending_base: Option<u32>,
+    pub(super) pending: Vec<HistoryMessage>,
     pub(super) usage: Usage,
     pub(super) index: u32,
     #[serde(default)]
@@ -337,6 +339,19 @@ impl State {
             && let Some(value) = policy.continuation(operation.to_owned()).await?
         {
             let mut cursor: Cursor = serde_json::from_value(value).map_err(recovery_error)?;
+            if let Some(base) = cursor.pending_base.take() {
+                let prefix = usize::try_from(base)
+                    .ok()
+                    .and_then(|base| cursor.snapshot.conversation.messages.get(..base))
+                    .ok_or_else(|| {
+                        recovery_error("Claude continuation pending prefix exceeds its conversation")
+                    })?;
+                cursor.pending = prefix
+                    .iter()
+                    .cloned()
+                    .chain(std::mem::take(&mut cursor.pending))
+                    .collect();
+            }
             cursor.recovered_code_index = Some(cursor.index);
 
             if cursor.model_receipt_start.is_none() {
@@ -407,6 +422,7 @@ impl State {
                     )
                 })
                 .cloned(),
+            pending_base: None,
             pending: Vec::new(),
             usage: Usage::default(),
             index: 0,
@@ -429,7 +445,7 @@ impl State {
         self.policy.is_some() && cursor.operation.is_some()
     }
 
-    pub(super) fn retain_pending(&self, cursor: &mut Cursor, pending: &[Message]) {
+    pub(super) fn retain_pending(&self, cursor: &mut Cursor, pending: &[HistoryMessage]) {
         if self.persists(cursor) {
             cursor.pending = pending.to_vec();
         }
@@ -453,12 +469,12 @@ impl State {
             cursor.tool_search = false;
         }
 
-        if let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) {
+        if let (Some(policy), Some(operation)) = (&self.policy, cursor.operation.clone()) {
             cursor.snapshot = self.snapshot(&Conversation::default()).await?;
             cursor.snapshot.conversation = std::mem::take(conversation);
-            let encoded = serde_json::value::to_raw_value(&*cursor).map_err(provider_error);
+            let encoded = encode_cursor(cursor);
             *conversation = std::mem::take(&mut cursor.snapshot).conversation;
-            policy.advance_encoded(operation.clone(), encoded?).await?;
+            policy.advance_encoded(operation, encoded?).await?;
             self.persistence_ready.notify_waiters();
         }
         Ok(())
@@ -649,6 +665,32 @@ impl State {
         }
         Ok(result)
     }
+}
+
+fn encode_cursor(cursor: &mut Cursor) -> Result<Box<serde_json::value::RawValue>> {
+    let shared = cursor
+        .snapshot
+        .conversation
+        .messages
+        .iter()
+        .zip(&cursor.pending)
+        .take_while(|(committed, pending)| committed.ptr_eq(pending))
+        .count();
+    let base = u32::try_from(shared).ok().filter(|base| *base > 0);
+    let pending = std::mem::take(&mut cursor.pending);
+    cursor.pending = pending[base.map_or(0, |_| shared)..].to_vec();
+    cursor.pending_base = base;
+    let encoded = cursor
+        .snapshot
+        .conversation
+        .messages
+        .iter()
+        .chain(&cursor.pending)
+        .try_for_each(HistoryMessage::cache_json)
+        .and_then(|()| serde_json::value::to_raw_value(&*cursor));
+    cursor.pending = pending;
+    cursor.pending_base = None;
+    encoded.map_err(provider_error)
 }
 
 pub(super) fn replay(operation: String, output: Value) -> Result<TurnResult> {

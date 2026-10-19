@@ -1,6 +1,6 @@
 use super::{
-    Cancellation, ContentBlock, CostStatus, Message, NanocodeError, ReportedTurnUsage,
-    ResponseContext, Result, Role, State, TurnUsage, provider_error,
+    Cancellation, ContentBlock, CostStatus, HistoryMessage, Message, NanocodeError,
+    ReportedTurnUsage, ResponseContext, Result, Role, State, TurnUsage, provider_error,
 };
 use crate::ToolResultContent;
 use nanocode_agent_core::{
@@ -30,7 +30,7 @@ fn tool_result_text(content: &ToolResultContent) -> String {
     }
 }
 
-pub(super) fn claude_transcript(messages: &[Message]) -> Vec<PromptMessage> {
+pub(super) fn claude_transcript(messages: &[HistoryMessage]) -> Vec<PromptMessage> {
     let mut transcript = TranscriptBuilder::default();
     let mut tools = HashMap::new();
     for message in messages {
@@ -83,7 +83,7 @@ const RUNNING_TOOL_RESULT: &str =
 
 const PENDING_REQUEST: &str = "<system-reminder>The user message above is still being handled by the main agent. Do not answer it or act on it here; only answer the side question below.</system-reminder>";
 
-fn side_messages(mut messages: Vec<Message>, question: &str) -> Vec<Message> {
+fn side_messages(mut messages: Vec<HistoryMessage>, question: &str) -> Vec<HistoryMessage> {
     let running = messages
         .last()
         .filter(|message| message.role == Role::Assistant)
@@ -103,6 +103,7 @@ fn side_messages(mut messages: Vec<Message>, question: &str) -> Vec<Message> {
     let text = ContentBlock::text(side_question_prompt(question));
     match messages.last_mut() {
         Some(message) if message.role == Role::User => {
+            let message = message.make_mut();
             if !message
                 .content
                 .iter()
@@ -112,10 +113,13 @@ fn side_messages(mut messages: Vec<Message>, question: &str) -> Vec<Message> {
             }
             message.content.push(text);
         }
-        _ => messages.push(Message {
-            role: Role::User,
-            content: running.into_iter().chain([text]).collect(),
-        }),
+        _ => messages.push(
+            Message {
+                role: Role::User,
+                content: running.into_iter().chain([text]).collect(),
+            }
+            .into(),
+        ),
     }
     messages
 }
@@ -129,11 +133,11 @@ impl State {
         Ok(claude_transcript(&snapshot.conversation.packed_messages()))
     }
 
-    pub(super) fn publish_side_view(&self, messages: Option<Vec<Message>>) {
-        *self.side_view.write().expect("side view lock poisoned") = messages.map(Arc::new);
+    pub(super) fn publish_side_view(&self, messages: Option<Arc<[HistoryMessage]>>) {
+        *self.side_view.write().expect("side view lock poisoned") = messages;
     }
 
-    async fn side_transcript(&self) -> Result<Vec<Message>> {
+    async fn side_transcript(&self) -> Result<Vec<HistoryMessage>> {
         let live = self.conversation.try_lock().is_err().then(|| {
             self.side_view
                 .read()
@@ -141,7 +145,7 @@ impl State {
                 .clone()
         });
         if let Some(Some(messages)) = live {
-            return Ok(messages.as_ref().clone());
+            return Ok(messages.to_vec());
         }
         Ok(self.latest_boundary().await?.conversation.packed_messages())
     }
