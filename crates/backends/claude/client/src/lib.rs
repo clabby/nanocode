@@ -1638,18 +1638,36 @@ impl PreparedWire {
         #[derive(Serialize)]
         struct Digest<'a> {
             wire: &'a str,
+            blake3: String,
+            bytes: usize,
+        }
+        Ok(serde_json::value::to_raw_value(&Digest {
+            wire: self.wire_name(),
+            blake3: blake3::hash(self.body.as_bytes()).to_hex().to_string(),
+            bytes: self.body.len(),
+        })?)
+    }
+
+    pub fn sha256_durable_input(&self) -> Result<Box<serde_json::value::RawValue>, ClaudeError> {
+        #[derive(Serialize)]
+        struct Digest<'a> {
+            wire: &'a str,
             sha256: String,
             bytes: usize,
         }
         Ok(serde_json::value::to_raw_value(&Digest {
-            wire: if self.subscription {
-                "subscription_wire_v1"
-            } else {
-                "messages_v1"
-            },
+            wire: self.wire_name(),
             sha256: subscription_wire::hex_digest(self.body.as_bytes()),
             bytes: self.body.len(),
         })?)
+    }
+
+    fn wire_name(&self) -> &'static str {
+        if self.subscription {
+            "subscription_wire_v1"
+        } else {
+            "messages_v1"
+        }
     }
 
     pub fn legacy_durable_input(&self) -> Result<Box<serde_json::value::RawValue>, ClaudeError> {

@@ -746,24 +746,40 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                             .await
                             .map_err(agent_error)?;
                     }
-                    let legacy = wire
-                        .legacy_durable_input()
-                        .map_err(crate::agent::provider_error)?;
-                    let key = EncodedPayload::encode(&*legacy).map_err(agent_error)?;
                     let state = self.session.state().await.map_err(agent_error)?;
-                    if !state
+                    let Some(step) = state
                         .operation(&id)
                         .and_then(|operation| operation.steps.get(&begin.step_id))
-                        .is_some_and(|step| {
-                            step.kind == begin.kind && step.input.key() == key.key()
-                        })
-                    {
+                        .filter(|step| step.kind == begin.kind)
+                    else {
                         return Err(agent_error(nanocode_durability::Error::InvalidState(
                             message,
                         )));
-                    }
+                    };
+                    let digest = wire
+                        .sha256_durable_input()
+                        .map_err(crate::agent::provider_error)?;
+                    let earlier = if EncodedPayload::encode(&*digest)
+                        .map_err(agent_error)?
+                        .matches_key(step.input.key())
+                    {
+                        digest
+                    } else {
+                        let legacy = wire
+                            .legacy_durable_input()
+                            .map_err(crate::agent::provider_error)?;
+                        if !EncodedPayload::encode(&*legacy)
+                            .map_err(agent_error)?
+                            .matches_key(step.input.key())
+                        {
+                            return Err(agent_error(nanocode_durability::Error::InvalidState(
+                                message,
+                            )));
+                        }
+                        legacy
+                    };
                     self.owner
-                        .begin_step(id, begin.step_id, begin.kind.clone(), &*legacy)
+                        .begin_step(id, begin.step_id, begin.kind.clone(), &*earlier)
                         .await
                 }
                 Err(error) => Err(error),

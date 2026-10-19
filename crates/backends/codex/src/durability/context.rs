@@ -154,7 +154,7 @@ pub(crate) fn preloaded_snapshot(
         &HashSet::new(),
     )
     .ok()?;
-    if prepared.payload.key() != key {
+    if !prepared.payload.matches_key(key) {
         return None;
     }
     Some((

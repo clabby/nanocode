@@ -13,7 +13,11 @@ const CHUNK_MAX: usize = 32 * 1024;
 const CHUNK_MASK_SMALL: u64 = !(u64::MAX >> 15);
 const CHUNK_MASK_LARGE: u64 = !(u64::MAX >> 11);
 
-const MANIFEST_PREFIX: char = '#';
+const MANIFEST_PREFIX: char = '%';
+
+const SHA256_MANIFEST_PREFIX: char = '#';
+
+const KEY_PREFIX: &str = "b3:";
 
 const GEAR: [u64; 256] = gear_table();
 
@@ -71,7 +75,43 @@ pub struct EncodedPayload {
     #[serde(skip)]
     content: Option<Arc<str>>,
     #[serde(skip)]
+    layout: Option<Arc<Layout>>,
+    #[serde(skip)]
     pending: Vec<crate::StoreRecord>,
+}
+
+#[derive(Debug)]
+struct Layout {
+    manifest: String,
+    ends: Vec<usize>,
+}
+
+impl Layout {
+    fn of(content: &str) -> Self {
+        let mut manifest = String::with_capacity(1 + content.len() / CHUNK_MIN * 64);
+        manifest.push(MANIFEST_PREFIX);
+        let mut ends = Vec::with_capacity(content.len() / CHUNK_AVG + 1);
+        let mut offset = 0;
+        while offset < content.len() {
+            let end = offset + chunk_end(&content[offset..]);
+            manifest.push_str(&content_hash(&content[offset..end]));
+            ends.push(end);
+            offset = end;
+        }
+        Self { manifest, ends }
+    }
+
+    fn hash(&self, index: usize) -> &str {
+        &self.manifest[1 + index * 64..1 + (index + 1) * 64]
+    }
+}
+
+fn keyed(json: &str) -> (Arc<str>, Option<Arc<Layout>>) {
+    if json.len() < INLINE_BYTES {
+        return (record_key(json).into(), None);
+    }
+    let layout = Layout::of(json);
+    (record_key(&layout.manifest).into(), Some(Arc::new(layout)))
 }
 
 impl EncodedPayload {
@@ -79,19 +119,26 @@ impl EncodedPayload {
         &self.key
     }
 
+    pub fn matches_key(&self, key: &str) -> bool {
+        self.key.as_ref() == key
+            || (!key.starts_with(KEY_PREFIX)
+                && self
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| sha256_key(content) == key))
+    }
+
     pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Self> {
         let json = serde_json::to_string(value).map_err(Error::InvalidPayload)?;
-        Ok(Self {
-            key: record_key(&json).into(),
-            content: Some(json.into()),
-            pending: Vec::new(),
-        })
+        Ok(Self::from_json(json.into()))
     }
 
     pub fn from_json(json: Arc<str>) -> Self {
+        let (key, layout) = keyed(&json);
         Self {
-            key: record_key(&json).into(),
+            key,
             content: Some(json),
+            layout,
             pending: Vec::new(),
         }
     }
@@ -100,6 +147,7 @@ impl EncodedPayload {
         Self {
             key: key.into(),
             content: None,
+            layout: None,
             pending: Vec::new(),
         }
     }
@@ -118,19 +166,11 @@ impl EncodedPayload {
 
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub fn from_key(key: &str) -> Self {
-        Self {
-            key: key.into(),
-            content: None,
-            pending: Vec::new(),
-        }
+        Self::by_key(key)
     }
 
     pub fn reference(&self) -> Self {
-        Self {
-            key: self.key.clone(),
-            content: None,
-            pending: Vec::new(),
-        }
+        Self::by_key(&self.key)
     }
 
     pub fn with_records(mut self, records: Vec<crate::StoreRecord>) -> Self {
@@ -151,39 +191,38 @@ impl EncodedPayload {
         let Some(content) = self.content.take() else {
             return;
         };
-        if content.len() < INLINE_BYTES {
-            if !known(&self.key) {
+        let layout = self.layout.take();
+        if known(&self.key) {
+            return;
+        }
+        let layout = match layout {
+            Some(layout) => layout,
+            None if content.len() >= INLINE_BYTES && self.key.starts_with(KEY_PREFIX) => {
+                Arc::new(Layout::of(&content))
+            }
+            None => {
                 records.push(crate::StoreRecord {
                     key: self.key.to_string(),
                     value: format!("={content}"),
                 });
+                return;
             }
-            return;
-        }
-
-        let mut manifest = String::with_capacity(1 + content.len() / CHUNK_MIN * 64);
-        manifest.push(MANIFEST_PREFIX);
+        };
         let mut offset = 0;
-        while offset < content.len() {
-            let end = offset + chunk_end(&content[offset..]);
-            let chunk = &content[offset..end];
-            let hash = record_key(chunk);
-            let key = chunk_key(&hash);
+        for (index, &end) in layout.ends.iter().enumerate() {
+            let key = chunk_key(layout.hash(index));
             if !known(&key) {
                 records.push(crate::StoreRecord {
                     key,
-                    value: chunk.to_owned(),
+                    value: content[offset..end].to_owned(),
                 });
             }
-            manifest.push_str(&hash);
             offset = end;
         }
-        if !known(&self.key) {
-            records.push(crate::StoreRecord {
-                key: self.key.to_string(),
-                value: manifest,
-            });
-        }
+        records.push(crate::StoreRecord {
+            key: self.key.to_string(),
+            value: layout.manifest.clone(),
+        });
     }
 
     pub async fn load(&self, store: &mut dyn crate::StateStore, state_id: &str) -> Result<Self> {
@@ -240,36 +279,21 @@ impl EncodedPayload {
         record: String,
     ) -> Result<Self> {
         let assembled;
+        let mut verified = false;
         let content = if let Some(content) = record.strip_prefix('=') {
             content
         } else if let Some(hashes) = record.strip_prefix(MANIFEST_PREFIX) {
-            if hashes.is_empty()
-                || hashes.len() % 64 != 0
-                || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+            if record_key(&record) != self.key.as_ref() {
+                return Err(Error::InvalidState(format!(
+                    "payload manifest checksum mismatch {}",
+                    self.key
+                )));
             }
-            let keys: Vec<String> = (0..hashes.len() / 64)
-                .map(|index| chunk_key(&hashes[index * 64..(index + 1) * 64]))
-                .collect();
-            let chunks = store.records(state_id, &keys).await?;
-            if chunks.len() != keys.len() {
-                return Err(Error::InvalidState("record batch length mismatch".into()));
-            }
-            let chunks = keys
-                .iter()
-                .zip(chunks)
-                .map(|(key, chunk)| {
-                    chunk.ok_or_else(|| {
-                        Error::InvalidState(format!("missing payload chunk {key} of {}", self.key))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut content = String::with_capacity(chunks.iter().map(String::len).sum());
-            for chunk in chunks {
-                content.push_str(&chunk);
-            }
-            assembled = content;
+            assembled = self.assemble(store, state_id, hashes, true).await?;
+            verified = true;
+            &assembled
+        } else if let Some(hashes) = record.strip_prefix(SHA256_MANIFEST_PREFIX) {
+            assembled = self.assemble(store, state_id, hashes, false).await?;
             &assembled
         } else {
             let count: usize = record
@@ -292,7 +316,7 @@ impl EncodedPayload {
             assembled = content;
             &assembled
         };
-        if record_key(content) != self.key.as_ref() {
+        if !verified && !key_matches(&self.key, content) {
             return Err(Error::InvalidState(format!(
                 "payload record checksum mismatch {}",
                 self.key
@@ -301,8 +325,45 @@ impl EncodedPayload {
         Ok(Self {
             key: self.key.clone(),
             content: Some(content.into()),
+            layout: None,
             pending: Vec::new(),
         })
+    }
+
+    async fn assemble<S: RecordSource + ?Sized>(
+        &self,
+        store: &mut S,
+        state_id: &str,
+        hashes: &str,
+        verify: bool,
+    ) -> Result<String> {
+        if hashes.is_empty()
+            || hashes.len() % 64 != 0
+            || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+        }
+        let keys: Vec<String> = (0..hashes.len() / 64)
+            .map(|index| chunk_key(&hashes[index * 64..(index + 1) * 64]))
+            .collect();
+        let chunks = store.records(state_id, &keys).await?;
+        if chunks.len() != keys.len() {
+            return Err(Error::InvalidState("record batch length mismatch".into()));
+        }
+        let mut content = String::new();
+        for (index, (key, chunk)) in keys.iter().zip(chunks).enumerate() {
+            let chunk = chunk.ok_or_else(|| {
+                Error::InvalidState(format!("missing payload chunk {key} of {}", self.key))
+            })?;
+            if verify && content_hash(&chunk) != hashes[index * 64..(index + 1) * 64] {
+                return Err(Error::InvalidState(format!(
+                    "payload chunk checksum mismatch {key} of {}",
+                    self.key
+                )));
+            }
+            content.push_str(&chunk);
+        }
+        Ok(content)
     }
 }
 
@@ -334,7 +395,22 @@ impl RecordSource for dyn crate::StateReader + '_ {
     }
 }
 
+fn content_hash(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
+}
+
 fn record_key(value: &str) -> String {
+    format!("{KEY_PREFIX}{}", content_hash(value))
+}
+
+fn key_matches(key: &str, content: &str) -> bool {
+    match key.strip_prefix(KEY_PREFIX) {
+        Some(hash) => content_hash(content) == hash,
+        None => sha256_key(content) == key,
+    }
+}
+
+fn sha256_key(value: &str) -> String {
     use sha2::{Digest, Sha256};
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(64);
