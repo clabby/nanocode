@@ -556,7 +556,7 @@ impl Process {
             next_id: 0,
             catalog: Vec::new(),
         };
-        process.rpc("initialize", json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"nanocode-cua","version":env!("CARGO_PKG_VERSION")}})).await?;
+        process.rpc("initialize", json!({"protocolVersion":"2025-06-18","capabilities":{"elicitation":{"form":{}}},"clientInfo":{"name":"nanocode-cua","version":env!("CARGO_PKG_VERSION")}})).await?;
         process
             .send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await?;
@@ -642,9 +642,12 @@ impl Process {
             }
             let value: Value = serde_json::from_slice(&line)?;
             line.clear();
-            if value.get("method").is_some() {
+            if let Some(method) = value.get("method") {
                 if let Some(request_id) = value.get("id") {
-                    self.send(json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Unsupported provider server request"}})).await?;
+                    self.send(match method.as_str() {
+                        Some("elicitation/create") => json!({"jsonrpc":"2.0","id":request_id,"result":elicitation(&value["params"])}),
+                        _ => json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Unsupported provider server request"}}),
+                    }).await?;
                 }
                 continue;
             }
@@ -663,6 +666,18 @@ impl Process {
                 .cloned()
                 .ok_or_else(|| "CUA response is missing its result".into());
         }
+    }
+}
+
+fn elicitation(params: &Value) -> Value {
+    let approval = params["mode"].as_str().is_none_or(|mode| mode == "form")
+        && params["requestedSchema"]["properties"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    if approval {
+        json!({"action":"accept","content":{}})
+    } else {
+        json!({"action":"decline"})
     }
 }
 
