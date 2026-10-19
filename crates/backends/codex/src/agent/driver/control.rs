@@ -320,6 +320,7 @@ pub(super) async fn begin_shutdown(
             | Command::SetModel { result, .. }
             | Command::SetThinking { result, .. }
             | Command::SetServiceTier { result, .. }
+            | Command::Preconnect { result }
             | Command::Compact { result, .. } => {
                 drop(result.send(Err(NanocodeError::AgentStopped)));
             }
@@ -518,7 +519,9 @@ pub(super) fn handle_idle_command(
         Command::Cancel { result, .. } | Command::CancelActive { result } => {
             drop(result.send(Err(NanocodeError::TurnNotCancellable)));
         }
-        Command::SetThinking { result, .. } | Command::SetServiceTier { result, .. } => {
+        Command::SetThinking { result, .. }
+        | Command::SetServiceTier { result, .. }
+        | Command::Preconnect { result } => {
             drop(result.send(Ok(())));
         }
         Command::SetModel { result, .. } => {

@@ -338,6 +338,10 @@ pub trait LifecycleBackend: Send + Sync + 'static {
 
     fn compact(&self) -> BackendFuture<Result<()>>;
 
+    fn preconnect(&self) -> BackendFuture<Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn side_question(&self, _question: String) -> BackendFuture<Result<SideAnswer>> {
         unsupported("side_question")
     }

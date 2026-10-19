@@ -481,6 +481,13 @@ impl AgentDriver {
                     drop(result.send(Ok(())));
                     continue;
                 }
+                if let Command::Preconnect { result } = command {
+                    let outcome = model
+                        .preconnect()
+                        .map_or(Ok(()), super::executor::spawn_driver);
+                    drop(result.send(outcome));
+                    continue;
+                }
                 if let Command::AppendDeveloperMessage { text, result } = command {
                     if !pending_developer_messages.is_empty() {
                         pending_developer_messages.push((text, result));
@@ -913,6 +920,9 @@ impl AgentDriver {
                                             default_thinking = thinking;
                                         });
                                         drop(result.send(outcome));
+                                    }
+                                    Some(Command::Preconnect { result }) => {
+                                        drop(result.send(Ok(())));
                                     }
                                     Some(Command::SetServiceTier { service_tier, result }) => {
                                         let outcome = crate::ModelSelection::Codex(thread_model)
@@ -1708,6 +1718,9 @@ impl AgentDriver {
                                     default_thinking = thinking;
                                 });
                                 drop(result.send(outcome));
+                            }
+                            Some(Command::Preconnect { result }) => {
+                                drop(result.send(Ok(())));
                             }
                             Some(Command::SetServiceTier { service_tier, result }) => {
                                 let outcome = crate::ModelSelection::Codex(thread_model)

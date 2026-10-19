@@ -321,6 +321,17 @@ impl LifecycleBackend for LocalLifecycle {
         })
     }
 
+    fn preconnect(&self) -> BackendFuture<Result<()>> {
+        let commands = self.commands.clone();
+        let shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            request_command(&commands, &shutdown, |result| Command::Preconnect {
+                result,
+            })
+            .await
+        })
+    }
+
     fn compact(&self) -> BackendFuture<Result<()>> {
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();

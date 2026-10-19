@@ -122,6 +122,9 @@ impl LifecycleBackend for Owned {
     fn compact(&self) -> BackendFuture<Result<()>> {
         self.inner.compact()
     }
+    fn preconnect(&self) -> BackendFuture<Result<()>> {
+        self.inner.preconnect()
+    }
     fn append_developer_message(
         &self,
         text: String,

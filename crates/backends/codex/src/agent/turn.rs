@@ -49,6 +49,9 @@ pub(super) enum Command {
     CancelActive {
         result: oneshot::Sender<Result<()>>,
     },
+    Preconnect {
+        result: oneshot::Sender<Result<()>>,
+    },
     Fork {
         origin: crate::Origin,
         point: ForkFrom,

@@ -575,6 +575,10 @@ impl Agent {
         self.backend.compact().await
     }
 
+    pub async fn preconnect(&self) -> Result<()> {
+        self.backend.preconnect().await
+    }
+
     pub async fn append_developer_message(
         &self,
         text: impl Into<String>,
