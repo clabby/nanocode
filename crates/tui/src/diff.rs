@@ -522,9 +522,8 @@ pub fn highlighted_diff_line(
 ) -> Vec<Span<'static>> {
     match line.kind {
         DiffLineKind::Context => {
-            let highlighted = super::highlight::line(old, &line.text, syntaxes);
-            let _ = super::highlight::line(new, &line.text, syntaxes);
-            highlighted
+            super::highlight::runs(new, &line.text, syntaxes);
+            super::highlight::line(old, &line.text, syntaxes)
         }
         DiffLineKind::Addition => super::highlight::line(new, &line.text, syntaxes),
         DiffLineKind::Deletion => super::highlight::line(old, &line.text, syntaxes),

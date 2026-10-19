@@ -184,6 +184,7 @@ struct Layout {
     lines: Option<Rows>,
     highlights: markdown::Highlights,
     stable: Option<Stable>,
+    formatted: Vec<Shown>,
 }
 
 struct Stable {
@@ -723,13 +724,21 @@ impl Transcript {
         {
             self.resident.push(index);
         }
-        let (mut highlights, stable) = previous.map_or_else(Default::default, |layout| {
+        let (mut highlights, stable, cached) = previous.map_or_else(Default::default, |layout| {
             let reusable = cell.appended
                 && layout.key.width == width
                 && layout.key.mode == key.mode
                 && layout.key.reasoning == key.reasoning;
-            (layout.highlights, layout.stable.filter(|_| reusable))
+            (
+                layout.highlights,
+                layout.stable.filter(|_| reusable),
+                layout.formatted,
+            )
         });
+        let mut formatted = Formatted {
+            cached,
+            used: Vec::new(),
+        };
         let context = RenderContext {
             width,
             theme,
@@ -745,7 +754,7 @@ impl Transcript {
                 if index > 0 {
                     out.push(Line::default(), None);
                 }
-                context.render(&cell.kind, &mut out);
+                context.render(&cell.kind, &mut out, &mut formatted);
                 let rows = Rows {
                     head: Rc::default(),
                     spinners: spinners(&out.lines, 0).collect(),
@@ -761,6 +770,7 @@ impl Transcript {
             lines: Some(rows.clone()),
             highlights,
             stable,
+            formatted: formatted.used,
         });
         rows
     }
@@ -947,15 +957,57 @@ impl Layout {
         let released = self.lines.take().is_some();
         if released {
             self.highlights.shrink_to_fit();
+            self.formatted = Vec::new();
         }
         released
     }
 }
 
-struct Gutter {
-    first: String,
-    rest: String,
-    style: Style,
+type Form = (ToolBody, u16, DisplayMode);
+
+struct Shown {
+    part: Part,
+    form: Form,
+    language: String,
+    text: String,
+    rows: Vec<Row>,
+}
+
+#[derive(Default)]
+struct Formatted {
+    cached: Vec<Shown>,
+    used: Vec<Shown>,
+}
+
+impl Formatted {
+    fn get(
+        &mut self,
+        part: &Part,
+        form: Form,
+        language: &str,
+        text: &str,
+        render: impl FnOnce() -> Vec<Row>,
+    ) -> Vec<Row> {
+        let found = self.cached.iter().position(|shown| {
+            shown.part == *part
+                && shown.form == form
+                && shown.language == language
+                && shown.text == text
+        });
+        let shown = match found {
+            Some(index) => self.cached.swap_remove(index),
+            None => Shown {
+                part: part.clone(),
+                form,
+                language: language.to_owned(),
+                text: text.to_owned(),
+                rows: render(),
+            },
+        };
+        let rows = shown.rows.clone();
+        self.used.push(shown);
+        rows
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1248,7 +1300,7 @@ impl RenderContext<'_> {
         Line::from(header)
     }
 
-    fn render(&self, kind: &CellKind, out: &mut Output) {
+    fn render(&self, kind: &CellKind, out: &mut Output, formatted: &mut Formatted) {
         let theme = self.theme;
         match kind {
             CellKind::User(text) => {
@@ -1297,7 +1349,7 @@ impl RenderContext<'_> {
                     out.push(line, whole(Part::Text));
                 }
             }
-            CellKind::Tool(tool) => self.tool(tool, tool.depth, false, out, &mut 0),
+            CellKind::Tool(tool) => self.tool(tool, tool.depth, false, out, &mut 0, formatted),
             CellKind::Notice(level, text) => {
                 let (icon, color) = match level {
                     NoticeLevel::Info => ("ℹ ", theme.muted()),
@@ -1339,6 +1391,7 @@ impl RenderContext<'_> {
         nested: bool,
         out: &mut Output,
         ordinal: &mut usize,
+        formatted: &mut Formatted,
     ) {
         let id = *ordinal;
         *ordinal += 1;
@@ -1399,42 +1452,33 @@ impl RenderContext<'_> {
         let gutter = Style::default().fg(theme.border());
         let show_input = !nested || !collapsed || tool.input_body == ToolBody::Diff;
         if show_input && !tool.input.trim().is_empty() {
-            let input = match (tool.input_body, self.mode) {
-                (ToolBody::Code, DisplayMode::Collapsed | DisplayMode::Beautified)
-                    if matches!(tool.language.as_str(), "js" | "javascript") =>
-                {
-                    Cow::Owned(beautify(&tool.input, "  "))
+            let part = Part::Input(id);
+            let form = (tool.input_body, inner, self.mode);
+            let shown = formatted.get(&part, form, &tool.language, &tool.input, || {
+                let input = match (tool.input_body, self.mode) {
+                    (ToolBody::Code, DisplayMode::Collapsed | DisplayMode::Beautified)
+                        if matches!(tool.language.as_str(), "js" | "javascript") =>
+                    {
+                        Cow::Owned(beautify(&tool.input, "  "))
+                    }
+                    _ => Cow::Borrowed(tool.input.as_str()),
+                };
+                let mut body = self.body(&input, tool.input_body, &tool.language, inner, &part);
+                if matches!(input, Cow::Owned(_)) {
+                    for (_, source) in &mut body {
+                        *source = whole(part.clone());
+                    }
                 }
-                _ => Cow::Borrowed(tool.input.as_str()),
-            };
-            let mut body = self.body(
-                &input,
-                tool.input_body,
-                &tool.language,
-                inner,
-                &Part::Input(id),
-            );
-            if matches!(input, Cow::Owned(_)) {
-                for (_, source) in &mut body {
-                    *source = whole(Part::Input(id));
-                }
-            }
-            let gutter = Gutter {
-                first: format!("{indent}  │ "),
-                rest: format!("{indent}  │ "),
-                style: gutter,
-            };
-            self.preview(
-                out,
-                body,
-                Part::Input(id),
-                self.limit(tool.input_body),
-                &gutter,
-                false,
+                self.preview(body, &part, self.limit(tool.input_body), false)
+            });
+            out.prefixed(
+                shown,
+                Span::styled(format!("{indent}  │ "), gutter),
+                Span::styled(format!("{indent}  │ "), gutter),
             );
         }
         for child in &tool.children {
-            self.tool(child, depth + 1, true, out, ordinal);
+            self.tool(child, depth + 1, true, out, ordinal, formatted);
         }
         let output = match self.mode {
             DisplayMode::Raw if !tool.raw_output.is_empty() => tool.raw_output.as_str(),
@@ -1442,29 +1486,21 @@ impl RenderContext<'_> {
         };
         let show_output = !nested || !collapsed || tool.unsuccessful();
         if show_output && !output.trim().is_empty() {
-            let body = if self.mode == DisplayMode::Raw {
-                self.body(output, ToolBody::Text, "", inner, &Part::Output(id))
+            let (body, language) = if self.mode == DisplayMode::Raw {
+                (ToolBody::Text, "")
             } else {
-                self.body(
-                    output,
-                    tool.output_body,
-                    &tool.language,
-                    inner,
-                    &Part::Output(id),
-                )
+                (tool.output_body, tool.language.as_str())
             };
-            let gutter = Gutter {
-                first: format!("{indent}  └ "),
-                rest: format!("{indent}    "),
-                style: gutter,
-            };
-            self.preview(
-                out,
-                body,
-                Part::Output(id),
-                self.limit(tool.output_body),
-                &gutter,
-                true,
+            let part = Part::Output(id);
+            let form = (body, inner, self.mode);
+            let shown = formatted.get(&part, form, language, output, || {
+                let rows = self.body(output, body, language, inner, &part);
+                self.preview(rows, &part, self.limit(tool.output_body), true)
+            });
+            out.prefixed(
+                shown,
+                Span::styled(format!("{indent}  └ "), gutter),
+                Span::styled(format!("{indent}    "), gutter),
             );
         }
     }
@@ -1520,15 +1556,7 @@ impl RenderContext<'_> {
         }
     }
 
-    fn preview(
-        &self,
-        out: &mut Output,
-        body: Vec<Row>,
-        part: Part,
-        preview: usize,
-        gutter: &Gutter,
-        tail: bool,
-    ) {
+    fn preview(&self, body: Vec<Row>, part: &Part, preview: usize, tail: bool) -> Vec<Row> {
         let total = body.len();
         let limit = if self.mode == DisplayMode::Collapsed {
             preview.min(total)
@@ -1549,7 +1577,7 @@ impl RenderContext<'_> {
                         .fg(self.theme.muted())
                         .add_modifier(Modifier::ITALIC),
                 ),
-                whole(part),
+                whole(part.clone()),
             );
             if tail {
                 shown.insert(0, hint);
@@ -1557,11 +1585,7 @@ impl RenderContext<'_> {
                 shown.push(hint);
             }
         }
-        out.prefixed(
-            shown,
-            Span::styled(gutter.first.clone(), gutter.style),
-            Span::styled(gutter.rest.clone(), gutter.style),
-        );
+        shown
     }
 }
 
