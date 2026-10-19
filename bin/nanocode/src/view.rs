@@ -765,6 +765,12 @@ fn footer(app: &App) -> Line<'static> {
             Style::default().fg(theme.muted()),
         ));
     }
+    if let Some(status) = app.host.config.clients.describe() {
+        spans.push(Span::styled(
+            format!(" · {status}"),
+            Style::default().fg(theme.accent()),
+        ));
+    }
     if let Some((model, thinking, _)) = &app.pending_switch {
         spans.push(Span::styled(
             format!(" → {model} {thinking} after turn"),

@@ -20,6 +20,7 @@ pub struct ModelClients {
     openai: Option<std::sync::Arc<dyn Fn() -> nanocode::codex::OpenAiBuilder + Send + Sync>>,
     claude: Option<std::sync::Arc<dyn Fn() -> ClaudeClient + Send + Sync>>,
     warm_up: Option<std::sync::Arc<dyn Fn() -> WarmUp + Send + Sync>>,
+    status: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl ModelClients {
@@ -50,6 +51,16 @@ impl ModelClients {
     {
         self.warm_up = Some(std::sync::Arc::new(move || Box::pin(warm_up()) as WarmUp));
         self
+    }
+
+    #[must_use]
+    pub fn status(mut self, status: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        self.status = Some(std::sync::Arc::new(status));
+        self
+    }
+
+    pub(crate) fn describe(&self) -> Option<String> {
+        self.status.as_ref()?()
     }
 
     pub(crate) fn warming(&self) -> Option<WarmUp> {

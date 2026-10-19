@@ -415,6 +415,9 @@ async fn exec(args: SessionArgs, clients: ModelClients) -> Result<()> {
     }
     .await;
     let mut stderr = std::io::stderr();
+    if let Some(status) = host.config.clients.describe() {
+        drop(writeln!(stderr, "{status}"));
+    }
     drop(writeln!(stderr, "session {}", agent.session_id()));
     let flushed = agent.flush().await;
     let shutdown = host.runtime.shutdown().await;
