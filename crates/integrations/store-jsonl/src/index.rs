@@ -562,6 +562,17 @@ impl Journal {
             self.persist_index();
         }
     }
+
+    pub(super) fn flush_lagging_index(&mut self) {
+        let lag = self
+            .index
+            .offset
+            .saturating_sub(self.persisted_offset.unwrap_or(0));
+        let saved = std::fs::metadata(self.index_path()).map_or(0, |metadata| metadata.len());
+        if lag > saved {
+            self.flush_index();
+        }
+    }
 }
 
 impl Drop for Journal {

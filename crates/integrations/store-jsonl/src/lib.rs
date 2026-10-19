@@ -1859,6 +1859,9 @@ impl JsonlStore {
                 drop(ready.send(Ok(())));
                 while let Some(job) = receiver.blocking_recv() {
                     job(&mut journal);
+                    if receiver.is_empty() {
+                        journal.flush_lagging_index();
+                    }
                 }
                 drop(journal);
                 let _ = finished.send(());
