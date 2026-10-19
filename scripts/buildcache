@@ -217,6 +217,11 @@ if [ -f "$entry/out-dir" ] && same_environment "$entry"; then
     esac
   done
   (cd "$out_dir" && touch $restored) || exit 1
+  if [ -f "$entry/digests" ]; then
+    while read -r name digest; do
+      printf '%s\n' "$digest" > "$out_dir/$name.nanocode-sha256"
+    done < "$entry/digests"
+  fi
   [ -s "$entry/stderr" ] && relocate "$cached_out" "$out_dir" < "$entry/stderr" >&2
   exit 0
 fi
@@ -226,49 +231,63 @@ trap 'rm -f "$stderr" "$status_file"' EXIT
 { { "$@"; echo $? > "$status_file"; } 2>&1 1>&3 3>&- | tee "$stderr" >&2; } 3>&1
 status=$(cat "$status_file")
 [ "$status" = 0 ] || exit "${status:-1}"
-depinfo=
-for file in "$out_dir"/*"$suffix".d; do
-  [ -f "$file" ] && depinfo=$file
-done
-[ -n "$depinfo" ] || exit 0
-while IFS= read -r line; do
-  case $line in
-    "#"* | "") ;;
-    *:)
-      case ${line%:} in
-        "$registry"* | "$cache/out/"*) ;;
-        *) exit 0 ;;
-      esac
-      ;;
-  esac
-done < "$depinfo"
-mkdir -p "$cache/units"
-staging=$(mktemp -d "$cache/units/.data.XXXXXX")
-mkdir "$staging/files"
-sed -n 's/^# env-dep:\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' "$depinfo" | sort -u | while IFS= read -r name; do
-  eval "defined=\${$name+1} current=\${$name-}"
-  case $current in
-    *"
-"*) echo multiline > "$staging/unsafe" ;;
-  esac
-  if [ -n "$defined" ]; then
-    printf '%s=%s\n' "$name" "$current"
-  else
-    printf '%s\n' "$name"
-  fi
-done > "$staging/env"
-if [ -f "$staging/unsafe" ]; then
-  rm -rf "$staging"
-  exit 0
-fi
-for file in "$out_dir"/*"$suffix"*; do
-  case $file in
-    *.nanocode-sha256) continue ;;
-  esac
+digests=
+for file in "$out_dir"/*"$suffix".rmeta "$out_dir"/lib*"$suffix".dylib "$out_dir"/lib*"$suffix".so; do
   [ -f "$file" ] || continue
-  cp -c "$file" "$staging/files/" 2>/dev/null || cp "$file" "$staging/files/" || { rm -rf "$staging"; exit 0; }
+  digest=$($sum < "$file") || continue
+  digest=${digest%% *}
+  printf '%s\n' "$digest" > "$file.nanocode-sha256.$$" && mv -f "$file.nanocode-sha256.$$" "$file.nanocode-sha256"
+  digests="$digests${file##*/} $digest
+"
 done
-cp "$stderr" "$staging/stderr"
-printf '%s\n' "$out_dir" > "$staging/out-dir"
-publish "$staging" "$entry"
+store() {
+  depinfo=
+  for file in "$out_dir"/*"$suffix".d; do
+    [ -f "$file" ] && depinfo=$file
+  done
+  [ -n "$depinfo" ] || return
+  while IFS= read -r line; do
+    case $line in
+      "#"* | "") ;;
+      *:)
+        case ${line%:} in
+          "$registry"* | "$cache/out/"*) ;;
+          *) return ;;
+        esac
+        ;;
+    esac
+  done < "$depinfo"
+  mkdir -p "$cache/units"
+  staging=$(mktemp -d "$cache/units/.data.XXXXXX") || return
+  mkdir "$staging/files"
+  sed -n 's/^# env-dep:\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' "$depinfo" | sort -u | while IFS= read -r name; do
+    eval "defined=\${$name+1} current=\${$name-}"
+    case $current in
+      *"
+"*) echo multiline > "$staging/unsafe" ;;
+    esac
+    if [ -n "$defined" ]; then
+      printf '%s=%s\n' "$name" "$current"
+    else
+      printf '%s\n' "$name"
+    fi
+  done > "$staging/env"
+  if [ -f "$staging/unsafe" ]; then
+    rm -rf "$staging"
+    return
+  fi
+  for file in "$out_dir"/*"$suffix"*; do
+    case $file in
+      *.nanocode-sha256) continue ;;
+    esac
+    [ -f "$file" ] || continue
+    cp -c "$file" "$staging/files/" 2>/dev/null || cp "$file" "$staging/files/" || { rm -rf "$staging"; return; }
+  done
+  printf '%s' "$digests" > "$staging/digests"
+  cp "$stderr" "$staging/stderr"
+  printf '%s\n' "$out_dir" > "$staging/out-dir"
+  publish "$staging" "$entry"
+}
+trap 'rm -f "$status_file"' EXIT
+(store; rm -f "$stderr") < /dev/null > /dev/null 2>&1 &
 exit 0
