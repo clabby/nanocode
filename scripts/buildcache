@@ -2,32 +2,12 @@
 case $1 in
   */rustc-parallel-frontend | */clippy-driver | clippy-driver) exec "$@" ;;
 esac
-self_dir=$(cd "$(dirname "$0")" && pwd -P)
-sccache=
-IFS=:
-for dir in $PATH; do
-  if [ -x "$dir/sccache" ] && [ "$(cd "$dir" && pwd -P)" != "$self_dir" ]; then
-    sccache=$dir/sccache
-    break
-  fi
-done
-unset IFS
-[ -n "$sccache" ] || exec "$@"
-cache=${XDG_CACHE_HOME:-$HOME/.cache}/nanocode/rustc
-if [ -z "${SCCACHE_SERVER_PORT:-}${SCCACHE_SERVER_UDS:-}" ]; then
-  mkdir -p "$cache"
-  SCCACHE_SERVER_UDS=$cache/sccache.sock
-  export SCCACHE_SERVER_UDS
-fi
-ulimit -n "$(ulimit -Hn)" 2>/dev/null || ulimit -n "$(sysctl -n kern.maxfilesperproc)" 2>/dev/null
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/nanocode/build
 if command -v shasum >/dev/null 2>&1; then
   sum="shasum -a 256"
 else
   sum=sha256sum
 fi
-cached() {
-  exec env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS "$sccache" "$@"
-}
 publish() {
   ln -sn "$1" "$2" 2>/dev/null || rm -rf "$1"
 }
@@ -35,6 +15,10 @@ relocate() {
   from=$(printf '%s' "$1" | sed 's/[][\.*^$#]/\\&/g')
   to=$(printf '%s' "$2" | sed 's/[\&#]/\\&/g')
   sed "s#$from#$to#g"
+}
+clone() {
+  [ -e "$2" ] && rm -f "$2"
+  cp -c "$1" "$2" 2>/dev/null || cp "$1" "$2"
 }
 preprocess() {
   skip=
@@ -66,7 +50,7 @@ compile_c() {
     esac
     previous=$arg
   done
-  [ "$optimize" = -O0 ] && exec "$@"
+  [ "$optimize" = -O0 ] && return
   case $source in
     "" | -*) return ;;
   esac
@@ -87,8 +71,7 @@ compile_c() {
   rm -f "$expanded"
   entry=$cache/c/${key%% *}
   if [ -f "$entry.o" ]; then
-    rm -f "$object"
-    cp -c "$entry.o" "$object" 2>/dev/null || cp "$entry.o" "$object" || exit 1
+    clone "$entry.o" "$object" || exit 1
     touch "$object"
     cat "$entry.err" >&2 2>/dev/null
     exit 0
@@ -113,7 +96,7 @@ case $1 in
   *rustc) ;;
   *)
     [ -n "${OUT_DIR:-}" ] && compile_c "$@"
-    cached "$@"
+    exec "$@"
     ;;
 esac
 unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR
@@ -124,7 +107,7 @@ stable() {
   stable_dir=$cache/out/${key%% *}
   if [ ! -e "$stable_dir" ]; then
     mkdir -p "$cache/out"
-    staging=$(mktemp -d "$cache/out/.staging.XXXXXX")
+    staging=$(mktemp -d "$cache/out/.data.XXXXXX")
     if cp -cR "$1/." "$staging/" 2>/dev/null || cp -R "$1/." "$staging/"; then
       publish "$staging" "$stable_dir"
     else
@@ -137,9 +120,7 @@ if [ -n "${OUT_DIR:-}" ] && [ -d "$OUT_DIR" ]; then
   [ -e "$stable_dir" ] && OUT_DIR=$stable_dir && export OUT_DIR
 fi
 registry=${CARGO_HOME:-$HOME/.cargo}/registry/src/
-linked= unkeyed= out_dir= suffix= source= previous=
-key_file=$(mktemp "${TMPDIR:-/tmp}/rustc-key.XXXXXX")
-trap 'rm -f "$key_file"' EXIT
+unkeyed= out_dir= suffix= source= previous= keys=
 for arg do
   shift
   keyed=$arg
@@ -157,14 +138,22 @@ for arg do
       ;;
     --out-dir) out_dir=$arg keyed= ;;
     --extern)
-      case $linked$arg in
-        1*=*)
+      case $arg in
+        *=*)
           path=${arg#*=}
-          keyed="${arg%%=*}=${path##*/} $($sum < "$path")" || unkeyed=1
+          memo=$path.nanocode-sha256
+          if [ -f "$memo" ] && ! [ "$path" -nt "$memo" ]; then
+            read -r identity < "$memo"
+          elif identity=$($sum < "$path"); then
+            identity=${identity%% *}
+            printf '%s\n' "$identity" > "$memo.$$" && mv -f "$memo.$$" "$memo"
+          else
+            unkeyed=1
+          fi
+          keyed="${arg%%=*}=${path##*/} $identity"
           ;;
       esac
       ;;
-    --crate-type) [ "$arg" = proc-macro ] || [ "$arg" = bin ] && linked=1 ;;
     -C)
       case $arg in
         extra-filename=*) suffix=${arg#extra-filename=} ;;
@@ -173,52 +162,113 @@ for arg do
   esac
   case $arg in
     "$registry"*.rs) source=$arg ;;
+    @*) unkeyed=1 ;;
   esac
-  printf '%s\n' "$keyed" >> "$key_file"
+  keys="$keys$keyed
+"
   previous=$arg
   set -- "$@" "$arg"
 done
-if [ -z "$linked" ] || [ -n "$unkeyed" ] || [ -z "$source" ] || [ -z "$out_dir" ] || [ -z "$suffix" ]; then
-  rm -f "$key_file"
-  cached "$@"
+if [ -n "$unkeyed" ] || [ -z "$source" ] || [ -z "$out_dir" ] || [ -z "$suffix" ]; then
+  exec "$@"
 fi
+case $1 in
+  */toolchains/*/bin/rustc)
+    memo=$cache/rustc/$(printf '%s' "$1" | tr '/ ' '__')
+    if [ -f "$memo" ] && ! [ "$1" -nt "$memo" ]; then
+      IFS= read -r version < "$memo"
+    else
+      version=$("$1" -vV | $sum) || exec "$@"
+      mkdir -p "$cache/rustc"
+      printf '%s\n' "$version" > "$memo.$$" && mv -f "$memo.$$" "$memo"
+    fi
+    ;;
+  *) version=$("$1" -vV | $sum) || exec "$@" ;;
+esac
 key=$( {
-  echo nanocode-rustc-cache-1
-  "$1" -vV
-  cat "$key_file"
+  echo nanocode-rustc-cache-3
+  printf '%s\n%s' "$version" "$keys"
   env | LC_ALL=C sort | grep -E '^(CARGO_|OUT_DIR=|RUSTC_BOOTSTRAP=|MACOSX_DEPLOYMENT_TARGET=|SDKROOT=)' | grep -v '^CARGO_MAKEFLAGS='
 } | $sum)
-entry=$cache/units/${key%% *}
-if [ -f "$entry/out-dir" ]; then
-  cached_out=$(cat "$entry/out-dir")
+key=${key%% *}
+entry=$cache/units/$key
+same_environment() {
+  [ -f "$1/env" ] || return 0
+  while IFS= read -r line; do
+    name=${line%%=*}
+    case $name in
+      "" | [0-9]* | *[!A-Za-z0-9_]*) return 1 ;;
+    esac
+    eval "defined=\${$name+1} current=\${$name-}"
+    case $line in
+      *=*) [ -n "$defined" ] && [ "$current" = "${line#*=}" ] || return 1 ;;
+      *) [ -z "$defined" ] || return 1 ;;
+    esac
+  done < "$1/env"
+}
+if [ -f "$entry/out-dir" ] && same_environment "$entry"; then
+  IFS= read -r cached_out < "$entry/out-dir"
+  restored=
   for file in "$entry"/files/*; do
     name=${file##*/}
     case $name in
       *.d) relocate "$cached_out" "$out_dir" < "$file" > "$out_dir/$name" || exit 1 ;;
-      *)
-        rm -f "$out_dir/$name"
-        cp -c "$file" "$out_dir/$name" 2>/dev/null || cp "$file" "$out_dir/$name" || exit 1
-        touch "$out_dir/$name"
-        ;;
+      *) clone "$file" "$out_dir/$name" || exit 1 && restored="$restored $name" ;;
     esac
   done
-  relocate "$cached_out" "$out_dir" < "$entry/stderr" >&2
+  (cd "$out_dir" && touch $restored) || exit 1
+  [ -s "$entry/stderr" ] && relocate "$cached_out" "$out_dir" < "$entry/stderr" >&2
   exit 0
 fi
 stderr=$(mktemp "${TMPDIR:-/tmp}/rustc-stderr.XXXXXX")
-trap 'rm -f "$key_file" "$stderr"' EXIT
-"$@" 2> "$stderr"
-status=$?
-cat "$stderr" >&2
-[ $status -eq 0 ] || exit $status
+status_file=$(mktemp "${TMPDIR:-/tmp}/rustc-status.XXXXXX")
+trap 'rm -f "$stderr" "$status_file"' EXIT
+{ { "$@"; echo $? > "$status_file"; } 2>&1 1>&3 3>&- | tee "$stderr" >&2; } 3>&1
+status=$(cat "$status_file")
+[ "$status" = 0 ] || exit "${status:-1}"
+depinfo=
+for file in "$out_dir"/*"$suffix".d; do
+  [ -f "$file" ] && depinfo=$file
+done
+[ -n "$depinfo" ] || exit 0
+while IFS= read -r line; do
+  case $line in
+    "#"* | "") ;;
+    *:)
+      case ${line%:} in
+        "$registry"* | "$cache/out/"*) ;;
+        *) exit 0 ;;
+      esac
+      ;;
+  esac
+done < "$depinfo"
 mkdir -p "$cache/units"
-staging=$(mktemp -d "$cache/units/.staging.XXXXXX")
+staging=$(mktemp -d "$cache/units/.data.XXXXXX")
 mkdir "$staging/files"
+sed -n 's/^# env-dep:\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' "$depinfo" | sort -u | while IFS= read -r name; do
+  eval "defined=\${$name+1} current=\${$name-}"
+  case $current in
+    *"
+"*) echo multiline > "$staging/unsafe" ;;
+  esac
+  if [ -n "$defined" ]; then
+    printf '%s=%s\n' "$name" "$current"
+  else
+    printf '%s\n' "$name"
+  fi
+done > "$staging/env"
+if [ -f "$staging/unsafe" ]; then
+  rm -rf "$staging"
+  exit 0
+fi
 for file in "$out_dir"/*"$suffix"*; do
+  case $file in
+    *.nanocode-sha256) continue ;;
+  esac
   [ -f "$file" ] || continue
   cp -c "$file" "$staging/files/" 2>/dev/null || cp "$file" "$staging/files/" || { rm -rf "$staging"; exit 0; }
 done
 cp "$stderr" "$staging/stderr"
-printf '%s' "$out_dir" > "$staging/out-dir"
+printf '%s\n' "$out_dir" > "$staging/out-dir"
 publish "$staging" "$entry"
 exit 0
