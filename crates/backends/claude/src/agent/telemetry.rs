@@ -278,7 +278,17 @@ pub(super) fn fail_attempt(
         span.record("retry.delay_ns", delay_ns);
         span.record("retry.server_requested", retry_after);
     }
-    tracing::warn!(target: "nanocode_claude", parent: span, error = %error, "Claude Messages attempt failed");
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !message.contains(&cause_text) {
+            message.push_str(": ");
+            message.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    tracing::warn!(target: "nanocode_claude", parent: span, error = %message, "Claude Messages attempt failed");
 }
 
 fn finish(span: &Span, error: Option<&NanocodeError>, message: &'static str) {
