@@ -268,26 +268,15 @@ impl SpawnPolicy {
 
 impl crate::Registry {
     pub fn spawn_policy(&self) -> SpawnPolicy {
-        self.spawn_policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        SpawnPolicy::clone(&self.spawn_policy.get())
     }
 
     pub fn set_spawn_policy(&self, policy: SpawnPolicy) {
-        *self
-            .spawn_policy
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+        self.spawn_policy.set(policy);
     }
 
-    pub fn update_spawn_policy(&self, update: impl FnOnce(&mut SpawnPolicy)) {
-        update(
-            &mut self
-                .spawn_policy
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+    pub fn update_spawn_policy(&self, update: impl FnMut(&mut SpawnPolicy)) {
+        self.spawn_policy.update(update);
     }
 }
 

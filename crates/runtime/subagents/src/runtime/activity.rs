@@ -1,4 +1,4 @@
-use super::{Registry, RestorationState, SubagentControl, lock_unpoisoned};
+use super::{Registry, RestorationState, SubagentControl};
 use crate::model::{AgentId, AgentStatus};
 use nanocode_agent_core::Agent;
 use serde::Serialize;
@@ -38,23 +38,28 @@ impl Registry {
     pub async fn activity(&self, root_session_id: &str) -> SubagentActivity {
         let revision = *self.revision.borrow();
         let durable = self.store_for(root_session_id).is_some();
-        let gate = lock_unpoisoned(&self.restored)
-            .get(root_session_id)
-            .map(|gate| gate.borrow().clone());
-        let reserved = lock_unpoisoned(&self.reserved).contains_key(root_session_id);
+        let (gate, reserved) = self.claims.read(|claims| {
+            (
+                claims
+                    .restored
+                    .get(root_session_id)
+                    .map(|gate| gate.borrow().clone()),
+                claims.reserved.contains_key(root_session_id),
+            )
+        });
         let (restoring, restore_failure) = match gate {
             None => (reserved, None),
             Some(RestorationState::Ready) => (false, None),
             Some(RestorationState::Failed(error)) => (false, Some(error)),
             Some(RestorationState::Loading | RestorationState::Resuming) => (true, None),
         };
-        let resuming = lock_unpoisoned(&self.pending_resume)
-            .get(root_session_id)
-            .cloned()
+        let resuming = self
+            .pending_resume
+            .read(|pending| pending.get(root_session_id).cloned())
             .unwrap_or_default();
-        let checkpoint_captures = lock_unpoisoned(&self.pending_checkpoints)
-            .get(root_session_id)
-            .copied()
+        let checkpoint_captures = self
+            .pending_checkpoints
+            .read(|pending| pending.get(root_session_id).copied())
             .unwrap_or_default();
         let mut activity = SubagentActivity {
             revision,
@@ -65,7 +70,7 @@ impl Registry {
             checkpoint_captures,
             ..SubagentActivity::default()
         };
-        let state = self.state.lock().await;
+        let state = self.state.acquire().await;
         if state.root_by_session.contains_key(root_session_id) {
             activity.restore_failure = Some(not_root(root_session_id));
             return activity;
@@ -127,7 +132,7 @@ impl Registry {
             return Ok(());
         }
         {
-            let state = self.state.lock().await;
+            let state = self.state.acquire().await;
             if state.root_by_session.contains_key(root_session_id) {
                 return Err(std::io::Error::other(not_root(root_session_id)));
             }

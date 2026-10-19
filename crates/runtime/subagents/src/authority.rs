@@ -59,7 +59,7 @@ impl SubagentControl {
         self.registry.set_spawn_policy(policy);
     }
 
-    pub fn update_spawn_policy(&self, update: impl FnOnce(&mut crate::SpawnPolicy)) {
+    pub fn update_spawn_policy(&self, update: impl FnMut(&mut crate::SpawnPolicy)) {
         self.registry.update_spawn_policy(update);
     }
 

@@ -5,12 +5,9 @@ use super::{
 use nanocode_agent_core::{Lineage, ModelSelection, SessionCheckpoint, Thinking};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+
+use nanocode_sync::Atom;
 
 #[cfg(not(target_family = "wasm"))]
 pub type SubagentStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -59,9 +56,9 @@ pub trait SubagentStore: Send + Sync {
 
 #[derive(Clone, Default)]
 pub struct MemorySubagentStore {
-    values: Arc<Mutex<HashMap<String, String>>>,
-    sessions: Arc<Mutex<HashMap<String, SessionCheckpoint>>>,
-    records: Arc<Mutex<MemoryRecords>>,
+    values: Arc<Atom<HashMap<String, Arc<str>>>>,
+    sessions: Arc<Atom<HashMap<String, Arc<SessionCheckpoint>>>>,
+    records: Arc<Atom<MemoryRecords>>,
 }
 
 type MemoryRecords = HashMap<(String, String), Arc<str>>;
@@ -74,22 +71,18 @@ impl MemorySubagentStore {
 
     #[must_use]
     pub fn session(&self, session_id: &str) -> Option<SessionCheckpoint> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(session_id)
-            .cloned()
+        self.sessions.read(|sessions| {
+            sessions
+                .get(session_id)
+                .map(|session| SessionCheckpoint::clone(session))
+        })
     }
 
     #[must_use]
     pub fn sessions(&self) -> Vec<String> {
         let mut ids = self
             .sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+            .read(|sessions| sessions.keys().cloned().collect::<Vec<_>>());
         ids.sort();
         ids
     }
@@ -103,10 +96,7 @@ impl SubagentStore for MemorySubagentStore {
         Box::pin(async move {
             Ok(self
                 .values
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(root_session_id)
-                .cloned())
+                .read(|values| values.get(root_session_id).map(|value| value.to_string())))
         })
     }
 
@@ -117,20 +107,22 @@ impl SubagentStore for MemorySubagentStore {
         records: Vec<Arc<str>>,
     ) -> SubagentStoreFuture<'a, std::io::Result<()>> {
         Box::pin(async move {
-            let mut stored = self
-                .records
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for record in records {
-                stored.insert(
-                    (root_session_id.to_owned(), checkpoint_key(&record)),
-                    record,
-                );
-            }
-            self.values
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(root_session_id.to_owned(), payload);
+            let keyed = records
+                .into_iter()
+                .map(|record| {
+                    (
+                        (root_session_id.to_owned(), checkpoint_key(&record)),
+                        record,
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.records.update(|stored| {
+                stored.extend(keyed.iter().cloned());
+            });
+            let payload: Arc<str> = payload.into();
+            self.values.update(|values| {
+                values.insert(root_session_id.to_owned(), Arc::clone(&payload));
+            });
             Ok(())
         })
     }
@@ -141,10 +133,10 @@ impl SubagentStore for MemorySubagentStore {
         checkpoint: SessionCheckpoint,
     ) -> SubagentStoreFuture<'a, std::io::Result<()>> {
         Box::pin(async move {
-            self.sessions
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(checkpoint.session_id().to_owned(), checkpoint);
+            let checkpoint = Arc::new(checkpoint);
+            self.sessions.update(|sessions| {
+                sessions.insert(checkpoint.session_id().to_owned(), Arc::clone(&checkpoint));
+            });
             Ok(())
         })
     }
@@ -156,10 +148,11 @@ impl SubagentStore for MemorySubagentStore {
     ) -> SubagentStoreFuture<'a, std::io::Result<String>> {
         Box::pin(async move {
             self.records
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&(root_session_id.to_owned(), key.to_owned()))
-                .map(|record| record.to_string())
+                .read(|records| {
+                    records
+                        .get(&(root_session_id.to_owned(), key.to_owned()))
+                        .map(|record| record.to_string())
+                })
                 .ok_or_else(|| std::io::Error::other(format!("missing subagent checkpoint {key}")))
         })
     }
@@ -204,7 +197,7 @@ pub(super) struct JournalCheckpoint {
 
     pub(super) pending: Option<Arc<str>>,
 
-    pub(super) checkpoint: Option<SessionCheckpoint>,
+    pub(super) checkpoint: Option<Arc<SessionCheckpoint>>,
 }
 
 impl JournalCheckpoint {
@@ -213,7 +206,7 @@ impl JournalCheckpoint {
         Ok(Self {
             key,
             pending: Some(json),
-            checkpoint: retain.then_some(checkpoint),
+            checkpoint: retain.then(|| Arc::new(checkpoint)),
         })
     }
 
@@ -221,7 +214,7 @@ impl JournalCheckpoint {
         Self {
             key: key.into(),
             pending: None,
-            checkpoint,
+            checkpoint: checkpoint.map(Arc::new),
         }
     }
 }

@@ -21,6 +21,7 @@ nanocode-agent-core.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 nanocode-schema.workspace = true
+nanocode-sync.workspace = true
 nanocode-tool-contracts.workspace = true
 serde.workspace = true
 serde_json.workspace = true

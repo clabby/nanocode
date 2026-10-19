@@ -20,6 +20,7 @@ use nanocode_agent_core::{
 };
 use nanocode_platform::Instant;
 use nanocode_schema::Validator;
+use nanocode_sync::{Atom, Owned, Sequencer, Turn};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -181,52 +182,56 @@ enum RestorationState {
 type RestorationOutcome = watch::Receiver<RestorationState>;
 
 pub struct Registry {
-    session_handles: std::sync::RwLock<HashMap<String, AgentHandle>>,
-    spawn_router: std::sync::RwLock<Option<Arc<dyn crate::SpawnRouter>>>,
+    session_handles: Atom<HashMap<String, AgentHandle>>,
+    spawn_router: Atom<Option<Arc<dyn crate::SpawnRouter>>>,
     id: SubagentRuntimeId,
-    state: tokio::sync::Mutex<RegistryState>,
+    state: Owned<RegistryState>,
     pub(super) updates: mpsc::UnboundedSender<ScopedAgentUpdate>,
     revision: watch::Sender<u64>,
     capacity: Capacity,
     max_resident: AtomicUsize,
 
     max_resident_explicit: std::sync::atomic::AtomicBool,
-    scope_locks: std::sync::Mutex<HashMap<String, Arc<ScopeLocks>>>,
-    store: std::sync::RwLock<Option<Arc<dyn SubagentStore>>>,
+    scope_locks: Atom<HashMap<String, Arc<ScopeLocks>>>,
+    store: Atom<Option<Arc<dyn SubagentStore>>>,
 
-    journals: std::sync::RwLock<HashMap<String, Arc<dyn SubagentStore>>>,
+    journals: Atom<HashMap<String, Arc<dyn SubagentStore>>>,
 
-    restored: std::sync::Mutex<HashMap<String, RestorationOutcome>>,
+    claims: Atom<JournalClaims>,
 
-    reserved: std::sync::Mutex<HashMap<String, nanocode_agent_core::backend::ChildJournal>>,
-
-    spawn_admission: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    spawn_admission: Atom<HashMap<String, Sequencer>>,
     journal_writer: std::sync::atomic::AtomicBool,
 
-    journal_writers: std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<JournalRequest>>>,
-    checkpoints: std::sync::Mutex<HashMap<(String, AgentId), durable::JournalCheckpoint>>,
+    journal_writers: Atom<HashMap<String, mpsc::UnboundedSender<JournalRequest>>>,
+    checkpoints: Atom<HashMap<(String, AgentId), durable::JournalCheckpoint>>,
 
-    pending_checkpoints: std::sync::Mutex<HashMap<String, usize>>,
+    pending_checkpoints: Atom<HashMap<String, usize>>,
 
-    progress_captures: std::sync::Mutex<HashMap<(String, AgentId), bool>>,
+    progress_captures: Atom<HashMap<(String, AgentId), bool>>,
 
-    completed_tools: std::sync::Mutex<std::collections::HashSet<(String, AgentId)>>,
-    pending_resume: std::sync::Mutex<HashMap<String, Vec<AgentId>>>,
+    completed_tools: Atom<std::collections::HashSet<(String, AgentId)>>,
+    pending_resume: Atom<HashMap<String, Vec<AgentId>>>,
 
-    wait_reported: std::sync::Mutex<HashMap<(String, AgentId), u64>>,
+    wait_reported: Atom<HashMap<(String, AgentId), u64>>,
 
-    idle_waits: std::sync::Mutex<HashMap<String, (Vec<AgentId>, u32)>>,
+    idle_waits: Atom<HashMap<String, (Vec<AgentId>, u32)>>,
 
     this: std::sync::OnceLock<Weak<Self>>,
 
-    status_queues: std::sync::Mutex<HashMap<(String, AgentId), mpsc::UnboundedSender<OrderedJob>>>,
+    status_queues: Atom<HashMap<(String, AgentId), mpsc::UnboundedSender<OrderedJob>>>,
 
-    completion_retries: std::sync::Mutex<HashMap<(String, AgentId), (u32, bool)>>,
-    completion_dispatch: std::sync::Mutex<HashMap<(String, AgentId), Arc<tokio::sync::Mutex<()>>>>,
+    completion_retries: Atom<HashMap<(String, AgentId), (u32, bool)>>,
+    completion_dispatch: Atom<HashMap<(String, AgentId), Sequencer>>,
 
-    parent_resolver: std::sync::RwLock<Option<ParentResolver>>,
+    parent_resolver: Atom<Option<ParentResolver>>,
 
-    pub(super) spawn_policy: std::sync::RwLock<crate::SpawnPolicy>,
+    pub(super) spawn_policy: Atom<crate::SpawnPolicy>,
+}
+
+#[derive(Clone, Default)]
+struct JournalClaims {
+    restored: HashMap<String, RestorationOutcome>,
+    reserved: HashMap<String, nanocode_agent_core::backend::ChildJournal>,
 }
 
 pub type ParentResolver = Arc<dyn Fn(&str) -> Option<Agent> + Send + Sync>;
@@ -321,8 +326,8 @@ enum JournalRequest {
 
 #[derive(Default)]
 pub(super) struct ScopeLocks {
-    pub(super) residency: tokio::sync::Mutex<()>,
-    pub(super) message: tokio::sync::Mutex<()>,
+    pub(super) residency: Sequencer,
+    pub(super) message: Sequencer,
 }
 
 fn copy_error(error: &std::io::Error) -> std::io::Error {
@@ -364,12 +369,22 @@ async fn journal_writer(
             0
         };
         if finished {
-            let mut writers = lock_unpoisoned(&live.journal_writers);
             while let Ok(request) = requests.try_recv() {
                 pending.push(request);
             }
             if pending.is_empty() {
-                writers.remove(&root_session_id);
+                requests.close();
+                live.journal_writers.update(|writers| {
+                    if writers
+                        .get(&root_session_id)
+                        .is_some_and(mpsc::UnboundedSender::is_closed)
+                    {
+                        writers.remove(&root_session_id);
+                    }
+                });
+                while let Ok(request) = requests.try_recv() {
+                    live.send_journal(&root_session_id, Some(request));
+                }
                 return;
             }
             continue;
@@ -1367,12 +1382,6 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 const IDLE_WAIT_LIMIT: u32 = 2;
 
-fn lock_unpoisoned<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 fn wait_mark(status: &AgentStatus, revision: u64) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1391,64 +1400,49 @@ impl Registry {
         let (revision, _) = watch::channel(0);
         Self {
             id: SubagentRuntimeId::next(),
-            spawn_router: std::sync::RwLock::new(None),
-            state: tokio::sync::Mutex::new(RegistryState::default()),
+            spawn_router: Atom::default(),
+            state: Owned::default(),
             updates,
             revision,
             capacity: Capacity::new(max_concurrency),
-            session_handles: std::sync::RwLock::new(HashMap::new()),
+            session_handles: Atom::default(),
             max_resident: AtomicUsize::new(crate::DEFAULT_MAX_RESIDENT_SUBAGENTS),
             max_resident_explicit: std::sync::atomic::AtomicBool::new(false),
-            scope_locks: std::sync::Mutex::new(HashMap::new()),
-            store: std::sync::RwLock::new(None),
-            journals: std::sync::RwLock::new(HashMap::new()),
-            restored: std::sync::Mutex::new(HashMap::new()),
-            reserved: std::sync::Mutex::new(HashMap::new()),
-            spawn_admission: std::sync::Mutex::new(HashMap::new()),
+            scope_locks: Atom::default(),
+            store: Atom::default(),
+            journals: Atom::default(),
+            claims: Atom::default(),
+            spawn_admission: Atom::default(),
             journal_writer: std::sync::atomic::AtomicBool::new(false),
-            journal_writers: std::sync::Mutex::new(HashMap::new()),
-            checkpoints: std::sync::Mutex::new(HashMap::new()),
-            pending_checkpoints: std::sync::Mutex::new(HashMap::new()),
-            progress_captures: std::sync::Mutex::new(HashMap::new()),
-            completed_tools: std::sync::Mutex::new(std::collections::HashSet::new()),
-            pending_resume: std::sync::Mutex::new(HashMap::new()),
-            wait_reported: std::sync::Mutex::new(HashMap::new()),
-            idle_waits: std::sync::Mutex::new(HashMap::new()),
+            journal_writers: Atom::default(),
+            checkpoints: Atom::default(),
+            pending_checkpoints: Atom::default(),
+            progress_captures: Atom::default(),
+            completed_tools: Atom::default(),
+            pending_resume: Atom::default(),
+            wait_reported: Atom::default(),
+            idle_waits: Atom::default(),
             this: std::sync::OnceLock::new(),
-            status_queues: std::sync::Mutex::new(HashMap::new()),
-            completion_retries: std::sync::Mutex::new(HashMap::new()),
-            completion_dispatch: std::sync::Mutex::new(HashMap::new()),
-            parent_resolver: std::sync::RwLock::new(None),
-            spawn_policy: std::sync::RwLock::new(crate::SpawnPolicy::default()),
+            status_queues: Atom::default(),
+            completion_retries: Atom::default(),
+            completion_dispatch: Atom::default(),
+            parent_resolver: Atom::default(),
+            spawn_policy: Atom::default(),
         }
     }
 
     pub fn set_parent_resolver(&self, resolver: ParentResolver) {
-        *self
-            .parent_resolver
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolver);
+        self.parent_resolver.set(Some(resolver));
     }
 
     pub(crate) fn continues_root(&self) -> bool {
-        self.parent_resolver
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
+        self.parent_resolver.read(Option::is_some)
     }
 
     fn store_for(&self, root_session_id: &str) -> Option<Arc<dyn SubagentStore>> {
         self.journals
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root_session_id)
-            .cloned()
-            .or_else(|| {
-                self.store
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
+            .read(|journals| journals.get(root_session_id).cloned())
+            .or_else(|| Option::clone(&self.store.get()))
     }
 
     pub fn reserve_journal(
@@ -1456,19 +1450,17 @@ impl Registry {
         root_session_id: &str,
         journal: nanocode_agent_core::backend::ChildJournal,
     ) -> bool {
-        let restored = self
-            .restored
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut reserved = self
-            .reserved
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if restored.contains_key(root_session_id) || reserved.contains_key(root_session_id) {
-            return false;
-        }
-        reserved.insert(root_session_id.to_owned(), journal);
-        true
+        self.claims
+            .try_update(|claims| {
+                (!claims.restored.contains_key(root_session_id)
+                    && !claims.reserved.contains_key(root_session_id))
+                .then(|| {
+                    claims
+                        .reserved
+                        .insert(root_session_id.to_owned(), journal.clone());
+                })
+            })
+            .is_some()
     }
 
     pub fn release_journal(
@@ -1476,18 +1468,20 @@ impl Registry {
         root_session_id: &str,
         journal: &nanocode_agent_core::backend::ChildJournal,
     ) {
-        let mut reserved = self
-            .reserved
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reserved.get(root_session_id).is_some_and(|reserved| {
-            std::ptr::addr_eq(
-                Arc::as_ptr(&reserved.store()),
-                Arc::as_ptr(&journal.store()),
-            )
-        }) {
-            reserved.remove(root_session_id);
-        }
+        self.claims.update(|claims| {
+            if claims
+                .reserved
+                .get(root_session_id)
+                .is_some_and(|reserved| {
+                    std::ptr::addr_eq(
+                        Arc::as_ptr(&reserved.store()),
+                        Arc::as_ptr(&journal.store()),
+                    )
+                })
+            {
+                claims.reserved.remove(root_session_id);
+            }
+        });
     }
 
     fn adopt_journal(self: &Arc<Self>, handle: &AgentHandle) {
@@ -1496,32 +1490,27 @@ impl Registry {
         };
         let root = handle.session_id().to_owned();
         let (ready, gate) = tokio::sync::watch::channel(RestorationState::Loading);
-        let journal = {
-            let mut restored = self
-                .restored
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if restored.contains_key(&root) {
-                return;
+        let Some(journal) = self.claims.try_update(|claims| {
+            if claims.restored.contains_key(&root) {
+                return None;
             }
-            restored.insert(root.clone(), gate);
-            self.reserved
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&root)
-                .unwrap_or_else(|| journal.clone())
+            claims.restored.insert(root.clone(), gate.clone());
+            Some(
+                claims
+                    .reserved
+                    .remove(&root)
+                    .unwrap_or_else(|| journal.clone()),
+            )
+        }) else {
+            return;
         };
-        self.spawn_admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone(), Arc::new(tokio::sync::Mutex::new(())));
-        self.journals
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                root.clone(),
-                Arc::new(durable::JournalStore(journal.store())),
-            );
+        self.spawn_admission.update(|admission| {
+            admission.insert(root.clone(), Sequencer::new());
+        });
+        let store: Arc<dyn SubagentStore> = Arc::new(durable::JournalStore(journal.store()));
+        self.journals.update(|journals| {
+            journals.insert(root.clone(), Arc::clone(&store));
+        });
         self.ensure_journal_writer();
         let registry = Arc::clone(self);
         drop(platform::spawn(async move {
@@ -1566,24 +1555,18 @@ impl Registry {
         }));
     }
 
-    pub(crate) async fn admit_spawn(
-        &self,
-        session_id: &str,
-    ) -> std::io::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+    pub(crate) async fn admit_spawn(&self, session_id: &str) -> std::io::Result<Option<Turn>> {
         let root = self
             .state
-            .lock()
+            .acquire()
             .await
             .root_session_id(session_id)
             .to_owned();
         let admission = self
             .spawn_admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&root)
-            .cloned();
+            .read(|admission| admission.get(&root).cloned());
         let guard = match admission {
-            Some(admission) => Some(admission.lock_owned().await),
+            Some(admission) => Some(admission.enter().await),
             None => None,
         };
         self.await_restored(session_id).await?;
@@ -1593,16 +1576,13 @@ impl Registry {
     pub(crate) async fn await_restored(&self, session_id: &str) -> std::io::Result<()> {
         let root = self
             .state
-            .lock()
+            .acquire()
             .await
             .root_session_id(session_id)
             .to_owned();
         let gate = self
-            .restored
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&root)
-            .cloned();
+            .claims
+            .read(|claims| claims.restored.get(&root).cloned());
         if let Some(mut gate) = gate {
             let outcome = gate
                 .wait_for(|outcome| {
@@ -1628,10 +1608,7 @@ impl Registry {
             self.max_resident
                 .store(crate::DURABLE_MAX_RESIDENT_SUBAGENTS, Ordering::Relaxed);
         }
-        *self
-            .store
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
+        self.store.set(Some(store));
         self.ensure_journal_writer();
     }
 
@@ -1652,7 +1629,7 @@ impl Registry {
                 };
                 let roots = live
                     .state
-                    .lock()
+                    .acquire()
                     .await
                     .scopes
                     .iter()
@@ -1672,24 +1649,38 @@ impl Registry {
         }));
     }
 
-    fn send_journal(&self, root_session_id: &str, request: Option<JournalRequest>) {
-        let mut writers = lock_unpoisoned(&self.journal_writers);
-        let request = match writers.get(root_session_id) {
-            Some(sender) => match request.map(|request| sender.send(request)) {
-                None | Some(Ok(())) => return,
-                Some(Err(mpsc::error::SendError(request))) => Some(request),
-            },
-            None => request,
-        };
+    fn send_journal(&self, root_session_id: &str, mut request: Option<JournalRequest>) {
         let Some(registry) = self.this.get().cloned() else {
             return;
         };
-        let (sender, requests) = mpsc::unbounded_channel();
+        let (sender, requests) = loop {
+            let current = self
+                .journal_writers
+                .read(|writers| writers.get(root_session_id).cloned())
+                .filter(|sender| !sender.is_closed());
+            if let Some(sender) = current {
+                match request.map(|request| sender.send(request)) {
+                    None | Some(Ok(())) => return,
+                    Some(Err(mpsc::error::SendError(returned))) => request = Some(returned),
+                }
+            }
+            let (sender, requests) = mpsc::unbounded_channel();
+            let installed =
+                self.journal_writers
+                    .try_update(|writers| match writers.get(root_session_id) {
+                        Some(existing) if !existing.is_closed() => None,
+                        _ => {
+                            writers.insert(root_session_id.to_owned(), sender.clone());
+                            Some(())
+                        }
+                    });
+            if installed.is_some() {
+                break (sender, requests);
+            }
+        };
         if let Some(request) = request {
             let _ = sender.send(request);
         }
-        writers.insert(root_session_id.to_owned(), sender);
-        drop(writers);
         let revision = self.revision.subscribe();
         drop(platform::spawn(journal_writer(
             registry,
@@ -1726,17 +1717,26 @@ impl Registry {
     }
 
     pub(super) fn scope_locks(&self, root_session_id: &str) -> Arc<ScopeLocks> {
-        Arc::clone(
-            lock_unpoisoned(&self.scope_locks)
-                .entry(root_session_id.to_owned())
-                .or_default(),
-        )
+        if let Some(locks) = self
+            .scope_locks
+            .read(|locks| locks.get(root_session_id).cloned())
+        {
+            return locks;
+        }
+        let created = Arc::new(ScopeLocks::default());
+        self.scope_locks.update(|locks| {
+            Arc::clone(
+                locks
+                    .entry(root_session_id.to_owned())
+                    .or_insert_with(|| Arc::clone(&created)),
+            )
+        })
     }
 
     async fn session_locks(&self, session_id: &str) -> Arc<ScopeLocks> {
         let root = self
             .state
-            .lock()
+            .acquire()
             .await
             .root_session_id(session_id)
             .to_owned();
@@ -1752,13 +1752,12 @@ impl Registry {
         cache: &mut durable::JournalCache,
     ) -> (bool, bool) {
         let (restoring, background) = {
-            let restored = self
-                .restored
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let gate = restored
-                .get(root_session_id)
-                .map(|gate| gate.borrow().clone());
+            let gate = self.claims.read(|claims| {
+                claims
+                    .restored
+                    .get(root_session_id)
+                    .map(|gate| gate.borrow().clone())
+            });
             (
                 matches!(
                     gate,
@@ -1796,11 +1795,8 @@ impl Registry {
             ))
         };
         let (snapshot, finished) = {
-            let state = self.state.lock().await;
-            let checkpoints = self
-                .checkpoints
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = self.state.acquire().await;
+            let checkpoints = self.checkpoints.get();
             let _collect = tracing::info_span!(
                 "subagent.journal.collect",
                 session.root_id = root_session_id
@@ -1928,11 +1924,8 @@ impl Registry {
     }
 
     async fn child_checkpoints(&self, root_session_id: &str) -> Vec<(Arc<str>, SessionCheckpoint)> {
-        let state = self.state.lock().await;
-        let checkpoints = self
-            .checkpoints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.state.acquire().await;
+        let checkpoints = self.checkpoints.get();
         let Some(scope) = state.scopes.get(root_session_id) else {
             return Vec::new();
         };
@@ -1948,7 +1941,7 @@ impl Registry {
                     )
                     .ok()?,
                 };
-                Some((checkpoint.key, checkpoint.checkpoint?))
+                Some((checkpoint.key, Arc::unwrap_or_clone(checkpoint.checkpoint?)))
             })
             .collect()
     }
@@ -2006,10 +1999,11 @@ impl Registry {
     ) -> std::io::Result<SessionCheckpoint> {
         let (key, pending) = self
             .checkpoints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&(root_session_id.to_owned(), id))
-            .map(|checkpoint| (Arc::clone(&checkpoint.key), checkpoint.pending.clone()))
+            .read(|checkpoints| {
+                checkpoints
+                    .get(&(root_session_id.to_owned(), id))
+                    .map(|checkpoint| (Arc::clone(&checkpoint.key), checkpoint.pending.clone()))
+            })
             .ok_or_else(|| {
                 std::io::Error::other(format!("subagent {id} has no journaled checkpoint"))
             })?;
@@ -2031,68 +2025,57 @@ impl Registry {
         id: AgentId,
         checkpoint: durable::JournalCheckpoint,
     ) {
-        self.checkpoints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((root_session_id.to_owned(), id), checkpoint);
+        self.checkpoints.update(|checkpoints| {
+            checkpoints.insert((root_session_id.to_owned(), id), checkpoint.clone());
+        });
     }
 
     fn release_recorded(&self, root_session_id: &str, key: &Arc<str>) {
-        let mut checkpoints = self
-            .checkpoints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for ((root, _), checkpoint) in checkpoints.iter_mut() {
-            if root == root_session_id && checkpoint.key == *key && checkpoint.pending.is_none() {
-                checkpoint.checkpoint = None;
+        self.checkpoints.update(|checkpoints| {
+            for ((root, _), checkpoint) in checkpoints.iter_mut() {
+                if root == root_session_id && checkpoint.key == *key && checkpoint.pending.is_none()
+                {
+                    checkpoint.checkpoint = None;
+                }
             }
-        }
+        });
     }
 
     fn acknowledge(&self, root_session_id: &str, records: &[(Arc<str>, Arc<str>)]) {
         if records.is_empty() {
             return;
         }
-        let mut checkpoints = self
-            .checkpoints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for ((root, _), checkpoint) in checkpoints.iter_mut() {
-            if root == root_session_id
-                && checkpoint.pending.is_some()
-                && records.iter().any(|(key, _)| *key == checkpoint.key)
-            {
-                checkpoint.pending = None;
+        self.checkpoints.update(|checkpoints| {
+            for ((root, _), checkpoint) in checkpoints.iter_mut() {
+                if root == root_session_id
+                    && checkpoint.pending.is_some()
+                    && records.iter().any(|(key, _)| *key == checkpoint.key)
+                {
+                    checkpoint.pending = None;
+                }
             }
-        }
+        });
     }
 
     fn begin_pending_checkpoint(&self, root_session_id: &str) -> bool {
         if self.store_for(root_session_id).is_none() {
             return false;
         }
-        *self
-            .pending_checkpoints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(root_session_id.to_owned())
-            .or_default() += 1;
+        self.pending_checkpoints.update(|pending| {
+            *pending.entry(root_session_id.to_owned()).or_default() += 1;
+        });
         true
     }
 
     fn finish_pending_checkpoint(&self, root_session_id: &str) {
-        {
-            let mut pending = self
-                .pending_checkpoints
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.pending_checkpoints.update(|pending| {
             if let Some(count) = pending.get_mut(root_session_id) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     pending.remove(root_session_id);
                 }
             }
-        }
+        });
         self.changed();
     }
 
@@ -2101,25 +2084,23 @@ impl Registry {
             return;
         }
         let key = (root_session_id.to_owned(), id);
-        {
-            let mut captures = self
-                .progress_captures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = self.progress_captures.update(|captures| {
             if let Some(again) = captures.get_mut(&key) {
                 *again = true;
-                return;
+                return false;
             }
             captures.insert(key.clone(), false);
+            true
+        });
+        if !started {
+            return;
         }
         let registry = Arc::clone(self);
         drop(platform::spawn(async move {
             loop {
                 let progressed = registry
                     .completed_tools
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&key);
+                    .update(|completed| completed.remove(&key));
                 let harness = registry.running_harness(&key.0, key.1).await;
 
                 let commits = registry.committable_calls(&key.0, key.1).await;
@@ -2139,29 +2120,32 @@ impl Registry {
                     }
                     registry.changed();
                 } else if progressed {
-                    registry
-                        .completed_tools
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(key.clone());
+                    registry.completed_tools.update(|completed| {
+                        completed.insert(key.clone());
+                    });
                 }
-                let mut captures = registry
-                    .progress_captures
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match captures.get_mut(&key) {
-                    Some(again) if *again => *again = false,
-                    _ => {
-                        captures.remove(&key);
-                        break;
-                    }
+                let finished =
+                    registry
+                        .progress_captures
+                        .update(|captures| match captures.get_mut(&key) {
+                            Some(again) if *again => {
+                                *again = false;
+                                false
+                            }
+                            _ => {
+                                captures.remove(&key);
+                                true
+                            }
+                        });
+                if finished {
+                    break;
                 }
             }
         }));
     }
 
     async fn commit_boundary(&self, root_session_id: &str, id: AgentId) {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.acquire().await;
         let Some(session) = state
             .scopes
             .get_mut(root_session_id)
@@ -2184,7 +2168,7 @@ impl Registry {
         root_session_id: &str,
         id: AgentId,
     ) -> Option<CommittedCalls> {
-        let state = self.state.lock().await;
+        let state = self.state.acquire().await;
         let session = state
             .scopes
             .get(root_session_id)
@@ -2206,7 +2190,7 @@ impl Registry {
 
     async fn retire_committed(&self, root_session_id: &str, id: AgentId, commits: CommittedCalls) {
         {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let Some(session) = state
                 .scopes
                 .get_mut(root_session_id)
@@ -2230,7 +2214,7 @@ impl Registry {
     }
 
     async fn reset_resume_attempts(&self, root_session_id: &str, id: AgentId) {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.acquire().await;
         if let Some(session) = state
             .scopes
             .get_mut(root_session_id)
@@ -2309,7 +2293,7 @@ impl Registry {
             return;
         };
         {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let Some(session) = state
                 .scopes
                 .get_mut(root_session_id)
@@ -2377,7 +2361,7 @@ impl Registry {
 
     async fn running_harness(&self, root_session_id: &str, id: AgentId) -> Option<HarnessHandle> {
         self.state
-            .lock()
+            .acquire()
             .await
             .scopes
             .get(root_session_id)
@@ -2443,7 +2427,7 @@ impl Registry {
             }
         }
         let mut report = RestoreReport::default();
-        let mut state = self.state.lock().await;
+        let mut state = self.state.acquire().await;
         if state
             .scopes
             .get(root_session_id)
@@ -2503,10 +2487,9 @@ impl Registry {
                 )
             })?;
         }
-        self.pending_resume
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root_session_id.to_owned(), report.interrupted.clone());
+        self.pending_resume.update(|pending| {
+            pending.insert(root_session_id.to_owned(), report.interrupted.clone());
+        });
         self.changed();
         Ok(report)
     }
@@ -2557,28 +2540,23 @@ impl Registry {
     ) -> Vec<(AgentId, std::io::Result<MessageReceipt>)> {
         let ids = self
             .pending_resume
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(root_session_id)
-            .cloned()
+            .read(|pending| pending.get(root_session_id).cloned())
             .unwrap_or_default();
         let mut results = Vec::with_capacity(ids.len());
         let settle = |id: AgentId| {
-            let mut pending = self
-                .pending_resume
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(ids) = pending.get_mut(root_session_id) {
-                ids.retain(|pending| *pending != id);
-                if ids.is_empty() {
-                    pending.remove(root_session_id);
+            self.pending_resume.update(|pending| {
+                if let Some(ids) = pending.get_mut(root_session_id) {
+                    ids.retain(|pending| *pending != id);
+                    if ids.is_empty() {
+                        pending.remove(root_session_id);
+                    }
                 }
-            }
+            });
         };
         for id in ids {
             let (task, evidence) = self
                 .state
-                .lock()
+                .acquire()
                 .await
                 .scopes
                 .get(root_session_id)
@@ -2634,17 +2612,11 @@ impl Registry {
     }
 
     pub fn set_spawn_router(&self, router: Arc<dyn crate::SpawnRouter>) {
-        *self
-            .spawn_router
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(router);
+        self.spawn_router.set(Some(router));
     }
 
     pub(super) fn spawn_router(&self) -> Option<Arc<dyn crate::SpawnRouter>> {
-        self.spawn_router
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        Option::clone(&self.spawn_router.get())
     }
 
     pub fn set_max_concurrency(&self, limit: usize) {
@@ -2659,7 +2631,7 @@ impl Registry {
     pub async fn is_root_session(&self, session_id: &str) -> bool {
         !self
             .state
-            .lock()
+            .acquire()
             .await
             .root_by_session
             .contains_key(session_id)
@@ -2667,7 +2639,7 @@ impl Registry {
 
     pub async fn child_session_id(&self, caller: &str, id: AgentId) -> std::io::Result<String> {
         self.await_restored(caller).await?;
-        let state = self.state.lock().await;
+        let state = self.state.acquire().await;
         let root = state.authorize(caller, id)?;
         state
             .scopes
@@ -2680,7 +2652,7 @@ impl Registry {
     #[doc(hidden)]
     pub async fn host_context(&self, root_session_id: &str, id: AgentId) -> Option<Arc<str>> {
         self.state
-            .lock()
+            .acquire()
             .await
             .scopes
             .get(root_session_id)
@@ -2689,7 +2661,7 @@ impl Registry {
     }
 
     pub(super) async fn descriptor_for_session(&self, session_id: &str) -> Option<AgentDescriptor> {
-        let state = self.state.lock().await;
+        let state = self.state.acquire().await;
         let root_session_id = state.root_by_session.get(session_id)?;
         state
             .scopes
@@ -2702,7 +2674,7 @@ impl Registry {
 
     #[doc(hidden)]
     pub async fn host_context_for_session(&self, session_id: &str) -> Option<Arc<str>> {
-        let state = self.state.lock().await;
+        let state = self.state.acquire().await;
         let root_session_id = state.root_by_session.get(session_id)?;
         state
             .scopes
@@ -2714,7 +2686,7 @@ impl Registry {
     }
 
     pub(super) async fn reserve(&self, session_id: &str) -> std::io::Result<AgentReservation> {
-        self.state.lock().await.reserve_for(session_id)
+        self.state.acquire().await.reserve_for(session_id)
     }
 
     pub(super) async fn reserve_many(
@@ -2722,7 +2694,7 @@ impl Registry {
         session_id: &str,
         count: usize,
     ) -> std::io::Result<Vec<AgentReservation>> {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.acquire().await;
         (0..count).map(|_| state.reserve_for(session_id)).collect()
     }
 
@@ -2749,7 +2721,7 @@ impl Registry {
     ) -> std::io::Result<(SubmissionOutcome, bool)> {
         self.await_restored(session_id).await?;
         let (outcome, root) = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let outcome = state.submit_result(session_id, instruction_revision, output)?;
             (outcome, state.root_session_id(session_id).to_owned())
         };
@@ -2795,21 +2767,33 @@ impl Registry {
             return;
         };
         let key = (root_session_id.to_owned(), id);
-        let mut queues = self
-            .status_queues
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let job = match queues.get(&key) {
-            Some(sender) => match sender.send(job) {
-                Ok(()) => return,
-                Err(mpsc::error::SendError(job)) => job,
-            },
-            None => job,
+        let mut job = job;
+        let (sender, mut receiver) = loop {
+            if let Some(sender) = self
+                .status_queues
+                .read(|queues| queues.get(&key).cloned())
+                .filter(|sender| !sender.is_closed())
+            {
+                match sender.send(job) {
+                    Ok(()) => return,
+                    Err(mpsc::error::SendError(returned)) => job = returned,
+                }
+            }
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let installed = self
+                .status_queues
+                .try_update(|queues| match queues.get(&key) {
+                    Some(existing) if !existing.is_closed() => None,
+                    _ => {
+                        queues.insert(key.clone(), sender.clone());
+                        Some(())
+                    }
+                });
+            if installed.is_some() {
+                break (sender, receiver);
+            }
         };
-        let (sender, mut receiver) = mpsc::unbounded_channel();
         let _ = sender.send(job);
-        queues.insert(key.clone(), sender);
-        drop(queues);
         drop(platform::spawn(async move {
             while let Some(job) = receiver.recv().await {
                 let Some(registry) = registry.upgrade() else {
@@ -2852,7 +2836,7 @@ impl Registry {
     }
 
     async fn send_unless_closed(&self, root_session_id: &str, id: AgentId, update: AgentUpdate) {
-        let state = self.state.lock().await;
+        let state = self.state.acquire().await;
         let closed = state
             .scopes
             .get(root_session_id)
@@ -2867,7 +2851,7 @@ impl Registry {
 
     pub async fn acknowledge_completion(&self, root_session_id: &str, id: AgentId, revision: u64) {
         let acknowledged = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             match state
                 .scopes
                 .get_mut(root_session_id)
@@ -2881,22 +2865,25 @@ impl Registry {
             }
         };
         if acknowledged {
-            lock_unpoisoned(&self.completion_retries).remove(&(root_session_id.to_owned(), id));
+            self.completion_retries.update(|retries| {
+                retries.remove(&(root_session_id.to_owned(), id));
+            });
             self.changed();
         }
     }
 
     pub fn retry_completion(self: &Arc<Self>, root_session_id: &str, id: AgentId, revision: u64) {
         let key = (root_session_id.to_owned(), id);
-        let delay = {
-            let mut retries = lock_unpoisoned(&self.completion_retries);
+        let Some(delay) = self.completion_retries.try_update(|retries| {
             let entry = retries.entry(key.clone()).or_insert((0, false));
             if entry.1 {
-                return;
+                return None;
             }
             entry.1 = true;
             entry.0 = entry.0.saturating_add(1);
-            completion_retry_delay(entry.0)
+            Some(completion_retry_delay(entry.0))
+        }) else {
+            return;
         };
         tracing::warn!(%id, revision, ?delay, "subagent completion was not delivered; retrying");
 
@@ -2906,11 +2893,13 @@ impl Registry {
             let Some(registry) = registry.upgrade() else {
                 return;
             };
-            if let Some(entry) = lock_unpoisoned(&registry.completion_retries).get_mut(&key) {
-                entry.1 = false;
-            }
+            registry.completion_retries.update(|retries| {
+                if let Some(entry) = retries.get_mut(&key) {
+                    entry.1 = false;
+                }
+            });
             let status = {
-                let state = registry.state.lock().await;
+                let state = registry.state.acquire().await;
                 state
                     .scopes
                     .get(&key.0)
@@ -2937,7 +2926,7 @@ impl Registry {
     async fn announce_restored_completions(&self, root_session_id: &str, ids: &[AgentId]) {
         for &id in ids {
             let announced = {
-                let mut state = self.state.lock().await;
+                let mut state = self.state.acquire().await;
                 let Some(session) = state
                     .scopes
                     .get_mut(root_session_id)
@@ -2980,7 +2969,7 @@ impl Registry {
         id: AgentId,
     ) -> Option<TurnSteer> {
         self.state
-            .lock()
+            .acquire()
             .await
             .begin_turn_steer(root_session_id, id)
     }
@@ -2992,7 +2981,7 @@ impl Registry {
         committed: bool,
     ) {
         self.state
-            .lock()
+            .acquire()
             .await
             .finish_turn_steer(root_session_id, steer, committed);
     }
@@ -3021,7 +3010,7 @@ impl Registry {
         } else {
             None
         };
-        let mut state = self.state.lock().await;
+        let mut state = self.state.acquire().await;
         state.validate_insert(&root_session_id, &descriptor)?;
         let (harness, harness_task) = harness::spawn(
             root_session_id.clone(),
@@ -3083,7 +3072,7 @@ impl Registry {
         if let Err(error) = saved {
             if let Some(session) = self
                 .state
-                .lock()
+                .acquire()
                 .await
                 .scopes
                 .get_mut(&root_session_id)
@@ -3111,7 +3100,7 @@ impl Registry {
     ) -> std::io::Result<()> {
         let harness = self
             .state
-            .lock()
+            .acquire()
             .await
             .harness_in_scope(root_session_id, id)?;
         harness.start(prompt, capacity).await
@@ -3137,7 +3126,7 @@ impl Registry {
     ) -> Option<u64> {
         let mut descriptor = None;
         let revision = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let last_used = state.next_access();
             let session = state
                 .scopes
@@ -3200,7 +3189,7 @@ impl Registry {
         error: String,
     ) {
         let status = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let Some(session) = state
                 .scopes
                 .get_mut(root_session_id)
@@ -3228,7 +3217,7 @@ impl Registry {
         result: AgentResult<TurnResult>,
     ) {
         let status = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let Some(session) = state
                 .scopes
                 .get_mut(root_session_id)
@@ -3302,12 +3291,12 @@ impl Registry {
 
     async fn enforce_resident_limit(&self, root_session_id: &str) {
         let locks = self.scope_locks(root_session_id);
-        let _residency_guard = locks.residency.lock().await;
+        let _residency_guard = locks.residency.enter().await;
         loop {
-            let _message_guard = locks.message.lock().await;
+            let _message_guard = locks.message.enter().await;
             let eviction = self
                 .state
-                .lock()
+                .acquire()
                 .await
                 .take_resident_eviction(root_session_id, self.max_resident.load(Ordering::Relaxed));
             let Some(ResidentEviction { id, harness }) = eviction else {
@@ -3324,7 +3313,7 @@ impl Registry {
                     };
                     if let Some(session) = self
                         .state
-                        .lock()
+                        .acquire()
                         .await
                         .scopes
                         .get_mut(root_session_id)
@@ -3337,7 +3326,7 @@ impl Registry {
                 Err(_) => {
                     if let Some(session) = self
                         .state
-                        .lock()
+                        .acquire()
                         .await
                         .scopes
                         .get_mut(root_session_id)
@@ -3355,7 +3344,7 @@ impl Registry {
             }
 
             let tasks = {
-                let mut state = self.state.lock().await;
+                let mut state = self.state.acquire().await;
                 let session = state
                     .scopes
                     .get_mut(root_session_id)
@@ -3375,7 +3364,7 @@ impl Registry {
 
     pub(super) async fn harness_closed(&self, root_session_id: &str, id: AgentId) {
         let (status_update, detach) = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let Some(scope) = state.scopes.get_mut(root_session_id) else {
                 return;
             };
@@ -3415,7 +3404,7 @@ impl Registry {
 
     async fn runtime_closed(&self, root_session_id: &str, id: AgentId) {
         let harness = {
-            let state = self.state.lock().await;
+            let state = self.state.acquire().await;
             state
                 .scopes
                 .get(root_session_id)
@@ -3440,11 +3429,7 @@ impl Registry {
     }
 
     fn schedule_parent_continuation(&self, root_session_id: &str, id: AgentId, revision: u64) {
-        let resolver = self
-            .parent_resolver
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let resolver = Option::clone(&self.parent_resolver.get());
         let (Some(resolver), Some(registry)) = (resolver, self.this.get().and_then(Weak::upgrade))
         else {
             return;
@@ -3476,11 +3461,13 @@ impl Registry {
                 "subagent completion parent is not the root session",
             ));
         }
-        let dispatch = lock_unpoisoned(&self.completion_dispatch)
-            .entry((root_session_id.to_owned(), id))
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _dispatch = dispatch.lock().await;
+        let dispatch = self.completion_dispatch.update(|dispatch| {
+            dispatch
+                .entry((root_session_id.to_owned(), id))
+                .or_default()
+                .clone()
+        });
+        let _dispatch = dispatch.enter().await;
         if self
             .peek_completion(root_session_id, id, revision)
             .await
@@ -3508,10 +3495,12 @@ impl Registry {
             .await
         {
             Ok(_) => {
-                lock_unpoisoned(&self.wait_reported).insert(
-                    (root_session_id.to_owned(), id),
-                    wait_mark(&status, revision),
-                );
+                self.wait_reported.update(|reported| {
+                    reported.insert(
+                        (root_session_id.to_owned(), id),
+                        wait_mark(&status, revision),
+                    );
+                });
                 self.acknowledge_completion(root_session_id, id, revision)
                     .await;
                 if self.store_for(root_session_id).is_some()
@@ -3541,7 +3530,7 @@ impl Registry {
         id: AgentId,
         revision: u64,
     ) -> Option<(AgentStatus, String)> {
-        let state = self.state.lock().await;
+        let state = self.state.acquire().await;
         state
             .scopes
             .get(root_session_id)
@@ -3558,7 +3547,7 @@ impl Registry {
     }
 
     async fn restore_completion(&self, root_session_id: &str, id: AgentId, revision: u64) {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.acquire().await;
         if let Some(session) = state
             .scopes
             .get_mut(root_session_id)
@@ -3575,7 +3564,7 @@ impl Registry {
 
     async fn observe_completions(&self, root_session_id: &str, ids: &[AgentId]) {
         let observed = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let Some(scope) = state.scopes.get_mut(root_session_id) else {
                 return;
             };
@@ -3591,11 +3580,11 @@ impl Registry {
         if observed.is_empty() {
             return;
         }
-        let mut retries = lock_unpoisoned(&self.completion_retries);
-        for id in observed {
-            retries.remove(&(root_session_id.to_owned(), id));
-        }
-        drop(retries);
+        self.completion_retries.update(|retries| {
+            for id in &observed {
+                retries.remove(&(root_session_id.to_owned(), *id));
+            }
+        });
         self.changed();
     }
 
@@ -3606,16 +3595,14 @@ impl Registry {
         include_self: bool,
     ) -> std::io::Result<Vec<AgentDirectoryEntry>> {
         self.await_restored(session_id).await?;
-        let state = self.state.lock().await;
+        let state = self.state.acquire().await;
         let mut entries = state.directory(session_id, include_completed, include_self);
         let root = state.root_session_id(session_id).to_owned();
         drop(state);
 
         if let Some(resuming) = self
             .pending_resume
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&root)
+            .read(|pending| pending.get(&root).cloned())
         {
             for entry in &mut entries {
                 entry.resuming = matches!(entry.status, AgentStatus::Interrupted)
@@ -3627,10 +3614,9 @@ impl Registry {
 
     pub(crate) fn register_handle(self: &Arc<Self>, handle: AgentHandle) {
         self.adopt_journal(&handle);
-        self.session_handles
-            .write()
-            .expect("session handles poisoned")
-            .insert(handle.session_id().to_owned(), handle);
+        self.session_handles.update(|handles| {
+            handles.insert(handle.session_id().to_owned(), handle.clone());
+        });
     }
 
     async fn rehydrate(
@@ -3640,7 +3626,7 @@ impl Registry {
         purpose: MessagePurpose,
     ) -> std::io::Result<()> {
         let (root, mut missing) = {
-            let state = self.state.lock().await;
+            let state = self.state.acquire().await;
             let root = state.root_session_id(session_id).to_owned();
             let scope = state
                 .scopes
@@ -3701,10 +3687,7 @@ impl Registry {
             };
             let parent = self
                 .session_handles
-                .read()
-                .expect("session handles poisoned")
-                .get(&parent_session)
-                .cloned()
+                .read(|handles| handles.get(&parent_session).cloned())
                 .ok_or_else(|| {
                     std::io::Error::other("subagent parent runtime is unavailable for rehydration")
                 })?;
@@ -3738,7 +3721,7 @@ impl Registry {
                 contract.schema,
                 needs_assignment.then(|| super::model::agent_prompt(id, &task)),
             );
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let session = state
                 .scopes
                 .get_mut(&root)
@@ -3807,10 +3790,10 @@ impl Registry {
         user: bool,
     ) -> std::io::Result<MessageReceipt> {
         let locks = self.session_locks(session_id).await;
-        let _residency_guard = locks.residency.lock().await;
-        let _message_guard = locks.message.lock().await;
+        let _residency_guard = locks.residency.enter().await;
+        let _message_guard = locks.message.enter().await;
         self.rehydrate(session_id, to, purpose).await?;
-        let prepared = self.state.lock().await.prepare_message(
+        let prepared = self.state.acquire().await.prepare_message(
             session_id,
             to,
             priority,
@@ -3823,14 +3806,14 @@ impl Registry {
             .harness
             .enqueue_delivery(prepared.message.clone())?;
         self.state
-            .lock()
+            .acquire()
             .await
             .commit_message(&prepared.root_session_id, prepared.message.clone())?;
         if self.store_for(&prepared.root_session_id).is_some()
             && let Err(error) = self.persist_durably(&prepared.root_session_id).await
         {
             self.state
-                .lock()
+                .acquire()
                 .await
                 .rollback_message(&prepared.root_session_id, prepared.message.id);
             return Err(error);
@@ -3839,7 +3822,7 @@ impl Registry {
             Ok(disposition) => disposition,
             Err(error) => {
                 self.state
-                    .lock()
+                    .acquire()
                     .await
                     .rollback_message(&prepared.root_session_id, prepared.message.id);
                 return Err(error);
@@ -3864,7 +3847,7 @@ impl Registry {
         disposition: MessageDisposition,
     ) {
         let thread = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let thread = state.thread_for_message(root_session_id, id);
             state.mark_message_admitted(root_session_id, id, disposition);
             thread
@@ -3885,7 +3868,7 @@ impl Registry {
 
     pub(super) async fn message_rejected(&self, root_session_id: &str, id: MessageId) {
         self.state
-            .lock()
+            .acquire()
             .await
             .rollback_message(root_session_id, id);
     }
@@ -3911,7 +3894,7 @@ impl Registry {
     ) -> Option<DelegationChange> {
         let (change, descriptor) = self
             .state
-            .lock()
+            .acquire()
             .await
             .begin_delegation(root_session_id, id)?;
         self.send(root_session_id, AgentUpdate::Added(descriptor));
@@ -3926,7 +3909,7 @@ impl Registry {
     ) {
         let descriptor = self
             .state
-            .lock()
+            .acquire()
             .await
             .rollback_delegation(root_session_id, change);
         if let Some(descriptor) = descriptor {
@@ -3948,7 +3931,7 @@ impl Registry {
     ) {
         let thread = self
             .state
-            .lock()
+            .acquire()
             .await
             .thread_for_message(root_session_id, message_id);
         let Some(thread) = thread else {
@@ -3964,7 +3947,7 @@ impl Registry {
         );
         self.changed();
         self.state
-            .lock()
+            .acquire()
             .await
             .mark_message_terminal(root_session_id, message_id);
     }
@@ -3999,17 +3982,14 @@ impl Registry {
         let deadline = Instant::now().checked_add(duration);
         loop {
             let (snapshot, root) = {
-                let state = self.state.lock().await;
+                let state = self.state.acquire().await;
                 let root = state.root_session_id(session_id).to_owned();
                 (state.wait_snapshot(session_id, ids)?, root)
             };
 
             let resuming = self
                 .pending_resume
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&root)
-                .cloned()
+                .read(|pending| pending.get(&root).cloned())
                 .unwrap_or_default();
             let terminal = snapshot
                 .iter()
@@ -4025,10 +4005,9 @@ impl Registry {
             let all_terminal = terminal.len() == snapshot.len();
             let summaries = snapshot.into_iter().map(|(summary, _)| summary).collect();
 
-            let mut fresh = false;
-            let mut delivered = HashSet::new();
-            {
-                let mut reported = lock_unpoisoned(&self.wait_reported);
+            let (fresh, delivered) = self.wait_reported.update(|reported| {
+                let mut fresh = false;
+                let mut delivered = HashSet::new();
                 for &(id, mark) in &terminal {
                     if reported.insert((session_id.to_owned(), id), mark) == Some(mark) {
                         delivered.insert(id);
@@ -4036,9 +4015,12 @@ impl Registry {
                         fresh = true;
                     }
                 }
-            }
+                (fresh, delivered)
+            });
             if fresh {
-                lock_unpoisoned(&self.idle_waits).remove(session_id);
+                self.idle_waits.update(|idle| {
+                    idle.remove(session_id);
+                });
                 if root == session_id {
                     let ids = terminal.iter().map(|(id, _)| *id).collect::<Vec<_>>();
                     self.observe_completions(&root, &ids).await;
@@ -4049,16 +4031,18 @@ impl Registry {
                 let mut key = ids.to_vec();
                 key.sort_unstable();
                 key.dedup();
-                let mut idle = lock_unpoisoned(&self.idle_waits);
-                let entry = idle
-                    .entry(session_id.to_owned())
-                    .or_insert_with(|| (key.clone(), 0));
-                if entry.0 != key {
-                    *entry = (key, 0);
-                }
-                entry.1 += 1;
-                if entry.1 > IDLE_WAIT_LIMIT {
-                    let ids = entry.0.iter().map(ToString::to_string).collect::<Vec<_>>();
+                let exhausted = self.idle_waits.update(|idle| {
+                    let entry = idle
+                        .entry(session_id.to_owned())
+                        .or_insert_with(|| (key.clone(), 0));
+                    if entry.0 != key {
+                        *entry = (key.clone(), 0);
+                    }
+                    entry.1 += 1;
+                    (entry.1 > IDLE_WAIT_LIMIT)
+                        .then(|| entry.0.iter().map(ToString::to_string).collect::<Vec<_>>())
+                });
+                if let Some(ids) = exhausted {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
@@ -4069,7 +4053,9 @@ impl Registry {
                 }
                 return Ok((summaries, delivered, false));
             }
-            lock_unpoisoned(&self.idle_waits).remove(session_id);
+            self.idle_waits.update(|idle| {
+                idle.remove(session_id);
+            });
             let timed_out = match deadline {
                 Some(deadline) => timeout_at(deadline, revision.changed()).await.is_err(),
                 None => {
@@ -4078,7 +4064,7 @@ impl Registry {
                 }
             };
             if timed_out {
-                let summaries = self.state.lock().await.summaries(session_id, ids)?;
+                let summaries = self.state.acquire().await.summaries(session_id, ids)?;
                 return Ok((summaries, delivered, true));
             }
         }
@@ -4091,9 +4077,9 @@ impl Registry {
     ) -> std::io::Result<Vec<AgentSummary>> {
         self.await_restored(session_id).await?;
         let locks = self.session_locks(session_id).await;
-        let _message_guard = locks.message.lock().await;
+        let _message_guard = locks.message.enter().await;
         let (root_session_id, ids, harnesses) = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             state.request_interrupt(session_id, id)?
         };
         self.changed();
@@ -4101,7 +4087,7 @@ impl Registry {
         self.interrupt_harnesses(&root_session_id, &ids, harnesses, deadline)
             .await?;
         self.state
-            .lock()
+            .acquire()
             .await
             .summaries_in_scope(&root_session_id, &ids)
     }
@@ -4109,14 +4095,14 @@ impl Registry {
     pub async fn close(&self, session_id: &str, id: AgentId) -> std::io::Result<Vec<AgentSummary>> {
         self.await_restored(session_id).await?;
         let locks = self.session_locks(session_id).await;
-        let _message_guard = locks.message.lock().await;
+        let _message_guard = locks.message.enter().await;
         let CloseRequest {
             root_session_id,
             ids,
             harnesses,
             status_updates,
         } = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             state.request_close(session_id, id)?
         };
         for (id, status) in status_updates {
@@ -4128,7 +4114,7 @@ impl Registry {
             .await?;
         let frozen = self
             .state
-            .lock()
+            .acquire()
             .await
             .scopes
             .get(&root_session_id)
@@ -4168,17 +4154,15 @@ impl Registry {
     async fn close_all(&self, session_id: &str) -> std::io::Result<Vec<AgentSummary>> {
         self.await_restored(session_id).await?;
         let locks = self.session_locks(session_id).await;
-        let _message_guard = locks.message.lock().await;
+        let _message_guard = locks.message.enter().await;
         let mut revision = self.revision.subscribe();
         let capture_deadline = Instant::now() + AGENT_STOP_TIMEOUT;
         let (request, final_journal) = loop {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             let root = state.root_session_id(session_id).to_owned();
             let captures_pending = self
                 .pending_checkpoints
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&root);
+                .read(|pending| pending.contains_key(&root));
             if captures_pending {
                 drop(state);
 
@@ -4189,10 +4173,9 @@ impl Registry {
                     }
                     Err(_) => {
                         tracing::warn!(%root, "subagent checkpoint capture timed out during shutdown");
-                        self.pending_checkpoints
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&root);
+                        self.pending_checkpoints.update(|pending| {
+                            pending.remove(&root);
+                        });
                         continue;
                     }
                 }
@@ -4204,10 +4187,7 @@ impl Registry {
                 .is_some_and(|scope| scope.journal_frozen);
             let final_journal = match self.store_for(&root) {
                 Some(_) if !frozen => {
-                    let checkpoints = self
-                        .checkpoints
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let checkpoints = self.checkpoints.get();
                     let scope = state.scope_mut(&root);
                     let payload = scope.journal_payload(&root, &checkpoints)?;
                     scope.journal_frozen = true;
@@ -4238,10 +4218,9 @@ impl Registry {
             .stop_and_close(root_session_id, ids, harnesses, true)
             .await;
         if result.is_ok() {
-            self.session_handles
-                .write()
-                .expect("session handles poisoned")
-                .remove(&root);
+            self.session_handles.update(|handles| {
+                handles.remove(&root);
+            });
         }
         let summaries = result?;
         journal_result?;
@@ -4270,7 +4249,7 @@ impl Registry {
             event_tasks,
         } = self
             .state
-            .lock()
+            .acquire()
             .await
             .finish_close(&root_session_id, &ids)?;
         for summary in &summaries {
@@ -4285,7 +4264,7 @@ impl Registry {
             );
         }
         let closed_sessions = {
-            let state = self.state.lock().await;
+            let state = self.state.acquire().await;
             state
                 .scopes
                 .get(&root_session_id)
@@ -4301,15 +4280,11 @@ impl Registry {
                 })
                 .unwrap_or_default()
         };
-        {
-            let mut handles = self
-                .session_handles
-                .write()
-                .expect("session handles poisoned");
-            for session in closed_sessions {
-                handles.remove(&session);
+        self.session_handles.update(|handles| {
+            for session in &closed_sessions {
+                handles.remove(session);
             }
-        }
+        });
         self.changed();
         self.wait_for_tasks(harness_tasks, deadline, "subagent harnesses")
             .await?;
@@ -4323,9 +4298,9 @@ impl Registry {
             return;
         }
         let locks = self.session_locks(session_id).await;
-        let _message_guard = locks.message.lock().await;
+        let _message_guard = locks.message.enter().await;
         let (root_session_id, ids, harnesses) = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.acquire().await;
             state.request_interrupt_all(session_id)
         };
         self.changed();
@@ -4425,7 +4400,12 @@ impl Registry {
     ) -> std::io::Result<()> {
         let mut revision = self.revision.subscribe();
         loop {
-            if self.state.lock().await.all_inactive(root_session_id, ids)? {
+            if self
+                .state
+                .acquire()
+                .await
+                .all_inactive(root_session_id, ids)?
+            {
                 return Ok(());
             }
             timeout_at(deadline, revision.changed())
@@ -4648,11 +4628,9 @@ pub(super) fn forward_events(
                     registry.commit_boundary(&root_session_id, id).await;
                 }
                 if completed_tool {
-                    registry
-                        .completed_tools
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert((root_session_id.clone(), id));
+                    registry.completed_tools.update(|completed| {
+                        completed.insert((root_session_id.clone(), id));
+                    });
                 }
                 if progress {
                     registry.capture_progress(&root_session_id, id);

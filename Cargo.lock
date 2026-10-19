@@ -2153,6 +2153,7 @@ dependencies = [
  "nanocode-agent-core",
  "nanocode-platform",
  "nanocode-schema",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "serde",
  "serde_json",
