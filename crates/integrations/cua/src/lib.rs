@@ -77,7 +77,10 @@ impl ComputerConfig {
                 "CUA_REPL_NODE_REPL_PATH",
                 node_repl.clone().into_os_string(),
             ),
-            ("CUA_REPL_ENABLED_SURFACES", OsString::from("computer")),
+            (
+                "CUA_REPL_ENABLED_SURFACES",
+                OsString::from("browser,computer"),
+            ),
             (
                 "NODE_REPL_NODE_PATH",
                 base.join("bin/node").into_os_string(),
