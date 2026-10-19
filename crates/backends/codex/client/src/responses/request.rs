@@ -1,8 +1,9 @@
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use serde::{Serialize, Serializer, ser::SerializeSeq};
+use serde_json::value::{RawValue, to_raw_value};
 
-use super::ResponseItem;
+use super::{ContentItem, FunctionOutputBody, FunctionOutputContent, ResponseItem};
 use crate::client::{ModelConfig, Thinking, pricing::ServiceTier, responses::StrictJsonSchema};
 
 #[derive(Clone)]
@@ -12,7 +13,7 @@ pub struct RequestProfile {
     prompt_cache_key: String,
     prefix: Arc<[ResponseItem]>,
     code_mode_tool_names: Arc<BTreeMap<String, CodeModeToolName>>,
-    tool_namespaces_info: Arc<BTreeMap<String, serde_json::Value>>,
+    tool_namespaces_info: Arc<RawValue>,
     logical_turn: u64,
     retained_config: Option<RetainedRequestConfig>,
 }
@@ -32,18 +33,17 @@ impl RequestProfile {
         prefix: Arc<[ResponseItem]>,
     ) -> Self {
         let session_id = session_id.into();
-        let mut profile = Self {
+        let code_mode_tool_names = Arc::default();
+        Self {
             thread_id: session_id.clone(),
             session_id,
             prompt_cache_key: prompt_cache_key.into(),
+            tool_namespaces_info: tool_namespaces_info(&prefix, &code_mode_tool_names),
             prefix,
-            code_mode_tool_names: Arc::default(),
-            tool_namespaces_info: Arc::default(),
+            code_mode_tool_names,
             logical_turn: 0,
             retained_config: None,
-        };
-        profile.tool_namespaces_info = Arc::new(tool_namespaces_info(&profile));
-        profile
+        }
     }
 
     #[must_use]
@@ -97,8 +97,8 @@ impl RequestProfile {
         store_responses: bool,
     ) -> Self {
         self.prompt_cache_key = prompt_cache_key;
+        self.tool_namespaces_info = tool_namespaces_info(&prefix, &self.code_mode_tool_names);
         self.prefix = prefix;
-        self.tool_namespaces_info = Arc::new(tool_namespaces_info(&self));
         self.retained_config = Some(RetainedRequestConfig {
             model_id_prefix,
             reasoning_mode,
@@ -117,7 +117,7 @@ impl RequestProfile {
                 .map(|(identifier, name)| (identifier, CodeModeToolName::from_flat_name(name)))
                 .collect(),
         );
-        self.tool_namespaces_info = Arc::new(tool_namespaces_info(&self));
+        self.tool_namespaces_info = tool_namespaces_info(&self.prefix, &self.code_mode_tool_names);
         self
     }
 }
@@ -535,18 +535,57 @@ impl Serialize for RequestResponseItem<'_> {
     where
         S: serde::Serializer,
     {
-        if self.strip_image_detail || self.item.id().is_some_and(|id| !id.is_prefixed()) {
+        let unprefixed_id = self.item.id().is_some_and(|id| !id.is_prefixed());
+        let strip_image_detail = self.strip_image_detail && has_image_detail(self.item);
+        if unprefixed_id || strip_image_detail {
             let mut item = self.item.clone();
-            if item.id().is_some_and(|id| !id.is_prefixed()) {
+            if unprefixed_id {
                 item.set_id(None);
             }
-            if self.strip_image_detail {
+            if strip_image_detail {
                 item.strip_image_details();
             }
             item.serialize(serializer)
         } else {
             self.item.serialize(serializer)
         }
+    }
+}
+
+fn has_image_detail(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { content, .. } => content.iter().any(|part| {
+            matches!(
+                part,
+                ContentItem::InputImage {
+                    detail: Some(_),
+                    ..
+                } | ContentItem::InputImageFile {
+                    detail: Some(_),
+                    ..
+                }
+            )
+        }),
+        ResponseItem::FunctionCallOutput {
+            output: FunctionOutputBody::Content(content),
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            output: FunctionOutputBody::Content(content),
+            ..
+        } => content.iter().any(|part| {
+            matches!(
+                part,
+                FunctionOutputContent::InputImage {
+                    detail: Some(_),
+                    ..
+                } | FunctionOutputContent::InputImageFile {
+                    detail: Some(_),
+                    ..
+                }
+            )
+        }),
+        _ => false,
     }
 }
 
@@ -788,7 +827,7 @@ impl Serialize for SerializedTurnMetadata<'_> {
             thread_id: &'a str,
             turn_id: String,
             request_kind: &'static str,
-            tool_namespaces_info: &'a BTreeMap<String, serde_json::Value>,
+            tool_namespaces_info: &'a RawValue,
         }
 
         let profile = self.profile;
@@ -804,7 +843,10 @@ impl Serialize for SerializedTurnMetadata<'_> {
     }
 }
 
-fn tool_namespaces_info(profile: &RequestProfile) -> BTreeMap<String, serde_json::Value> {
+fn tool_namespaces_info(
+    prefix: &[ResponseItem],
+    code_mode_tool_names: &BTreeMap<String, CodeModeToolName>,
+) -> Arc<RawValue> {
     use super::ToolDefinition;
     use serde_json::json;
     fn insert(
@@ -868,14 +910,14 @@ fn tool_namespaces_info(profile: &RequestProfile) -> BTreeMap<String, serde_json
         }
     }
     let mut result = BTreeMap::new();
-    for item in profile.prefix() {
+    for item in prefix {
         if let ResponseItem::AdditionalTools { tools, .. } = item {
             for tool in tools {
                 direct(&mut result, "functions", tool);
             }
         }
     }
-    for (identifier, tool) in profile.code_mode_tool_names.iter() {
+    for (identifier, tool) in code_mode_tool_names {
         insert(
             &mut result,
             tool.namespace.as_deref().unwrap_or("functions"),
@@ -885,5 +927,5 @@ fn tool_namespaces_info(profile: &RequestProfile) -> BTreeMap<String, serde_json
             false,
         );
     }
-    result
+    Arc::from(to_raw_value(&result).expect("JSON values serialize"))
 }
