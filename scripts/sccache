@@ -1,0 +1,148 @@
+#!/bin/sh
+case $1 in
+  */rustc-parallel-frontend | */clippy-driver | clippy-driver) exec "$@" ;;
+esac
+self_dir=$(cd "$(dirname "$0")" && pwd -P)
+sccache=
+IFS=:
+for dir in $PATH; do
+  if [ -x "$dir/sccache" ] && [ "$(cd "$dir" && pwd -P)" != "$self_dir" ]; then
+    sccache=$dir/sccache
+    break
+  fi
+done
+unset IFS
+[ -n "$sccache" ] || exec "$@"
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/nanocode/rustc
+if [ -z "${SCCACHE_SERVER_PORT:-}${SCCACHE_SERVER_UDS:-}" ]; then
+  mkdir -p "$cache"
+  SCCACHE_SERVER_UDS=$cache/sccache.sock
+  export SCCACHE_SERVER_UDS
+fi
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || ulimit -n "$(sysctl -n kern.maxfilesperproc)" 2>/dev/null
+cached() {
+  exec env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS "$sccache" "$@"
+}
+case $1 in
+  *rustc) ;;
+  *) cached "$@" ;;
+esac
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR
+if command -v shasum >/dev/null 2>&1; then
+  sum="shasum -a 256"
+else
+  sum=sha256sum
+fi
+publish() {
+  ln -sn "$1" "$2" 2>/dev/null || rm -rf "$1"
+}
+relocate() {
+  from=$(printf '%s' "$1" | sed 's/[][\.*^$#]/\\&/g')
+  to=$(printf '%s' "$2" | sed 's/[\&#]/\\&/g')
+  sed "s#$from#$to#g"
+}
+stable() {
+  stable_dir=
+  listing=$(cd "$1" && find . | LC_ALL=C sort && find . -type f -exec $sum {} + | LC_ALL=C sort) || return
+  key=$(printf '%s\n' "$listing" | $sum)
+  stable_dir=$cache/out/${key%% *}
+  if [ ! -e "$stable_dir" ]; then
+    mkdir -p "$cache/out"
+    staging=$(mktemp -d "$cache/out/.staging.XXXXXX")
+    if cp -cR "$1/." "$staging/" 2>/dev/null || cp -R "$1/." "$staging/"; then
+      publish "$staging" "$stable_dir"
+    else
+      rm -rf "$staging"
+    fi
+  fi
+}
+if [ -n "${OUT_DIR:-}" ] && [ -d "$OUT_DIR" ]; then
+  stable "$OUT_DIR"
+  [ -e "$stable_dir" ] && OUT_DIR=$stable_dir && export OUT_DIR
+fi
+registry=${CARGO_HOME:-$HOME/.cargo}/registry/src/
+linked= unkeyed= out_dir= suffix= source= previous=
+key_file=$(mktemp "${TMPDIR:-/tmp}/rustc-key.XXXXXX")
+trap 'rm -f "$key_file"' EXIT
+for arg do
+  shift
+  keyed=$arg
+  case $previous in
+    -L)
+      case $arg in
+        native=*/build/*/out | all=*/build/*/out | crate=*/build/*/out)
+          if [ -d "${arg#*=}" ]; then
+            stable "${arg#*=}"
+            [ -e "$stable_dir" ] && arg=${arg%%=*}=$stable_dir keyed=$arg
+          fi
+          ;;
+        dependency=*) keyed=dependency= ;;
+      esac
+      ;;
+    --out-dir) out_dir=$arg keyed= ;;
+    --extern)
+      case $linked$arg in
+        1*=*)
+          path=${arg#*=}
+          keyed="${arg%%=*}=${path##*/} $($sum < "$path")" || unkeyed=1
+          ;;
+      esac
+      ;;
+    --crate-type) [ "$arg" = proc-macro ] || [ "$arg" = bin ] && linked=1 ;;
+    -C)
+      case $arg in
+        extra-filename=*) suffix=${arg#extra-filename=} ;;
+      esac
+      ;;
+  esac
+  case $arg in
+    "$registry"*.rs) source=$arg ;;
+  esac
+  printf '%s\n' "$keyed" >> "$key_file"
+  previous=$arg
+  set -- "$@" "$arg"
+done
+if [ -z "$linked" ] || [ -n "$unkeyed" ] || [ -z "$source" ] || [ -z "$out_dir" ] || [ -z "$suffix" ]; then
+  rm -f "$key_file"
+  cached "$@"
+fi
+key=$( {
+  echo nanocode-rustc-cache-1
+  "$1" -vV
+  cat "$key_file"
+  env | LC_ALL=C sort | grep -E '^(CARGO_|OUT_DIR=|RUSTC_BOOTSTRAP=|MACOSX_DEPLOYMENT_TARGET=|SDKROOT=)' | grep -v '^CARGO_MAKEFLAGS='
+} | $sum)
+entry=$cache/units/${key%% *}
+if [ -f "$entry/out-dir" ]; then
+  cached_out=$(cat "$entry/out-dir")
+  for file in "$entry"/files/*; do
+    name=${file##*/}
+    case $name in
+      *.d) relocate "$cached_out" "$out_dir" < "$file" > "$out_dir/$name" || exit 1 ;;
+      *)
+        rm -f "$out_dir/$name"
+        cp -c "$file" "$out_dir/$name" 2>/dev/null || cp "$file" "$out_dir/$name" || exit 1
+        touch "$out_dir/$name"
+        ;;
+    esac
+  done
+  relocate "$cached_out" "$out_dir" < "$entry/stderr" >&2
+  exit 0
+fi
+stderr=$(mktemp "${TMPDIR:-/tmp}/rustc-stderr.XXXXXX")
+trap 'rm -f "$key_file" "$stderr"' EXIT
+"$@" 2> "$stderr"
+status=$?
+cat "$stderr" >&2
+[ $status -eq 0 ] || exit $status
+mkdir -p "$cache/units"
+staging=$(mktemp -d "$cache/units/.staging.XXXXXX")
+mkdir "$staging/files"
+for file in "$out_dir"/*"$suffix"*; do
+  [ -f "$file" ] || continue
+  cp -c "$file" "$staging/files/" 2>/dev/null || cp "$file" "$staging/files/" || { rm -rf "$staging"; exit 0; }
+done
+cp "$stderr" "$staging/stderr"
+printf '%s' "$out_dir" > "$staging/out-dir"
+publish "$staging" "$entry"
+exit 0
