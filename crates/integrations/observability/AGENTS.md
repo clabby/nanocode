@@ -11,6 +11,7 @@
 ## Instrumentation
 
 - tracing-opentelemetry ends a span at its last exit, not when it closes. Keep the span entered for the whole operation it measures, for example by instrumenting each stream poll, or the exported duration stops at the last poll. Record `duration_ns` when the measured work deliberately excludes queueing, as `tool.execute` does for admission.
+- `--telemetry` / `NANOCODE_TELEMETRY` selects what is recorded: `off` (no traces, metrics or local files), `agent` (the default) or `all`. Terminal rendering spans, the `nanocode_tui` crate's spans and the CLI's frame, view, render, input and app-event spans under `TUI_TARGET`, are exported only with `all`. In `agent` both OpenTelemetry layers filter them out by target, so their callsites have `Interest::never` and the spans are never created; frame metrics on the `nc_metrics` target stay on. In one terminal session they were 1,751 of 1,812 spans and 2.1 of 2.3 MB of trace data. Give new per-frame or rendering spans `target: TUI_TARGET`; the `nc.frame` fields below need `all`.
 - Parents are exported only when they end, so a running or interrupted turn leaves its children without an exported parent. Put `session.id` directly on agent-path spans: `model.call`, `tool.call`, `tool.execute`, `code_mode.cell`, `code_mode.cell_actor` and `code_mode.wait`. Cells and waits also carry the model's `tool.call_id`; nested calls use `<call_id>/code-<n>`.
 
 ## Analysis

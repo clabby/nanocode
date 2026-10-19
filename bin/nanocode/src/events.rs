@@ -1,6 +1,7 @@
 use std::{borrow::Cow, collections::HashMap, time::Duration};
 
 use nanocode::agent::events::{AgentEvent, AgentEventKind, TextDeltaRef};
+use nanocode_observability::TUI_TARGET;
 use nanocode_tui::{
     format::{humanize_tool, shorten_home},
     transcript::{CellKind, NoticeLevel, ToolBody, ToolCell, ToolStatus, Transcript},
@@ -203,7 +204,7 @@ impl EventMapper {
     }
 
     pub fn apply(&mut self, transcript: &mut Transcript, event: &AgentEvent) -> Mapped {
-        let _span = tracing::info_span!(target: "nanocode", "nc.transcript.apply", event.kind = ?event.kind, event.bytes = event.payload.get().len(), cells = transcript.len()).entered();
+        let _span = tracing::info_span!(target: TUI_TARGET, "nc.transcript.apply", event.kind = ?event.kind, event.bytes = event.payload.get().len(), cells = transcript.len()).entered();
         let mut mapped = Mapped {
             accepted: None,
             changed: false,

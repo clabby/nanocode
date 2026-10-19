@@ -29,6 +29,7 @@ pub use cli::ObservabilityOutputArgs;
 
 pub const DEFAULT_FILTER: &str = "warn,nanocode=info,nanocode_backend_codex=info,nanocode_backend_claude=info,nanocode_claude=info,nanocode_agent=info,nanocode_code_mode=info,nanocode_subagents=info,nanocode_durability=info,nanocode_store_jsonl=info,nanocode=info";
 pub const METRICS_TARGET: &str = "nc_metrics";
+pub const TUI_TARGET: &str = "nanocode_tui";
 
 const DEPLOYMENT_ENVIRONMENT_NAME: &str = "deployment.environment.name";
 const PROCESS_PID: &str = "process.pid";
@@ -44,6 +45,16 @@ pub enum LogFormat {
     Compact,
 
     Json,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Telemetry {
+    Off,
+
+    #[default]
+    Agent,
+
+    All,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -67,6 +78,7 @@ pub struct ObservabilityBuilder {
     environment: Option<String>,
     otlp_endpoint: Option<String>,
     otlp_directory: Option<PathBuf>,
+    telemetry: Telemetry,
     shutdown_timeout: Option<Duration>,
 }
 
@@ -108,6 +120,7 @@ impl ObservabilityBuilder {
             environment: None,
             otlp_endpoint: None,
             otlp_directory: None,
+            telemetry: Telemetry::Agent,
             shutdown_timeout: None,
         }
     }
@@ -151,6 +164,12 @@ impl ObservabilityBuilder {
     #[must_use]
     pub fn otlp_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.otlp_directory = Some(directory.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -200,6 +219,7 @@ impl ObservabilityBuilder {
             self.otlp_endpoint.as_deref(),
             self.otlp_directory.as_deref(),
         ) {
+            _ if self.telemetry == Telemetry::Off => (None, None),
             (endpoint, directory) if endpoint.is_some() || directory.is_some() => {
                 let resource = self.resource();
                 let files = directory.map(file::Exporters::create).transpose()?;
@@ -213,13 +233,15 @@ impl ObservabilityBuilder {
             }
             _ => (None, None),
         };
+        let terminal = self.telemetry == Telemetry::All;
         let tracing_layer = match &tracer_provider {
             Some(provider) => Some(
                 tracing_opentelemetry::layer()
                     .with_tracer(provider.tracer(self.service_name.clone()))
                     .with_filter(EnvFilter::try_new(self.otel_filter.as_str())?)
-                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    .with_filter(tracing_subscriber::filter::filter_fn(move |metadata| {
                         metadata.target() != METRICS_TARGET
+                            && (terminal || !terminal_target(metadata.target()))
                     })),
             ),
             None => None,
@@ -227,7 +249,10 @@ impl ObservabilityBuilder {
         let metrics_layer = match &meter_provider {
             Some(provider) => Some(
                 MetricsLayer::new(provider.clone())
-                    .with_filter(EnvFilter::try_new(self.otel_filter.as_str())?),
+                    .with_filter(EnvFilter::try_new(self.otel_filter.as_str())?)
+                    .with_filter(tracing_subscriber::filter::filter_fn(move |metadata| {
+                        terminal || !terminal_target(metadata.target())
+                    })),
             ),
             None => None,
         };
@@ -338,6 +363,12 @@ fn meter_provider(
         builder = builder.with_reader(PeriodicReader::builder(exporter).build());
     }
     Ok(builder.build())
+}
+
+fn terminal_target(target: &str) -> bool {
+    target
+        .strip_prefix(TUI_TARGET)
+        .is_some_and(|module| module.is_empty() || module.starts_with("::"))
 }
 
 fn signal_endpoint(endpoint: &str, signal: &str) -> String {

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, time::Instant};
 
 use nanocode::agent::events::{AgentEvent, AgentEventKind};
-use nanocode_observability::METRICS_TARGET;
+use nanocode_observability::{METRICS_TARGET, TUI_TARGET};
 use nanocode_tui::crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
 use opentelemetry::{Context, trace::TraceContextExt};
 use serde_json::Value;
@@ -56,7 +56,7 @@ pub fn input_span(event: &Event) -> Span {
         Event::FocusGained => "focus_gained",
         Event::FocusLost => "focus_lost",
     };
-    tracing::info_span!(target: "nanocode", "nc.input", input.action = action, input.redraw = Empty, session.id = Empty)
+    tracing::info_span!(target: TUI_TARGET, "nc.input", input.action = action, input.redraw = Empty, session.id = Empty)
 }
 
 #[derive(Default)]
@@ -269,7 +269,7 @@ impl FrameMetrics {
     }
 
     pub fn frame(&mut self, session: Option<&str>) -> Span {
-        let span = tracing::info_span!(target: "nanocode", "nc.frame", session.id = session, frame.input = self.input.is_some(), frame.stream = self.stream.is_some(), frame.resize = self.resize.is_some(), frame.input_ms = Empty, frame.stream_ms = Empty, frame.resize_ms = Empty, thread.cpu_ns = Empty, otel.status_code = Empty);
+        let span = tracing::info_span!(target: TUI_TARGET, "nc.frame", session.id = session, frame.input = self.input.is_some(), frame.stream = self.stream.is_some(), frame.resize = self.resize.is_some(), frame.input_ms = Empty, frame.stream_ms = Empty, frame.resize_ms = Empty, thread.cpu_ns = Empty, otel.status_code = Empty);
         if let Some(context) = self.input_context.take() {
             span.add_link(context.span().span_context().clone());
         }

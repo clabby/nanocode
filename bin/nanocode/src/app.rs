@@ -18,6 +18,7 @@ use nanocode::{
     },
     durability::{SessionSummary, TranscriptItem},
 };
+use nanocode_observability::TUI_TARGET;
 use nanocode_tui::{
     composer::{Composer, ComposerAction},
     crossterm::event::{
@@ -874,7 +875,7 @@ impl App {
     }
 
     fn handle_app(&mut self, event: AppEvent) -> Redraw {
-        let _span = tracing::info_span!(target: "nanocode", "nc.app_event", event.kind = event.kind(), session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        let _span = tracing::info_span!(target: TUI_TARGET, "nc.app_event", event.kind = event.kind(), session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         match event {
             AppEvent::Reload => {
                 self.request_reload(false);

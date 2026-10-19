@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum, builder::NonEmptyStringValueParser};
 
-use crate::{LogFormat, LogOutput, METRICS_TARGET, ObservabilityBuilder};
+use crate::{LogFormat, LogOutput, METRICS_TARGET, ObservabilityBuilder, Telemetry};
 
 #[derive(Clone, Debug, Args)]
 pub struct ObservabilityOutputArgs {
@@ -31,6 +31,16 @@ pub struct ObservabilityOutputArgs {
         help = "Write tracing logs to this file"
     )]
     log_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "NANOCODE_TELEMETRY",
+        global = true,
+        default_value_t,
+        value_enum,
+        help = "OpenTelemetry traces and metrics to record locally and export"
+    )]
+    telemetry: TelemetryArg,
 
     #[arg(
         long,
@@ -81,7 +91,8 @@ impl ObservabilityOutputArgs {
         let mut builder = ObservabilityBuilder::new(service_name, service_version)
             .format(self.log_format.into())
             .output(output)
-            .environment(self.otel_environment.clone());
+            .environment(self.otel_environment.clone())
+            .telemetry(self.telemetry.into());
         if let Some(filter) = &self.log_filter {
             builder = builder
                 .filter(format!("{filter},{METRICS_TARGET}=off"))
@@ -91,6 +102,29 @@ impl ObservabilityOutputArgs {
             builder = builder.otlp_endpoint(endpoint.clone());
         }
         builder
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum TelemetryArg {
+    #[value(help = "Record no traces or metrics")]
+    Off,
+    #[default]
+    #[value(
+        help = "Agent turns, model calls, tools and durable writes, plus terminal frame metrics"
+    )]
+    Agent,
+    #[value(help = "Agent work and a span for every terminal frame, layout, render and draw")]
+    All,
+}
+
+impl From<TelemetryArg> for Telemetry {
+    fn from(telemetry: TelemetryArg) -> Self {
+        match telemetry {
+            TelemetryArg::Off => Self::Off,
+            TelemetryArg::Agent => Self::Agent,
+            TelemetryArg::All => Self::All,
+        }
     }
 }
 
