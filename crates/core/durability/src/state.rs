@@ -48,6 +48,9 @@ pub enum Transition {
         accepted_after_model_call_index: u32,
 
         input: EncodedPayload,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_key: Option<String>,
     },
 
     SteerWithdrawn {
@@ -687,6 +690,7 @@ impl JournalState {
                 steer_index,
                 accepted_after_model_call_index,
                 input: _,
+                input_key: _,
                 message_id,
             } => {
                 self.ensure_prior_operations_terminal(operation_id)?;
@@ -907,6 +911,7 @@ impl JournalState {
                 steer_index,
                 accepted_after_model_call_index,
                 input,
+                input_key,
                 message_id,
             } => {
                 let operation = self.pending_operation_mut(&operation_id)?;
@@ -914,7 +919,7 @@ impl JournalState {
                     operation.steer_receipts.insert(
                         id.clone(),
                         IdentifiedSteerReceipt {
-                            input_key: input.key().to_owned(),
+                            input_key: input_key.unwrap_or_else(|| input.key().to_owned()),
                             index: steer_index,
                             withdrawn: false,
                         },

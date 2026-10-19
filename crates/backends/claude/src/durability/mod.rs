@@ -372,12 +372,13 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         id: String,
         message_id: Option<String>,
         after: u32,
+        identity_json: String,
         input_json: String,
     ) -> PolicyFuture<'_, Option<u32>> {
         Box::pin(async move {
             self.get()
                 .await?
-                .accept_steer(id, message_id, after, input_json)
+                .accept_steer(id, message_id, after, identity_json, input_json)
                 .await
         })
     }
@@ -619,17 +620,31 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         id: String,
         message_id: Option<String>,
         after: u32,
+        identity_json: String,
         input_json: String,
     ) -> PolicyFuture<'_, Option<u32>> {
         Box::pin(async move {
-            let input: Box<serde_json::value::RawValue> = serde_json::from_str(&input_json)
-                .map_err(|error| {
+            let raw = |json: &str| {
+                serde_json::from_str::<Box<RawValue>>(json).map_err(|error| {
                     nanocode_agent_core::NanocodeError::InvalidRequest(error.to_string())
-                })?;
-            self.owner
-                .accept_steer(id, after, &input, message_id)
-                .await
-                .map_err(agent_error)
+                })
+            };
+            let input = raw(&input_json)?;
+            match message_id {
+                Some(message_id) => {
+                    self.owner
+                        .accept_identified_steer(
+                            id,
+                            message_id,
+                            after,
+                            &raw(&identity_json)?,
+                            &input,
+                        )
+                        .await
+                }
+                None => self.owner.accept_steer(id, after, &input, None).await,
+            }
+            .map_err(agent_error)
         })
     }
     fn retained_steers(&self, id: String) -> PolicyFuture<'_, Vec<ClaudeSteer>> {

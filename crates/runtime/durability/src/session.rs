@@ -326,6 +326,7 @@ enum Command {
         operation_id: String,
         accepted_after_model_call_index: u32,
         input: EncodedPayload,
+        identity: Option<EncodedPayload>,
         result: oneshot::Sender<Result<Option<u32>>>,
     },
     IdentifiedSteerAccepted {
@@ -796,6 +797,7 @@ impl Driver {
                 operation_id,
                 accepted_after_model_call_index,
                 input,
+                identity,
                 result,
             } => {
                 let outcome = match self.authorize(&caller) {
@@ -806,6 +808,7 @@ impl Driver {
                             accepted_after_model_call_index,
                             input,
                             message_id,
+                            identity,
                         )
                         .await
                     }
@@ -1390,16 +1393,18 @@ impl Driver {
         accepted_after_model_call_index: u32,
         input: EncodedPayload,
         message_id: Option<String>,
+        identity: Option<EncodedPayload>,
     ) -> Result<Option<u32>> {
         self.require_claimed(caller, &operation_id)?;
         self.require_running(&operation_id)?;
         let operation = self.state.operation(&operation_id).ok_or_else(|| {
             Error::InvalidState(format!("operation `{operation_id}` was not accepted"))
         })?;
+        let identity = identity.as_ref().unwrap_or(&input);
         if let Some(id) = &message_id
             && let Some(receipt) = operation.steer_receipts.get(id)
         {
-            if !input.matches_key(&receipt.input_key) {
+            if !identity.matches_key(&receipt.input_key) {
                 return Err(Error::SteerConflict {
                     message_id: id.clone(),
                 });
@@ -1419,12 +1424,14 @@ impl Driver {
                     "operation `{operation_id}` exceeded the steer counter range"
                 ))
             })?;
+        let input_key = (identity.key() != input.key()).then(|| identity.key().to_owned());
         self.apply(Transition::SteerAccepted {
             message_id,
             operation_id,
             steer_index,
             accepted_after_model_call_index,
             input,
+            input_key,
         })
         .await?;
         Ok(Some(steer_index))
@@ -3044,6 +3051,29 @@ impl DurableOwner {
             operation_id,
             accepted_after_model_call_index,
             input: EncodedPayload::encode(input)?,
+            identity: None,
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn accept_identified_steer<K: Serialize + ?Sized, I: Serialize + ?Sized>(
+        &self,
+        operation_id: String,
+        message_id: String,
+        accepted_after_model_call_index: u32,
+        identity: &K,
+        input: &I,
+    ) -> Result<Option<u32>> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::AcceptSteer {
+            message_id: Some(message_id),
+            caller: self.caller()?,
+            operation_id,
+            accepted_after_model_call_index,
+            input: EncodedPayload::encode(input)?,
+            identity: Some(EncodedPayload::encode(identity)?),
             result,
         })
         .await?;

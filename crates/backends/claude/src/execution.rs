@@ -99,6 +99,7 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         _id: String,
         _message_id: Option<String>,
         _after: u32,
+        _identity_json: String,
         _input_json: String,
     ) -> PolicyFuture<'_, Option<u32>> {
         Box::pin(async {

@@ -4977,11 +4977,6 @@ impl State {
         if !turn.accepting {
             return Err(NanocodeError::TurnNotSteerable);
         }
-        if self.policy.is_some()
-            && matches!(&prompt.instruction, nanocode_agent_core::input::PromptInput::Content(items) if items.iter().any(|item| matches!(item, nanocode_agent_core::input::UserInput::LocalImage { .. })))
-        {
-            return Err(NanocodeError::InvalidRequest("durable Claude steering requires inline images; local image paths cannot be retained safely".into()));
-        }
         let frozen = crate::prompt::freeze(prompt, turn.images).await?;
         let local_index = || {
             turn.next_index
@@ -4998,6 +4993,7 @@ impl State {
                     operation.clone(),
                     id.clone(),
                     turn.model_call_index,
+                    input_json.clone(),
                     journaled,
                 )
                 .await?
