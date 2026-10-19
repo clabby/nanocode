@@ -84,7 +84,7 @@ enum HostCommand {
     ToolResult {
         execution_id: u64,
         id: u64,
-        value: Value,
+        encoded: String,
         success: bool,
     },
     Shutdown,
@@ -183,14 +183,14 @@ impl EmbeddedHost {
         &self,
         execution_id: u64,
         id: u64,
-        value: Value,
+        encoded: String,
         success: bool,
     ) -> Result<(), String> {
         self.command_tx
             .send(HostCommand::ToolResult {
                 execution_id,
                 id,
-                value,
+                encoded,
                 success,
             })
             .map_err(|_| {
@@ -352,10 +352,10 @@ fn run_execution_in_context<'js>(
                 CommandPoll::Command(HostCommand::ToolResult {
                     execution_id: result_execution_id,
                     id,
-                    value,
+                    encoded,
                     success,
                 }) if result_execution_id == execution_id => {
-                    resolve_tool(ctx, &state, id, &value, success)?;
+                    resolve_tool(ctx, &state, id, encoded, success)?;
                     drain_jobs(ctx);
                 }
                 CommandPoll::TimerReady => {
@@ -649,7 +649,7 @@ fn resolve_tool(
     ctx: &Ctx<'_>,
     state: &Rc<RefCell<ExecutionState>>,
     id: u64,
-    value: &Value,
+    encoded: String,
     success: bool,
 ) -> Result<(), String> {
     let (resolve, reject) = state
@@ -661,8 +661,6 @@ fn resolve_tool(
     let function = function
         .restore(ctx)
         .map_err(|error| format!("failed to restore QuickJS tool promise: {error}"))?;
-    let encoded = serde_json::to_string(value)
-        .map_err(|error| format!("failed to encode QuickJS tool result: {error}"))?;
     function
         .call::<_, ()>((encoded,))
         .catch(ctx)

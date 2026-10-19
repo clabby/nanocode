@@ -179,7 +179,7 @@ enum CellUpdate {
     NestedCallStarted {
         call_id: String,
         name: String,
-        input: Value,
+        input: Arc<Value>,
         delivered: bool,
     },
     NestedCall(ObservedNestedCall),
@@ -202,7 +202,7 @@ impl CodeModeObserver for IgnoreCodeModeUpdates {
 
 struct CompletedNestedCall {
     id: u64,
-    value: Value,
+    input: Arc<Value>,
     call: NestedToolCall,
     process_trace: Option<ToolProcessTraceWire>,
 }
@@ -214,15 +214,37 @@ struct ObservedNestedCall {
     delivered: bool,
 }
 
+struct PendingCall {
+    call_id: String,
+    name: String,
+    input: Arc<Value>,
+    started: Instant,
+    started_after_ns: u64,
+}
+
 struct PendingCallReceipts {
-    calls: HashMap<u64, (NestedToolCall, Instant)>,
+    calls: HashMap<u64, PendingCall>,
     updates: mpsc::UnboundedSender<CellUpdate>,
 }
 
 impl Drop for PendingCallReceipts {
     fn drop(&mut self) {
-        for (id, (mut call, started)) in self.calls.drain() {
-            call.duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let message = "Code Mode cell ended before the tool returned; execution outcome unknown";
+        for (id, pending) in self.calls.drain() {
+            let call = NestedToolCall {
+                call_id: pending.call_id,
+                name: pending.name,
+                input: Arc::unwrap_or_clone(pending.input),
+                output: ToolOutputBody::Text(message.to_owned()),
+                structured_result: serde_json::json!({
+                    "error": message, "code": "CODE_MODE_CALL_INTERRUPTED", "outcome": "unknown",
+                }),
+                success: false,
+                started_after_ns: pending.started_after_ns,
+                duration_ns: u64::try_from(pending.started.elapsed().as_nanos())
+                    .unwrap_or(u64::MAX),
+                metadata: None,
+            };
             let _ = self
                 .updates
                 .send(CellUpdate::NestedCall(ObservedNestedCall {
@@ -1372,21 +1394,18 @@ impl EmbeddedHost {
                         } => {
                             let nested_call_id = format!("{}/code-{id}", context.call_id);
                             let started = Instant::now();
-                            let message = "Code Mode cell ended before the tool returned; execution outcome unknown";
-                            pending_receipts.calls.insert(id, (NestedToolCall {
-                                call_id: nested_call_id.clone(), name: name.clone(), input: input.clone(),
-                                output: ToolOutputBody::Text(message.to_owned()),
-                                structured_result: serde_json::json!({
-                                    "error": message, "code": "CODE_MODE_CALL_INTERRUPTED", "outcome": "unknown",
-                                }),
-                                success: false,
+                            let input = Arc::new(input);
+                            pending_receipts.calls.insert(id, PendingCall {
+                                call_id: nested_call_id.clone(),
+                                name: name.clone(),
+                                input: Arc::clone(&input),
+                                started,
                                 started_after_ns: u64::try_from(started.duration_since(actor_started_at).as_nanos()).unwrap_or(u64::MAX),
-                                duration_ns: 0, metadata: None,
-                            }, started));
+                            });
                             let _ = updates.send(CellUpdate::NestedCallStarted {
                                 call_id: nested_call_id,
                                 name: name.clone(),
-                                input: input.clone(),
+                                input: Arc::clone(&input),
                                 delivered: false,
                             });
                             let nested_call = execute_nested_call(
@@ -1442,13 +1461,17 @@ impl EmbeddedHost {
     ) -> Result<(), HostFailure> {
         let CompletedNestedCall {
             id,
-            value,
-            call,
+            input,
+            mut call,
             process_trace,
         } = completed;
         let success = call.success;
 
         pending_receipts.calls.remove(&id);
+        call.input = Arc::unwrap_or_clone(input);
+        let encoded = serde_json::to_string(&call.structured_result).map_err(|error| {
+            HostFailure::new(format!("failed to encode Code Mode tool result: {error}"))
+        })?;
         let _ = pending_receipts
             .updates
             .send(CellUpdate::NestedCall(ObservedNestedCall {
@@ -1458,7 +1481,7 @@ impl EmbeddedHost {
                 delivered: false,
             }));
         self.worker
-            .send_tool_result(cell_id, id, value, success)
+            .send_tool_result(cell_id, id, encoded, success)
             .map_err(HostFailure::new)
     }
 }
@@ -1601,7 +1624,7 @@ async fn execute_nested_call(
     tools: &dyn CodeModeToolset,
     id: u64,
     name: String,
-    input: Value,
+    input: Arc<Value>,
     context: &OwnedToolContext,
     cell_started_at: Instant,
 ) -> CompletedNestedCall {
@@ -1620,18 +1643,20 @@ async fn execute_nested_call(
     .with_instruction_revision(context.instruction_revision())
     .with_host_context(context.host_context())
     .with_turn_id(context.turn_id());
-    let execution = tools.execute_nested(&name, input.clone(), context).await;
+    let mut execution = tools
+        .execute_nested(&name, Value::clone(&input), context)
+        .await;
     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let value = execution.structured_result();
+    let value = execution.take_structured_result();
     let process_trace = execution.process_trace().copied().map(Into::into);
     CompletedNestedCall {
         id,
-        value: value.clone(),
+        input,
         process_trace,
         call: NestedToolCall {
             call_id,
             name,
-            input,
+            input: Value::Null,
             output: execution.output,
             structured_result: value,
             success: execution.success,
