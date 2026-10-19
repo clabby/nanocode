@@ -52,9 +52,9 @@ Commands:
                          the same time (a machine-wide stall rather than this code path)
   trace <id>             Ancestors and descendant tree of a span (row id, span id or tool call id) with self time
   sessions               Sessions (threads) with turn, model and tool totals
-  breakdown              Turn wall time split exclusively into model calls, tool work (exec cells, waits, Codex
-                         tool calls and the terminal's tool calls), durable store writes and other (the agent
-                         loop itself), per session (--by model or --by none to aggregate)
+  breakdown              Turn wall time split exclusively into model calls, tool work (exec cells until they finish,
+                         waits, Codex tool calls and the terminal's tool calls), durable store writes and other
+                         (the agent loop itself), per session (--by model or --by none to aggregate)
   builds                 Executables that produced telemetry (path and build time), with processes, sessions and spans
   prune                  Delete raw telemetry directories older than --older-than whose process has exited and
                          whose files are fully ingested; their spans stay in the cache (--dry-run lists them)
@@ -929,10 +929,10 @@ function breakdown(db, options) {
       AND (? IS NULL OR session_id LIKE ? || '%') ORDER BY start_us`).all(since, since, options.session ?? null, options.session ?? null);
   const parts = db.prepare(`SELECT name, start_us, end_us FROM spans INDEXED BY spans_agent_session
     WHERE session_id = ? AND ui = 0 AND name IN ('model.call', 'model.compaction', 'model.warmup', 'code_mode.cell',
-      'code_mode.wait', 'tool.call', 'nc.tool_call', 'durability.store')
+      'code_mode.cell_actor', 'code_mode.wait', 'tool.call', 'nc.tool_call', 'durability.store')
       AND start_us < ? AND end_us > ?`);
-  const rank = { 'model.call': 0, 'model.compaction': 0, 'model.warmup': 0, 'code_mode.cell': 1, 'code_mode.wait': 1,
-    'tool.call': 1, 'nc.tool_call': 1, 'durability.store': 2 };
+  const rank = { 'model.call': 0, 'model.compaction': 0, 'model.warmup': 0, 'code_mode.cell': 1,
+    'code_mode.cell_actor': 1, 'code_mode.wait': 1, 'tool.call': 1, 'nc.tool_call': 1, 'durability.store': 2 };
   const labels = ['model calls', 'tools', 'durability', 'other'];
   const key = options.by ?? 'session';
   const totals = new Map();
