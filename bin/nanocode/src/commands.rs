@@ -1,4 +1,4 @@
-pub const COMMANDS: [(&str, &str); 30] = [
+pub const COMMANDS: [(&str, &str); 31] = [
     (
         "/model",
         "choose harness, model, thinking and speed for a new thread",
@@ -14,6 +14,10 @@ pub const COMMANDS: [(&str, &str); 30] = [
         "open the side pane: a forked side thread that never interrupts the turn",
     ),
     ("/resume", "resume a saved session"),
+    (
+        "/login",
+        "sign in with ChatGPT or Claude: /login codex|claude",
+    ),
     ("/new", "start a new session"),
     (
         "/agents",

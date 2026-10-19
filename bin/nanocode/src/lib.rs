@@ -9,6 +9,7 @@ mod extras;
 mod focus;
 mod history;
 mod host;
+mod login;
 mod models;
 mod sessions;
 mod side;

@@ -260,6 +260,13 @@ impl From<&str> for OpenAiAuth {
 }
 
 #[cfg(not(target_family = "wasm"))]
+pub fn chatgpt_auth_file() -> Result<std::path::PathBuf, nanocode_home::HomeError> {
+    Ok(nanocode_home::AgentHome::from_env()?
+        .nanocode_home()
+        .join("auth.json"))
+}
+
+#[cfg(not(target_family = "wasm"))]
 #[derive(Default)]
 struct ChatGptHomeAuth {
     loaded: tokio::sync::OnceCell<OpenAiAuth>,
@@ -271,12 +278,12 @@ impl ChatGptHomeAuth {
         self.loaded
             .get_or_try_init(|| async {
                 tokio::task::spawn_blocking(|| {
-                    let home = nanocode_home::AgentHome::from_env().map_err(|error| {
+                    let path = chatgpt_auth_file().map_err(|error| {
                         OpenAiAuthError::Unavailable(Arc::from(error.to_string()))
                     })?;
-                    load_chatgpt_auth(home.nanocode_home().join("auth.json")).map_err(|error| {
+                    load_chatgpt_auth(path).map_err(|error| {
                         OpenAiAuthError::LoginRequired(Arc::from(format!(
-                            "{error}; save a ChatGPT login there"
+                            "{error}; sign in with /login codex"
                         )))
                     })
                 })

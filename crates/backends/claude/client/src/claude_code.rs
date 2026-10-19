@@ -484,12 +484,10 @@ impl Default for ClaudeClient {
     fn default() -> Self {
         nanocode_tls::install_default_rustls_crypto_provider();
         let http = reqwest::Client::new();
-        Self::subscription(
-            http.clone(),
-            Arc::new(RefreshingClaudeAuth::new(
-                Arc::new(ClaudeCodeLogin { http }),
-                REFRESH_MARGIN,
-            )),
-        )
+        let claude_code = Arc::new(RefreshingClaudeAuth::new(
+            Arc::new(ClaudeCodeLogin { http: http.clone() }),
+            REFRESH_MARGIN,
+        ));
+        Self::subscription(http, Arc::new(crate::home::HomeFirst::new(claude_code)))
     }
 }

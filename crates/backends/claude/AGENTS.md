@@ -4,6 +4,7 @@
 - File tools use the workspace as their relative-path base, not an authorization boundary. Accept host-accessible absolute paths, parent traversal and symlinks consistently with Bash. Keep exact-match editing, concurrent-change checks, atomic replacement and caller output budgets; do not add workspace-only or arbitrary file-size/search caps. Attach workspace guidance only for targets within that workspace.
 
 - `client/` (`nanocode-backend-claude-client`) owns the Messages protocol types, `ClaudeClient`, authentication, subscription wire compatibility and transport; this crate re-exports it at the crate root. `upstream::VERSION` reuses the client's pinned CLI version.
+- The native default client prefers the nanocode login in `<nanocode home>/claude.json`, written by `ClaudeHomeLogin` for `/login claude`, and falls back to the Claude Code login. Its file host serializes compare-and-swap through a sibling `.lock` file and replaces the store atomically.
 - `tools/` (`nanocode-backend-claude-tools`) owns independent provider tool definitions and handlers; keep it independent of clients, agent lifecycle, runtime and durability. Preserve this backend's public tool paths through re-exports.
 - Preserve the exact identity and core text blocks in `prompts/claude-code-system.json`, with version and official package integrity recorded in `prompts/upstream.json`.
 - Keep provider blocks unchanged. Add Code Mode and environment/project context as separate blocks. Preserve explicit caller system overrides.

@@ -13,6 +13,8 @@ use thiserror::Error;
 mod auth;
 #[cfg(not(target_family = "wasm"))]
 mod claude_code;
+#[cfg(not(target_family = "wasm"))]
+mod home;
 mod subscription_identity;
 #[doc(hidden)]
 pub mod subscription_wire;
@@ -21,6 +23,8 @@ pub use subscription_wire::SubscriptionIdentity;
 use transport::{HttpClient, HttpError, HttpResponse};
 pub mod subscription;
 pub use auth::{ClaudeAccessToken, ClaudeTokenSource, RefreshingClaudeAuth};
+#[cfg(not(target_family = "wasm"))]
+pub use home::ClaudeHomeLogin;
 
 pub const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 

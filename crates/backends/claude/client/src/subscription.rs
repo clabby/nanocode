@@ -841,7 +841,7 @@ impl ClaudeAuthProvider for ClaudeSubscription {
     }
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     nanocode_platform::system_time()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
