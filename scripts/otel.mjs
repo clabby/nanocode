@@ -142,7 +142,8 @@ function openDb(file) {
       session_id TEXT PRIMARY KEY, root_session_id TEXT, parent_session_id TEXT, origin TEXT, depth INTEGER,
       model TEXT, effort TEXT, first_us INTEGER, last_us INTEGER, turns INTEGER, model_calls INTEGER,
       model_ms REAL, cells INTEGER, cell_ms REAL, tool_calls INTEGER, tool_ms REAL, spans INTEGER);
-    CREATE VIEW IF NOT EXISTS tools AS
+    DROP VIEW IF EXISTS tools;
+    CREATE VIEW tools AS
       SELECT s.id, datetime(s.start_us / 1e6, 'unixepoch', 'localtime') AS at, s.start_us, s.tool, s.dur_ms,
         json_extract(s.attrs, '$."duration_ns"') / 1e6 AS exec_ms,
         json_extract(s.attrs, '$."tool.admission.wait_ns"') / 1e6 AS admission_ms,
@@ -154,14 +155,16 @@ function openDb(file) {
         (SELECT e.content FROM events e WHERE e.span = s.id AND e.kind = 'tool.arguments' LIMIT 1) AS arguments,
         s.trace_id, s.span_id, s.parent_id
       FROM spans s WHERE s.name = 'tool.execute';
-    CREATE VIEW IF NOT EXISTS cells AS
+    DROP VIEW IF EXISTS cells;
+    CREATE VIEW cells AS
       SELECT s.id, datetime(s.start_us / 1e6, 'unixepoch', 'localtime') AS at, s.start_us, s.name, s.dur_ms, s.status,
         s.error, s.session_id, s.call_id, json_extract(s.attrs, '$."cell.id"') AS cell_id,
         json_extract(s.attrs, '$.running') AS running, json_extract(s.attrs, '$."nested.count"') AS nested,
         json_extract(s.attrs, '$."source.bytes"') AS source_bytes,
         json_extract(s.attrs, '$."wait.yield_time_ms"') AS yield_time_ms, s.thread_name, s.trace_id, s.span_id
       FROM spans s WHERE s.name IN ('code_mode.cell', 'code_mode.wait');
-    CREATE VIEW IF NOT EXISTS models AS
+    DROP VIEW IF EXISTS models;
+    CREATE VIEW models AS
       SELECT s.id, datetime(s.start_us / 1e6, 'unixepoch', 'localtime') AS at, s.start_us, s.model, s.dur_ms,
         json_extract(s.attrs, '$."time_to_first_event_ns"') / 1e6 AS first_event_ms,
         json_extract(s.attrs, '$."time_to_first_output_ns"') / 1e6 AS first_output_ms,
@@ -175,15 +178,18 @@ function openDb(file) {
         json_extract(s.attrs, '$."reasoning.effort"') AS effort,
         s.status, s.error, s.session_id, s.thread_name, s.trace_id, s.span_id
       FROM spans s WHERE s.name = 'model.call';
-    CREATE VIEW IF NOT EXISTS turns AS
+    DROP VIEW IF EXISTS turns;
+    CREATE VIEW turns AS
       SELECT s.id, datetime(s.start_us / 1e6, 'unixepoch', 'localtime') AS at, s.start_us, s.dur_ms, s.session_id,
         json_extract(s.attrs, '$."turn.index"') AS turn_index, s.model,
         json_extract(s.attrs, '$."agent.origin"') AS origin, json_extract(s.attrs, '$."agent.depth"') AS depth,
         json_extract(s.attrs, '$."parent.session.id"') AS parent_session_id,
         json_extract(s.attrs, '$."usage.total_tokens"') AS total_tokens, s.status, s.error, s.trace_id, s.span_id
       FROM spans s WHERE s.name = 'agent.turn';
-    CREATE VIEW IF NOT EXISTS frames AS
-      SELECT s.id, s.start_us, s.dur_ms, s.session_id, json_extract(s.attrs, '$."frame.input"') AS input,
+    DROP VIEW IF EXISTS frames;
+    CREATE VIEW frames AS
+      SELECT s.id, s.start_us, s.dur_ms, json_extract(s.attrs, '$."thread.cpu_ns"') / 1e6 AS cpu_ms, s.session_id,
+        json_extract(s.attrs, '$."frame.input"') AS input,
         json_extract(s.attrs, '$."frame.stream"') AS stream, json_extract(s.attrs, '$."frame.resize"') AS resize,
         s.pid, s.trace_id, s.span_id
       FROM spans s WHERE s.name = 'nc.frame';

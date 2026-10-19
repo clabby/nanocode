@@ -47,7 +47,7 @@ tracing-opentelemetry.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
+nix = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

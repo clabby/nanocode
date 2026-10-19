@@ -703,10 +703,12 @@ impl App {
                 let span = metrics.frame(self.agent.as_ref().map(|agent| agent.session_id()));
                 let _frame = span.enter();
                 let frame_started = metrics.begin();
+                let cpu_started = crate::telemetry::frame_cpu(&span);
                 if let Err(error) = terminal.draw(|frame| view::draw(self, frame)) {
                     span.record("otel.status_code", "ERROR");
                     return Err(error.into());
                 }
+                crate::telemetry::record_frame_cpu(&span, cpu_started);
                 metrics.presented(frame_started);
                 scheduler.presented(Instant::now());
                 if self.animating() {

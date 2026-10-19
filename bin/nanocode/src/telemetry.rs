@@ -269,7 +269,7 @@ impl FrameMetrics {
     }
 
     pub fn frame(&mut self, session: Option<&str>) -> Span {
-        let span = tracing::info_span!(target: "nanocode", "nc.frame", session.id = session, frame.input = self.input.is_some(), frame.stream = self.stream.is_some(), frame.resize = self.resize.is_some(), otel.status_code = Empty);
+        let span = tracing::info_span!(target: "nanocode", "nc.frame", session.id = session, frame.input = self.input.is_some(), frame.stream = self.stream.is_some(), frame.resize = self.resize.is_some(), thread.cpu_ns = Empty, otel.status_code = Empty);
         if let Some(context) = self.input_context.take() {
             span.add_link(context.span().span_context().clone());
         }
@@ -299,6 +299,34 @@ impl FrameMetrics {
             tracing::event!(target: METRICS_TARGET, Level::INFO, { histogram.nc.resize_to_frame_ms = millis(at, now) });
         }
     }
+}
+
+pub fn frame_cpu(span: &Span) -> Option<u64> {
+    if span.is_disabled() {
+        None
+    } else {
+        thread_cpu_ns()
+    }
+}
+
+pub fn record_frame_cpu(span: &Span, started: Option<u64>) {
+    if let (Some(started), Some(finished)) = (started, thread_cpu_ns()) {
+        span.record("thread.cpu_ns", finished.saturating_sub(started));
+    }
+}
+
+#[cfg(unix)]
+fn thread_cpu_ns() -> Option<u64> {
+    let time = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID).ok()?;
+    u64::try_from(time.tv_sec())
+        .ok()?
+        .checked_mul(1_000_000_000)?
+        .checked_add(u64::try_from(time.tv_nsec()).ok()?)
+}
+
+#[cfg(not(unix))]
+const fn thread_cpu_ns() -> Option<u64> {
+    None
 }
 
 fn millis(from: Instant, to: Instant) -> f64 {
