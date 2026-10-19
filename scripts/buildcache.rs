@@ -15,7 +15,7 @@ use std::{
 };
 
 const RUST_KEY: &str = "nanocode-rustc-cache-4";
-const C_KEY: &str = "nanocode-c-cache-2 -ffile-prefix-map=<out>=.";
+const C_KEY: &str = "nanocode-c-cache-3 -ffile-prefix-map=<out>=. -MD";
 const MEMO: &str = ".nanocode-sha256";
 
 type Environment = BTreeMap<OsString, OsString>;
@@ -530,7 +530,7 @@ fn store(
 }
 
 fn c(cache: &Path, args: &[OsString], environment: Environment) -> ExitCode {
-    let (mut object, mut source, mut compile, mut optimize) = (None, None, false, b"-O0".to_vec());
+    let (mut object, mut source, mut compile) = (None, None, false);
     for index in 1..args.len() {
         let arg = args[index].as_bytes();
         match args[index - 1].as_bytes() {
@@ -546,35 +546,19 @@ fn c(cache: &Path, args: &[OsString], environment: Environment) -> ExitCode {
         if arg == b"-c" {
             compile = true;
         }
-        if arg.starts_with(b"-O") {
-            optimize = arg.to_vec();
-        }
     }
     let (Some(object), Some(source), true) = (object, source, compile) else {
         return exec(args, &environment);
     };
-    if optimize == b"-O0" || args[source].as_bytes().starts_with(b"-") {
+    if args[source].as_bytes().starts_with(b"-") {
         return exec(args, &environment);
     }
     let out_dir = environment.get(OsStr::new("OUT_DIR")).cloned().unwrap_or_default();
-    let out_dir = out_dir.as_bytes();
-    let mut preprocess = Command::new(&args[0]);
-    let mut skip = false;
-    for arg in &args[1..] {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if arg == "-o" {
-            skip = true;
-            continue;
-        }
-        preprocess.arg(if arg == "-c" { OsStr::new("-E") } else { arg.as_os_str() });
-    }
-    let Ok(expanded) = preprocess.env_clear().envs(&environment).stderr(Stdio::null()).output() else {
+    let out_dir = out_dir.as_bytes().to_vec();
+    let Ok(source_text) = fs::read(&args[source]) else {
         return exec(args, &environment);
     };
-    if !expanded.status.success() {
+    if volatile(&source_text) {
         return exec(args, &environment);
     }
     let Ok(version) = Command::new(&args[0]).arg("--version").output() else {
@@ -591,7 +575,7 @@ fn c(cache: &Path, args: &[OsString], environment: Environment) -> ExitCode {
         if index == object || index + 1 == object {
             continue;
         }
-        hasher.update(&relocate(arg.as_bytes(), out_dir, b"<out>"));
+        hasher.update(&relocate(arg.as_bytes(), &out_dir, b"<out>"));
         hasher.update(b"\n");
     }
     for name in ["MACOSX_DEPLOYMENT_TARGET", "SDKROOT", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH"] {
@@ -602,25 +586,31 @@ fn c(cache: &Path, args: &[OsString], environment: Environment) -> ExitCode {
             hasher.update(b"\n");
         }
     }
-    hasher.update(&relocate(&expanded.stdout, out_dir, b"<out>"));
+    let mut source_hasher = Sha256::new();
+    source_hasher.update(&source_text);
+    hasher.update(source_hasher.finish().as_bytes());
     let entry = cache.join("c").join(hasher.finish());
     let object = PathBuf::from(&args[object]);
-    let mut cached_object = entry.clone().into_os_string();
-    cached_object.push(".o");
-    let mut cached_errors = entry.clone().into_os_string();
-    cached_errors.push(".err");
-    if clone(Path::new(&cached_object), &object).is_ok() && touch(&object).is_ok() {
-        if let Ok(errors) = fs::read(&cached_errors) {
+    if headers_match(&entry, &out_dir)
+        && clone(&entry.join("object"), &object).is_ok()
+        && touch(&object).is_ok()
+    {
+        if let Ok(errors) = fs::read(entry.join("stderr")) {
             let _ = io::stderr().write_all(&errors);
         }
         return ExitCode::SUCCESS;
     }
+    let mut depfile = object.clone().into_os_string();
+    depfile.push(format!(".{}.buildcache.d", std::process::id()));
     let mut map = OsString::from("-ffile-prefix-map=");
-    map.push(OsStr::from_bytes(out_dir));
+    map.push(OsStr::from_bytes(&out_dir));
     map.push("=.");
     let output = match Command::new(&args[0])
         .args(&args[1..])
         .arg(&map)
+        .arg("-MD")
+        .arg("-MF")
+        .arg(&depfile)
         .env_clear()
         .envs(&environment)
         .stderr(Stdio::piped())
@@ -634,14 +624,100 @@ fn c(cache: &Path, args: &[OsString], environment: Environment) -> ExitCode {
     };
     let _ = io::stdout().write_all(&output.stdout);
     let _ = io::stderr().write_all(&output.stderr);
-    if output.status.success() && fs::create_dir_all(cache.join("c")).is_ok() {
-        let mut staging = cached_object.clone();
-        staging.push(format!(".{}", std::process::id()));
-        if fs::write(&cached_errors, &output.stderr).is_ok() && clone(&object, Path::new(&staging)).is_ok() {
-            let _ = fs::rename(&staging, &cached_object);
-        }
+    let dependencies = fs::read(&depfile);
+    let _ = fs::remove_file(&depfile);
+    if output.status.success()
+        && let Ok(dependencies) = dependencies
+        && let Some(manifest) = manifest(&dependencies, &out_dir)
+    {
+        let _ = store_object(cache, &entry, &object, &manifest, &output.stderr);
     }
     exit_code(output.status)
+}
+
+fn volatile(text: &[u8]) -> bool {
+    [b"__DATE__" as &[u8], b"__TIME__", b"__TIMESTAMP__"]
+        .iter()
+        .any(|token| text.windows(token.len()).any(|window| window == *token))
+}
+
+fn dependency_paths(depfile: &[u8]) -> Vec<Vec<u8>> {
+    let Some(colon) = depfile.windows(2).position(|window| window == b": ") else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    let mut current = Vec::new();
+    let mut bytes = depfile[colon + 2..].iter().peekable();
+    while let Some(&byte) = bytes.next() {
+        match byte {
+            b'\\' if bytes.peek() == Some(&&b' ') => {
+                current.push(b' ');
+                bytes.next();
+            }
+            b'\\' if bytes.peek() == Some(&&b'\n') => {
+                bytes.next();
+            }
+            b' ' | b'\n' | b'\t' | b'\r' => {
+                if !current.is_empty() {
+                    paths.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(byte),
+        }
+    }
+    if !current.is_empty() {
+        paths.push(current);
+    }
+    paths
+}
+
+fn manifest(depfile: &[u8], out_dir: &[u8]) -> Option<Vec<u8>> {
+    let mut manifest = Vec::new();
+    for path in dependency_paths(depfile).into_iter().skip(1) {
+        let contents = fs::read(OsStr::from_bytes(&path)).ok()?;
+        if volatile(&contents) {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&contents);
+        manifest.extend_from_slice(hasher.finish().as_bytes());
+        manifest.push(b' ');
+        manifest.extend_from_slice(&relocate(&path, out_dir, b"<out>"));
+        manifest.push(b'\n');
+    }
+    Some(manifest)
+}
+
+fn headers_match(entry: &Path, out_dir: &[u8]) -> bool {
+    let Ok(manifest) = fs::read(entry.join("headers")) else {
+        return false;
+    };
+    manifest.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).all(|line| {
+        let Some(at) = line.iter().position(|byte| *byte == b' ') else {
+            return false;
+        };
+        let path = relocate(&line[at + 1..], b"<out>", out_dir);
+        digest_file(Path::new(OsStr::from_bytes(&path))).is_ok_and(|digest| digest.as_bytes() == &line[..at])
+    })
+}
+
+fn store_object(cache: &Path, entry: &Path, object: &Path, manifest: &[u8], errors: &[u8]) -> io::Result<()> {
+    fs::create_dir_all(cache.join("c"))?;
+    let staging = cache.join("c").join(format!(".data.{}.{}", std::process::id(), unique()));
+    let result = (|| -> io::Result<()> {
+        fs::create_dir(&staging)?;
+        clone(object, &staging.join("object"))?;
+        fs::write(staging.join("headers"), manifest)?;
+        fs::write(staging.join("stderr"), errors)?;
+        if fs::symlink_metadata(entry).is_ok() {
+            fs::remove_file(entry)?;
+        }
+        symlink(&staging, entry)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
 }
 
 struct Sha256 {
