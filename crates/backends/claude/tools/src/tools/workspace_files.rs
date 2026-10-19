@@ -309,12 +309,20 @@ impl ClaudeWorkspaceFiles {
 
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("file has no parent")?;
-    let mut file =
-        tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("create temp file: {e}"))?;
+    let existing = fs::metadata(path).ok();
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    if existing.is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut file = builder
+        .tempfile_in(parent)
+        .map_err(|e| format!("create temp file: {e}"))?;
     file.write_all(content.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     flush_to_disk(file.as_file()).map_err(|e| format!("sync: {e}"))?;
-    if let Ok(meta) = fs::metadata(path) {
+    if let Some(meta) = existing {
         file.as_file()
             .set_permissions(meta.permissions())
             .map_err(|e| format!("permissions: {e}"))?;
