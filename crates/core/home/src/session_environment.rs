@@ -10,9 +10,9 @@ pub struct SessionEnvironment {
 }
 
 impl SessionEnvironment {
-    pub const SESSION_ID_VAR: &'static str = "CODEX_THREAD_ID";
+    pub const SESSION_ID_VAR: &'static str = "NANOCODE_SESSION_ID";
 
-    pub const ROOT_SESSION_ID_VAR: &'static str = "NANOCODEX_ROOT_SESSION_ID";
+    pub const ROOT_SESSION_ID_VAR: &'static str = "NANOCODE_ROOT_SESSION_ID";
 
     pub const VARIABLES: [&'static str; 2] = [Self::SESSION_ID_VAR, Self::ROOT_SESSION_ID_VAR];
 

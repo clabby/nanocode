@@ -1,7 +1,5 @@
 pub mod bash;
 pub mod host;
-#[cfg(not(target_family = "wasm"))]
-pub mod notebook;
 pub mod tasks;
 pub mod web;
 #[cfg(not(target_family = "wasm"))]
@@ -15,8 +13,6 @@ pub use host::{
     ImageSource, McpToolDefinition, ToolContent, ToolOutput, ToolResultBlock,
 };
 pub use nanocode_home::SessionEnvironment;
-#[cfg(not(target_family = "wasm"))]
-pub use notebook::ClaudeNotebook;
 pub use tasks::ClaudeTasks;
 pub use web::{
     ApprovedPage, ApprovedWebFetchSource, ApprovedWebProvider, ClaudeWeb, WebFetchRequest,

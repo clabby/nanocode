@@ -1038,22 +1038,6 @@ impl ClaudeBuilder {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    pub fn notebook(mut self, notebook: Arc<crate::tools::notebook::ClaudeNotebook>) -> Self {
-        for schema in crate::tools::notebook::ClaudeNotebook::definitions() {
-            let definition: ToolDefinition = serde_json::from_value(schema)
-                .expect("built-in Claude notebook schema must remain valid");
-            let name = definition.name.clone();
-            let notebook = notebook.clone();
-            self = self.tool(definition, move |input| {
-                let notebook = notebook.clone();
-                let name = name.clone();
-                async move { notebook.execute(&name, input).await }
-            });
-        }
-        self
-    }
-
-    #[cfg(not(target_family = "wasm"))]
     pub fn sandbox_bash<E>(mut self, bash: Arc<crate::tools::bash::ClaudeBash<E>>) -> Self
     where
         E: crate::tools::bash::SandboxBashExecutor + 'static,
@@ -1557,6 +1541,7 @@ impl ClaudeBuilder {
             task_board: self.task_board,
             cancellations: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             sequence: std::sync::Mutex::new(1),
             accepted_turns: AtomicU64::new(accepted_turns),
             steering: Mutex::new(HashMap::new()),
@@ -2760,6 +2745,7 @@ struct State {
     task_board: Option<Arc<crate::tools::tasks::ClaudeTasks>>,
     cancellations: Mutex<HashMap<BackendTurnKey, Arc<Cancellation>>>,
     stopped: AtomicBool,
+    closing: AtomicBool,
 
     sequence: std::sync::Mutex<u64>,
     accepted_turns: AtomicU64,
@@ -3529,6 +3515,7 @@ struct ResponseOutcome {
 }
 struct ResponseContext<'a> {
     disable_tools: bool,
+    force_text: bool,
     container: Option<&'a str>,
     previous_message_id: Option<&'a str>,
     template: Option<&'a MessagesRequest>,
@@ -3862,7 +3849,9 @@ impl State {
         }
         let (status, kind) = match result {
             Ok(_) => ("completed", AgentEventKind::RunCompleted),
-            Err(NanocodexError::TurnCancelled) => ("cancelled", AgentEventKind::RunFailed),
+            Err(NanocodexError::TurnCancelled | NanocodexError::TurnStopped) => {
+                ("cancelled", AgentEventKind::RunFailed)
+            }
             Err(_) => ("failed", AgentEventKind::RunFailed),
         };
         self.emit(events,kind,json!({"status":status,"model":self.model(),"reasoning_mode":reasoning_mode,"effort":effort,"transport":"messages_sse","orchestration":"claude","duration_ms":ns/1_000_000,"duration_ns":ns,"estimated_cost":null,"cost_usd":null,"cost_status":"other"}));
@@ -4060,7 +4049,7 @@ impl State {
         if request.diagnostics.is_some() {
             request.diagnostics = Some(json!({"previous_message_id":context.previous_message_id}));
         }
-        request.tool_choice = context.disable_tools.then(|| json!({"type":"none"}));
+        request.tool_choice = context.force_text.then(|| json!({"type":"none"}));
 
         request.cache_system_prefix().map_err(provider_error)?;
         client.prepare_request(&mut request);
@@ -4172,7 +4161,6 @@ impl State {
         let max_attempts = if context.disable_tools { 3 } else { 5 };
         let mut attempt = 0;
         let mut dispatched: Option<u64> = None;
-        request.messages = Vec::new();
         loop {
             if cancel.flag.load(Ordering::SeqCst) {
                 return Err(ResponseFailure {
@@ -4198,7 +4186,9 @@ impl State {
 
             dispatched.get_or_insert_with(&elapsed_ns);
 
-            fill(&mut request, &suffix);
+            if attempt > 1 {
+                fill(&mut request, &suffix);
+            }
             let opened = tokio::select! {
                 result = client.stream(&request).instrument(attempt_span.clone()) => result,
                 () = cancel.cancelled() => {
@@ -4497,8 +4487,13 @@ impl State {
                 );
             }
         }
-        if let Err(error) = self.settle(&conversation, &request, &result).await {
+        if let Err(error) = self.settle(&mut conversation, &request, &result).await {
             result = Err(error);
+        }
+        if matches!(result, Err(NanocodexError::TurnCancelled))
+            && self.closing.load(Ordering::SeqCst)
+        {
+            result = Err(NanocodexError::TurnStopped);
         }
         if result
             .as_ref()
@@ -4705,28 +4700,42 @@ impl State {
             }
         }
         messages.push(Message::text(Role::User, COMPACTION_INSTRUCTIONS));
-        let response = self
-            .response(
-                &messages,
-                tools.clone(),
-                cancel,
-                None,
-                0,
-                ResponseContext {
-                    disable_tools: true,
-                    container: context.container.as_deref(),
-                    previous_message_id: context.previous_message_id.as_deref(),
-                    template: Some(&template),
-                    wire_profile: cursor.wire_profile.as_ref(),
-                    effect: cursor.effect(self, step),
-                },
-            )
-            .await
-            .map_err(|failure| failure.error)?;
-        if let Some(upgrade) = response.upgrade {
-            context.recovery_notices.push(upgrade.notice);
+        let forced = format!("{step}-text");
+        let mut response = None;
+        for (force_text, step) in [(false, step), (true, forced.as_str())] {
+            let outcome = self
+                .response(
+                    &messages,
+                    tools.clone(),
+                    cancel,
+                    None,
+                    0,
+                    ResponseContext {
+                        disable_tools: true,
+                        force_text,
+                        container: context.container.as_deref(),
+                        previous_message_id: context.previous_message_id.as_deref(),
+                        template: Some(&template),
+                        wire_profile: cursor.wire_profile.as_ref(),
+                        effect: cursor.effect(self, step),
+                    },
+                )
+                .await
+                .map_err(|failure| failure.error)?;
+            if let Some(upgrade) = outcome.upgrade {
+                context.recovery_notices.push(upgrade.notice);
+            }
+            let calls_tools = outcome
+                .message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+            response = Some(outcome.message);
+            if !calls_tools {
+                break;
+            }
         }
-        let response = response.message;
+        let response = response.ok_or_else(|| provider_error("compaction made no request"))?;
         if response.stop_reason != Some(StopReason::EndTurn) || response.role != Role::Assistant {
             return Err(provider_error("compaction summary did not end normally"));
         }
@@ -4805,6 +4814,9 @@ impl State {
     }
 
     async fn finalize_server_turn(&self, conversation: &mut Conversation) {
+        if unfinished_server_turn_start(&conversation.messages).is_none() {
+            return;
+        }
         let mut messages = conversation.packed_messages();
         if self.recover_server_turn(conversation, &mut messages).await {
             conversation.messages = messages;
@@ -5446,6 +5458,7 @@ impl State {
                     index,
                     ResponseContext {
                         disable_tools: false,
+                        force_text: false,
                         container: conversation.container.as_deref(),
                         previous_message_id: previous_message_id.as_deref(),
                         template: Some(&cursor.template),
@@ -6746,6 +6759,7 @@ impl LifecycleBackend for Driver {
     fn shutdown(&self) -> BackendFuture<Result<()>> {
         let state = self.state.clone();
         Box::pin(async move {
+            state.closing.store(true, Ordering::SeqCst);
             let first_shutdown = !state.stopped.swap(true, Ordering::SeqCst);
             if let Some(cancel) = state.compaction_cancel.lock().await.as_ref() {
                 cancel.cancel();

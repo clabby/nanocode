@@ -19,7 +19,7 @@
     "full": [],
     "expanded": [
       "--tools",
-      "Agent,Bash,Glob,Grep,Read,Write,Edit,NotebookEdit,TaskOutput,TaskStop,AskUserQuestion,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,TaskCreate,TaskGet,TaskList,TaskUpdate,TodoWrite,Skill,WebFetch,WebSearch,ToolSearch"
+      "Agent,Bash,Glob,Grep,Read,Write,Edit,TaskOutput,TaskStop,EnterPlanMode,ExitPlanMode,TaskCreate,TaskGet,TaskList,TaskUpdate,TodoWrite,Skill,WebFetch,WebSearch,ToolSearch"
     ],
     "host": [
       "--permission-prompt-tool",
@@ -27,28 +27,13 @@
     ]
   },
   "tool_profiles": {
-    "Agent": "expanded",
     "Bash": "expanded",
-    "CronCreate": "host",
-    "CronDelete": "host",
-    "CronList": "host",
     "Edit": "expanded",
-    "EnterWorktree": "expanded",
-    "ExitWorktree": "expanded",
-    "ListAgents": "host",
-    "NotebookEdit": "expanded",
     "Read": "expanded",
-    "ReportFindings": "host",
-    "ScheduleWakeup": "host",
-    "SendMessage": "host",
     "TaskStop": "expanded",
     "WebFetch": "expanded",
     "WebSearch": "expanded",
-    "Workflow": "host",
     "Write": "expanded",
-    "AskUserQuestion": "host",
-    "EnterPlanMode": "host",
-    "ExitPlanMode": "host",
     "Glob": "expanded",
     "Grep": "expanded",
     "TaskCreate": "expanded",
@@ -63,7 +48,7 @@
     },
     {
       "path": "tools/src/tools/upstream.json",
-      "sha256": "c59ad0a65d053d1afa2f5a2eacb6da7dea2843ef3b5d6ec4d0b6f978d088abcb"
+      "sha256": "cce1cf98ec8dd390b712943cd944e4d7ac96b622381708a1945d04ffbd246683"
     }
   ],
   "scope": "Exact SDK identity and core text blocks, and model-visible tool names, descriptions and input schemas from official CLI requests to a local Messages stub with a dummy API key. Request-specific billing, authentication, cache policy, environment, project memory and attribution remain separate host context. Bash uses the upstream expanded catalog profile with Glob and Grep. Captured contract availability is not a claim of implementing every Claude Code host action. TaskOutput, TodoWrite and Skill remain separately supplied SDK extensions when registered."

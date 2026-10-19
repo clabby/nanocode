@@ -34,6 +34,10 @@ impl CodeModeToolPolicy for StandardToolPolicy {
         .find_map(|(tool, routing)| (tool.name() == name).then_some(routing))
     }
 
+    fn exclusive(&self, name: &str) -> bool {
+        StandardTool::ApplyPatch.name() == name
+    }
+
     fn direct_host_tool(&self, name: &str) -> bool {
         [
             StandardTool::ExecCommand,

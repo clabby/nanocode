@@ -26,12 +26,49 @@ pub(crate) struct Highlights {
     blocks: Vec<HighlightedBlock>,
 }
 
+impl Highlights {
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.blocks.shrink_to_fit();
+        for block in &mut self.blocks {
+            block.code.shrink_to_fit();
+            block.runs.shrink_to_fit();
+            block.lines.shrink_to_fit();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct HighlightedBlock {
     language: Option<String>,
     code: String,
-    lines: Vec<Vec<Span<'static>>>,
+    runs: Vec<(Style, usize)>,
+    lines: Vec<(usize, usize)>,
     resume: Option<Resume>,
+}
+
+impl HighlightedBlock {
+    fn spans<'a>(&'a self, line: usize, spans: &mut Vec<Span<'a>>) {
+        let first = line
+            .checked_sub(1)
+            .map_or(0, |previous| self.lines[previous].1);
+        let (mut start, end) = self.lines[line];
+        spans.clear();
+        spans.extend(self.runs[first..end].iter().map(|&(style, run)| {
+            let span = Span::styled(&self.code[start..run], style);
+            start = run;
+            span
+        }));
+    }
+}
+
+fn push_runs(
+    runs: &mut Vec<(Style, usize)>,
+    lines: &mut Vec<(usize, usize)>,
+    start: usize,
+    line: Vec<(Style, usize)>,
+) {
+    runs.extend(line.into_iter().map(|(style, end)| (style, start + end)));
+    lines.push((start, runs.len()));
 }
 
 #[derive(Clone)]
@@ -469,9 +506,12 @@ impl<'a> Renderer<'a> {
             self.theme,
         ));
         let content_width = self.width.saturating_sub(4).max(1);
-        for highlighted in &self.highlights.blocks[block].lines {
+        let highlighted = &self.highlights.blocks[block];
+        let mut source = Vec::new();
+        for line in 0..highlighted.lines.len() {
+            highlighted.spans(line, &mut source);
             for (index, mut spans) in
-                super::highlight::wrap_spans(highlighted, content_width.saturating_sub(2).max(1))
+                super::highlight::wrap_spans(&source, content_width.saturating_sub(2).max(1))
                     .into_iter()
                     .enumerate()
             {
@@ -525,27 +565,38 @@ impl<'a> Renderer<'a> {
                 .then(|| {
                     let mut lines = std::mem::take(&mut cached.lines);
                     lines.truncate(resume.lines);
+                    let mut runs = std::mem::take(&mut cached.runs);
+                    runs.truncate(lines.last().map_or(0, |&(_, end)| end));
                     (
+                        runs,
                         lines,
                         resume.offset,
                         HighlightLines::from_state(theme, resume.highlight, resume.parse),
                     )
                 })
         });
-        let (mut lines, offset, mut highlighter) = resumed.unwrap_or_else(|| {
+        let (mut runs, mut lines, offset, mut highlighter) = resumed.unwrap_or_else(|| {
             let syntax = language.map_or_else(
                 || assets.syntaxes.find_syntax_plain_text(),
                 |language| super::highlight::syntax_for_token(&assets.syntaxes, language),
             );
-            (Vec::new(), 0, HighlightLines::new(syntax, theme))
+            (
+                Vec::new(),
+                Vec::new(),
+                0,
+                HighlightLines::new(syntax, theme),
+            )
         });
         let (complete, last) = source[offset..]
             .rsplit_once('\n')
             .unwrap_or(("", &source[offset..]));
         if offset < source.len() - last.len() {
-            lines.extend(complete.split('\n').map(|source_line| {
-                super::highlight::line(&mut highlighter, source_line, &assets.syntaxes)
-            }));
+            let mut start = offset;
+            for source_line in complete.split('\n') {
+                let line = super::highlight::runs(&mut highlighter, source_line, &assets.syntaxes);
+                push_runs(&mut runs, &mut lines, start, line);
+                start += source_line.len() + 1;
+            }
         }
         let (highlight, parse) = highlighter.state();
         let resume = Resume {
@@ -555,14 +606,12 @@ impl<'a> Renderer<'a> {
             parse: parse.clone(),
         };
         let mut highlighter = HighlightLines::from_state(theme, highlight, parse);
-        lines.push(super::highlight::line(
-            &mut highlighter,
-            last,
-            &assets.syntaxes,
-        ));
+        let line = super::highlight::runs(&mut highlighter, last, &assets.syntaxes);
+        push_runs(&mut runs, &mut lines, source.len() - last.len(), line);
         let highlighted = HighlightedBlock {
             language: language.map(str::to_owned),
             code,
+            runs,
             lines,
             resume: Some(resume),
         };
@@ -577,8 +626,11 @@ impl<'a> Renderer<'a> {
     fn narrow_code_block(&mut self, block: usize) {
         let gutter = Style::default().fg(self.theme.border());
         let content_width = self.width.saturating_sub(2).max(1);
-        for highlighted in &self.highlights.blocks[block].lines {
-            for spans in super::highlight::wrap_spans(highlighted, content_width) {
+        let highlighted = &self.highlights.blocks[block];
+        let mut source = Vec::new();
+        for line in 0..highlighted.lines.len() {
+            highlighted.spans(line, &mut source);
+            for spans in super::highlight::wrap_spans(&source, content_width) {
                 let mut line = vec![Span::styled("┃ ", gutter)];
                 line.extend(spans);
                 self.lines.push(Line::from(line));

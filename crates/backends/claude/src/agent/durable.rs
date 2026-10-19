@@ -397,11 +397,7 @@ impl State {
             lifecycle_turn_id: candidate_id("lifecycle"),
             stop_hook_active: false,
             instruction_revision: None,
-            snapshot: if self.policy.is_some() && operation.is_some() {
-                self.snapshot(conversation).await?
-            } else {
-                Snapshot::default()
-            },
+            snapshot: Snapshot::default(),
             template,
             dynamic_tool_names,
             wire_profile: Some(wire_profile),
@@ -449,7 +445,7 @@ impl State {
     pub(super) async fn advance_cursor(
         &self,
         cursor: &mut Cursor,
-        conversation: &Conversation,
+        conversation: &mut Conversation,
     ) -> Result<()> {
         let _update = self.persistence_update.lock().await;
         self.advance_cursor_locked(cursor, conversation).await
@@ -457,7 +453,7 @@ impl State {
     pub(super) async fn advance_cursor_locked(
         &self,
         cursor: &mut Cursor,
-        conversation: &Conversation,
+        conversation: &mut Conversation,
     ) -> Result<()> {
         if self.code_only && !is_code_only_catalog(&cursor.template.tools) {
             cursor.template.tools = self.code_only_tools();
@@ -466,9 +462,10 @@ impl State {
         }
 
         if let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) {
-            cursor.snapshot = self.snapshot(conversation).await?;
+            cursor.snapshot = self.snapshot(&Conversation::default()).await?;
+            cursor.snapshot.conversation = std::mem::take(conversation);
             let encoded = serde_json::value::to_raw_value(&*cursor).map_err(provider_error);
-            cursor.snapshot = Snapshot::default();
+            *conversation = std::mem::take(&mut cursor.snapshot).conversation;
             policy.advance_encoded(operation.clone(), encoded?).await?;
             self.persistence_ready.notify_waiters();
         }
@@ -476,7 +473,7 @@ impl State {
     }
     pub(super) async fn settle(
         &self,
-        conversation: &Conversation,
+        conversation: &mut Conversation,
         request: &BackendPrompt,
         result: &Result<TurnResult>,
     ) -> Result<()> {
@@ -493,8 +490,21 @@ impl State {
             self.stopped.store(true, Ordering::SeqCst);
             return Ok(());
         }
-        let checkpoint =
-            serde_json::to_value(self.snapshot(conversation).await?).map_err(provider_error)?;
+        if matches!(result, Err(NanocodexError::TurnCancelled))
+            && self.closing.load(Ordering::SeqCst)
+        {
+            let released = policy.release(operation.clone()).await;
+            if let Some(turn) = self.steering.lock().await.get_mut(&request.key) {
+                turn.operation = None;
+            }
+            self.persistence_ready.notify_waiters();
+            return released;
+        }
+        let mut snapshot = self.snapshot(&Conversation::default()).await?;
+        snapshot.conversation = std::mem::take(conversation);
+        let checkpoint = serde_json::to_value(&snapshot).map_err(provider_error);
+        *conversation = snapshot.conversation;
+        let checkpoint = checkpoint?;
         let settled =
             match result {
                 Ok(result) => policy

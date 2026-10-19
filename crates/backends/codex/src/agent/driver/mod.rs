@@ -392,6 +392,7 @@ impl AgentDriver {
                             default_service_tier,
                         )
                         .await;
+                        mark_all_queued_turns_cancelled(&mut queued_turns);
                         commands_open = false;
                         continue;
                     }
@@ -941,6 +942,7 @@ impl AgentDriver {
                                             default_service_tier,
                                         )
                                         .await;
+                                        mark_all_queued_turns_cancelled(&mut queued_turns);
                                         commands_open = false;
                                         break execution.as_mut().await;
                                     }
@@ -1755,6 +1757,7 @@ impl AgentDriver {
                                     default_service_tier,
                                 )
                                 .await;
+                                mark_all_queued_turns_cancelled(&mut queued_turns);
                                 commands_open = false;
                             }
                             None => {
@@ -1816,6 +1819,15 @@ impl AgentDriver {
                         false,
                         None,
                     )
+                }
+                Ok(ModelTurnOutcome::Cancelled(_)) if !commands_open => {
+                    if let Some(operation_id) = &execution_operation {
+                        self.execution.release_claim(operation_id).await;
+                    }
+                    model.replace_client((self.spawner.service_factory)(Arc::clone(
+                        &self.spawner.config,
+                    )));
+                    (Err(NanocodexError::TurnStopped), true, None)
                 }
                 Ok(ModelTurnOutcome::Cancelled(checkpoint)) => {
                     let checkpoint = Arc::new(CommittedSession::new(
@@ -1902,14 +1914,24 @@ impl AgentDriver {
                     }
                 }
             };
-            let outcome = self
-                .execution
-                .recover_failure(execution_operation.as_deref(), outcome)
-                .await;
+            let outcome = match outcome {
+                Err(NanocodexError::TurnStopped) if !commands_open => {
+                    Err(NanocodexError::TurnStopped)
+                }
+                outcome => {
+                    self.execution
+                        .recover_failure(execution_operation.as_deref(), outcome)
+                        .await
+                }
+            };
 
             let terminal = match &outcome {
-                Ok(_) => Some("completed"),
-                Err(NanocodexError::TurnCancelled) => Some("cancelled"),
+                Ok(_) => "completed",
+                Err(NanocodexError::TurnCancelled | NanocodexError::TurnStopped) => "cancelled",
+                Err(_) => "failed",
+            };
+            let emitted = model.emit_terminal(terminal);
+            let outcome = match outcome {
                 Err(error)
                     if matches!(
                         error.execution_policy_disposition(),
@@ -1919,18 +1941,17 @@ impl AgentDriver {
                         )
                     ) =>
                 {
-                    None
+                    Err(error)
                 }
-                Err(_) => Some("failed"),
-            };
-            let outcome = match terminal {
-                Some(status) => model.emit_terminal(status).and(outcome),
-                None => outcome,
+                outcome => emitted.and(outcome),
             };
             if !commands_open
                 && !terminal_failure_committed
                 && let Err(error) = &outcome
-                && !matches!(error, NanocodexError::TurnCancelled)
+                && !matches!(
+                    error,
+                    NanocodexError::TurnCancelled | NanocodexError::TurnStopped
+                )
             {
                 shutdown_failures.push(error.to_string());
             }

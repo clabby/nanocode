@@ -97,6 +97,33 @@ impl Index {
         }
     }
 
+    pub(super) fn relocate(
+        &mut self,
+        offset: u64,
+        last: Option<Location>,
+        entries: &HashMap<u64, Location>,
+        mut relocated: impl FnMut(&str, Record) -> Option<Record>,
+    ) -> io::Result<()> {
+        let deferred: Vec<String> = self.deferred.keys().cloned().collect();
+        for id in deferred {
+            self.load_records(&id)?;
+        }
+        self.file = None;
+        self.migrated = false;
+        self.offset = offset;
+        self.last = last;
+        for state in self.states.values_mut() {
+            state.location = entries
+                .get(&state.location.position)
+                .copied()
+                .ok_or_else(invalid)?;
+            for (key, record) in &mut state.records {
+                *record = relocated(key, *record).ok_or_else(invalid)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn load_records(&mut self, id: &str) -> io::Result<()> {
         let Some(block) = self.deferred.get(id).copied() else {
             return Ok(());
@@ -290,6 +317,9 @@ impl Journal {
     }
 
     pub(super) fn persist_index(&mut self) {
+        if self.sealed.is_some() {
+            return;
+        }
         if std::fs::metadata(&self.path)
             .ok()
             .and_then(|metadata| identity(&metadata).ok())
@@ -512,6 +542,7 @@ impl Journal {
         self.index = Index::new(self.index.source.clone());
         self.persisted_offset = None;
         self.cached = None;
+        self.sealed = None;
     }
 
     pub(super) fn refresh_index(&mut self) -> Result<(), nanocode_durability_core::StoreError> {
@@ -528,17 +559,7 @@ impl Journal {
 impl Journal {
     pub(super) fn flush_index(&mut self) {
         if self.ready && (self.persisted_offset != Some(self.index.offset) || self.index.migrated) {
-            match self.file.try_lock() {
-                Ok(()) => {
-                    self.persist_index();
-                    if let Err(error) = self.file.unlock() {
-                        tracing::warn!(%error, "could not unlock JSONL journal after saving its index");
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(%error, "leaving JSONL index at its previous committed offset")
-                }
-            }
+            self.persist_index();
         }
     }
 }

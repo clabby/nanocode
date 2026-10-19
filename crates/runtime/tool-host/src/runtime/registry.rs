@@ -60,6 +60,7 @@ pub(crate) struct ToolRegistry {
     by_name: HashMap<Box<str>, usize>,
     pub(super) providers: Vec<Arc<dyn DynamicToolProvider>>,
     pub(super) policies: Vec<Arc<dyn crate::CodeModeToolPolicy>>,
+    nested_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl ToolRegistry {
@@ -202,6 +203,27 @@ impl ToolRegistry {
         if let Some(arguments_content) = &arguments_content {
             record_tool_content(&span, "tool.arguments", arguments_content);
         }
+        let queued_at = std::time::Instant::now();
+        let exclusive = self.policies.iter().any(|policy| policy.exclusive(name));
+        let _admission = if exclusive {
+            (
+                None,
+                Some(self.nested_gate.write().instrument(span.clone()).await),
+            )
+        } else {
+            (
+                Some(self.nested_gate.read().instrument(span.clone()).await),
+                None,
+            )
+        };
+        span.record(
+            "tool.admission",
+            if exclusive { "exclusive" } else { "shared" },
+        );
+        span.record(
+            "tool.admission.wait_ns",
+            u64::try_from(queued_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
         let started_at = std::time::Instant::now();
         let dispatch = self
             .execute_nested_inner(name, input, context)
@@ -331,6 +353,7 @@ impl ToolRegistry {
             by_name,
             providers: Vec::new(),
             policies: Vec::new(),
+            nested_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 

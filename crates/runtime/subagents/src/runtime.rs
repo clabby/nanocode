@@ -3081,7 +3081,9 @@ impl Registry {
             } else {
                 match result {
                     Ok(_) => complete_session(session, submitted_output),
-                    Err(NanocodexError::TurnCancelled) => AgentStatus::Interrupted,
+                    Err(NanocodexError::TurnCancelled | NanocodexError::TurnStopped) => {
+                        AgentStatus::Interrupted
+                    }
                     Err(error) => AgentStatus::Failed {
                         error: error.to_string(),
                     },

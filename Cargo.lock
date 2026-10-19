@@ -2091,6 +2091,7 @@ name = "nanocode-store-jsonl"
 version = "0.6.7"
 dependencies = [
  "nanocode-durability-core",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "sha2",
@@ -2171,6 +2172,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -2292,7 +2294,9 @@ dependencies = [
  "nanocode-observability",
  "nanocode-store-jsonl",
  "nanocode-tui",
+ "nix 0.31.3",
  "opentelemetry",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

@@ -6,28 +6,29 @@ mod index;
 pub use compact::CompactionStats;
 
 use nanocode_durability_core::{
-    OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoreRecord, StoreUpdate,
-    StoredState,
+    OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoreRecord,
+    StoreReplacement, StoreUpdate, StoredState,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeStruct};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap, HashSet},
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
     fs::{File, Metadata, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     ops::Range,
-    path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError, Weak},
+    path::{Path, PathBuf},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 const JOB_CAPACITY: usize = 1;
-
-static OPENING: Mutex<BTreeMap<PathBuf, Weak<Semaphore>>> = Mutex::new(BTreeMap::new());
+const JOURNAL_READ_BUFFER_BYTES: usize = 128 * 1024;
+const SEAL_POLL_FIRST: Duration = Duration::from_millis(1);
+const SEAL_POLL_LONGEST: Duration = Duration::from_millis(100);
 
 type Job = Box<dyn FnOnce(&mut Journal) + Send>;
 
@@ -45,12 +46,51 @@ enum Entry {
     },
 }
 
+impl Entry {
+    fn claim(&self) -> Claim<'_> {
+        match self {
+            Self::Acquire { state_id, owner } => Claim {
+                state_id,
+                owner,
+                revision: None,
+            },
+            Self::Replace {
+                state_id,
+                owner,
+                revision,
+                ..
+            } => Claim {
+                state_id,
+                owner,
+                revision: Some(*revision),
+            },
+        }
+    }
+}
+
+fn replacement(entries: Vec<Entry>) -> Option<StoreReplacement> {
+    entries.into_iter().find_map(|entry| match entry {
+        Entry::Replace {
+            payload, records, ..
+        } => Some(StoreReplacement { payload, records }),
+        Entry::Acquire { .. } => None,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct Batch {
+    id: String,
+    count: usize,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Line<'a> {
     Acquire {
         state_id: &'a str,
         owner: &'a OwnerToken,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        batch: Option<&'a Batch>,
     },
     Replace {
         state_id: &'a str,
@@ -58,7 +98,219 @@ enum Line<'a> {
         revision: u64,
         payload: &'a str,
         records: Spanned<'a, [StoreRecord]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        batch: Option<&'a Batch>,
     },
+    Seal {
+        seal: &'a str,
+        pid: u32,
+    },
+    Unseal {
+        seal: &'a str,
+    },
+}
+
+struct Claim<'a> {
+    state_id: &'a str,
+    owner: &'a OwnerToken,
+    revision: Option<u64>,
+}
+
+enum Verdict {
+    Valid,
+    Stale,
+}
+
+trait Owners {
+    fn owner(&self, id: &str) -> Option<&OwnerToken>;
+    fn revision(&self, id: &str) -> u64;
+}
+
+fn judge(view: &impl Owners, claims: &[Claim<'_>]) -> Result<Verdict, StoreError> {
+    let mut owners: HashMap<&str, &OwnerToken> = HashMap::new();
+    let mut revisions: HashMap<&str, u64> = HashMap::new();
+    for claim in claims {
+        let owner = owners
+            .get(claim.state_id)
+            .copied()
+            .or_else(|| view.owner(claim.state_id));
+        match claim.revision {
+            None => {
+                let next = owner
+                    .map_or(Some(1), |owner| owner.fence().checked_add(1))
+                    .ok_or_else(|| backend("JSONL owner fence overflow"))?;
+                match claim.owner.fence().cmp(&next) {
+                    Ordering::Equal => {
+                        owners.insert(claim.state_id, claim.owner);
+                    }
+                    Ordering::Less => return Ok(Verdict::Stale),
+                    Ordering::Greater => return Err(backend("invalid JSONL owner fence sequence")),
+                }
+            }
+            Some(revision) => match owner {
+                Some(current) if current == claim.owner => {
+                    let next = revisions
+                        .get(claim.state_id)
+                        .copied()
+                        .unwrap_or_else(|| view.revision(claim.state_id))
+                        .checked_add(1)
+                        .ok_or_else(|| backend("JSONL revision overflow"))?;
+                    match revision.cmp(&next) {
+                        Ordering::Equal => {
+                            revisions.insert(claim.state_id, revision);
+                        }
+                        Ordering::Less => return Ok(Verdict::Stale),
+                        Ordering::Greater => {
+                            return Err(backend("invalid JSONL state revision or owner"));
+                        }
+                    }
+                }
+                Some(current) if claim.owner.fence() <= current.fence() => {
+                    return Ok(Verdict::Stale);
+                }
+                _ => return Err(backend("invalid JSONL state revision or owner")),
+            },
+        }
+    }
+    Ok(Verdict::Valid)
+}
+
+#[derive(Clone)]
+struct Sealed {
+    id: String,
+    pid: u32,
+}
+
+enum Outcome {
+    Committed,
+    Stale(Vec<Entry>),
+    Sealed(Vec<Entry>),
+}
+
+enum Unit<'a> {
+    Entries(Vec<(Location, Indexed<'a>, &'a [u8])>),
+    Void,
+}
+
+fn scan(
+    reader: &mut impl BufRead,
+    mut position: u64,
+    end: u64,
+    interrupted_at_end: bool,
+    mut each: impl FnMut(Unit<'_>, Location) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let mut line = Vec::new();
+    let mut group: Vec<(Location, Vec<u8>)> = Vec::new();
+    let mut open: Option<Batch> = None;
+    while position < end {
+        line.clear();
+        reader.read_until(b'\n', &mut line).map_err(backend)?;
+        if line.last() != Some(&b'\n') {
+            break;
+        }
+        let location = Location {
+            position,
+            length: line.len(),
+        };
+        position = position
+            .checked_add(line.len() as u64)
+            .ok_or_else(|| backend("JSONL offset overflow"))?;
+        if position > end {
+            return Err(backend("JSONL entry crossed an appended boundary"));
+        }
+        let parsed = serde_json::from_slice::<Indexed>(&line);
+        let batch = parsed
+            .as_ref()
+            .ok()
+            .and_then(|entry| entry.batch.clone())
+            .filter(|batch| batch.count > 1);
+        if open.is_some() && open != batch {
+            let (last, _) = group.pop().ok_or_else(|| backend("empty JSONL batch"))?;
+            group.clear();
+            open = None;
+            each(Unit::Void, last)?;
+        }
+        match parsed {
+            Err(error) => {
+                tracing::warn!(
+                    position = location.position,
+                    %error,
+                    "skipping an unparseable JSONL line"
+                );
+                each(Unit::Void, location)?;
+            }
+            Ok(entry) => match batch {
+                Some(batch) => {
+                    group.push((location, line.clone()));
+                    let complete = group.len() == batch.count;
+                    open = Some(batch);
+                    if complete {
+                        let lines = group
+                            .iter()
+                            .map(|(location, bytes)| {
+                                serde_json::from_slice::<Indexed>(bytes)
+                                    .map(|entry| (*location, entry, bytes.as_slice()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(backend)?;
+                        each(Unit::Entries(lines), location)?;
+                        group.clear();
+                        open = None;
+                    }
+                }
+                None => each(Unit::Entries(vec![(location, entry, &line)]), location)?,
+            },
+        }
+    }
+    if interrupted_at_end
+        && position == end
+        && let Some((last, _)) = group.pop()
+    {
+        each(Unit::Void, last)?;
+    }
+    Ok(())
+}
+
+fn claim<'a>(entry: &'a Indexed<'_>) -> Result<Claim<'a>, StoreError> {
+    let state_id = entry
+        .state_id
+        .as_deref()
+        .ok_or_else(|| backend("JSONL entry has no state"))?;
+    let owner = entry
+        .owner
+        .as_ref()
+        .ok_or_else(|| backend("JSONL entry has no owner"))?;
+    match entry.kind {
+        Kind::Acquire => Ok(Claim {
+            state_id,
+            owner,
+            revision: None,
+        }),
+        Kind::Replace => Ok(Claim {
+            state_id,
+            owner,
+            revision: Some(
+                entry
+                    .revision
+                    .ok_or_else(|| backend("invalid JSONL replacement entry"))?,
+            ),
+        }),
+        Kind::Seal | Kind::Unseal => Err(backend("JSONL seal inside an entry batch")),
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    let Ok(pid) = i32::try_from(pid) else {
+        return true;
+    };
+    !matches!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH))
+}
+
+#[cfg(not(unix))]
+const fn process_alive(_: u32) -> bool {
+    true
 }
 
 #[derive(Default)]
@@ -125,11 +377,13 @@ impl Write for Counted<'_> {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Kind {
     Acquire,
     Replace,
+    Seal,
+    Unseal,
 }
 
 #[derive(Deserialize)]
@@ -142,12 +396,16 @@ struct Indexed<'a> {
     #[serde(rename = "type")]
     kind: Kind,
     #[serde(borrow)]
-    state_id: Cow<'a, str>,
-    owner: OwnerToken,
+    state_id: Option<Cow<'a, str>>,
+    owner: Option<OwnerToken>,
     revision: Option<u64>,
     payload: Option<Text>,
     #[serde(borrow)]
     records: Option<Vec<IndexedRecord<'a>>>,
+    batch: Option<Batch>,
+    #[serde(borrow)]
+    seal: Option<Cow<'a, str>>,
+    pid: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -331,6 +589,17 @@ struct Journal {
     ready: bool,
     invalid_index: Option<String>,
     cached: Option<CachedEntry>,
+    sealed: Option<Sealed>,
+}
+
+impl Owners for index::Index {
+    fn owner(&self, id: &str) -> Option<&OwnerToken> {
+        self.owners.get(id)
+    }
+
+    fn revision(&self, id: &str) -> u64 {
+        self.states.get(id).map_or(0, |state| state.revision)
+    }
 }
 
 impl Journal {
@@ -340,8 +609,7 @@ impl Journal {
             let file = OpenOptions::new()
                 .create(true)
                 .read(true)
-                .write(true)
-                .truncate(false)
+                .append(true)
                 .open(path)
                 .map_err(backend)?;
             let canonical = std::fs::canonicalize(path).map_err(backend)?;
@@ -362,15 +630,14 @@ impl Journal {
             ready: false,
             invalid_index: None,
             cached: None,
+            sealed: None,
         };
         store.restore_index();
-        store.locked(|store| {
-            store.clear_temporaries().map_err(backend)?;
-            if store.persisted_offset.is_none() {
-                store.persist_index();
-            }
-            Ok(())
-        })?;
+        store.sync()?;
+        store.clear_temporaries().map_err(backend)?;
+        if store.persisted_offset.is_none() {
+            store.persist_index();
+        }
         store.ready = true;
         Ok(store)
     }
@@ -386,6 +653,7 @@ impl Journal {
             .ok_or_else(|| std::io::Error::other("journal has no filename"))?
             .to_os_string();
         prefix.push(suffix);
+        prefix.push(format!("{}-", std::process::id()));
         tempfile::Builder::new()
             .prefix(&prefix)
             .tempfile_in(directory)
@@ -410,14 +678,21 @@ impl Journal {
             .collect();
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
-            if prefixes.iter().any(|prefix| {
-                entry
-                    .file_name()
-                    .as_encoded_bytes()
-                    .starts_with(prefix.as_encoded_bytes())
-            }) && entry.file_type()?.is_file()
-            {
-                std::fs::remove_file(entry.path())?;
+            let name = entry.file_name();
+            let abandoned = prefixes.iter().any(|prefix| {
+                name.as_encoded_bytes()
+                    .strip_prefix(prefix.as_encoded_bytes())
+                    .and_then(|rest| std::str::from_utf8(rest).ok())
+                    .and_then(|rest| rest.split_once('-'))
+                    .and_then(|(pid, _)| pid.parse::<u32>().ok())
+                    .is_some_and(|pid| !process_alive(pid))
+            });
+            if abandoned && entry.file_type()?.is_file() {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(())
@@ -432,109 +707,147 @@ impl Journal {
         home.join("sessions.jsonl")
     }
 
-    fn locked<T>(
-        &mut self,
-        action: impl FnOnce(&mut Self) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
-        let span = tracing::info_span!(
-            "durability.jsonl.transaction",
-            lock.wait_ms = tracing::field::Empty
-        );
-        let _entered = span.enter();
-        let started = Instant::now();
+    fn sync(&mut self) -> Result<(), StoreError> {
         loop {
-            self.file.lock().map_err(backend)?;
-            let current = std::fs::metadata(&self.path)
-                .map_err(backend)
-                .and_then(|metadata| identity(&metadata));
-            match current {
-                Ok(source) if source == self.index.source => break,
-                Ok(_) => {
-                    self.file.unlock().map_err(backend)?;
-                    self.reopen_compacted()?;
-                }
-                Err(error) => {
-                    self.file.unlock().map_err(backend)?;
-                    return Err(error);
-                }
+            let current = identity(&std::fs::metadata(&self.path).map_err(backend)?)?;
+            if current == self.index.source {
+                break;
             }
+            self.reopen_compacted()?;
         }
-        span.record("lock.wait_ms", started.elapsed().as_secs_f64() * 1_000.0);
-        if !self.ready && self.persisted_offset.is_none() && self.index.offset == 0 {
-            self.restore_index();
-        }
-        let result = self.refresh_index().and_then(|()| {
-            self.ready = true;
-            action(self)
-        });
-        let unlocked = self.file.unlock().map_err(backend);
-        match result {
-            Ok(value) => unlocked.map(|()| value),
-            Err(error) => Err(error),
+        self.refresh_index()
+    }
+
+    fn writable(&mut self) -> Result<(), StoreError> {
+        let mut delay = SEAL_POLL_FIRST;
+        loop {
+            self.sync()?;
+            let Some(sealed) = self.sealed.clone() else {
+                return Ok(());
+            };
+            if !process_alive(sealed.pid) {
+                tracing::warn!(
+                    seal = sealed.id,
+                    pid = sealed.pid,
+                    "releasing the seal of an exited JSONL compactor"
+                );
+                self.append_marker(&Line::Unseal { seal: &sealed.id })?;
+                continue;
+            }
+            thread::sleep(delay);
+            delay = delay.saturating_mul(2).min(SEAL_POLL_LONGEST);
         }
     }
 
     fn refresh(&mut self) -> Result<(), StoreError> {
-        if identity(&std::fs::metadata(&self.path).map_err(backend)?)? != self.index.source {
-            return Err(identity_changed());
-        }
-        let length = self.file.metadata().map_err(backend)?.len();
+        self.consume(None)
+    }
+
+    fn consume(&mut self, until: Option<u64>) -> Result<(), StoreError> {
+        let length = self.reads.metadata().map_err(backend)?.len();
         if length < self.index.offset {
             return Err(backend(
                 "JSONL durability log was truncated before its committed offset",
             ));
         }
-        if length == self.index.offset {
+        let end = until.unwrap_or(length);
+        if end > length {
+            return Err(backend("JSONL append position is beyond the journal"));
+        }
+        if end <= self.index.offset {
             return Ok(());
         }
         let _span = tracing::info_span!(
             "durability.jsonl.recover",
-            log.unindexed_bytes = length - self.index.offset
+            log.unindexed_bytes = end - self.index.offset
         )
         .entered();
-        let mut reader = BufReader::new(self.file.try_clone().map_err(backend)?);
+        let mut reader = BufReader::with_capacity(
+            JOURNAL_READ_BUFFER_BYTES,
+            self.reads.try_clone().map_err(backend)?,
+        );
         reader
             .seek(SeekFrom::Start(self.index.offset))
             .map_err(backend)?;
-        let mut line = Vec::new();
-        while self.index.offset < length {
-            line.clear();
-            reader.read_until(b'\n', &mut line).map_err(backend)?;
-            if line.last() != Some(&b'\n') {
-                self.file.set_len(self.index.offset).map_err(backend)?;
-                self.file.sync_all().map_err(backend)?;
-                break;
+        let start = self.index.offset;
+        scan(&mut reader, start, end, until.is_some(), |unit, last| {
+            if let Unit::Entries(lines) = unit {
+                self.settle(&lines)?;
             }
-            self.replay(&line)?;
-            self.index.last = Some(Location {
-                position: self.index.offset,
-                length: line.len(),
-            });
-            self.index.offset = self
-                .index
-                .offset
-                .checked_add(line.len() as u64)
+            self.index.last = Some(last);
+            self.index.offset = last
+                .position
+                .checked_add(last.length as u64)
                 .ok_or_else(|| backend("JSONL offset overflow"))?;
+            Ok(())
+        })
+    }
+
+    fn settle(&mut self, lines: &[(Location, Indexed<'_>, &[u8])]) -> Result<(), StoreError> {
+        if let [(_, entry, _)] = lines
+            && matches!(entry.kind, Kind::Seal | Kind::Unseal)
+        {
+            let seal = entry
+                .seal
+                .as_deref()
+                .ok_or_else(|| backend("invalid JSONL seal entry"))?;
+            match (entry.kind, &self.sealed) {
+                (Kind::Seal, None) => {
+                    self.sealed = Some(Sealed {
+                        id: seal.to_owned(),
+                        pid: entry
+                            .pid
+                            .ok_or_else(|| backend("invalid JSONL seal entry"))?,
+                    });
+                }
+                (Kind::Unseal, Some(sealed)) if sealed.id == seal => self.sealed = None,
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.sealed.is_some() {
+            return Ok(());
+        }
+        let claims = lines
+            .iter()
+            .map(|(_, entry, _)| claim(entry))
+            .collect::<Result<Vec<_>, _>>()?;
+        if matches!(judge(&self.index, &claims)?, Verdict::Stale) {
+            tracing::debug!(
+                position = lines.first().map(|(location, _, _)| location.position),
+                "skipping a JSONL entry superseded by a concurrent writer"
+            );
+            return Ok(());
+        }
+        for (location, entry, line) in lines {
+            self.replay(*location, entry, line)?;
         }
         Ok(())
     }
 
-    fn replay(&mut self, line: &[u8]) -> Result<(), StoreError> {
-        let indexed: Indexed = serde_json::from_slice(line).map_err(backend)?;
-        let location = Location {
-            position: self.index.offset,
-            length: line.len(),
-        };
+    fn replay(
+        &mut self,
+        location: Location,
+        indexed: &Indexed<'_>,
+        line: &[u8],
+    ) -> Result<(), StoreError> {
+        let id = indexed
+            .state_id
+            .as_deref()
+            .ok_or_else(|| backend("JSONL entry has no state"))?;
+        let owner = indexed
+            .owner
+            .clone()
+            .ok_or_else(|| backend("JSONL entry has no owner"))?;
         match indexed.kind {
-            Kind::Acquire => self.acquired(&indexed.state_id, indexed.owner),
+            Kind::Acquire => self.acquired(id, owner),
             Kind::Replace => {
                 let (Some(revision), Some(Text), Some(records)) =
-                    (indexed.revision, indexed.payload, indexed.records)
+                    (indexed.revision, &indexed.payload, &indexed.records)
                 else {
                     return Err(backend("invalid JSONL replacement entry"));
                 };
-                let id = &*indexed.state_id;
-                self.check_replacement(id, &indexed.owner, revision)?;
+                self.check_replacement(id, &owner, revision)?;
                 if !records.is_empty()
                     && let Err(error) = self.index.load_records(id)
                 {
@@ -564,6 +877,7 @@ impl Journal {
                 );
                 Ok(())
             }
+            Kind::Seal | Kind::Unseal => Err(backend("JSONL seal inside an entry batch")),
         }
     }
 
@@ -785,12 +1099,15 @@ impl Journal {
     ) -> Result<Vec<bool>, StoreError> {
         let mut staged = HashMap::new();
         let mut fresh = Vec::with_capacity(records.len());
+        let (mut encoded, mut stored) = (Vec::new(), Vec::new());
         for record in records {
-            let existing = self.record(id, &record.key)?;
-            let retained = existing
-                .as_deref()
-                .or_else(|| staged.get(record.key.as_str()).copied());
-            if retained.is_some_and(|value| value != record.value) {
+            let retained = match self.matches(id, record, &mut encoded, &mut stored)? {
+                Some(equal) => Some(equal),
+                None => staged
+                    .get(record.key.as_str())
+                    .map(|value| *value == record.value),
+            };
+            if retained == Some(false) {
                 return Err(StoreError::NotCommitted(format!(
                     "durability record `{}` has conflicting content",
                     record.key
@@ -802,28 +1119,126 @@ impl Journal {
         Ok(fresh)
     }
 
-    fn append(&mut self, entry: Entry) -> Result<(), StoreError> {
-        self.append_entries(vec![entry])
+    fn matches(
+        &mut self,
+        id: &str,
+        record: &StoreRecord,
+        encoded: &mut Vec<u8>,
+        stored: &mut Vec<u8>,
+    ) -> Result<Option<bool>, StoreError> {
+        let Some(indexed) = self.location(id, &record.key)? else {
+            return Ok(None);
+        };
+        if let Record::Value { location, digest } = indexed {
+            encoded.clear();
+            serde_json::to_writer(&mut *encoded, &record.value).map_err(backend)?;
+            if encoded.len() == location.length {
+                stored.resize(location.length, 0);
+                if let Err(error) = self
+                    .reads
+                    .seek(SeekFrom::Start(location.position))
+                    .and_then(|_| self.reads.read_exact(stored))
+                {
+                    return Err(self.invalidated(error));
+                }
+                if stored == encoded && value_digest(id, &record.key, stored) == digest {
+                    return Ok(Some(true));
+                }
+            }
+        }
+        Ok(Some(
+            self.record(id, &record.key)?
+                .is_some_and(|value| value == record.value),
+        ))
     }
 
-    fn append_entries(&mut self, entries: Vec<Entry>) -> Result<(), StoreError> {
+    fn append_raw(&mut self, bytes: &[u8]) -> Result<u64, StoreError> {
+        let length = self.file.metadata().map_err(backend)?.len();
+        let separated = length == 0 || {
+            let mut last = [0];
+            self.reads
+                .seek(SeekFrom::Start(length - 1))
+                .and_then(|_| self.reads.read_exact(&mut last))
+                .map_err(backend)?;
+            last[0] == b'\n'
+        };
+        let framed;
+        let data = if separated {
+            bytes
+        } else {
+            let mut separated = Vec::with_capacity(bytes.len() + 1);
+            separated.push(b'\n');
+            separated.extend_from_slice(bytes);
+            framed = separated;
+            framed.as_slice()
+        };
+        let written = self.file.write(data).map_err(backend)?;
+        if written != data.len() {
+            return Err(backend("JSONL append wrote only part of its entries"));
+        }
+        let end = self.file.stream_position().map_err(backend)?;
+        let started = Instant::now();
+        self.file.sync_all().map_err(backend)?;
+        tracing::Span::current().record(
+            "fsync.duration_ms",
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        end.checked_sub(bytes.len() as u64)
+            .ok_or_else(|| backend("JSONL append position underflow"))
+    }
+
+    fn append_marker(&mut self, line: &Line<'_>) -> Result<(), StoreError> {
+        let mut bytes = serde_json::to_vec(line).map_err(backend)?;
+        bytes.push(b'\n');
+        let start = self.append_raw(&bytes)?;
+        self.consume(Some(start))?;
+        self.consume(None)
+    }
+
+    fn seal(&mut self, seal: &str) -> Result<Option<u64>, StoreError> {
+        let mut bytes = serde_json::to_vec(&Line::Seal {
+            seal,
+            pid: std::process::id(),
+        })
+        .map_err(backend)?;
+        bytes.push(b'\n');
+        let start = self.append_raw(&bytes)?;
+        self.consume(Some(start))?;
+        if self.index.offset != start {
+            return Err(backend("JSONL journal did not reach its appended seal"));
+        }
+        let won = self.sealed.is_none();
+        self.consume(None)?;
+        Ok(won.then_some(start))
+    }
+
+    fn commit(&mut self, entries: Vec<Entry>) -> Result<Outcome, StoreError> {
         let span = tracing::info_span!(
             "durability.jsonl.append",
             entry.count = entries.len(),
             log.bytes = tracing::field::Empty,
             encode.duration_ms = tracing::field::Empty,
             fsync.duration_ms = tracing::field::Empty,
-            index.duration_ms = tracing::field::Empty
+            index.duration_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty
         );
         let _entered = span.enter();
         let started = Instant::now();
+        let batch = (entries.len() > 1).then(|| Batch {
+            id: OwnerId::new().as_str().to_owned(),
+            count: entries.len(),
+        });
         let mut bytes = Vec::new();
         let mut lengths = Vec::with_capacity(entries.len());
         let spans = Spans::default();
         for entry in &entries {
             let start = bytes.len();
             let line = match entry {
-                Entry::Acquire { state_id, owner } => Line::Acquire { state_id, owner },
+                Entry::Acquire { state_id, owner } => Line::Acquire {
+                    state_id,
+                    owner,
+                    batch: batch.as_ref(),
+                },
                 Entry::Replace {
                     state_id,
                     owner,
@@ -839,6 +1254,7 @@ impl Journal {
                         value: records,
                         spans: &spans,
                     },
+                    batch: batch.as_ref(),
                 },
             };
             serde_json::to_writer(
@@ -857,18 +1273,37 @@ impl Journal {
             "encode.duration_ms",
             started.elapsed().as_secs_f64() * 1_000.0,
         );
-        self.file
-            .seek(SeekFrom::Start(self.index.offset))
-            .map_err(backend)?;
-        self.file.write_all(&bytes).map_err(backend)?;
+        let origin = self.append_raw(&bytes)?;
+        self.consume(Some(origin))?;
+        if self.index.offset != origin {
+            return Err(backend("JSONL journal did not reach its appended entries"));
+        }
         let started = Instant::now();
-        self.file.sync_all().map_err(backend)?;
-        span.record(
-            "fsync.duration_ms",
-            started.elapsed().as_secs_f64() * 1_000.0,
-        );
-        let started = Instant::now();
-        let origin = self.index.offset;
+        let void = if self.sealed.is_some() {
+            Some(true)
+        } else {
+            let claims: Vec<_> = entries.iter().map(Entry::claim).collect();
+            matches!(judge(&self.index, &claims)?, Verdict::Stale).then_some(false)
+        };
+        if let Some(sealed) = void {
+            let length = *lengths
+                .last()
+                .ok_or_else(|| backend("empty JSONL append"))?;
+            let end = origin
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| backend("JSONL offset overflow"))?;
+            self.index.last = Some(Location {
+                position: end - length as u64,
+                length,
+            });
+            self.index.offset = end;
+            span.record("outcome", if sealed { "sealed" } else { "superseded" });
+            return Ok(if sealed {
+                Outcome::Sealed(entries)
+            } else {
+                Outcome::Stale(entries)
+            });
+        }
         let mut values = spans.values.into_inner().into_iter();
         for (entry, length) in entries.into_iter().zip(lengths) {
             let location = Location {
@@ -914,7 +1349,8 @@ impl Journal {
             "index.duration_ms",
             started.elapsed().as_secs_f64() * 1_000.0,
         );
-        Ok(())
+        span.record("outcome", "committed");
+        Ok(Outcome::Committed)
     }
 }
 
@@ -934,30 +1370,45 @@ impl Journal {
                 "a companion state must differ from its state".into(),
             ));
         }
-        self.locked(|store| {
+        let mut update = Some(update);
+        let mut planned: Option<(u64, Option<StoreReplacement>)> = None;
+        loop {
+            self.writable()?;
             let mut entries = Vec::new();
-            let companion = match companion {
+            let held = match &companion {
                 Some((companion_id, companion_owner)) => {
-                    let fence = store.next_fence(companion_id).ok_or_else(|| {
+                    let fence = self.next_fence(companion_id).ok_or_else(|| {
                         StoreError::NotCommitted("JSONL owner fence overflow".into())
                     })?;
-                    let owner = OwnerToken::new(companion_owner, fence);
-                    let state = store.state(companion_id)?;
+                    let owner = OwnerToken::new(companion_owner.clone(), fence);
+                    let state = self.state(companion_id)?;
                     entries.push(Entry::Acquire {
-                        state_id: companion_id.into(),
+                        state_id: (*companion_id).into(),
                         owner: owner.clone(),
                     });
-                    Some((companion_id, OwnedState { owner, state }))
+                    Some(OwnedState { owner, state })
                 }
                 None => None,
             };
-            let fence = store
+            let fence = self
                 .next_fence(id)
                 .ok_or_else(|| StoreError::NotCommitted("JSONL owner fence overflow".into()))?;
-            let owner = OwnerToken::new(owner_id, fence);
-            let mut state = store.state(id)?;
+            let owner = OwnerToken::new(owner_id.clone(), fence);
+            let mut state = self.state(id)?;
             let current = state.revision;
-            let replacement = update(&state)?;
+            let replacement = match planned.take() {
+                Some((revision, replacement)) if revision == current => replacement,
+                Some(_) => {
+                    return Err(StoreError::NotCommitted(
+                        "JSONL state changed while its acquisition was retried".into(),
+                    ));
+                }
+                None => update
+                    .take()
+                    .ok_or_else(|| backend("JSONL acquisition update already ran"))?(
+                    &state
+                )?,
+            };
             entries.push(Entry::Acquire {
                 state_id: id.into(),
                 owner: owner.clone(),
@@ -968,46 +1419,49 @@ impl Journal {
                     .checked_add(1)
                     .ok_or_else(|| StoreError::NotCommitted("JSONL revision overflow".into()))?;
                 let fresh =
-                    store.rebuilt(|store| store.validate_records(id, &replacement.records))?;
+                    self.rebuilt(|store| store.validate_records(id, &replacement.records))?;
+                if self.next_fence(id) != Some(fence)
+                    || self.revision(id) != current
+                    || held.as_ref().zip(companion.as_ref()).is_some_and(
+                        |(held, (companion_id, _))| {
+                            self.next_fence(companion_id) != Some(held.owner.fence())
+                                || self.revision(companion_id) != held.state.revision
+                        },
+                    )
+                {
+                    planned = Some((current, Some(replacement)));
+                    continue;
+                }
                 let records = replacement
                     .records
                     .into_iter()
                     .zip(fresh)
                     .filter_map(|(record, fresh)| fresh.then_some(record))
                     .collect();
+                state = StoredState {
+                    revision,
+                    payload: Some(replacement.payload.clone()),
+                };
                 entries.push(Entry::Replace {
                     state_id: id.into(),
                     owner: owner.clone(),
                     revision,
-                    payload: replacement.payload.clone(),
+                    payload: replacement.payload,
                     records,
                 });
-                state = StoredState {
-                    revision,
-                    payload: Some(replacement.payload),
-                };
             }
-            if store.next_fence(id) != Some(fence)
-                || store.revision(id) != current
-                || companion.as_ref().is_some_and(|(companion_id, companion)| {
-                    store.next_fence(companion_id) != Some(companion.owner.fence())
-                        || store.revision(companion_id) != companion.state.revision
-                })
-            {
-                return Err(StoreError::NotCommitted(
-                    "JSONL index changed while validating records".into(),
-                ));
+            match self.commit(entries)? {
+                Outcome::Committed => return Ok((OwnedState { owner, state }, held)),
+                Outcome::Stale(entries) | Outcome::Sealed(entries) => {
+                    planned = Some((current, crate::replacement(entries)));
+                }
             }
-            store.append_entries(entries)?;
-            Ok((
-                OwnedState { owner, state },
-                companion.map(|(_, companion)| companion),
-            ))
-        })
+        }
     }
 
     fn read_record(&mut self, id: &str, key: &str) -> Result<Option<String>, StoreError> {
-        self.locked(|store| store.rebuilt(|store| store.record(id, key)))
+        self.sync()?;
+        self.rebuilt(|store| store.record(id, key))
     }
 
     fn read_records(
@@ -1015,43 +1469,45 @@ impl Journal {
         id: &str,
         keys: &[String],
     ) -> Result<Vec<Option<String>>, StoreError> {
-        self.locked(|store| {
-            store.rebuilt(|store| keys.iter().map(|key| store.record(id, key)).collect())
-        })
+        self.sync()?;
+        self.rebuilt(|store| keys.iter().map(|key| store.record(id, key)).collect())
     }
 
     fn peek(&mut self, id: &str) -> Result<StoredState, StoreError> {
-        self.locked(|store| store.state(id))
+        self.sync()?;
+        self.state(id)
     }
 
     fn list_states(&mut self, limit: usize) -> Result<Vec<String>, StoreError> {
-        self.locked(|store| {
-            Ok(store
-                .index
-                .created
-                .iter()
-                .rev()
-                .take(limit)
-                .cloned()
-                .collect())
-        })
+        self.sync()?;
+        Ok(self
+            .index
+            .created
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect())
     }
 
     fn acquire(&mut self, id: &str, owner_id: OwnerId) -> Result<OwnedState, StoreError> {
-        self.locked(|store| {
-            let fence = store
+        loop {
+            self.writable()?;
+            let fence = self
                 .next_fence(id)
                 .ok_or_else(|| StoreError::NotCommitted("JSONL owner fence overflow".into()))?;
-            let owner = OwnerToken::new(owner_id, fence);
-            store.append(Entry::Acquire {
+            let owner = OwnerToken::new(owner_id.clone(), fence);
+            let entry = Entry::Acquire {
                 state_id: id.into(),
                 owner: owner.clone(),
-            })?;
-            Ok(OwnedState {
-                owner,
-                state: store.state(id)?,
-            })
-        })
+            };
+            if let Outcome::Committed = self.commit(vec![entry])? {
+                return Ok(OwnedState {
+                    owner,
+                    state: self.state(id)?,
+                });
+            }
+        }
     }
 
     fn replace(
@@ -1062,8 +1518,10 @@ impl Journal {
         payload: String,
         records: Vec<StoreRecord>,
     ) -> Result<u64, StoreError> {
-        self.locked(|store| {
-            let (revision, fresh) = store.rebuilt(|store| {
+        let mut replacement = StoreReplacement { payload, records };
+        loop {
+            self.writable()?;
+            let (revision, fresh) = self.rebuilt(|store| {
                 if store.index.owners.get(id) != Some(owner) {
                     return Err(StoreError::Fenced);
                 }
@@ -1074,26 +1532,42 @@ impl Journal {
                 let revision = actual
                     .checked_add(1)
                     .ok_or_else(|| StoreError::NotCommitted("JSONL revision overflow".into()))?;
-                let fresh = store.validate_records(id, &records)?;
+                let fresh = store.validate_records(id, &replacement.records)?;
                 Ok((revision, fresh))
             })?;
-            let records = records
+            let records = replacement
+                .records
                 .into_iter()
                 .zip(fresh)
                 .filter_map(|(record, fresh)| fresh.then_some(record))
                 .collect();
-            store.append(Entry::Replace {
+            let entry = Entry::Replace {
                 state_id: id.into(),
                 owner: owner.clone(),
                 revision,
-                payload,
+                payload: replacement.payload,
                 records,
-            })?;
-            Ok(revision)
-        })
+            };
+            match self.commit(vec![entry])? {
+                Outcome::Committed => return Ok(revision),
+                Outcome::Sealed(entries) => {
+                    replacement = crate::replacement(entries)
+                        .ok_or_else(|| backend("JSONL replacement entry disappeared"))?;
+                }
+                Outcome::Stale(_) => {
+                    return Err(if self.index.owners.get(id) == Some(owner) {
+                        StoreError::Conflict {
+                            expected,
+                            actual: self.revision(id),
+                        }
+                    } else {
+                        StoreError::Fenced
+                    });
+                }
+            }
+        }
     }
 }
-
 pub struct JsonlStore {
     jobs: mpsc::Sender<Job>,
     closed: oneshot::Receiver<()>,
@@ -1111,29 +1585,12 @@ impl JsonlStore {
 
     pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_owned();
-        let key = path.clone();
-        Self::admitted(&key, move || Journal::open(&path)).await
+        Self::opened(Self::start(move || Journal::open(&path))?).await
     }
 
     pub async fn open_home_async(home: &Path) -> Result<Self, StoreError> {
         let home = home.to_owned();
-        Self::admitted(&Journal::home_path(&home), move || {
-            Journal::open(&Journal::home(&home)?)
-        })
-        .await
-    }
-
-    async fn admitted(
-        path: &Path,
-        open: impl FnOnce() -> Result<Journal, StoreError> + Send + 'static,
-    ) -> Result<Self, StoreError> {
-        let permit = opening(path).await?;
-        Self::opened(Self::start(move || {
-            let journal = open();
-            drop(permit);
-            journal
-        })?)
-        .await
+        Self::opened(Self::start(move || Journal::open(&Journal::home(&home)?))?).await
     }
 
     pub async fn compact(&mut self) -> Result<CompactionStats, StoreError> {
@@ -1331,28 +1788,6 @@ fn identity(metadata: &Metadata) -> Result<String, StoreError> {
 #[cfg(not(unix))]
 fn identity(metadata: &Metadata) -> Result<String, StoreError> {
     Ok(format!("{:?}", metadata.created().map_err(backend)?))
-}
-
-async fn opening(path: &Path) -> Result<OwnedSemaphorePermit, StoreError> {
-    let mut key = PathBuf::new();
-    for component in std::path::absolute(path).map_err(backend)?.components() {
-        match component {
-            Component::ParentDir => {
-                key.pop();
-            }
-            component => key.push(component),
-        }
-    }
-    let gate = {
-        let mut gates = OPENING.lock().unwrap_or_else(PoisonError::into_inner);
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        gates.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
-            let gate = Arc::new(Semaphore::new(1));
-            gates.insert(key, Arc::downgrade(&gate));
-            gate
-        })
-    };
-    gate.acquire_owned().await.map_err(backend)
 }
 
 fn identity_changed() -> StoreError {

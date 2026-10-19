@@ -15,15 +15,6 @@ pub(crate) enum PathState {
     Other,
 }
 
-impl PathState {
-    pub(crate) fn canonical(&self) -> Option<&Path> {
-        match self {
-            Self::File { canonical } | Self::Dir { canonical } => Some(canonical),
-            _ => None,
-        }
-    }
-}
-
 pub(crate) fn path_state(path: &Path) -> io::Result<PathState> {
     let link = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,

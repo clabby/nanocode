@@ -375,6 +375,11 @@ enum Command {
         caller: Caller,
         result: oneshot::Sender<Result<()>>,
     },
+    Abandonable {
+        caller: Caller,
+        kinds: Vec<String>,
+        result: oneshot::Sender<Result<()>>,
+    },
     Describe {
         caller: Caller,
         record: crate::catalog::SessionRecord,
@@ -400,6 +405,7 @@ impl Command {
             | Self::Cancel { result, .. }
             | Self::PruneReceipts { result, .. }
             | Self::DiscardUnused { result, .. }
+            | Self::Abandonable { result, .. }
             | Self::Stage { result, .. }
             | Self::Acquire { result } => drop(result.send(Err(error))),
             Self::CommitCheckpoint { result, .. } | Self::Append { result, .. } => {
@@ -445,6 +451,7 @@ struct Driver {
     active_agent_generation: Option<u64>,
     claimed: HashMap<String, Caller>,
     running: HashSet<String>,
+    abandonable: HashSet<String>,
     poisoned: bool,
     staged: Vec<SessionWrite>,
     preview: Option<(String, Option<String>)>,
@@ -981,22 +988,7 @@ impl Driver {
                 write,
                 result,
             } => {
-                let outcome = match self.authorize(&caller) {
-                    Ok(()) => match self.state.first_pending_operation() {
-                        Some((pending_id, _)) => Err(Error::OperationBlocked {
-                            operation_id: "standalone-checkpoint".to_owned(),
-                            pending_id: pending_id.to_owned(),
-                        }),
-                        None => match self.stage(write) {
-                            Ok(()) => {
-                                self.applied(Transition::CheckpointCommitted { checkpoint })
-                                    .await
-                            }
-                            Err(error) => Err(error),
-                        },
-                    },
-                    Err(error) => Err(error),
-                };
+                let outcome = self.commit_standalone(&caller, checkpoint, write).await;
                 drop(result.send(outcome));
             }
             Command::Stage { write, result } => drop(result.send(self.stage(write))),
@@ -1006,6 +998,16 @@ impl Driver {
                     Ok(()) => self.discard_unused().await,
                     Err(error) => Err(error),
                 };
+                drop(result.send(outcome));
+            }
+            Command::Abandonable {
+                caller,
+                kinds,
+                result,
+            } => {
+                let outcome = self.authorize(&caller).map(|()| {
+                    self.abandonable = kinds.into_iter().collect();
+                });
                 drop(result.send(outcome));
             }
             Command::Describe {
@@ -1141,12 +1143,73 @@ impl Driver {
         })
     }
 
+    async fn commit_standalone(
+        &mut self,
+        caller: &Caller,
+        checkpoint: EncodedPayload,
+        write: SessionWrite,
+    ) -> Result<SessionReceipt> {
+        self.authorize(caller)?;
+        self.abandon_stale("").await?;
+        if let Some((pending_id, _)) = self.state.first_pending_operation() {
+            return Err(Error::OperationBlocked {
+                operation_id: "standalone-checkpoint".to_owned(),
+                pending_id: pending_id.to_owned(),
+            });
+        }
+        self.stage(write)?;
+        self.applied(Transition::CheckpointCommitted { checkpoint })
+            .await
+    }
+
+    async fn abandon_stale(&mut self, except: &str) -> Result<()> {
+        if self.abandonable.is_empty() {
+            return Ok(());
+        }
+        loop {
+            let Some((operation_id, operation)) = self.state.first_pending_operation() else {
+                return Ok(());
+            };
+            if operation_id == except || self.claimed.contains_key(operation_id) {
+                return Ok(());
+            }
+            let (operation_id, input) = (operation_id.to_owned(), operation.input.clone());
+            let checkpoint = operation
+                .cancellation_requires_checkpoint()
+                .then(|| self.state.latest_checkpoint().cloned());
+            let input = input.load(&mut *self.store, &self.state_id).await?;
+            let kind = serde_json::from_str::<serde_json::Value>(input.json()?)
+                .ok()
+                .and_then(|input| input.get("kind")?.as_str().map(str::to_owned));
+            if !kind.is_some_and(|kind| self.abandonable.contains(&kind)) {
+                return Ok(());
+            }
+            let checkpoint = match checkpoint {
+                Some(Some(checkpoint)) => Some(checkpoint),
+                Some(None) => {
+                    return Err(Error::CancellationCheckpointRequired { operation_id });
+                }
+                None => None,
+            };
+            tracing::warn!(
+                operation = operation_id,
+                "abandoning a maintenance operation left pending without a live attempt"
+            );
+            self.apply_terminal(Transition::OperationCancelled {
+                operation_id,
+                checkpoint,
+            })
+            .await?;
+        }
+    }
+
     async fn admit(
         &mut self,
         caller: &Caller,
         operation_id: String,
         input: EncodedPayload,
     ) -> Result<StoredAdmission> {
+        self.abandon_stale(&operation_id).await?;
         if let Some(operation) = self.state.operation(&operation_id) {
             if operation.input != input {
                 return Err(Error::OperationConflict { operation_id });
@@ -1175,6 +1238,15 @@ impl Driver {
                 OperationStatus::Cancelled { .. } => Ok(StoredAdmission::Cancelled),
             };
         }
+        if let Some((pending_id, _)) = self
+            .state
+            .first_pending_operation_where(|pending_id| !self.claimed.contains_key(pending_id))
+        {
+            return Err(Error::OperationBlocked {
+                operation_id,
+                pending_id: pending_id.to_owned(),
+            });
+        }
         self.apply(Transition::OperationAccepted {
             operation_id: operation_id.clone(),
             input,
@@ -1190,6 +1262,7 @@ impl Driver {
         candidate_operation_id: String,
         input: EncodedPayload,
     ) -> Result<(String, StoredAdmission)> {
+        self.abandon_stale(&candidate_operation_id).await?;
         if let Some((pending_id, operation)) = self
             .state
             .first_pending_operation_where(|pending_id| !self.claimed.contains_key(pending_id))
@@ -1215,6 +1288,7 @@ impl Driver {
 
     async fn begin_attempt(&mut self, caller: &Caller, operation_id: String) -> Result<()> {
         self.require_claimed(caller, &operation_id)?;
+        self.abandon_stale(&operation_id).await?;
         if let Some((pending_id, _)) = self.state.first_pending_operation()
             && pending_id != operation_id
         {
@@ -2026,6 +2100,7 @@ impl DurableSession {
             active_agent_generation: None,
             claimed: HashMap::new(),
             running: HashSet::new(),
+            abandonable: HashSet::new(),
             poisoned: false,
             staged: Vec::new(),
             preview: None,
@@ -2666,6 +2741,17 @@ impl DurableOwner {
             caller: self.caller()?,
             operation_id,
             continuation,
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn abandon_stale_kinds(&self, kinds: &[&str]) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::Abandonable {
+            caller: self.caller()?,
+            kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
             result,
         })
         .await?;

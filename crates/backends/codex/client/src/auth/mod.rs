@@ -202,8 +202,8 @@ impl OpenAiAuth {
 
     #[cfg(not(target_family = "wasm"))]
     #[must_use]
-    pub fn codex_home() -> Self {
-        Self::managed_chatgpt(Arc::new(CodexHomeAuth::default()))
+    pub fn chatgpt() -> Self {
+        Self::managed_chatgpt(Arc::new(ChatGptHomeAuth::default()))
     }
 
     #[doc(hidden)]
@@ -261,12 +261,12 @@ impl From<&str> for OpenAiAuth {
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Default)]
-struct CodexHomeAuth {
+struct ChatGptHomeAuth {
     loaded: tokio::sync::OnceCell<OpenAiAuth>,
 }
 
 #[cfg(not(target_family = "wasm"))]
-impl CodexHomeAuth {
+impl ChatGptHomeAuth {
     async fn load(&self) -> Result<&OpenAiAuth, OpenAiAuthError> {
         self.loaded
             .get_or_try_init(|| async {
@@ -274,9 +274,9 @@ impl CodexHomeAuth {
                     let home = nanocode_home::AgentHome::from_env().map_err(|error| {
                         OpenAiAuthError::Unavailable(Arc::from(error.to_string()))
                     })?;
-                    load_chatgpt_auth(home.codex_home().join("auth.json")).map_err(|error| {
+                    load_chatgpt_auth(home.nanocode_home().join("auth.json")).map_err(|error| {
                         OpenAiAuthError::LoginRequired(Arc::from(format!(
-                            "{error}; run `codex login`"
+                            "{error}; save a ChatGPT login there"
                         )))
                     })
                 })
@@ -288,7 +288,7 @@ impl CodexHomeAuth {
 }
 
 #[cfg(not(target_family = "wasm"))]
-impl OpenAiAuthSource for CodexHomeAuth {
+impl OpenAiAuthSource for ChatGptHomeAuth {
     fn validate(&self) -> Result<(), OpenAiAuthError> {
         Ok(())
     }

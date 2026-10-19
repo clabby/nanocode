@@ -139,7 +139,7 @@ impl Default for ModelConfig {
         #[cfg(not(target_family = "wasm"))]
         {
             let mut config = Self {
-                auth: OpenAiAuth::codex_home(),
+                auth: OpenAiAuth::chatgpt(),
                 ..Self::api_key_defaults()
             };
             let mode = config.auth.mode();

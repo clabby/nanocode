@@ -95,9 +95,25 @@ pub fn line(
     text: &str,
     syntaxes: &SyntaxSet,
 ) -> Vec<Span<'static>> {
+    let mut start = 0;
+    runs(highlighter, text, syntaxes)
+        .into_iter()
+        .map(|(style, end)| {
+            let span = Span::styled(text[start..end].to_owned(), style);
+            start = end;
+            span
+        })
+        .collect()
+}
+
+pub(crate) fn runs(
+    highlighter: &mut HighlightLines<'_>,
+    text: &str,
+    syntaxes: &SyntaxSet,
+) -> Vec<(Style, usize)> {
     let line = format!("{text}\n");
     let Ok(regions) = highlighter.highlight_line(&line, syntaxes) else {
-        return vec![Span::styled(text.to_owned(), code_style())];
+        return vec![(code_style(), text.len())];
     };
     let regions = regions
         .into_iter()
@@ -105,20 +121,18 @@ pub fn line(
         .filter(|(_, region)| !region.is_empty())
         .collect::<Vec<_>>();
     if regions.is_empty() {
-        return vec![Span::styled(String::new(), code_style())];
+        return vec![(code_style(), 0)];
     }
     let joined = |left: &(Style, &str), right: &(Style, &str)| {
         left.0 == right.0 && printable(left.1) && printable(right.1)
     };
-    let mut spans = Vec::with_capacity(regions.chunk_by(joined).count());
+    let mut end = 0;
+    let mut runs = Vec::with_capacity(regions.chunk_by(joined).count());
     for run in regions.chunk_by(joined) {
-        let mut content = String::with_capacity(run.iter().map(|(_, region)| region.len()).sum());
-        for (_, region) in run {
-            content.push_str(region);
-        }
-        spans.push(Span::styled(content, run[0].0));
+        end += run.iter().map(|(_, region)| region.len()).sum::<usize>();
+        runs.push((run[0].0, end));
     }
-    spans
+    runs
 }
 
 fn span_style(style: SyntaxStyle) -> Style {

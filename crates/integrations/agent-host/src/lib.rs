@@ -100,9 +100,7 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
         #[cfg(not(target_family = "wasm"))]
         let store = nanocode_home::AgentHome::from_env()
             .map_err(|error| nanocode_durability::StoreError::Backend(error.to_string()))
-            .and_then(|home| {
-                nanocode_store_jsonl::JsonlStore::open_home(&home.codex_home().join("nanocode"))
-            })
+            .and_then(|home| nanocode_store_jsonl::JsonlStore::open_home(home.nanocode_home()))
             .map_err(nanocode_durability::Error::from)
             .and_then(SessionStore::new)?;
         #[cfg(target_family = "wasm")]
@@ -118,10 +116,8 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
             Some(Box::pin(async {
                 let home = nanocode_home::AgentHome::from_env()
                     .map_err(|error| nanocode_durability::StoreError::Backend(error.to_string()))?;
-                let store = nanocode_store_jsonl::JsonlStore::open_home_async(
-                    &home.codex_home().join("nanocode"),
-                )
-                .await?;
+                let store =
+                    nanocode_store_jsonl::JsonlStore::open_home_async(home.nanocode_home()).await?;
                 let store = SessionStore::new(store)?;
                 store.register_format(C::builtin_format())?;
                 store.register_format(A::builtin_format())?;

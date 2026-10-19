@@ -945,11 +945,6 @@ pub fn describe_tool(cell: &mut ToolCell, name: &str, arguments: &Value) {
                 cell.details.push(format!("pages {pages}"));
             }
         }
-        "NotebookEdit" => {
-            cell.name = "edit notebook".into();
-            cell.title = field("notebook_path").unwrap_or_default();
-            cell.input = field("new_source").unwrap_or_default();
-        }
         "view_image" => {
             cell.name = "view image".into();
             cell.title = field("path").unwrap_or_default();

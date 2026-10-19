@@ -203,19 +203,20 @@ impl EncodedPayload {
         store: &mut dyn crate::StateStore,
         state_id: &str,
     ) -> Result<Vec<Self>> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<_> = values.iter().map(|value| value.key.to_string()).collect();
+        let records = store.read_records(state_id, &keys).await?;
+        if records.len() != values.len() {
+            return Err(Error::InvalidState("record batch length mismatch".into()));
+        }
         let mut result = Vec::with_capacity(values.len());
-        for page in values.chunks(16) {
-            let keys: Vec<_> = page.iter().map(|value| value.key.to_string()).collect();
-            let records = store.read_records(state_id, &keys).await?;
-            if records.len() != page.len() {
-                return Err(Error::InvalidState("record batch length mismatch".into()));
-            }
-            for (value, record) in page.iter().zip(records) {
-                let record = record.ok_or_else(|| {
-                    Error::InvalidState(format!("missing payload record {}", value.key))
-                })?;
-                result.push(value.load_record(store, state_id, record).await?);
-            }
+        for (value, record) in values.iter().zip(records) {
+            let record = record.ok_or_else(|| {
+                Error::InvalidState(format!("missing payload record {}", value.key))
+            })?;
+            result.push(value.load_record(store, state_id, record).await?);
         }
         Ok(result)
     }
@@ -226,8 +227,9 @@ impl EncodedPayload {
         state_id: &str,
         record: String,
     ) -> Result<Self> {
+        let assembled;
         let content = if let Some(content) = record.strip_prefix('=') {
-            content.to_owned()
+            content
         } else if let Some(hashes) = record.strip_prefix(MANIFEST_PREFIX) {
             if hashes.is_empty()
                 || hashes.len() % 64 != 0
@@ -238,20 +240,25 @@ impl EncodedPayload {
             let keys: Vec<String> = (0..hashes.len() / 64)
                 .map(|index| chunk_key(&hashes[index * 64..(index + 1) * 64]))
                 .collect();
-            let mut content = String::new();
-            for page in keys.chunks(16) {
-                let chunks = store.records(state_id, page).await?;
-                if chunks.len() != page.len() {
-                    return Err(Error::InvalidState("record batch length mismatch".into()));
-                }
-                for (key, chunk) in page.iter().zip(chunks) {
-                    let chunk = chunk.ok_or_else(|| {
-                        Error::InvalidState(format!("missing payload chunk {key} of {}", self.key))
-                    })?;
-                    content.push_str(&chunk);
-                }
+            let chunks = store.records(state_id, &keys).await?;
+            if chunks.len() != keys.len() {
+                return Err(Error::InvalidState("record batch length mismatch".into()));
             }
-            content
+            let chunks = keys
+                .iter()
+                .zip(chunks)
+                .map(|(key, chunk)| {
+                    chunk.ok_or_else(|| {
+                        Error::InvalidState(format!("missing payload chunk {key} of {}", self.key))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut content = String::with_capacity(chunks.iter().map(String::len).sum());
+            for chunk in chunks {
+                content.push_str(&chunk);
+            }
+            assembled = content;
+            &assembled
         } else {
             let count: usize = record
                 .strip_prefix('+')
@@ -270,9 +277,10 @@ impl EncodedPayload {
                     })?;
                 content.push_str(&chunk);
             }
-            content
+            assembled = content;
+            &assembled
         };
-        if record_key(&content) != self.key.as_ref() {
+        if record_key(content) != self.key.as_ref() {
             return Err(Error::InvalidState(format!(
                 "payload record checksum mismatch {}",
                 self.key

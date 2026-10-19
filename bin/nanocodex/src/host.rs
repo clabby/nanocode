@@ -196,7 +196,7 @@ impl Host {
                 gateway.check(model)?;
                 OpenAi::builder(gateway.auth.clone()).responses_gateway(gateway.route.clone())
             }
-            None => OpenAi::builder(nanocode::codex::OpenAiAuth::codex_home()),
+            None => OpenAi::builder(nanocode::codex::OpenAiAuth::chatgpt()),
         }
         .raw_api_events(false)
         .build()?;
@@ -322,7 +322,7 @@ pub fn home_dir(explicit: Option<&Path>) -> Result<PathBuf> {
         return Ok(home.to_path_buf());
     }
     let home = nanocode_home::AgentHome::from_env()?;
-    Ok(home.codex_home().join("nanocode"))
+    Ok(home.nanocode_home().to_path_buf())
 }
 
 pub async fn open_store(home: &Path) -> Result<SessionStore> {
@@ -338,7 +338,7 @@ pub fn runner_configs(args: &RemoteArgs) -> Result<(Vec<Runner>, Vec<RunnerServe
             let token = args
                 .runner_token
                 .as_ref()
-                .ok_or("--runner-connect requires --runner-token or NANOCODEX_RUNNER_TOKEN")?;
+                .ok_or("--runner-connect requires --runner-token or NANOCODE_RUNNER_TOKEN")?;
             let mut runner = Runner::connect(url).token(token);
             if let Some(name) = &args.runner_name {
                 runner = runner.name(name);

@@ -174,15 +174,20 @@ struct CacheKey {
     reasoning: bool,
 }
 
-#[derive(Clone)]
 struct Layout {
     key: CacheKey,
-    lines: Rc<Vec<Line<'static>>>,
-    spinners: Rc<[(usize, usize)]>,
-    highlights: Rc<markdown::Highlights>,
+    rows: usize,
+    lines: Option<Rows>,
+    highlights: markdown::Highlights,
 }
 
-impl Layout {
+#[derive(Clone)]
+struct Rows {
+    lines: Rc<Vec<Line<'static>>>,
+    spinners: Rc<[(usize, usize)]>,
+}
+
+impl Rows {
     fn line(&self, row: usize, spinner: &str) -> Line<'static> {
         let mut line = self.lines[row].clone();
         for (_, span) in self.spinners.iter().filter(|(slot, _)| *slot == row) {
@@ -201,6 +206,7 @@ pub struct TranscriptPolicy {
 pub struct Transcript {
     cells: Vec<Cell>,
     cache: Vec<Option<Layout>>,
+    resident: Vec<usize>,
     revision: u64,
     scroll: usize,
     mode: DisplayMode,
@@ -219,6 +225,7 @@ impl Transcript {
         Self {
             cells: Vec::new(),
             cache: Vec::new(),
+            resident: Vec::new(),
             revision: 0,
             scroll: 0,
             mode: DisplayMode::Collapsed,
@@ -245,6 +252,7 @@ impl Transcript {
     pub fn clear(&mut self) {
         self.cells.clear();
         self.cache.clear();
+        self.resident.clear();
         self.scroll = 0;
         self.last_total = None;
         self.anchor = None;
@@ -286,6 +294,7 @@ impl Transcript {
 
     pub fn invalidate(&mut self) {
         self.cache.iter_mut().for_each(|entry| *entry = None);
+        self.resident.clear();
     }
 
     #[must_use]
@@ -373,9 +382,13 @@ impl Transcript {
             };
             let mut total = 0;
             let mut index = self.cells.len();
+            let below = needed.saturating_sub(self.last_height);
             while index > 0 && total < needed {
                 index -= 1;
-                total += self.layout(index, self.last_width, &theme).lines.len();
+                total += self.rows(index, self.last_width, &theme);
+                if total <= below {
+                    self.evict(index);
+                }
             }
             self.theme = Some(theme);
             if index == 0 {
@@ -428,18 +441,42 @@ impl Transcript {
         }
     }
 
-    fn layout(&mut self, index: usize, width: u16, theme: &Theme) -> Layout {
-        let cell = &self.cells[index];
-        let key = CacheKey {
+    fn key(&self, index: usize, width: u16) -> CacheKey {
+        CacheKey {
             width,
-            revision: cell.revision,
+            revision: self.cells[index].revision,
             mode: self.mode,
             reasoning: self.reasoning,
-        };
-        if let Some(layout) = &self.cache[index]
-            && layout.key == key
+        }
+    }
+
+    fn rows(&mut self, index: usize, width: u16, theme: &Theme) -> usize {
+        match &self.cache[index] {
+            Some(layout) if layout.key == self.key(index, width) => layout.rows,
+            _ => self.layout(index, width, theme).lines.len(),
+        }
+    }
+
+    fn evict(&mut self, index: usize) {
+        if let Some(Some(layout)) = self.cache.get_mut(index)
+            && layout.lines.take().is_some()
         {
-            return layout.clone();
+            layout.highlights.shrink_to_fit();
+            self.resident.retain(|&resident| resident != index);
+        }
+    }
+
+    fn layout(&mut self, index: usize, width: u16, theme: &Theme) -> Rows {
+        let key = self.key(index, width);
+        let cell = &self.cells[index];
+        if let Some(Layout {
+            key: cached,
+            lines: Some(rows),
+            ..
+        }) = &self.cache[index]
+            && *cached == key
+        {
+            return rows.clone();
         }
         let span = tracing::info_span!(
             "tui.transcript.layout",
@@ -450,10 +487,14 @@ impl Transcript {
             layout.lines = tracing::field::Empty
         );
         let _entered = span.enter();
-        let mut highlights = self.cache[index]
-            .take()
-            .map(|layout| Rc::unwrap_or_clone(layout.highlights))
-            .unwrap_or_default();
+        let previous = self.cache[index].take();
+        if !previous
+            .as_ref()
+            .is_some_and(|layout| layout.lines.is_some())
+        {
+            self.resident.push(index);
+        }
+        let mut highlights = previous.map(|layout| layout.highlights).unwrap_or_default();
         let mut lines = Vec::new();
         if index > 0 {
             lines.push(Line::default());
@@ -478,20 +519,23 @@ impl Transcript {
                     .map(move |(span, _)| (row, span))
             })
             .collect::<Rc<[_]>>();
-        let layout = Layout {
-            key,
+        let rows = Rows {
             lines: Rc::new(lines),
             spinners,
-            highlights: Rc::new(highlights),
         };
-        span.record("layout.lines", layout.lines.len());
-        self.cache[index] = Some(layout.clone());
-        layout
+        span.record("layout.lines", rows.lines.len());
+        self.cache[index] = Some(Layout {
+            key,
+            rows: rows.lines.len(),
+            lines: Some(rows.clone()),
+            highlights,
+        });
+        rows
     }
 
     fn extend(
         &mut self,
-        layouts: &mut Vec<Layout>,
+        layouts: &mut Vec<usize>,
         total: &mut usize,
         needed: usize,
         floor: usize,
@@ -501,9 +545,12 @@ impl Transcript {
         let mut index = self.cells.len() - layouts.len();
         while index > 0 && (*total < needed || index > floor) {
             index -= 1;
-            let layout = self.layout(index, width, theme);
-            *total += layout.lines.len();
-            layouts.push(layout);
+            let rows = self.rows(index, width, theme);
+            *total += rows;
+            layouts.push(rows);
+            if *total <= self.scroll {
+                self.evict(index);
+            }
         }
     }
 
@@ -526,7 +573,7 @@ impl Transcript {
         let height = usize::from(area.height);
         self.last_width = width;
         if self.theme.as_ref() != Some(theme) {
-            self.cache.iter_mut().for_each(|entry| *entry = None);
+            self.invalidate();
             self.theme = Some(theme.clone());
         }
         let count = self.cells.len();
@@ -549,10 +596,7 @@ impl Transcript {
             && first <= count
             && count - first <= layouts.len()
         {
-            let since = layouts[..count - first]
-                .iter()
-                .map(|layout| layout.lines.len())
-                .sum::<usize>();
+            let since = layouts[..count - first].iter().sum::<usize>();
             self.scroll += since.saturating_sub(lines);
         }
         self.extend(
@@ -577,26 +621,44 @@ impl Transcript {
             .rows()
             .filter(|row| !row.is_empty());
         let mut offset = 0;
-        'layouts: for layout in layouts.iter().rev() {
-            let count = layout.lines.len();
-            let next = offset + count;
+        let mut visible = Vec::new();
+        for (index, &lines) in (first..count).zip(layouts.iter().rev()) {
+            let next = offset + lines;
             if next > start && offset < end {
-                let from = start.saturating_sub(offset);
-                let to = (end - offset).min(count);
-                for row in from..to {
-                    let Some(row_area) = rows.next() else {
-                        break 'layouts;
-                    };
-                    if layout.spinners.iter().any(|(slot, _)| *slot == row) {
-                        render_line(&layout.line(row, spinner), row_area, buffer);
-                    } else {
-                        render_line(&layout.lines[row], row_area, buffer);
-                    }
-                }
+                visible.push((index, offset));
             }
             offset = next;
             if offset >= end {
                 break;
+            }
+        }
+        let cache = &mut self.cache;
+        let shown = match (visible.first(), visible.last()) {
+            (Some(&(top, _)), Some(&(bottom, _))) => top..bottom + 1,
+            _ => 0..0,
+        };
+        self.resident.retain(|index| {
+            let keep = shown.contains(index);
+            if !keep && let Some(Some(layout)) = cache.get_mut(*index) {
+                layout.lines = None;
+                layout.highlights.shrink_to_fit();
+            }
+            keep
+        });
+        'layouts: for (index, offset) in visible {
+            let layout = self.layout(index, width, theme);
+            let count = layout.lines.len();
+            let from = start.saturating_sub(offset);
+            let to = (end - offset).min(count);
+            for row in from..to {
+                let Some(row_area) = rows.next() else {
+                    break 'layouts;
+                };
+                if layout.spinners.iter().any(|(slot, _)| *slot == row) {
+                    render_line(&layout.line(row, spinner), row_area, buffer);
+                } else {
+                    render_line(&layout.lines[row], row_area, buffer);
+                }
             }
         }
         if self.scroll > 0 {

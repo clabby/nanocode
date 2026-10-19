@@ -237,7 +237,20 @@ const fn family(harness: HarnessArg) -> nanocode::HarnessFamily {
     }
 }
 
-async fn interactive(args: SessionArgs) -> Result<()> {
+async fn interactive(mut args: SessionArgs) -> Result<()> {
+    let reload = match &args.reload_state {
+        Some(path) => Some(app::reload::read(path).await?),
+        None => None,
+    };
+    if let Some(state) = &reload {
+        args.resume.clone_from(&state.session);
+        args.prompt = None;
+        args.continue_last = false;
+        args.model = Some(state.model.to_string());
+        args.harness = None;
+        args.thinking = Some(state.thinking.to_string());
+        args.tier = Some(state.tier.as_str().to_owned());
+    }
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(
             "the interactive interface needs a terminal; use `nanocodex exec <prompt>` for scripts"
@@ -291,6 +304,7 @@ async fn interactive(args: SessionArgs) -> Result<()> {
                 .map(host::parse_thinking)
                 .transpose()?,
             tier_override: args.tier.as_deref().map(host::parse_tier).transpose()?,
+            reload,
         },
         terminal,
     )
@@ -352,18 +366,24 @@ async fn exec(args: SessionArgs) -> Result<()> {
         eprintln!("nanocodex: computer use unavailable, continuing without it: {reason}");
     }
     tokio::spawn(async move { while events.recv().await.is_some() {} });
-    for pending in pending {
-        eprintln!("nanocodex: resuming interrupted turn {}", pending.id);
-        let turn = agent
-            .prompt(nanocode::PromptRequest::new(pending.prompt).request_id(&pending.id))
-            .await?;
-        stream_turn(turn, std::io::stderr()).await?;
+    let outcome: Result<()> = async {
+        for pending in pending {
+            eprintln!("nanocodex: resuming interrupted turn {}", pending.id);
+            let turn = agent
+                .prompt(nanocode::PromptRequest::new(pending.prompt).request_id(&pending.id))
+                .await?;
+            stream_turn(turn, std::io::stderr()).await?;
+        }
+        stream_turn(agent.prompt(prompt.as_str()).await?, std::io::stdout()).await
     }
-    stream_turn(agent.prompt(prompt.as_str()).await?, std::io::stdout()).await?;
+    .await;
     let mut stderr = std::io::stderr();
     drop(writeln!(stderr, "session {}", agent.session_id()));
-    agent.flush().await?;
-    host.runtime.shutdown().await?;
+    let flushed = agent.flush().await;
+    let shutdown = host.runtime.shutdown().await;
+    outcome?;
+    flushed?;
+    shutdown?;
     Ok(())
 }
 

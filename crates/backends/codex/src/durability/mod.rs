@@ -31,6 +31,8 @@ mod session;
 pub use format::CodexCheckpointFormat;
 pub use session::DurableSessionExt;
 
+const MAINTENANCE_KINDS: &[&str] = &["standalone_compaction"];
+
 impl<F> DurableAgentExt for NanocodexBuilder<F> {
     async fn durability(self, state: DurableSession) -> AgentResult<Self> {
         let state_id = state.state_id().to_owned();
@@ -39,6 +41,10 @@ impl<F> DurableAgentExt for NanocodexBuilder<F> {
                 thinking: self.config.thinking,
                 service_tier: self.config.service_tier,
             })
+            .await
+            .map_err(agent_error)?;
+        owner
+            .abandon_stale_kinds(MAINTENANCE_KINDS)
             .await
             .map_err(agent_error)?;
         let record = state.record().await.map_err(agent_error)?;
@@ -723,6 +729,10 @@ impl LazyExecution {
                     }
                     None => state.acquire_agent().await.map_err(agent_error)?,
                 };
+                owner
+                    .abandon_stale_kinds(MAINTENANCE_KINDS)
+                    .await
+                    .map_err(agent_error)?;
                 let record = state.record().await.map_err(agent_error)?.ok_or_else(|| {
                     agent_error(nanocode_durability::Error::InvalidState(
                         "described durable session has no record".to_owned(),

@@ -40,10 +40,14 @@ nanocode-store-jsonl = { path = "../../crates/integrations/store-jsonl", version
 nanocode-tui = { path = "../../crates/tui", version = "0.6.7" }
 opentelemetry.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 uuid = { workspace = true, features = ["v7"] }
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 [lints]
 workspace = true

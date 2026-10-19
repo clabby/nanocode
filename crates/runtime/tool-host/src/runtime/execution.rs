@@ -1034,6 +1034,8 @@ pub(super) fn tool_execution_span(
         tool.arguments.kind = arguments_kind,
         tool.arguments.count = arguments_count,
         tool.arguments.keys = argument_keys,
+        tool.admission = tracing::field::Empty,
+        tool.admission.wait_ns = tracing::field::Empty,
         process.exit.code = tracing::field::Empty,
         process.running = tracing::field::Empty,
         process.wall_time_ms = tracing::field::Empty,

@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::Serialize;
 
@@ -171,7 +168,7 @@ pub(crate) fn scan_root(root: &SkillRoot, diagnostics: &mut Vec<Diagnostic>) -> 
 pub(crate) fn user_skill_roots(home: &AgentHome) -> Vec<SkillRoot> {
     let mut roots = vec![
         SkillRoot::new(
-            home.codex_home().join("skills"),
+            home.nanocode_home().join("skills"),
             Scope::User,
             Convention::Codex,
         ),
@@ -208,12 +205,5 @@ impl AgentHome {
 
     pub fn skills_for(&self, project: &ProjectHome) -> SkillSet {
         resolve_skills(&self.skill_roots_for(project))
-    }
-}
-
-pub(crate) fn is_skill_dir(path: &Path) -> Option<PathBuf> {
-    match (path_state(path), path_state(&path.join("SKILL.md"))) {
-        (Ok(PathState::Dir { canonical }), Ok(PathState::File { .. })) => Some(canonical),
-        _ => None,
     }
 }

@@ -48,6 +48,10 @@ pub trait CodeModeToolPolicy: Send + Sync {
         None
     }
 
+    fn exclusive(&self, _name: &str) -> bool {
+        false
+    }
+
     fn append_observation_content(
         &self,
         _calls: &[CodeModeToolObservation<'_>],

@@ -24,6 +24,8 @@ mod format;
 
 pub use format::ClaudeCheckpointFormat;
 
+const MAINTENANCE_KINDS: &[&str] = &["compact", "session_end"];
+
 impl DurableBackendRegistration for ClaudeBuilder {
     fn checkpoint_format(&self) -> Option<Arc<dyn CheckpointFormat>> {
         Some(Arc::new(ClaudeCheckpointFormat))
@@ -72,6 +74,10 @@ impl DurableAgentExt for ClaudeBuilder {
             }
         }
         .map_err(agent_error)?;
+        owner
+            .abandon_stale_kinds(MAINTENANCE_KINDS)
+            .await
+            .map_err(agent_error)?;
         drop(state.take_checkpoint_preload(""));
         let record = state.record().await.map_err(agent_error)?;
         let branches = Branches {
@@ -278,6 +284,10 @@ impl LazyClaudeExecution {
                         .map_err(agent_error)?,
                     (None, None) => state.acquire_agent().await.map_err(agent_error)?,
                 };
+                owner
+                    .abandon_stale_kinds(MAINTENANCE_KINDS)
+                    .await
+                    .map_err(agent_error)?;
                 let record = state.record().await.map_err(agent_error)?.ok_or_else(|| {
                     agent_error(nanocode_durability::Error::InvalidState(
                         "described durable session has no record".to_owned(),
@@ -389,6 +399,10 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
 
     fn advance(&self, id: String, state: Value) -> PolicyFuture<'_, ()> {
         Box::pin(async move { self.get().await?.advance(id, state).await })
+    }
+
+    fn advance_encoded(&self, id: String, state: Box<RawValue>) -> PolicyFuture<'_, ()> {
+        Box::pin(async move { self.get().await?.advance_encoded(id, state).await })
     }
 
     fn begin_step(
@@ -649,7 +663,7 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
 
     fn advance_encoded(&self, id: String, state: Box<RawValue>) -> PolicyFuture<'_, ()> {
         Box::pin(async move {
-            let state = EncodedPayload::encode(&*state).map_err(agent_error)?;
+            let state = EncodedPayload::from_json(Arc::from(state.get()));
             self.owner.advance(id, state).await.map_err(agent_error)
         })
     }

@@ -8,10 +8,10 @@ use std::{
 use clap::Parser;
 use futures_util::StreamExt;
 use nanocode::{
-    AgentStatus, ExecutorSelection, HarnessFamily, ModelSelection, PromptRequest, PromptRoute,
-    Runner, RunnerEvent, RunnerInfo, RunnerProtocol, RunnerServer, RunnerServerConfig,
-    RunnerStatus, ScopedAgentUpdate, ServiceTier, SessionCheckpoint, Thinking, TurnControl,
-    TurnResult,
+    AgentStatus, ExecutionPolicyDisposition, ExecutorSelection, HarnessFamily, ModelSelection,
+    PromptRequest, PromptRoute, Runner, RunnerEvent, RunnerInfo, RunnerProtocol, RunnerServer,
+    RunnerServerConfig, RunnerStatus, ScopedAgentUpdate, ServiceTier, SessionCheckpoint, Thinking,
+    TurnControl, TurnResult,
     agent::{
         Agent, AgentEvents,
         events::{AgentEvent, AgentEventKind},
@@ -42,6 +42,8 @@ use crate::{
     models, view,
 };
 
+pub(crate) mod reload;
+
 pub const DISPLAY_FRAME: Duration = Duration::from_micros(16_667);
 pub const SPINNER_FRAME: Duration = Duration::from_millis(80);
 pub const QUIT_CONFIRMATION: Duration = Duration::from_secs(2);
@@ -49,6 +51,7 @@ pub const TOOL_PREVIEW_LINES: usize = 6;
 pub const DIFF_PREVIEW_LINES: usize = 40;
 
 pub enum AppEvent {
+    Reload,
     Agent {
         generation: u64,
         event: AgentEvent,
@@ -76,7 +79,24 @@ pub enum AppEvent {
     PromptFailed {
         generation: u64,
         error: String,
-        text: String,
+        text: Option<String>,
+    },
+    PromptBlocked {
+        generation: u64,
+        error: String,
+        durable: bool,
+        claimed: bool,
+        blocked: PendingTurn,
+    },
+    OwnerMoved {
+        generation: u64,
+    },
+    Recovered {
+        generation: u64,
+        result: std::result::Result<Vec<PendingTurn>, String>,
+        error: String,
+        durable: bool,
+        blocked: PendingTurn,
     },
     SteerSent {
         id: String,
@@ -116,6 +136,7 @@ pub enum AppEvent {
 impl AppEvent {
     const fn kind(&self) -> &'static str {
         match self {
+            Self::Reload => "reload",
             Self::Agent { .. } => "agent",
             Self::TurnStarted { .. } => "turn_started",
             Self::RoutedTurn { .. } => "routed_turn",
@@ -124,6 +145,9 @@ impl AppEvent {
             Self::ImagePasted(_) => "image_pasted",
             Self::TurnFinished { .. } => "turn_finished",
             Self::PromptFailed { .. } => "prompt_failed",
+            Self::PromptBlocked { .. } => "prompt_blocked",
+            Self::Recovered { .. } => "recovered",
+            Self::OwnerMoved { .. } => "owner_moved",
             Self::SteerSent { .. } => "steer_sent",
             Self::RunnerListening(_) => "runner_listening",
             Self::AgentReady(_) => "agent_ready",
@@ -210,6 +234,7 @@ pub struct Launch {
     pub home: PathBuf,
     pub thinking_override: Option<Thinking>,
     pub tier_override: Option<ServiceTier>,
+    pub reload: Option<reload::State>,
 }
 
 pub struct App {
@@ -241,6 +266,10 @@ pub struct App {
     pub(crate) attachments: Vec<PathBuf>,
     attachments_by_id: HashMap<String, Vec<PathBuf>>,
     next_attachments: Vec<PathBuf>,
+    resumes: HashMap<String, (nanocode::agent::input::Prompt, bool)>,
+    resuming: bool,
+    hold_queue: bool,
+    moved: bool,
     pub(crate) pending_copy: Option<(String, &'static str)>,
     pub(crate) interrupting: bool,
     thinking_override: Option<Thinking>,
@@ -251,6 +280,8 @@ pub struct App {
     pub(crate) tx: UnboundedSender<AppEvent>,
     quit: bool,
     reload: bool,
+    reload_all: bool,
+    submissions: tokio::task::JoinSet<()>,
     quit_armed: Option<Instant>,
     esc_armed: Option<Instant>,
     stashed_draft: Option<String>,
@@ -265,7 +296,7 @@ pub struct App {
 }
 
 pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
-    let (tx, rx) = unbounded_channel();
+    let (tx, mut rx) = unbounded_channel();
     let history = launch
         .history_path
         .as_ref()
@@ -303,6 +334,10 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         attachments: Vec::new(),
         attachments_by_id: HashMap::new(),
         next_attachments: Vec::new(),
+        resumes: HashMap::new(),
+        resuming: false,
+        hold_queue: false,
+        moved: false,
         pending_copy: None,
         interrupting: false,
         thinking_override: launch.thinking_override,
@@ -313,6 +348,8 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         tx,
         quit: false,
         reload: false,
+        reload_all: false,
+        submissions: tokio::task::JoinSet::new(),
         quit_armed: None,
         esc_armed: None,
         stashed_draft: None,
@@ -325,6 +362,10 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         views: HashMap::new(),
         panes: crate::side::Panes::default(),
     };
+    let instance = reload::Instance::start(app.tx.clone()).await?;
+    if let Some(state) = launch.reload {
+        app.restore_reload(state);
+    }
     for server in app.host.runtime.runner_servers() {
         app.notice(NoticeLevel::Info, listener_notice(&server));
     }
@@ -352,16 +393,46 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
             }
         }
     }
-    let outcome = app.event_loop(&mut terminal, rx).await;
+    let outcome = app.event_loop(&mut terminal, &mut rx).await;
     drop(terminal);
     let session = app.session_id();
-    if let Some(agent) = app.agent.take() {
-        drop(agent.flush().await);
+    let moved = app.moved;
+    if app.reload_all
+        && let Err(error) = instance.broadcast().await
+    {
+        eprintln!("nanocodex: could not reload every window: {error}");
     }
-    drop(app.host.runtime.shutdown().await);
+    if let Some(agent) = app.agent.as_ref()
+        && let Err(error) = agent.flush().await
+        && !moved
+    {
+        eprintln!("nanocodex: could not flush the session: {error}");
+    }
+    if let Err(error) = app.host.runtime.shutdown().await
+        && !moved
+    {
+        eprintln!("nanocodex: shutdown did not complete cleanly: {error}");
+    }
+    while let Some(result) = app.submissions.join_next().await {
+        if let Err(error) = result {
+            eprintln!("nanocodex: prompt task failed during shutdown: {error}");
+        }
+    }
     if app.reload && outcome.is_ok() {
-        return Err(reload(session).into());
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::Agent { generation, event } if generation == app.generation => {
+                    app.agent_event(&event);
+                }
+                AppEvent::SteerSent { .. } => { app.handle_app(event); }
+                _ => {}
+            }
+        }
+        let state = instance.save(&app.reload_state()).await?;
+        instance.close().await?;
+        return Err(reload(session, state).into());
     }
+    instance.close().await?;
     if let Some(agent_session) = session {
         eprintln!("{} resume {agent_session}", invoked_name());
     }
@@ -392,7 +463,7 @@ fn reload_program() -> std::io::Result<PathBuf> {
     std::env::current_exe()
 }
 
-fn reload_args(session: Option<&str>) -> Vec<std::ffi::OsString> {
+fn reload_args(session: Option<&str>, state: PathBuf) -> Vec<std::ffi::OsString> {
     let mut command = <crate::cli::Cli as clap::CommandFactory>::command();
     command.build();
     let mut args: Vec<std::ffi::OsString> = Vec::new();
@@ -437,7 +508,7 @@ fn reload_args(session: Option<&str>) -> Vec<std::ffi::OsString> {
                 (required || present).then(|| original.next()).flatten()
             })
             .flatten();
-        if matches!(definition.get_id().as_str(), "resume" | "continue_last") {
+        if matches!(definition.get_id().as_str(), "resume" | "continue_last" | "reload_state") {
             continue;
         }
         args.push(arg);
@@ -447,24 +518,26 @@ fn reload_args(session: Option<&str>) -> Vec<std::ffi::OsString> {
         args.push("--resume".into());
         args.push(session.into());
     }
+    args.push("--reload-state".into());
+    args.push(state.into_os_string());
     args
 }
 
 #[cfg(unix)]
-fn reload(session: Option<String>) -> String {
+fn reload(session: Option<String>, state: PathBuf) -> String {
     use std::os::unix::process::CommandExt;
     let program = match reload_program() {
         Ok(program) => program,
         Err(error) => return format!("reload failed to locate nanocodex: {error}"),
     };
     let error = std::process::Command::new(&program)
-        .args(reload_args(session.as_deref()))
+        .args(reload_args(session.as_deref(), state.clone()))
         .exec();
-    format!("reload failed to start {}: {error}", program.display())
+    format!("reload failed to start {}: {error}; saved window state: {}", program.display(), state.display())
 }
 
 #[cfg(not(unix))]
-fn reload(session: Option<String>) -> String {
+fn reload(session: Option<String>, _state: PathBuf) -> String {
     match session {
         Some(session) => format!(
             "reload is not supported on this platform; run {} resume {session}",
@@ -550,7 +623,7 @@ impl App {
     async fn event_loop(
         &mut self,
         terminal: &mut TerminalSession,
-        mut rx: UnboundedReceiver<AppEvent>,
+        rx: &mut UnboundedReceiver<AppEvent>,
     ) -> Result<()> {
         let mut input = EventStream::new();
         let mut scheduler = RenderScheduler::new(DISPLAY_FRAME, Instant::now());
@@ -720,6 +793,10 @@ impl App {
     fn handle_app(&mut self, event: AppEvent) -> bool {
         let _span = tracing::info_span!(target: "nanocodex", "nc.app_event", event.kind = event.kind(), session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         match event {
+            AppEvent::Reload => {
+                self.request_reload(false);
+                true
+            }
             AppEvent::Agent { generation, event } => {
                 if generation == self.generation {
                     self.agent_event(&event);
@@ -770,6 +847,7 @@ impl App {
                 }
                 self.queue.convert(&id, QueueKind::FollowUp);
                 self.queue.set_state(&id, QueueState::Sent);
+                self.resuming = false;
                 self.mapper.begin_turn();
                 self.turn = TurnState::Running {
                     control,
@@ -783,6 +861,9 @@ impl App {
                     return false;
                 }
                 self.turn = TurnState::Idle;
+                if std::mem::take(&mut self.resuming) && result.is_err() && !self.interrupting {
+                    self.hold_after_failed_resume();
+                }
                 match result {
                     Err(error) if !self.mapper.reported() => {
                         self.transcript.finish_running_tools(ToolStatus::Failed);
@@ -809,23 +890,70 @@ impl App {
                     return false;
                 }
                 self.turn = TurnState::Idle;
+                self.resuming = false;
                 let steers = self.queue.drain_kind(QueueKind::Steer);
-                if let Some(item) = self
-                    .queue
-                    .items()
-                    .iter()
-                    .find(|item| item.state == QueueState::Sent)
-                    .map(|item| item.id.clone())
-                {
-                    self.queue.remove(&item);
+                self.remove_sent_prompt();
+                self.restore_prompt(&error, text, steers);
+                true
+            }
+            AppEvent::PromptBlocked {
+                generation,
+                error,
+                durable,
+                claimed,
+                blocked,
+            } => {
+                if generation != self.generation {
+                    return false;
                 }
-                self.notice(NoticeLevel::Error, format!("prompt failed: {error}"));
-                let mut restored = vec![text];
-                restored.extend(steers.into_iter().map(|steer| steer.text));
-                if !self.composer.is_empty() {
-                    restored.push(self.composer.text().to_owned());
+                self.turn = TurnState::Idle;
+                self.resuming = false;
+                self.remove_sent_prompt();
+                if claimed {
+                    self.after_turn();
+                } else {
+                    self.recover(error, durable, blocked);
                 }
-                self.composer.set_text(restored.join("\n\n"));
+                true
+            }
+            AppEvent::OwnerMoved { generation } => {
+                if generation != self.generation || self.moved {
+                    return false;
+                }
+                self.moved = true;
+                self.hold_queue = true;
+                self.notice(NoticeLevel::Warning, OWNER_MOVED);
+                true
+            }
+            AppEvent::Recovered {
+                generation,
+                result,
+                error,
+                durable,
+                blocked,
+            } => {
+                if generation != self.generation {
+                    return false;
+                }
+                match result {
+                    Ok(pending) if pending.first().is_some_and(|turn| turn.id != blocked.id) => {
+                        if matches!(self.turn, TurnState::Idle) {
+                            self.resume_pending(pending, Some((blocked, durable)));
+                        } else {
+                            self.hold(blocked, durable);
+                        }
+                    }
+                    Ok(_) => {
+                        self.restore_prompt(&error, (!durable).then_some(blocked.text), Vec::new());
+                    }
+                    Err(load) => {
+                        self.notice(
+                            NoticeLevel::Error,
+                            format!("could not load interrupted turns: {load}"),
+                        );
+                        self.restore_prompt(&error, (!durable).then_some(blocked.text), Vec::new());
+                    }
+                }
                 true
             }
             AppEvent::SteerSent { id, result } => {
@@ -956,6 +1084,7 @@ impl App {
 
     fn ready(&mut self, ready: Ready) {
         self.starting = false;
+        self.moved = false;
         self.generation += 1;
         if !ready.reset_transcript
             && self
@@ -1019,19 +1148,114 @@ impl App {
                 );
             }
         }
-        let mut pending = ready.pending.into_iter();
-        if let Some(turn) = pending.next() {
-            self.notice(NoticeLevel::Info, "continuing the interrupted turn…");
-            for later in pending {
-                let id = self.enqueue_follow_up(later.text);
-                drop(id);
-            }
-            if let Some(agent) = self.agent.clone() {
-                self.launch_turn(agent, turn.id, turn.text, turn.prompt);
-            }
+        if !ready.pending.is_empty() {
+            self.resume_pending(ready.pending, None);
             return;
         }
         self.after_turn();
+    }
+
+    fn resume_pending(&mut self, pending: Vec<PendingTurn>, blocked: Option<(PendingTurn, bool)>) {
+        let Some(agent) = self.agent.clone() else {
+            return;
+        };
+        let resumed = pending
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut pending = pending.into_iter();
+        let Some(first) = pending.next() else {
+            return;
+        };
+        let queued = self
+            .queue
+            .drain_kind(QueueKind::FollowUp)
+            .into_iter()
+            .filter(|item| !resumed.contains(&item.id))
+            .collect::<Vec<_>>();
+        for turn in pending {
+            self.hold(turn, true);
+        }
+        if let Some((blocked, durable)) =
+            blocked.filter(|(blocked, _)| !resumed.contains(&blocked.id))
+        {
+            self.hold(blocked, durable);
+        }
+        for item in queued {
+            self.queue.push(item);
+        }
+        self.resumes.remove(&first.id);
+        self.notice(NoticeLevel::Info, "continuing the interrupted turn…");
+        self.launch_turn(agent, first.id, first.text, first.prompt, true);
+    }
+
+    fn hold(&mut self, turn: PendingTurn, durable: bool) {
+        self.queue.push(QueuedPrompt {
+            id: turn.id.clone(),
+            kind: QueueKind::FollowUp,
+            state: QueueState::Pending,
+            text: turn.text,
+        });
+        self.resumes.insert(turn.id, (turn.prompt, durable));
+    }
+
+    fn recover(&mut self, error: String, durable: bool, blocked: PendingTurn) {
+        let (Some(store), Some(agent)) = (self.host.config.store.clone(), self.agent.as_ref())
+        else {
+            self.restore_prompt(&error, (!durable).then_some(blocked.text), Vec::new());
+            return;
+        };
+        let session_id = agent.session_id().to_owned();
+        let generation = self.generation;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = match store.turns(&session_id).await {
+                Ok(turns) => pending_turns(&turns).map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            drop(tx.send(AppEvent::Recovered {
+                generation,
+                result,
+                error,
+                durable,
+                blocked,
+            }));
+        });
+    }
+
+    fn hold_after_failed_resume(&mut self) {
+        self.hold_queue = true;
+        self.flash("the resumed turn did not finish · queued prompts wait for your next message");
+    }
+
+    fn remove_sent_prompt(&mut self) {
+        if let Some(item) = self
+            .queue
+            .items()
+            .iter()
+            .find(|item| item.state == QueueState::Sent)
+            .map(|item| item.id.clone())
+        {
+            self.queue.remove(&item);
+        }
+    }
+
+    fn restore_prompt(&mut self, error: &str, text: Option<String>, steers: Vec<QueuedPrompt>) {
+        self.notice(NoticeLevel::Error, format!("prompt failed: {error}"));
+        if text.is_none() {
+            self.hold_after_failed_resume();
+        }
+        let mut restored = text
+            .into_iter()
+            .chain(steers.into_iter().map(|steer| steer.text))
+            .collect::<Vec<_>>();
+        if restored.is_empty() {
+            return;
+        }
+        if !self.composer.is_empty() {
+            restored.push(self.composer.text().to_owned());
+        }
+        self.composer.set_text(restored.join("\n\n"));
     }
 
     fn agent_event(&mut self, event: &AgentEvent) {
@@ -1097,6 +1321,7 @@ impl App {
     }
 
     fn settle_turn(&mut self) {
+        if self.quit { return; }
         self.awaiting_terminal = false;
         let unaccepted = self
             .queue
@@ -1112,7 +1337,7 @@ impl App {
     }
 
     fn after_turn(&mut self) {
-        if !matches!(self.turn, TurnState::Idle) || self.agent.is_none() {
+        if self.quit || !matches!(self.turn, TurnState::Idle) || self.agent.is_none() {
             return;
         }
         if self.interrupting || self.esc_armed.is_some() {
@@ -1132,6 +1357,9 @@ impl App {
         {
             return;
         }
+        if self.hold_queue {
+            return;
+        }
         let next = self
             .queue
             .items()
@@ -1142,6 +1370,12 @@ impl App {
         let Some(item) = self.queue.remove(&id) else {
             return;
         };
+        if let Some((prompt, durable)) = self.resumes.remove(&id) {
+            if let Some(agent) = self.agent.clone() {
+                self.launch_turn(agent, id, item.text, prompt, durable);
+            }
+            return;
+        }
         let mut text = item.text;
         let mut attachments = self.attachments_by_id.remove(&id).unwrap_or_default();
         let extra = self.queue.drain_kind(QueueKind::Steer);
@@ -1164,7 +1398,7 @@ impl App {
         };
         let id = uuid::Uuid::now_v7().to_string();
         let sent = crate::extras::prompt_for(&text, &attachments);
-        self.launch_turn(agent, id, text, sent);
+        self.launch_turn(agent, id, text, sent, false);
     }
 
     fn launch_turn(
@@ -1173,7 +1407,10 @@ impl App {
         id: String,
         text: String,
         sent: nanocode::agent::input::Prompt,
+        durable: bool,
     ) {
+        self.resuming = durable;
+        self.resumes.insert(id.clone(), (sent.clone(), durable));
         self.queue.push(QueuedPrompt {
             id: id.clone(),
             kind: QueueKind::FollowUp,
@@ -1187,22 +1424,43 @@ impl App {
         let generation = self.generation;
         let tx = self.tx.clone();
         let span = self.spans.begin(&id, Some(agent.session_id()));
-        tokio::spawn(tracing::Instrument::instrument(
+        self.submissions.spawn(tracing::Instrument::instrument(
             async move {
-                match agent.prompt(PromptRequest::new(sent).request_id(id)).await {
+                let request = PromptRequest::new(sent.clone()).request_id(id.clone());
+                match agent.prompt(request).await {
                     Ok(turn) => {
                         drop(tx.send(AppEvent::TurnStarted {
                             generation,
                             control: turn.control(),
                         }));
-                        let result = turn.result().await.map_err(|error| error.to_string());
+                        let result = turn.result().await.map_err(|error| {
+                            report_owner_moved(&tx, generation, &error);
+                            error.to_string()
+                        });
                         drop(tx.send(AppEvent::TurnFinished { generation, result }));
                     }
+                    Err(error)
+                        if error.execution_policy_disposition()
+                            == Some(ExecutionPolicyDisposition::Retry) =>
+                    {
+                        drop(tx.send(AppEvent::PromptBlocked {
+                            generation,
+                            error: error.to_string(),
+                            durable,
+                            claimed: durable && operation_active(&error),
+                            blocked: PendingTurn {
+                                id,
+                                text,
+                                prompt: sent,
+                            },
+                        }));
+                    }
                     Err(error) => {
+                        report_owner_moved(&tx, generation, &error);
                         drop(tx.send(AppEvent::PromptFailed {
                             generation,
                             error: error.to_string(),
-                            text,
+                            text: (!durable).then_some(text),
                         }));
                     }
                 }
@@ -1225,6 +1483,7 @@ impl App {
 
     fn flush_pending_steers(&mut self) {
         let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "flush_pending_steers", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
+        if self.quit { return; }
         if matches!(self.turn, TurnState::External(_)) {
             self.route_pending_steers();
             return;
@@ -1242,17 +1501,21 @@ impl App {
         let control = control.clone();
         for (id, text) in pending {
             self.queue.set_state(&id, QueueState::Sent);
-            let prompt = crate::extras::prompt_for(
+            let prompt = self.resumes.get(&id).map(|(prompt, _)| prompt.clone()).unwrap_or_else(|| crate::extras::prompt_for(
                 &text,
-                &self.attachments_by_id.remove(&id).unwrap_or_default(),
-            );
+                self.attachments_by_id.get(&id).map_or(&[], Vec::as_slice),
+            ));
             let control = control.clone();
             let tx = self.tx.clone();
-            tokio::spawn(async move {
+            let generation = self.generation;
+            self.submissions.spawn(async move {
                 let result = control
                     .steer_with_id(id.clone(), prompt)
                     .await
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| {
+                        report_owner_moved(&tx, generation, &error);
+                        error.to_string()
+                    });
                 drop(tx.send(AppEvent::SteerSent { id, result }));
             });
         }
@@ -1273,13 +1536,13 @@ impl App {
         let generation = self.generation;
         for (id, text) in pending {
             self.queue.set_state(&id, QueueState::Sent);
-            let prompt = crate::extras::prompt_for(
+            let prompt = self.resumes.get(&id).map(|(prompt, _)| prompt.clone()).unwrap_or_else(|| crate::extras::prompt_for(
                 &text,
-                &self.attachments_by_id.remove(&id).unwrap_or_default(),
-            );
+                self.attachments_by_id.get(&id).map_or(&[], Vec::as_slice),
+            ));
             let agent = agent.clone();
             let tx = self.tx.clone();
-            tokio::spawn(async move {
+            self.submissions.spawn(async move {
                 match agent.route_prompt(prompt).await {
                     Ok(PromptRoute::Steered) => {
                         drop(tx.send(AppEvent::SteerSent { id, result: Ok(()) }))
@@ -1290,13 +1553,19 @@ impl App {
                             id,
                             control: turn.control(),
                         }));
-                        let result = turn.result().await.map_err(|error| error.to_string());
+                        let result = turn.result().await.map_err(|error| {
+                            report_owner_moved(&tx, generation, &error);
+                            error.to_string()
+                        });
                         drop(tx.send(AppEvent::TurnFinished { generation, result }));
                     }
-                    Err(error) => drop(tx.send(AppEvent::SteerSent {
-                        id,
-                        result: Err(error.to_string()),
-                    })),
+                    Err(error) => {
+                        report_owner_moved(&tx, generation, &error);
+                        drop(tx.send(AppEvent::SteerSent {
+                            id,
+                            result: Err(error.to_string()),
+                        }));
+                    }
                 }
             });
         }
@@ -1501,7 +1770,7 @@ impl App {
                 } else {
                     self.quit_armed = Some(Instant::now());
                     self.flash(if busy {
-                        "press ctrl+c again to quit · esc esc interrupts the turn"
+                        "press ctrl+c again to quit · the turn continues when you resume · esc esc interrupts it"
                     } else {
                         "press ctrl+c again to quit"
                     });
@@ -1607,7 +1876,11 @@ impl App {
             .items()
             .iter()
             .rev()
-            .find(|item| item.kind == QueueKind::FollowUp && item.state == QueueState::Pending)
+            .find(|item| {
+                item.kind == QueueKind::FollowUp
+                    && item.state == QueueState::Pending
+                    && !self.resumes.contains_key(&item.id)
+            })
             .map(|item| item.id.clone());
         match latest {
             Some(id) => {
@@ -1764,6 +2037,11 @@ impl App {
             self.message_focused(id, text);
             return;
         }
+        if self.moved {
+            self.composer.set_text(text);
+            self.flash(OWNER_MOVED);
+            return;
+        }
         let attachments = std::mem::take(&mut self.attachments);
         match self.turn {
             TurnState::Running { .. } | TurnState::Starting(_) | TurnState::External(_) => {
@@ -1776,6 +2054,12 @@ impl App {
             {
                 let id = self.enqueue_follow_up(text);
                 self.attachments_by_id.insert(id, attachments);
+            }
+            TurnState::Idle if self.hold_queue => {
+                self.hold_queue = false;
+                let id = self.enqueue_follow_up(text);
+                self.attachments_by_id.insert(id, attachments);
+                self.after_turn();
             }
             TurnState::Idle => {
                 self.next_attachments = attachments;
@@ -1930,14 +2214,7 @@ impl App {
             "mouse" => self.toggle_mouse = true,
             "help" | "keys" | "?" => self.overlay = Some(Overlay::Help),
             "quit" | "exit" | "q" => self.quit = true,
-            "reload" | "restart" if !matches!(self.turn, TurnState::Idle) => self.notice(
-                NoticeLevel::Warning,
-                "a turn is running; wait for it to finish or press Esc Esc, then /reload",
-            ),
-            "reload" | "restart" => {
-                self.reload = true;
-                self.quit = true;
-            }
+            "reload" | "restart" => self.request_reload(true),
             other => self.notice(
                 NoticeLevel::Warning,
                 format!("unknown command /{other}; try /help"),
@@ -2368,22 +2645,7 @@ pub async fn open_session(
     model
         .capabilities(nanocode::ModelTransport::Native)
         .check_thinking(thinking)?;
-    let pending = stored
-        .turns
-        .iter()
-        .filter(|turn| turn.status == nanocode::durability::TurnStatus::Pending)
-        .map(|turn| {
-            let input = turn.input.get("prompt").unwrap_or(&turn.input).clone();
-            let prompt = serde_json::from_value::<nanocode::agent::input::Prompt>(input).map_err(
-                |error| format!("pending turn {} has an unreadable prompt: {error}", turn.id),
-            )?;
-            Ok::<_, crate::host::Error>(PendingTurn {
-                id: turn.id.clone(),
-                text: turn.preview.clone().unwrap_or_default(),
-                prompt,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let pending = pending_turns(&stored.turns)?;
     let prompts = stored
         .turns
         .iter()
@@ -2420,6 +2682,65 @@ pub async fn open_session(
         pending,
         prompts,
     })
+}
+
+const OWNER_MOVED: &str = "this session was opened in another nc window, which now owns it; this window stopped writing so the two cannot conflict. /resume here takes it back and stops the other window";
+
+fn report_owner_moved(
+    tx: &UnboundedSender<AppEvent>,
+    generation: u64,
+    error: &nanocode::NanocodexError,
+) {
+    if owner_moved(error) {
+        drop(tx.send(AppEvent::OwnerMoved { generation }));
+    }
+}
+
+fn owner_moved(error: &nanocode::NanocodexError) -> bool {
+    use nanocode::durability::{Error, StoreError};
+    match error {
+        nanocode::NanocodexError::ExecutionPolicy { source, .. } => {
+            source.downcast_ref::<Error>().is_some_and(|error| {
+                matches!(
+                    error,
+                    Error::ModelOwnerFenced | Error::Store(StoreError::Fenced)
+                )
+            }) || source
+                .downcast_ref::<nanocode::NanocodexError>()
+                .is_some_and(owner_moved)
+        }
+        nanocode::NanocodexError::Shutdown(inner) => owner_moved(inner),
+        _ => false,
+    }
+}
+
+fn operation_active(error: &nanocode::NanocodexError) -> bool {
+    matches!(
+        error,
+        nanocode::NanocodexError::ExecutionPolicy { source, .. }
+            if matches!(
+                source.downcast_ref::<nanocode::durability::Error>(),
+                Some(nanocode::durability::Error::OperationActive { .. })
+            )
+    )
+}
+
+fn pending_turns(turns: &[nanocode::durability::StoredTurn]) -> Result<Vec<PendingTurn>> {
+    turns
+        .iter()
+        .filter(|turn| turn.status == nanocode::durability::TurnStatus::Pending)
+        .map(|turn| {
+            let input = turn.input.get("prompt").unwrap_or(&turn.input).clone();
+            let prompt = serde_json::from_value::<nanocode::agent::input::Prompt>(input).map_err(
+                |error| format!("pending turn {} has an unreadable prompt: {error}", turn.id),
+            )?;
+            Ok::<_, crate::host::Error>(PendingTurn {
+                id: turn.id.clone(),
+                text: turn.preview.clone().unwrap_or_default(),
+                prompt,
+            })
+        })
+        .collect()
 }
 
 pub fn subagent_status(status: &AgentStatus) -> (NodeStatus, String) {

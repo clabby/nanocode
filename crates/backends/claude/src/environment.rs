@@ -56,7 +56,20 @@ fn host_lines() -> Vec<String> {
     {
         lines.push(format!("OS Version: {version}"));
     }
+    lines.extend(session_store_line());
     lines
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn session_store_line() -> Option<String> {
+    let home = nanocode_home::AgentHome::from_env().ok()?;
+    let store = home.nanocode_home();
+    store.join("sessions.jsonl").is_file().then(|| {
+        format!(
+            "Nanocode sessions: {} (find one by ID with `nc sessions --all`; sessions.jsonl is too large to search directly)",
+            store.display()
+        )
+    })
 }
 
 #[cfg(target_family = "wasm")]

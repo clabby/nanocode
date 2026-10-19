@@ -197,7 +197,7 @@ impl ProjectHome {
                 format: ProfileFormat::ClaudeMarkdown,
             });
             roots.push(AgentProfileRoot {
-                path: directory.join(".codex/agents"),
+                path: directory.join(".nanocode/agents"),
                 scope: Scope::Project,
                 convention: Convention::Codex,
                 format: ProfileFormat::CodexToml,

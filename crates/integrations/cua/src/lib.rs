@@ -159,7 +159,11 @@ impl ComputerConfig {
         let home = std::env::var_os("HOME").ok_or("Default Sky CUA requires HOME")?;
         let codex_home = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(home).join(".codex"));
+            .unwrap_or_else(|| PathBuf::from(&home).join(".codex"));
+        let nanocode_home = std::env::var_os("NANOCODE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&home).join(".nanocode"));
         let base = PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/cua_node");
         let mut config = Self::new(base.join("bin/node_repl"));
         let service = codex_home.join("computer-use/Codex Computer Use.app");
@@ -190,7 +194,7 @@ impl ComputerConfig {
         .map(|(key, value)| (OsString::from(key), value))
         .collect();
         config.catalog_cache = Some(CatalogCache {
-            path: codex_home.join("nanocode").join("cua-catalog.json"),
+            path: nanocode_home.join("cua-catalog.json"),
             inputs: vec![
                 config.executable.clone(),
                 base.join("bin/node"),

@@ -10,7 +10,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Shared Codex (~/.codex) and Claude (~/.claude) user/project context resolution for Nanocodex"
+description = "Shared nanocode (~/.nanocode) and Claude (~/.claude) user/project context resolution"
 keywords = ["ai", "agents", "codex", "claude", "skills"]
 categories = ["development-tools", "filesystem"]
 

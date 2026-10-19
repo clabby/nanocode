@@ -2,23 +2,16 @@ use crate::tools::{SessionEnvironment, ToolContent, ToolOutput, media::MediaRead
 use regex::RegexBuilder;
 use serde_json::{Value, json};
 use std::{
-    fs::{self, OpenOptions},
-    io::{Read as _, Write as _},
-    path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    fs,
+    io::{BufRead as _, BufReader, Write as _},
+    path::{Path, PathBuf},
 };
-
-const MAX_FILE: usize = 1024 * 1024;
-const MAX_VISITS: usize = 10_000;
-const MAX_SEARCH_BYTES: u64 = 128 * 1024 * 1024;
-static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct ClaudeWorkspaceFiles {
     root: PathBuf,
-    root_alias: PathBuf,
     base: PathBuf,
-    confined: bool,
+    relative_paths: bool,
     media: MediaReadOptions,
     read_token_budget: usize,
 }
@@ -26,24 +19,16 @@ pub struct ClaudeWorkspaceFiles {
 impl ClaudeWorkspaceFiles {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, String> {
         let given = root.as_ref();
-        let root_alias = if given.is_absolute() {
-            given.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|e| format!("workspace current directory: {e}"))?
-                .join(given)
-        };
         let root = fs::canonicalize(given).map_err(|e| format!("workspace root: {e}"))?;
         if !root.is_dir() {
             return Err("workspace root is not a directory".into());
         }
         Ok(Self {
             base: root.clone(),
-            confined: true,
+            relative_paths: true,
             root,
-            root_alias,
             media: MediaReadOptions::default(),
-            read_token_budget: 200_000,
+            read_token_budget: usize::MAX,
         })
     }
 
@@ -58,17 +43,16 @@ impl ClaudeWorkspaceFiles {
             .ok_or("directory has no filesystem root")?
             .to_path_buf();
         Ok(Self {
-            root_alias: root.clone(),
             root,
             base,
-            confined: false,
+            relative_paths: false,
             media: MediaReadOptions::default(),
-            read_token_budget: 200_000,
+            read_token_budget: usize::MAX,
         })
     }
 
     fn shown(&self, relative: &Path) -> String {
-        if self.confined {
+        if self.relative_paths {
             relative.display().to_string()
         } else {
             self.root.join(relative).display().to_string()
@@ -168,10 +152,10 @@ impl ClaudeWorkspaceFiles {
             } else {
                 Self::field(&input, "file_path")?
             };
-            let relative = this.relative(requested, true)?;
-            let relative = if relative == Path::new(".") { Path::new("") } else { &relative };
-
-            if let Ok(loader) = crate::tools::ClaudeProjectContext::new(&this.root) {
+            if let Ok(path) = fs::canonicalize(this.resolve(requested)?)
+                && let Ok(relative) = path.strip_prefix(&this.base)
+                && let Ok(loader) = crate::tools::ClaudeProjectContext::new(&this.base)
+            {
                 let context = loader.load_for_path(relative);
                 if !context.excerpts.is_empty() || !context.diagnostics.is_empty() {
                     let context = json!(context);
@@ -223,46 +207,20 @@ impl ClaudeWorkspaceFiles {
             .ok_or_else(|| format!("missing or invalid {key}"))
     }
 
-    fn relative(&self, text: &str, allow_root: bool) -> Result<PathBuf, String> {
-        if text.len() > 4096 {
-            return Err("path exceeds 4096-byte limit".into());
-        }
-        let joined;
-        let path = if Path::new(text).is_absolute() || self.confined {
-            Path::new(text)
-        } else {
-            joined = self.base.join(text);
-            joined.as_path()
-        };
-        let relative = if path.is_absolute() {
-            path.strip_prefix(&self.root)
-                .or_else(|_| path.strip_prefix(&self.root_alias))
-                .map_err(|_| "absolute path outside workspace".to_string())?
-        } else {
-            path
-        };
-        if relative
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_)))
-        {
-            if !(allow_root && (text == "." || relative.as_os_str().is_empty())) {
-                return Err("path must not contain traversal, root, or special components".into());
-            }
-        }
-        if !allow_root && relative.as_os_str().is_empty() {
+    fn resolve(&self, text: &str) -> Result<PathBuf, String> {
+        if text.is_empty() {
             return Err("file path is empty".into());
         }
-        Ok(relative.to_path_buf())
+        Ok(self.base.join(text))
+    }
+
+    fn relative_path(&self, path: &Path) -> PathBuf {
+        path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
     }
 
     fn existing(&self, text: &str) -> Result<(PathBuf, PathBuf), String> {
-        let rel = self.relative(text, true)?;
-        let target = self.root.join(&rel);
-        let real = fs::canonicalize(target).map_err(|e| format!("path: {e}"))?;
-        if !real.starts_with(&self.root) {
-            return Err("symlink escapes workspace".into());
-        }
-        Ok((rel, real))
+        let real = fs::canonicalize(self.resolve(text)?).map_err(|e| format!("path: {e}"))?;
+        Ok((self.relative_path(&real), real))
     }
 
     fn file(&self, text: &str) -> Result<(PathBuf, PathBuf), String> {
@@ -274,15 +232,7 @@ impl ClaudeWorkspaceFiles {
     }
 
     fn read_text(path: &Path) -> Result<String, String> {
-        let f = fs::File::open(path).map_err(|e| format!("read: {e}"))?;
-        let mut bytes = Vec::new();
-        f.take((MAX_FILE + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("read: {e}"))?;
-        if bytes.len() > MAX_FILE {
-            return Err("file exceeds 1 MiB text limit".into());
-        }
-        String::from_utf8(bytes).map_err(|_| "file is not UTF-8 text".into())
+        fs::read_to_string(path).map_err(|e| format!("read: {e}"))
     }
 
     fn read(&self, input: &Value) -> Result<String, String> {
@@ -290,35 +240,7 @@ impl ClaudeWorkspaceFiles {
             return Err("pages is only applicable to PDF files".into());
         }
         let (_, path) = self.file(Self::field(input, "file_path")?)?;
-        let allow_large = input
-            .get("allow_large")
-            .map_or(Some(false), Value::as_bool)
-            .ok_or("allow_large must be a boolean")?;
-        let source_limit = if allow_large {
-            16 * 1024 * 1024
-        } else {
-            MAX_FILE
-        };
-        let mut bytes = Vec::new();
-        fs::File::open(&path)
-            .map_err(|e| format!("read: {e}"))?
-            .take((source_limit + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("read: {e}"))?;
-        if bytes.len() > source_limit {
-            return Err(if allow_large {
-                "text exceeds 16 MiB source limit"
-            } else {
-                "file exceeds 1 MiB text limit; use allow_large: true"
-            }
-            .into());
-        }
-        let content = String::from_utf8(bytes).map_err(|_| "file is not UTF-8 text")?;
-        let output_limit = self
-            .read_token_budget
-            .min(if allow_large { usize::MAX } else { 25_000 })
-            .saturating_mul(4)
-            .min(16 * 1024 * 1024);
+        let output_limit = self.read_token_budget.saturating_mul(4);
         let offset = input
             .get("offset")
             .map_or(Some(1), Value::as_u64)
@@ -331,15 +253,19 @@ impl ClaudeWorkspaceFiles {
             return Err("limit must be positive".into());
         }
         let mut out = String::new();
-        for (i, line) in content
+        let file = fs::File::open(path).map_err(|e| format!("read: {e}"))?;
+        for (i, line) in BufReader::new(file)
             .lines()
             .enumerate()
             .skip(offset.saturating_sub(1).min(usize::MAX as u64) as usize)
             .take(usize::try_from(limit).unwrap_or(usize::MAX))
         {
+            let line = line.map_err(|e| format!("read: {e}"))?;
             let line = format!("{}\t{}\n", i + 1, line);
             if out.len().saturating_add(line.len()) > output_limit {
-                return Err("requested text exceeds the available Read budget; use offset/limit or allow_large: true".into());
+                return Err(
+                    "requested text exceeds the available Read budget; use offset/limit".into(),
+                );
             }
             out.push_str(&line);
         }
@@ -347,46 +273,40 @@ impl ClaudeWorkspaceFiles {
     }
 
     fn write_target(&self, text: &str) -> Result<(PathBuf, PathBuf), String> {
-        let rel = self.relative(text, false)?;
-        let path = self.root.join(&rel);
-        if !self.confined {
-            let parent = path.parent().ok_or("file has no parent")?;
-            fs::create_dir_all(parent).map_err(|e| format!("create directory: {e}"))?;
-            let path = match fs::canonicalize(&path) {
-                Ok(real) => real,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => path,
-                Err(e) => return Err(format!("check target: {e}")),
-            };
-            return Ok((rel, path));
-        }
-        let parent = path.parent().ok_or("file has no parent")?;
-        let mut current = self.root.clone();
-        for component in rel.parent().into_iter().flat_map(Path::components) {
-            current.push(component.as_os_str());
-            match fs::symlink_metadata(&current) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err("symlink parent rejected".into());
+        let mut path = self.resolve(text)?;
+        loop {
+            match fs::canonicalize(&path) {
+                Ok(real) => {
+                    if !real.is_file() {
+                        return Err("target is not a regular file".into());
+                    }
+                    return Ok((self.relative_path(&real), real));
                 }
-                Ok(meta) if !meta.is_dir() => return Err("parent is not a directory".into()),
-                Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir(&current).map_err(|e| format!("create directory: {e}"))?
+                    match fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            let target =
+                                fs::read_link(&path).map_err(|e| format!("read link: {e}"))?;
+                            path = path.parent().ok_or("file has no parent")?.join(target);
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(format!("check target: {e}")),
+                    }
+                    let parent = path.parent().ok_or("file has no parent")?;
+                    fs::create_dir_all(parent).map_err(|e| format!("create directory: {e}"))?;
+                    let parent = fs::canonicalize(parent).map_err(|e| format!("parent: {e}"))?;
+                    let path = parent.join(path.file_name().ok_or("file has no name")?);
+                    return Ok((self.relative_path(&path), path));
                 }
-                Err(e) => return Err(format!("check parent: {e}")),
+                Err(e) => return Err(format!("path: {e}")),
             }
         }
-        if fs::canonicalize(parent).map_err(|e| format!("parent: {e}"))? != parent {
-            return Err("parent escapes workspace or uses a symlink".into());
-        }
-        reject_symlink_target(&path)?;
-        Ok((rel, path))
     }
 
     fn write(&self, input: &Value) -> Result<String, String> {
         let content = Self::field(input, "content")?;
-        if content.len() > MAX_FILE {
-            return Err("content exceeds 1 MiB text limit".into());
-        }
         let (rel, path) = self.write_target(Self::field(input, "file_path")?)?;
         atomic_write(&path, content)?;
         Ok(format!("Wrote {}", self.shown(&rel)))
@@ -413,20 +333,11 @@ impl ClaudeWorkspaceFiles {
             return Err(format!("old_string occurs {count} times; set replace_all"));
         }
 
-        let replacements = if replace_all { count } else { 1 };
-        let updated_len = content.len() - old.len() * replacements;
-        let updated_len = new
-            .len()
-            .checked_mul(replacements)
-            .and_then(|added| updated_len.checked_add(added))
-            .filter(|&len| len <= MAX_FILE)
-            .ok_or("edited content exceeds 1 MiB text limit")?;
         let updated = if replace_all {
             content.replace(old, new)
         } else {
             content.replacen(old, new, 1)
         };
-        debug_assert_eq!(updated.len(), updated_len);
         let (_, path) = self.write_target(text)?;
 
         if Self::read_text(&path)? != content {
@@ -450,23 +361,18 @@ impl ClaudeWorkspaceFiles {
     fn walk(&self, path: &Path) -> Result<Vec<PathBuf>, String> {
         let mut stack = vec![path.to_path_buf()];
         let mut files = Vec::new();
-        let mut visits = 0;
         while let Some(next) = stack.pop() {
-            visits += 1;
-            if visits > MAX_VISITS {
-                return Err("search exceeds 10000 entries".into());
-            }
             let meta = fs::symlink_metadata(&next).map_err(|e| format!("walk: {e}"))?;
             if meta.file_type().is_symlink() {
+                if fs::metadata(&next).is_ok_and(|meta| meta.is_file()) {
+                    files.push(next);
+                }
                 continue;
             }
             if meta.is_file() {
                 files.push(next);
             } else if meta.is_dir() {
                 for entry in fs::read_dir(&next).map_err(|e| format!("walk: {e}"))? {
-                    if visits + stack.len() >= MAX_VISITS {
-                        return Err("search exceeds 10000 entries".into());
-                    }
                     stack.push(entry.map_err(|e| format!("walk: {e}"))?.path());
                 }
             }
@@ -477,47 +383,34 @@ impl ClaudeWorkspaceFiles {
 
     fn glob(&self, input: &Value) -> Result<String, String> {
         let raw_pattern = Self::field(input, "pattern")?;
-        let pattern = if Path::new(raw_pattern).is_absolute() {
-            self.relative(raw_pattern, false)?
+        let pattern = Path::new(raw_pattern);
+        let mut prefix = pattern
+            .components()
+            .take_while(|part| {
+                !part
+                    .as_os_str()
+                    .to_string_lossy()
+                    .contains(['*', '?', '[', '{', '\\'])
+            })
+            .collect::<PathBuf>();
+        if prefix == pattern {
+            prefix.pop();
+        }
+        let matcher = glob_regex(
+            pattern
+                .strip_prefix(&prefix)
+                .map_err(|e| format!("glob path: {e}"))?
                 .to_str()
-                .ok_or("pattern is not UTF-8")?
-                .to_owned()
-        } else {
-            raw_pattern.to_owned()
+                .ok_or("pattern is not UTF-8")?,
+        )?;
+        let (_, search_root) = self.search_root(input)?;
+        let root = match fs::canonicalize(search_root.join(prefix)) {
+            Ok(root) => root,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(e) => return Err(format!("glob path: {e}")),
         };
-        let matcher = glob_regex(&pattern)?;
-
-        let literal_prefix = pattern
-            .split('/')
-            .take_while(|part| !part.contains(['*', '?', '[', '{', '\\']))
-            .collect::<Vec<_>>()
-            .join("/");
-        let anchored = Path::new(raw_pattern).is_absolute() && !self.confined;
-        let (_, root) = if anchored {
-            (PathBuf::new(), self.root.clone())
-        } else {
-            self.search_root(input)?
-        };
-        if !literal_prefix.is_empty() {
-            let candidate = root.join(&literal_prefix);
-            if candidate.exists()
-                && !fs::canonicalize(&candidate)
-                    .map_err(|e| format!("glob path: {e}"))?
-                    .starts_with(&self.root)
-            {
-                return Err("glob symlink escapes workspace".into());
-            }
-        }
         let mut out = String::new();
-        let start = if anchored {
-            root.join(&literal_prefix)
-        } else {
-            root.clone()
-        };
-        if anchored && !start.exists() {
-            return Ok(out);
-        }
-        let mut files = self.walk(&start)?;
+        let mut files = self.walk(&root)?;
         files.sort_by_cached_key(|path| {
             (
                 std::cmp::Reverse(fs::metadata(path).and_then(|m| m.modified()).ok()),
@@ -530,10 +423,7 @@ impl ClaudeWorkspaceFiles {
                 .map_err(|_| "search path changed")?
                 .to_string_lossy();
             if matcher.is_match(rel.as_ref()) {
-                let shown = self.shown(
-                    file.strip_prefix(&self.root)
-                        .map_err(|_| "search escaped workspace")?,
-                );
+                let shown = self.shown(&self.relative_path(&file));
                 if !push_bounded(&mut out, &format!("{shown}\n")) {
                     break;
                 }
@@ -568,9 +458,6 @@ impl ClaudeWorkspaceFiles {
             }
         }
         let pattern = Self::field(input, "pattern")?;
-        if pattern.is_empty() || pattern.len() > 4096 {
-            return Err("pattern must be 1 to 4096 bytes".into());
-        }
         let mode = input
             .get("output_mode")
             .map_or(Some("files_with_matches"), Value::as_str)
@@ -587,15 +474,15 @@ impl ClaudeWorkspaceFiles {
         let only_matching = grep_bool(input, "-o", false)?;
         let line_numbers = grep_bool(input, "-n", true)?;
         let multiline = grep_bool(input, "multiline", false)?;
-        let before = grep_number(input, "-B", 0, 2000)?;
-        let after = grep_number(input, "-A", 0, 2000)?;
+        let before = grep_number(input, "-B", 0)?;
+        let after = grep_number(input, "-A", 0)?;
         if input.get("-C").is_some() && input.get("context").is_some() {
             return Err("-C conflicts with context".into());
         }
         let context = if input.get("-C").is_some() {
-            grep_number(input, "-C", 0, 2000)?
+            grep_number(input, "-C", 0)?
         } else {
-            grep_number(input, "context", 0, 2000)?
+            grep_number(input, "context", 0)?
         };
         let before = if input.get("-B").is_some() {
             before
@@ -607,8 +494,8 @@ impl ClaudeWorkspaceFiles {
         } else {
             context
         };
-        let offset = grep_number(input, "offset", 0, u64::MAX)?;
-        let head_limit = grep_number(input, "head_limit", 250, u64::MAX)?;
+        let offset = grep_number(input, "offset", 0)?;
+        let head_limit = grep_number(input, "head_limit", 250)?;
         if only_matching && (before > 0 || after > 0 || multiline) {
             return Err("-o cannot be combined with context or multiline".into());
         }
@@ -623,9 +510,6 @@ impl ClaudeWorkspaceFiles {
         types.add_defaults();
         if let Some(kind) = input.get("type") {
             let kind = kind.as_str().ok_or("invalid type")?;
-            if kind.is_empty() || kind.len() > 64 {
-                return Err("invalid type".into());
-            }
             types.select(kind);
         }
         let types = types
@@ -635,19 +519,14 @@ impl ClaudeWorkspaceFiles {
             .case_insensitive(!sensitive)
             .multi_line(multiline)
             .dot_matches_new_line(multiline)
-            .size_limit(4 * 1024 * 1024)
             .build()
             .map_err(|e| format!("invalid or oversized regex: {e}"))?;
         let (_, root) = self.search_root(input)?;
         let mut out = String::new();
-        let mut searched_bytes = 0u64;
         let mut skipped = 0u64;
         let mut yielded = 0u64;
         for file in self.walk(&root)? {
-            let shown = self.shown(
-                file.strip_prefix(&self.root)
-                    .map_err(|_| "search escaped workspace")?,
-            );
+            let shown = self.shown(&self.relative_path(&file));
             if let (Some(glob), Some(matcher)) = (glob, &glob_matcher) {
                 let relative = file
                     .strip_prefix(&root)
@@ -663,13 +542,6 @@ impl ClaudeWorkspaceFiles {
             }
             if types.matched(&file, false).is_ignore() {
                 continue;
-            }
-            let size = fs::metadata(&file)
-                .map_err(|e| format!("search metadata: {e}"))?
-                .len();
-            searched_bytes = searched_bytes.saturating_add(size.min((MAX_FILE + 1) as u64));
-            if searched_bytes > MAX_SEARCH_BYTES {
-                return Err("search exceeds 128 MiB scan limit".into());
             }
             let Ok(contents) = Self::read_text(&file) else {
                 continue;
@@ -810,70 +682,29 @@ fn grep_bool(input: &Value, key: &str, default: bool) -> Result<bool, String> {
         .ok_or_else(|| format!("invalid {key}"))
 }
 
-fn grep_number(input: &Value, key: &str, default: u64, max: u64) -> Result<u64, String> {
-    let value = input
+fn grep_number(input: &Value, key: &str, default: u64) -> Result<u64, String> {
+    input
         .get(key)
         .map_or(Some(default), Value::as_u64)
-        .ok_or_else(|| format!("invalid {key}"))?;
-    if value > max {
-        return Err(format!("{key} exceeds {max}"));
-    }
-    Ok(value)
-}
-
-fn reject_symlink_target(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err("symlink target rejected".into()),
-        Ok(meta) if !meta.is_file() => Err("target is not a regular file".into()),
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("check target: {e}")),
-    }
+        .ok_or_else(|| format!("invalid {key}"))
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("file has no parent")?;
-    let mut temp = None;
-    for _ in 0..16 {
-        let name = format!(
-            ".nanocode-{}-{}.tmp",
-            std::process::id(),
-            TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let candidate = parent.join(name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&candidate) {
-            Ok(file) => {
-                temp = Some((candidate, file));
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("create temp file: {e}")),
-        }
+    let mut file =
+        tempfile::NamedTempFile::new_in(parent).map_err(|e| format!("create temp file: {e}"))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    file.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync: {e}"))?;
+    if let Ok(meta) = fs::metadata(path) {
+        file.as_file()
+            .set_permissions(meta.permissions())
+            .map_err(|e| format!("permissions: {e}"))?;
     }
-    let (temp_path, mut file) = temp.ok_or("could not allocate temp file")?;
-    let result = (|| {
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("write: {e}"))?;
-        file.sync_all().map_err(|e| format!("sync: {e}"))?;
-        drop(file);
-        reject_symlink_target(path)?;
-        if let Ok(meta) = fs::metadata(path) {
-            fs::set_permissions(&temp_path, meta.permissions())
-                .map_err(|e| format!("permissions: {e}"))?;
-        }
-        fs::rename(&temp_path, path).map_err(|e| format!("rename: {e}"))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
+    file.persist(path).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
 }
 
 fn push_bounded(output: &mut String, line: &str) -> bool {
@@ -882,12 +713,8 @@ fn push_bounded(output: &mut String, line: &str) -> bool {
 }
 
 fn validate_pattern(pattern: &str) -> Result<(), String> {
-    if pattern.is_empty()
-        || pattern.len() > 512
-        || pattern.starts_with('/')
-        || pattern.split('/').any(|part| part == ".." || part == ".")
-    {
-        return Err("invalid glob pattern or traversal".into());
+    if pattern.is_empty() {
+        return Err("glob pattern is empty".into());
     }
     Ok(())
 }

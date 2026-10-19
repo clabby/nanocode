@@ -8,7 +8,7 @@ use crate::{LogFormat, LogOutput, METRICS_TARGET, ObservabilityBuilder};
 pub struct ObservabilityOutputArgs {
     #[arg(
         long = "log",
-        env = "NANOCODEX_LOG",
+        env = "NANOCODE_LOG",
         global = true,
         value_parser = NonEmptyStringValueParser::new(),
         help = "Tracing filter in RUST_LOG syntax for the log file and OpenTelemetry export"
@@ -17,7 +17,7 @@ pub struct ObservabilityOutputArgs {
 
     #[arg(
         long,
-        env = "NANOCODEX_LOG_FORMAT",
+        env = "NANOCODE_LOG_FORMAT",
         global = true,
         default_value_t,
         value_enum
@@ -26,7 +26,7 @@ pub struct ObservabilityOutputArgs {
 
     #[arg(
         long,
-        env = "NANOCODEX_LOG_FILE",
+        env = "NANOCODE_LOG_FILE",
         global = true,
         help = "Write tracing logs to this file"
     )]

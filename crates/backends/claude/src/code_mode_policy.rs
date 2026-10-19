@@ -29,4 +29,8 @@ impl CodeModeToolPolicy for ClaudeToolPolicy {
         .contains(&name)
         .then_some(WorkspaceToolRouting::File)
     }
+
+    fn exclusive(&self, name: &str) -> bool {
+        ["Write", "Edit"].contains(&name)
+    }
 }

@@ -17,6 +17,9 @@ sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [lints]
 workspace = true
 

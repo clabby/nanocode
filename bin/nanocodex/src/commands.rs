@@ -56,7 +56,7 @@ pub const COMMANDS: [(&str, &str); 30] = [
     ),
     (
         "/reload",
-        "restart with the newest nanocodex on PATH, keeping this session",
+        "restart all nc windows with the newest binary, continuing active turns and queued prompts",
     ),
     ("/quit", "exit nanocodex"),
 ];

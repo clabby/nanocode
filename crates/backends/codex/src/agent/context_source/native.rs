@@ -8,18 +8,18 @@ use crate::{NanocodexError, Result};
 
 #[derive(Clone, Default)]
 pub(crate) struct ContextSourceConfig {
-    codex_home: Option<PathBuf>,
+    nanocode_home: Option<PathBuf>,
     claude_home: Option<PathBuf>,
     execution_environment: Option<super::ExecutionEnvironment>,
 }
 
 impl ContextSourceConfig {
-    pub(crate) fn set_codex_home(&mut self, codex_home: PathBuf) {
-        self.codex_home = Some(codex_home);
+    pub(crate) fn set_nanocode_home(&mut self, nanocode_home: PathBuf) {
+        self.nanocode_home = Some(nanocode_home);
     }
 
-    pub(crate) fn codex_home(&self) -> Option<&Path> {
-        self.codex_home.as_deref()
+    pub(crate) fn nanocode_home(&self) -> Option<&Path> {
+        self.nanocode_home.as_deref()
     }
 
     pub(crate) fn set_claude_home(&mut self, claude_home: PathBuf) {
@@ -37,7 +37,7 @@ impl ContextSourceConfig {
     pub(crate) fn build(&self) -> ContextSource {
         ContextSource {
             global_instructions: load_global_instructions(
-                self.codex_home(),
+                self.nanocode_home(),
                 self.claude_home.as_deref(),
             ),
             execution_environment: self.execution_environment.clone(),

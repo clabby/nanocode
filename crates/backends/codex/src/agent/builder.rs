@@ -269,8 +269,8 @@ impl<F> NanocodexBuilder<F> {
 
     #[cfg(not(target_family = "wasm"))]
     #[must_use]
-    pub fn codex_home(mut self, codex_home: impl Into<PathBuf>) -> Self {
-        self.codex.context.set_codex_home(codex_home.into());
+    pub fn nanocode_home(mut self, nanocode_home: impl Into<PathBuf>) -> Self {
+        self.codex.context.set_nanocode_home(nanocode_home.into());
         self
     }
 

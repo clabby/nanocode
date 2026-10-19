@@ -133,16 +133,16 @@ pub async fn load_sequence<T: DeserializeOwned>(
         next = page.previous;
         pages.push(page.items);
     }
-    let mut items = Vec::new();
-    for page in pages.into_iter().rev() {
-        for chunk in page.chunks(16) {
-            for reference in chunk {
-                keys.insert(reference.key().to_owned());
-            }
-            for payload in reader.load_payloads(chunk.to_vec()).await? {
-                items.push(payload.decode()?);
-            }
-        }
+    let references: Vec<_> = pages.into_iter().rev().flatten().collect();
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    for reference in &references {
+        keys.insert(reference.key().to_owned());
+    }
+    let mut items = Vec::with_capacity(references.len());
+    for payload in reader.load_payloads(references).await? {
+        items.push(payload.decode()?);
     }
     Ok(items)
 }

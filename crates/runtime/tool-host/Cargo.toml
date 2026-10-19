@@ -20,6 +20,7 @@ nanocode-tools.workspace = true
 nanocode-types.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]

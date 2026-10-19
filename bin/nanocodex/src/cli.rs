@@ -83,7 +83,7 @@ pub struct SessionArgs {
     #[arg(
         short,
         long,
-        env = "NANOCODEX_MODEL",
+        env = "NANOCODE_MODEL",
         help = "Model id or alias (see 'nanocodex models'); defaults to gpt-6.1-sol at xhigh thinking on the fast tier"
     )]
     pub model: Option<String>,
@@ -122,6 +122,9 @@ pub struct SessionArgs {
     )]
     pub resume: Option<String>,
 
+    #[arg(long, hide = true)]
+    pub reload_state: Option<PathBuf>,
+
     #[arg(
         short = 'c',
         long = "continue",
@@ -134,8 +137,8 @@ pub struct SessionArgs {
 
     #[arg(
         long,
-        env = "NANOCODEX_HOME",
-        help = "Directory for saved sessions, history and pasted images (defaults to $CODEX_HOME/nanocode)"
+        env = "NANOCODE_HOME",
+        help = "Directory for saved sessions, history and pasted images (defaults to ~/.nanocode)"
     )]
     pub home: Option<PathBuf>,
 
@@ -160,7 +163,7 @@ pub struct GatewayArgs {
     #[arg(
         long,
         value_enum,
-        env = "NANOCODEX_GATEWAY",
+        env = "NANOCODE_GATEWAY",
         help = "Route Codex models (gpt-6.1-sol, luna, astra) through a Responses gateway for this process, including /new, /model and resumed sessions; keys are read from the provider's environment variable and never saved; Claude models keep their own login; restart to change"
     )]
     pub gateway: Option<GatewayArg>,
@@ -200,6 +203,7 @@ impl SessionArgs {
             tier: self.tier.or(root.tier),
             workspace: self.workspace.or(root.workspace),
             resume: self.resume.or(root.resume),
+            reload_state: self.reload_state.or(root.reload_state),
             continue_last: self.continue_last || root.continue_last,
             ephemeral: self.ephemeral || root.ephemeral,
             home: self.home.or(root.home),
@@ -258,7 +262,7 @@ pub struct RemoteArgs {
 
     #[arg(
         long,
-        env = "NANOCODEX_RUNNER_TOKEN",
+        env = "NANOCODE_RUNNER_TOKEN",
         hide_env_values = true,
         help = "Shared secret authenticating the runner connection"
     )]
@@ -312,7 +316,7 @@ pub struct HandArgs {
 
     #[arg(
         long,
-        env = "NANOCODEX_RUNNER_TOKEN",
+        env = "NANOCODE_RUNNER_TOKEN",
         hide_env_values = true,
         help = "Shared secret presented to or required from the brain"
     )]
@@ -336,8 +340,8 @@ pub struct HandArgs {
 pub struct SessionsArgs {
     #[arg(
         long,
-        env = "NANOCODEX_HOME",
-        help = "Session store directory (defaults to $CODEX_HOME/nanocode)"
+        env = "NANOCODE_HOME",
+        help = "Session store directory (defaults to ~/.nanocode)"
     )]
     pub home: Option<PathBuf>,
 

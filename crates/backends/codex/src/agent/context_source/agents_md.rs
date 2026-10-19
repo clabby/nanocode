@@ -6,22 +6,22 @@ use tracing::warn;
 const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 
 pub(crate) fn load_global_instructions(
-    codex_home: Option<&Path>,
+    nanocode_home: Option<&Path>,
     claude_home: Option<&Path>,
 ) -> Option<Arc<str>> {
-    let (codex, claude) = match (codex_home, claude_home) {
+    let (nanocode, claude) = match (nanocode_home, claude_home) {
         (None, None) => return None,
-        (Some(codex), Some(claude)) => (codex, claude),
+        (Some(nanocode), Some(claude)) => (nanocode, claude),
         (Some(home), None) | (None, Some(home)) => (home, home),
     };
-    let global = AgentHome::new(codex, claude).global_instructions();
+    let global = AgentHome::new(nanocode, claude).global_instructions();
     report(&global.diagnostics);
 
     let texts = global
         .sources
         .iter()
         .filter(|source| match source.convention {
-            Convention::Codex => codex_home.is_some(),
+            Convention::Codex => nanocode_home.is_some(),
             Convention::Claude => claude_home.is_some(),
         })
         .map(|source| source.text.as_str())

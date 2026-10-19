@@ -166,6 +166,7 @@ impl State {
                 0,
                 ResponseContext {
                     disable_tools: false,
+                    force_text: false,
                     container: None,
                     previous_message_id: None,
                     template: Some(&template),

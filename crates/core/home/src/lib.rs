@@ -1,7 +1,6 @@
 mod agents;
 mod fs_util;
 mod instructions;
-mod link;
 mod project;
 mod session_environment;
 #[cfg(not(target_family = "wasm"))]
@@ -22,29 +21,13 @@ pub use agents::{
 pub use instructions::{
     GlobalInstructions, InstructionKind, InstructionSource, MAX_INSTRUCTION_FILE_BYTES,
 };
-pub use link::{LinkAction, LinkMode, LinkOutcome, LinkReport, SharedItem};
 pub use project::{InstructionFile, ProjectHome, ProjectInstructions};
 pub use session_environment::SessionEnvironment;
 pub use skills::{SkillEntry, SkillRoot, SkillSet, resolve_skills};
 
-pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
+pub const NANOCODE_HOME_ENV: &str = "NANOCODE_HOME";
 
 pub const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
-
-pub const NATIVE_OWNED_ENTRIES: &[&str] = &[
-    "settings.json",
-    "settings.local.json",
-    "config.toml",
-    "auth.json",
-    ".credentials.json",
-    "sessions",
-    "projects",
-    "history.jsonl",
-    "todos",
-    "statsig",
-    "shell-snapshots",
-    "plugins",
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum HomeError {
@@ -112,15 +95,15 @@ impl fmt::Display for Diagnostic {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AgentHome {
-    codex_home: PathBuf,
+    nanocode_home: PathBuf,
     claude_home: PathBuf,
     user_home: Option<PathBuf>,
 }
 
 impl AgentHome {
-    pub fn new(codex_home: impl Into<PathBuf>, claude_home: impl Into<PathBuf>) -> Self {
+    pub fn new(nanocode_home: impl Into<PathBuf>, claude_home: impl Into<PathBuf>) -> Self {
         Self {
-            codex_home: codex_home.into(),
+            nanocode_home: nanocode_home.into(),
             claude_home: claude_home.into(),
             user_home: None,
         }
@@ -143,12 +126,12 @@ impl AgentHome {
                 .map(PathBuf::from)
         };
         let user_home = get("HOME").or_else(|| get("USERPROFILE"));
-        let codex_home = match get(CODEX_HOME_ENV) {
+        let nanocode_home = match get(NANOCODE_HOME_ENV) {
             Some(path) => path,
             None => user_home
                 .as_ref()
-                .ok_or(HomeError::Unavailable(CODEX_HOME_ENV))?
-                .join(".codex"),
+                .ok_or(HomeError::Unavailable(NANOCODE_HOME_ENV))?
+                .join(".nanocode"),
         };
         let claude_home = match get(CLAUDE_CONFIG_DIR_ENV) {
             Some(path) => path,
@@ -158,14 +141,14 @@ impl AgentHome {
                 .join(".claude"),
         };
         Ok(Self {
-            codex_home,
+            nanocode_home,
             claude_home,
             user_home,
         })
     }
 
-    pub fn codex_home(&self) -> &Path {
-        &self.codex_home
+    pub fn nanocode_home(&self) -> &Path {
+        &self.nanocode_home
     }
 
     pub fn claude_home(&self) -> &Path {

@@ -459,12 +459,10 @@ impl ModelRun {
         let canonical_context = current_context.full_item();
         if let Some(update) = session.context.update(current_context) {
             if update.full {
-                session
-                    .conversation
-                    .append_canonical_context(
-                        developer_context(&self.config, &self.tools),
-                        update.item,
-                    );
+                session.conversation.append_canonical_context(
+                    developer_context(&self.config, &self.tools),
+                    update.item,
+                );
             } else {
                 session
                     .conversation

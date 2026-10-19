@@ -150,7 +150,7 @@ impl AgentHome {
                 format: ProfileFormat::ClaudeMarkdown,
             },
             AgentProfileRoot {
-                path: self.codex_home().join("agents"),
+                path: self.nanocode_home().join("agents"),
                 scope: Scope::User,
                 convention: Convention::Codex,
                 format: ProfileFormat::CodexToml,

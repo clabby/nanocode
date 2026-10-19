@@ -207,7 +207,7 @@ impl AgentHome {
             ("AGENTS.override.md", InstructionKind::AgentsOverride),
             ("AGENTS.md", InstructionKind::Agents),
         ] {
-            let path = self.codex_home().join(name);
+            let path = self.nanocode_home().join(name);
             match load_candidate(
                 &path,
                 Scope::User,

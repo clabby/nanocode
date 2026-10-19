@@ -360,7 +360,7 @@ impl StoredCredentials {
             .as_ref()
             .ok_or_else(|| ChatGptAuthError::InvalidStore {
                 path: path.to_path_buf(),
-                detail: "Codex auth.json has no ChatGPT tokens".into(),
+                detail: "auth.json has no ChatGPT tokens".into(),
             })?;
         let claims: IdClaims = decode_jwt(&tokens.id_token)?;
         let auth = claims.auth.unwrap_or_default();
@@ -370,7 +370,7 @@ impl StoredCredentials {
             .or(auth.account_id)
             .ok_or_else(|| ChatGptAuthError::InvalidStore {
                 path: path.to_path_buf(),
-                detail: "Codex auth.json has no ChatGPT account ID".into(),
+                detail: "auth.json has no ChatGPT account ID".into(),
             })?;
         let credentials = Self {
             id_token: tokens.id_token.clone(),
@@ -612,7 +612,7 @@ fn personal_access_token_from_document(
     let access_token = document.personal_access_token.as_deref().ok_or_else(|| {
         ChatGptAuthError::InvalidStore {
             path: path.to_path_buf(),
-            detail: "Codex auth.json has no personal access token".into(),
+            detail: "auth.json has no personal access token".into(),
         }
     })?;
     validate_personal_access_token(access_token).map_err(|error| {

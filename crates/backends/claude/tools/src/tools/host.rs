@@ -145,66 +145,27 @@ pub const MAX_HOST_INPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HostTool {
-    Agent,
-
     TaskOutput,
 
     TaskStop,
-
-    AskUserQuestion,
-
-    EnterPlanMode,
-
-    ExitPlanMode,
-
-    EnterWorktree,
-
-    ExitWorktree,
 }
 impl HostTool {
-    pub const ALL: [Self; 8] = [
-        Self::Agent,
-        Self::TaskOutput,
-        Self::TaskStop,
-        Self::AskUserQuestion,
-        Self::EnterPlanMode,
-        Self::ExitPlanMode,
-        Self::EnterWorktree,
-        Self::ExitWorktree,
-    ];
+    pub const ALL: [Self; 2] = [Self::TaskOutput, Self::TaskStop];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Agent => "Agent",
             Self::TaskOutput => "TaskOutput",
             Self::TaskStop => "TaskStop",
-            Self::AskUserQuestion => "AskUserQuestion",
-            Self::EnterPlanMode => "EnterPlanMode",
-            Self::ExitPlanMode => "ExitPlanMode",
-            Self::EnterWorktree => "EnterWorktree",
-            Self::ExitWorktree => "ExitWorktree",
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostRequest {
-    Agent(AgentRequest),
-
     TaskOutput(TaskOutputRequest),
 
     TaskStop(TaskStopRequest),
-
-    AskUserQuestion(QuestionsRequest),
-
-    EnterPlanMode,
-
-    ExitPlanMode(ExitPlanRequest),
-
-    EnterWorktree(EnterWorktreeRequest),
-
-    ExitWorktree(ExitWorktreeRequest),
 }
 
 pub trait ClaudeHost: Send + Sync {
@@ -251,21 +212,6 @@ impl<H: ClaudeHost> ClaudeHostTools<H> {
             return Err("host tools require real session, turn and call identities".into());
         }
         let request = match tool {
-            HostTool::Agent => {
-                let request: AgentRequest = decode(input)?;
-                if request.max_turns.is_some_and(|turns| turns == 0) {
-                    return Err("max_turns must be positive".into());
-                }
-                if matches!(request.isolation, Some(AgentIsolation::Remote))
-                    && !request.run_in_background
-                {
-                    return Err("remote Agent isolation requires background execution".into());
-                }
-                if request.run_in_background && !self.enabled.contains(&HostTool::TaskStop) {
-                    return Err("background Agent requires an installed TaskStop capability".into());
-                }
-                HostRequest::Agent(request)
-            }
             HostTool::TaskOutput => {
                 let request: TaskOutputRequest = decode(input)?;
                 HostRequest::TaskOutput(request)
@@ -274,43 +220,6 @@ impl<H: ClaudeHost> ClaudeHostTools<H> {
                 let request: TaskStopRequest = decode(input)?;
                 HostRequest::TaskStop(request)
             }
-            HostTool::AskUserQuestion => {
-                let request: QuestionsRequest = decode(input)?;
-                if !(1..=4).contains(&request.questions.len()) {
-                    return Err("questions requires 1..4 entries".into());
-                }
-                for question in &request.questions {
-                    if question.header.chars().count() > 12 {
-                        return Err("header must contain at most 12 characters".into());
-                    }
-                    if !(2..=4).contains(&question.options.len()) {
-                        return Err("question requires 2..4 options".into());
-                    }
-                    let mut labels = BTreeSet::new();
-                    for option in &question.options {
-                        if !labels.insert(&option.label) {
-                            return Err("duplicate option label".into());
-                        }
-                    }
-                }
-                HostRequest::AskUserQuestion(request)
-            }
-            HostTool::EnterPlanMode => {
-                let _: EmptyRequest = decode(input)?;
-                HostRequest::EnterPlanMode
-            }
-            HostTool::ExitPlanMode => {
-                let request: ExitPlanRequest = decode(input)?;
-                HostRequest::ExitPlanMode(request)
-            }
-            HostTool::EnterWorktree => {
-                let request: EnterWorktreeRequest = decode(input)?;
-                if request.name.is_some() && request.path.is_some() {
-                    return Err("name and path are mutually exclusive".into());
-                }
-                HostRequest::EnterWorktree(request)
-            }
-            HostTool::ExitWorktree => HostRequest::ExitWorktree(decode(input)?),
         };
         self.host.execute(request, context).await
     }
@@ -328,62 +237,8 @@ fn definition(tool: HostTool) -> Value {
             "description": "SDK extension: read a host-owned background task's status and output, optionally waiting up to timeout milliseconds.",
             "input_schema": schema::<TaskOutputRequest>()
         }),
-        HostTool::Agent => {
-            let mut definition = crate::upstream::tool_value(tool.name());
-            definition["input_schema"]["properties"]["model"]["enum"] =
-                schema::<AgentModel>()["enum"].clone();
-            definition
-        }
         _ => crate::upstream::tool_value(tool.name()),
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRequest {
-    pub prompt: String,
-
-    pub description: String,
-
-    #[serde(default = "default_subagent_type")]
-    pub subagent_type: String,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<AgentModel>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume: Option<String>,
-
-    #[serde(default = "default_block")]
-    pub run_in_background: bool,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_turns: Option<u32>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub isolation: Option<AgentIsolation>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentModel {
-    Sonnet,
-
-    Opus,
-
-    Haiku,
-
-    Fable,
-
-    Mythos,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentIsolation {
-    Worktree,
-
-    Remote,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -397,9 +252,6 @@ pub struct TaskOutputRequest {
     #[serde(default = "default_timeout")]
     pub timeout: u64,
 }
-fn default_subagent_type() -> String {
-    "general-purpose".to_owned()
-}
 const fn default_block() -> bool {
     true
 }
@@ -412,88 +264,6 @@ const fn default_timeout() -> u64 {
 pub struct TaskStopRequest {
     #[serde(alias = "shell_id")]
     pub task_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionsRequest {
-    pub questions: Vec<UserQuestion>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct UserQuestion {
-    pub question: String,
-
-    pub header: String,
-
-    pub options: Vec<QuestionOption>,
-
-    #[serde(rename = "multiSelect")]
-    pub multi_select: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionOption {
-    pub label: String,
-
-    pub description: String,
-
-    #[serde(
-        default,
-        rename = "preview",
-        alias = "markdown",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub markdown: Option<String>,
-}
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct EmptyRequest {}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ExitPlanRequest {
-    #[serde(default, rename = "allowedPrompts")]
-    pub allowed_prompts: Vec<PlanPrompt>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PlanPrompt {
-    pub tool: PlanTool,
-
-    pub prompt: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-pub enum PlanTool {
-    Bash,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct EnterWorktreeRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ExitWorktreeRequest {
-    pub action: WorktreeAction,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum WorktreeAction {
-    Keep,
-
-    Remove,
 }
 
 pub fn mcp_tool_output(result: Value) -> Result<ToolOutput, String> {

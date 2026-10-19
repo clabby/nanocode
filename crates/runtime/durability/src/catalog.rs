@@ -410,6 +410,7 @@ mod store {
         store: WeakSharedStore,
         state_id: String,
         checkpoint_key: Option<String>,
+        record_inferred: bool,
     }
 
     impl StoredSession {
@@ -615,6 +616,7 @@ mod store {
                     checkpoint_key: state
                         .latest_checkpoint()
                         .map(|payload| payload.key().to_owned()),
+                    record_inferred: state.session().is_none(),
                 },
             })
         }
@@ -694,7 +696,7 @@ mod store {
         }
 
         pub async fn resume(&self, id: &str) -> Result<DurableSession> {
-            let record = self.resume_record(id).await?;
+            let record = self.resume_record(id, None).await?;
             let session = DurableSession::open_shared_described(
                 self.store.clone(),
                 id.to_owned(),
@@ -706,7 +708,15 @@ mod store {
         }
 
         pub async fn prepare_resume(&self, id: &str) -> Result<DurableSession> {
-            let record = self.resume_record(id).await?;
+            self.prepare_resume_with(id, None).await
+        }
+
+        async fn prepare_resume_with(
+            &self,
+            id: &str,
+            loaded: Option<(&str, &Value)>,
+        ) -> Result<DurableSession> {
+            let record = self.resume_record(id, loaded).await?;
             DurableSession::prepare_shared_described(
                 self.store.clone(),
                 id.to_owned(),
@@ -731,7 +741,13 @@ mod store {
                     "the stored session identity changed after loading".to_owned(),
                 ));
             }
-            let state = self.prepare_resume(id).await?;
+            let inferred = match (&stored.loaded.checkpoint_key, &stored.checkpoint) {
+                (Some(key), Some(checkpoint)) if stored.loaded.record_inferred => {
+                    Some((key.as_str(), checkpoint))
+                }
+                _ => None,
+            };
+            let state = self.prepare_resume_with(id, inferred).await?;
             if let (Some(key), Some(checkpoint)) =
                 (&stored.loaded.checkpoint_key, &stored.checkpoint)
             {
@@ -740,10 +756,19 @@ mod store {
             Ok(state)
         }
 
-        async fn resume_record(&self, id: &str) -> Result<Option<SessionRecord>> {
+        async fn resume_record(
+            &self,
+            id: &str,
+            loaded: Option<(&str, &Value)>,
+        ) -> Result<Option<SessionRecord>> {
             let state = self.require(id).await?;
             if state.session().is_some() {
                 return Ok(None);
+            }
+            if let (Some(payload), Some((key, checkpoint))) = (state.latest_checkpoint(), loaded)
+                && payload.key() == key
+            {
+                return self.infer_record(id, checkpoint).map(Some);
             }
             self.native_checkpoint(id, &state)
                 .await?
@@ -1262,13 +1287,9 @@ mod store {
             .iter()
             .map(|turn| AdmittedTurn {
                 input: &turn.input,
-                steers: state
-                    .operations()
-                    .iter()
-                    .find(|(id, _)| id.as_str() == turn.id)
-                    .map_or(0, |(_, operation)| {
-                        operation.retired_steers as usize + operation.steers.len()
-                    }),
+                steers: state.operation(&turn.id).map_or(0, |operation| {
+                    operation.retired_steers as usize + operation.steers.len()
+                }),
             })
             .collect()
     }
