@@ -138,6 +138,7 @@ struct LiveCell {
     tools: Arc<dyn CodeModeToolset>,
     id: u64,
     origin_call_id: String,
+    session_id: String,
     turn_id: AtomicU64,
     observation: Arc<Mutex<CellObservationState>>,
     lifecycle: Arc<CellLifecycle>,
@@ -303,6 +304,8 @@ impl CodeModeRuntime {
             "code_mode.cell",
             otel.kind = "internal",
             otel.status_code = tracing::field::Empty,
+            session.id = context.session_id.as_str(),
+            tool.call_id = context.call_id.as_str(),
             cell.id = tracing::field::Empty,
             source.bytes = source.len(),
             source.lines = source.lines().count(),
@@ -316,23 +319,8 @@ impl CodeModeRuntime {
             .execute_inner(source, tools, context, started_at, observer)
             .instrument(span.clone())
             .await;
-        span.record(
-            "status",
-            if execution.success {
-                "completed"
-            } else {
-                "failed"
-            },
-        );
-        span.record(
-            "otel.status_code",
-            if execution.success { "OK" } else { "ERROR" },
-        );
         span.record("nested.count", execution.nested_calls.len());
-        span.record(
-            "duration_ns",
-            u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
+        finish_cell_span(&span, &execution, started_at);
         execution
     }
 
@@ -428,13 +416,44 @@ impl CodeModeRuntime {
         input: &str,
         observer: &mut dyn CodeModeObserver,
     ) -> CodeModeExecution {
+        let started_at = Instant::now();
+        let span = info_span!(
+            target: "nanocode_code_mode",
+            "code_mode.wait",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            session.id = tracing::field::Empty,
+            tool.call_id = tracing::field::Empty,
+            cell.id = tracing::field::Empty,
+            wait.yield_time_ms = tracing::field::Empty,
+            wait.terminate = tracing::field::Empty,
+            running = tracing::field::Empty,
+            status = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let execution = self
+            .wait_inner(input, observer, started_at)
+            .instrument(span.clone())
+            .await;
+        if let Some(cell) = &execution.cell {
+            span.record("running", cell.running);
+        }
+        finish_cell_span(&span, &execution, started_at);
+        execution
+    }
+
+    async fn wait_inner(
+        &self,
+        input: &str,
+        observer: &mut dyn CodeModeObserver,
+        started_at: Instant,
+    ) -> CodeModeExecution {
         let preempt = Preemption {
             signal: self.preempt.subscribe(),
             turn: self.current_turn.load(Ordering::Acquire),
             seen: self.preempt_consumed.load(Ordering::Acquire),
             consumed: Arc::clone(&self.preempt_consumed),
         };
-        let started_at = Instant::now();
         let arguments = match serde_json::from_str::<WaitArguments>(input) {
             Ok(arguments) => arguments,
             Err(error) => {
@@ -455,6 +474,10 @@ impl CodeModeRuntime {
                 );
             }
         };
+        let span = tracing::Span::current();
+        span.record("cell.id", cell_id);
+        span.record("wait.terminate", arguments.terminate);
+        span.record("wait.yield_time_ms", arguments.yield_time_ms);
         let Some(cell) = self.cells.lock().await.live_cells.get(&cell_id).cloned() else {
             return failed_execution(
                 started_at,
@@ -462,6 +485,8 @@ impl CodeModeRuntime {
                 Vec::new(),
             );
         };
+        span.record("session.id", cell.session_id.as_str());
+        span.record("tool.call_id", cell.origin_call_id.as_str());
         cell.turn_id
             .store(self.current_turn.load(Ordering::Acquire), Ordering::Release);
         let observation = match cell.begin_observation().await {
@@ -529,6 +554,25 @@ impl CodeModeRuntime {
         }
         cell.join().await;
     }
+}
+
+fn finish_cell_span(span: &tracing::Span, execution: &CodeModeExecution, started_at: Instant) {
+    span.record(
+        "status",
+        if execution.success {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    span.record(
+        "otel.status_code",
+        if execution.success { "OK" } else { "ERROR" },
+    );
+    span.record(
+        "duration_ns",
+        u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    );
 }
 
 fn observer_yield_timeout(yield_time: Duration) -> Duration {
@@ -769,6 +813,8 @@ impl LiveCell {
             "code_mode.cell_actor",
             otel.kind = "internal",
             otel.status_code = tracing::field::Empty,
+            session.id = context.session_id.as_str(),
+            tool.call_id = context.call_id.as_str(),
             cell.id = id,
             runtime.first_event_ns = tracing::field::Empty,
             runtime.event_count = tracing::field::Empty,
@@ -779,6 +825,7 @@ impl LiveCell {
             duration_ns = tracing::field::Empty,
         );
         let origin_call_id = context.call_id.clone();
+        let session_id = context.session_id.clone();
         let task = tokio::spawn(
             run_cell_actor(
                 host,
@@ -798,6 +845,7 @@ impl LiveCell {
             tools,
             id,
             origin_call_id,
+            session_id,
             turn_id: AtomicU64::new(turn_id),
             observation: Arc::new(Mutex::new(CellObservationState {
                 updates,

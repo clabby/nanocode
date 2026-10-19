@@ -448,7 +448,7 @@ impl ModelRun {
         )?;
         self.stats.tool_calls += 1;
         let started_at = Instant::now();
-        let span = model_tool_span(call, call_index);
+        let span = model_tool_span(&self.provider_session_id, call, call_index);
         record_span_content(&span, "tool.arguments", &call.input);
         let active = ActiveToolCall {
             call_id: call.call_id.clone(),

@@ -59,6 +59,7 @@ impl ModelRun {
             .with_model_call_started_at(started_at);
         let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = model_call_span(
+            &self.provider_session_id,
             call_index,
             model.as_str(),
             reasoning_mode.as_str(),
@@ -283,13 +284,18 @@ pub(super) fn panic_payload(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-pub(super) fn model_tool_span(call: &CodeCall, call_index: u32) -> tracing::Span {
+pub(super) fn model_tool_span(
+    session_id: &str,
+    call: &CodeCall,
+    call_index: u32,
+) -> tracing::Span {
     let qualified_name = qualified_tool_name(call);
     info_span!(
         target: "nanocode",
         "tool.call",
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,
+        session.id = session_id,
         tool.name = %qualified_name,
         tool.call_id = %call.call_id,
         tool.arguments.bytes = call.input.len(),
@@ -356,7 +362,9 @@ pub(super) fn record_indexed_span_content(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn model_call_span(
+    session_id: &str,
     call_index: u32,
     model: &str,
     reasoning_mode: &str,
@@ -370,6 +378,7 @@ pub(super) fn model_call_span(
         "model.call",
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,
+        session.id = session_id,
         model,
         reasoning.mode = reasoning_mode,
         reasoning.effort = reasoning_effort,

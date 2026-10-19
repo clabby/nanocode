@@ -71,6 +71,7 @@ pub(super) fn finish_turn(span: &Span, result: &Result<TurnResult>) {
 }
 
 pub(super) fn model_call_span(
+    session_id: &str,
     call_index: u32,
     model: &str,
     reasoning_mode: &str,
@@ -82,6 +83,7 @@ pub(super) fn model_call_span(
         "model.call",
         otel.kind = "internal",
         otel.status_code = Empty,
+        session.id = session_id,
         model,
         reasoning.mode = reasoning_mode,
         reasoning.effort = effort,

@@ -266,7 +266,10 @@ impl TraceWriter {
             let mut message = Some(message);
             while let Some(next) = message.take() {
                 match next {
-                    TraceMessage::Span(span) => self.spans.push(span),
+                    TraceMessage::Span(mut span) => {
+                        crate::typed::restore_integers(&mut span);
+                        self.spans.push(span);
+                    }
                     TraceMessage::Resource(resource) => {
                         self.write();
                         self.resource = resource;

@@ -5,6 +5,7 @@ extern crate self as nanocode_observability;
 
 mod cli;
 mod file;
+mod typed;
 
 use std::{fs::OpenOptions, io, path::PathBuf, time::Duration};
 
@@ -294,7 +295,9 @@ fn tracer_provider(
             .with_protocol(Protocol::HttpBinary)
             .with_http_client(reqwest::blocking::Client::new())
             .build()?;
-        builder = builder.with_span_processor(BatchSpanProcessor::builder(exporter).build());
+        builder = builder.with_span_processor(
+            BatchSpanProcessor::builder(typed::IntegerAttributes(exporter)).build(),
+        );
     }
     Ok(builder.build())
 }

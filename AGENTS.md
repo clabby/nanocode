@@ -32,6 +32,7 @@
 - Route subagent journal writes through the per-root journal writer and acknowledge each request only after its store save completes. Keep subagent message, residency and journal serialization per root so a slow or fenced store for one root cannot stall another.
 - [Fast Rust Builds](https://matklad.github.io/2021/09/04/fast-rust-builds.html)
 - Keep logs, traces, and benchmark artifacts in ignored output/. Never commit credentials or personal test data.
+- Answer performance and telemetry questions from the recorded OTLP data with `node scripts/otel.mjs`: `tails`, `outliers`, `trace <id>`, `sessions`, `report` and raw `sql` over an incremental SQLite cache in output/telemetry. See crates/integrations/observability/AGENTS.md for the data model and instrumentation rules.
 - Prefer simple code and small changes. Preserve unrelated work. Use subagents only when explicitly requested.
 - Avoid magic constants, arbitrary caps, and speculative defensive checks. Limits must come from a real protocol constraint, measured resource requirement, or explicit caller policy; document their source. Surface invalid states instead of hiding them with silent truncation, clamping, or fallback values.
 - Work in the main checkout on master and push each completed change directly to master. Never create worktrees or feature branches. Commit only your own changes and leave other dirty or untracked files alone; if a push is rejected, rebase onto origin/master, resolve conflicts and push again.

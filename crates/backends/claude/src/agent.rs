@@ -4032,8 +4032,14 @@ impl State {
                 "effort": effort,
             }),
         );
-        let span =
-            telemetry::model_call_span(call_index, &model, reasoning_mode, &effort, messages.len());
+        let span = telemetry::model_call_span(
+            &self.session_id,
+            call_index,
+            &model,
+            reasoning_mode,
+            &effort,
+            messages.len(),
+        );
         let started = Instant::now();
         let outcome = self
             .request_response(messages, tools, cancel, Some(events), index, context)
