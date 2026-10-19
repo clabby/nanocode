@@ -219,6 +219,28 @@ impl StateStore for PostgresStore {
         })
     }
 
+    fn owner<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
+        Box::pin(async move {
+            self.client
+                .query_opt(
+                    "SELECT owner_id, fence::text FROM nanocode_durable_owners WHERE state_id = $1",
+                    &[&state_id],
+                )
+                .await
+                .map_err(backend)?
+                .map(|row| {
+                    Ok(OwnerToken::new(
+                        OwnerId::from(row.get::<_, String>(0)),
+                        parse_u64(&row.get::<_, String>(1), "Postgres owner fence")?,
+                    ))
+                })
+                .transpose()
+        })
+    }
+
     fn list_states<'a>(
         &'a mut self,
         limit: usize,

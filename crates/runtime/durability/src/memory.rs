@@ -44,6 +44,10 @@ enum Command {
         state_id: String,
         result: oneshot::Sender<Result<StoredState, StoreError>>,
     },
+    Owner {
+        state_id: String,
+        result: oneshot::Sender<Result<Option<OwnerToken>, StoreError>>,
+    },
     ListStates {
         limit: usize,
         result: oneshot::Sender<Result<Vec<String>, StoreError>>,
@@ -434,6 +438,9 @@ impl MemoryStore {
                             write,
                         )));
                     }
+                    Command::Owner { state_id, result } => {
+                        drop(result.send(Ok(tables.owners.get(&state_id).cloned())));
+                    }
                     Command::Peek { state_id, result } => {
                         drop(result.send(Ok(
                             tables.states.get(&state_id).cloned().unwrap_or_default(),
@@ -573,6 +580,16 @@ impl StateStore for MemoryStore {
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         Box::pin(self.request(move |result| Command::ListStates { limit, result }))
+    }
+
+    fn owner<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
+        Box::pin(self.request(|result| Command::Owner {
+            state_id: state_id.to_owned(),
+            result,
+        }))
     }
 }
 

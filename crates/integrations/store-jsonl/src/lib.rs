@@ -1594,6 +1594,11 @@ impl Journal {
         self.state(id)
     }
 
+    fn owner(&mut self, id: &str) -> Result<Option<OwnerToken>, StoreError> {
+        self.sync()?;
+        Ok(self.index.owners.get(id).cloned())
+    }
+
     fn list_states(&mut self, limit: usize) -> Result<Vec<String>, StoreError> {
         self.sync()?;
         Ok(self
@@ -1982,6 +1987,13 @@ impl StateStore for JsonlStore {
     fn peek<'a>(&'a mut self, id: &'a str) -> StoreFuture<'a, Result<StoredState, StoreError>> {
         let id = id.to_owned();
         self.read(move |journal| journal.peek(&id))
+    }
+    fn owner<'a>(
+        &'a mut self,
+        id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
+        let id = id.to_owned();
+        self.read(move |journal| journal.owner(&id))
     }
     fn list_states<'a>(
         &'a mut self,

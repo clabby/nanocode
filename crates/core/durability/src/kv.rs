@@ -276,6 +276,19 @@ impl<B: KeyValue + ?Sized> KeyValueStore<B> {
         }
     }
 
+    async fn current_owner(&self, state_id: &str) -> Result<Option<OwnerToken>, StoreError> {
+        match self.backend.get(&self.head_key(state_id)).await? {
+            None => Ok(None),
+            Some(entry) => {
+                let head = Head::parse(&entry.version)?;
+                Ok(Some(OwnerToken::new(
+                    OwnerId::from(head.owner.to_owned()),
+                    head.fence,
+                )))
+            }
+        }
+    }
+
     async fn records(
         &self,
         state_id: &str,
@@ -347,6 +360,13 @@ impl<B: KeyValue + ?Sized + 'static> StateStore for KeyValueStore<B> {
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         Box::pin(self.state_ids(limit))
+    }
+
+    fn owner<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
+        Box::pin(self.current_owner(state_id))
     }
 
     fn acquire<'a>(

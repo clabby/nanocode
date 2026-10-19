@@ -17,30 +17,123 @@ pub struct Agent {
     pub(super) seed: Arc<ArcSwap<SeedState>>,
 
     pub(super) interrupted: Arc<Interrupted>,
+
+    pub(super) requests: Arc<Requests>,
+
+    pub(super) ownership: Option<OwnershipProbe>,
 }
+
+pub(super) type OwnershipProbe =
+    Arc<dyn Fn() -> super::backend::BackendFuture<Result<bool>> + Send + Sync>;
 
 #[derive(Default)]
 pub(super) struct Interrupted(ArcSwapOption<Resumption>);
+
+impl Interrupted {
+    pub(super) fn replace(&self, turns: Vec<InterruptedTurn>) {
+        self.0
+            .store((!turns.is_empty()).then(|| Resumption::new(turns)));
+    }
+
+    pub(super) fn take_turns(&self) -> Vec<InterruptedTurn> {
+        self.0
+            .swap(None)
+            .map(|resumption| resumption.turns.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Requests(ArcSwap<std::collections::HashMap<String, Arc<Signal>>>);
+
+pub(super) struct Signal {
+    finish: ArcSwapOption<tokio::sync::oneshot::Sender<()>>,
+    finished: futures_util::future::Shared<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Signal {
+    pub(super) fn new() -> Arc<Self> {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        Arc::new(Self {
+            finish: ArcSwapOption::from_pointee(finish),
+            finished: futures_util::FutureExt::shared(finished),
+        })
+    }
+
+    pub(super) fn fire(&self) {
+        drop(self.finish.swap(None));
+    }
+
+    pub(super) async fn wait(&self) {
+        let _ = self.finished.clone().await;
+    }
+}
+
+struct RequestClaim {
+    requests: Arc<Requests>,
+    id: String,
+    signal: Arc<Signal>,
+}
+
+impl Drop for RequestClaim {
+    fn drop(&mut self) {
+        self.requests.0.rcu(|requests| {
+            let mut requests = std::collections::HashMap::clone(requests);
+            if requests
+                .get(&self.id)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.signal))
+            {
+                requests.remove(&self.id);
+            }
+            requests
+        });
+        self.signal.fire();
+    }
+}
 
 type InterruptedTurn = (String, serde_json::Value);
 
 struct Resumption {
     turns: Vec<InterruptedTurn>,
     claimed: AtomicBool,
-    finish: ArcSwapOption<tokio::sync::oneshot::Sender<()>>,
-    finished: futures_util::future::Shared<tokio::sync::oneshot::Receiver<()>>,
+    done: Arc<Signal>,
 }
 
 impl Resumption {
     fn new(turns: Vec<InterruptedTurn>) -> Arc<Self> {
-        let (finish, finished) = tokio::sync::oneshot::channel();
         Arc::new(Self {
             turns,
             claimed: AtomicBool::new(false),
-            finish: ArcSwapOption::from_pointee(finish),
-            finished: futures_util::FutureExt::shared(finished),
+            done: Signal::new(),
         })
     }
+}
+
+fn tracked(
+    claim: Option<RequestClaim>,
+    result: super::backend::BackendFuture<Result<TurnResult>>,
+) -> super::backend::BackendFuture<Result<TurnResult>> {
+    let Some(claim) = claim else {
+        return result;
+    };
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let forward = async move {
+        drop(sender.send(result.await));
+        drop(claim);
+    };
+    #[cfg(not(target_family = "wasm"))]
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn(forward)),
+        Err(_) => {
+            return Box::pin(async move {
+                forward.await;
+                receiver.await.unwrap_or(Err(NanocodeError::TurnStopped))
+            });
+        }
+    }
+    #[cfg(target_family = "wasm")]
+    nanocode_platform::spawn_local(forward);
+    Box::pin(async move { receiver.await.unwrap_or(Err(NanocodeError::TurnStopped)) })
 }
 
 #[derive(Clone, Default)]
@@ -79,6 +172,8 @@ impl Clone for Agent {
             driver_turn_ids: self.driver_turn_ids,
             seed: Arc::clone(&self.seed),
             interrupted: Arc::clone(&self.interrupted),
+            requests: Arc::clone(&self.requests),
+            ownership: self.ownership.clone(),
         }
     }
 }
@@ -93,6 +188,8 @@ pub struct WeakAgent {
     driver_turn_ids: bool,
     seed: Arc<ArcSwap<SeedState>>,
     interrupted: Arc<Interrupted>,
+    requests: Arc<Requests>,
+    ownership: Option<OwnershipProbe>,
 }
 
 impl WeakAgent {
@@ -121,6 +218,8 @@ impl WeakAgent {
             driver_turn_ids: self.driver_turn_ids,
             seed: Arc::clone(&self.seed),
             interrupted: Arc::clone(&self.interrupted),
+            requests: Arc::clone(&self.requests),
+            ownership: self.ownership.clone(),
         })
     }
 
@@ -445,6 +544,31 @@ impl Agent {
             driver_turn_ids: self.driver_turn_ids,
             seed: Arc::clone(&self.seed),
             interrupted: Arc::clone(&self.interrupted),
+            requests: Arc::clone(&self.requests),
+            ownership: self.ownership.clone(),
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_ownership_probe<P>(mut self, probe: P) -> Self
+    where
+        P: Fn() -> super::backend::BackendFuture<Result<bool>> + Send + Sync + 'static,
+    {
+        self.ownership = Some(Arc::new(probe));
+        self
+    }
+
+    #[doc(hidden)]
+    pub async fn reopen(&self) -> Result<()> {
+        self.backend.reopen(self.events.clone()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn owns_session(&self) -> Result<bool> {
+        match &self.ownership {
+            Some(probe) => probe().await,
+            None => self.backend.owns_session().await,
         }
     }
 
@@ -474,14 +598,14 @@ impl Agent {
                 return Ok(());
             };
             if resumption.claimed.swap(true, Ordering::AcqRel) {
-                let _ = resumption.finished.clone().await;
+                resumption.done.wait().await;
                 continue;
             }
             let (result, remaining) = self.resume_turns(&resumption.turns, request_id).await;
             self.interrupted
                 .0
                 .store((!remaining.is_empty()).then(|| Resumption::new(remaining)));
-            drop(resumption.finish.swap(None));
+            resumption.done.fire();
             return result;
         }
     }
@@ -514,10 +638,12 @@ impl Agent {
 
     async fn resume_turn(&self, id: String, input: serde_json::Value) -> Result<()> {
         let prompt = self.backend.decode_durable_prompt(input)?;
+        let claim = self.claim_request(&id).await;
         let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (events, _turn_events) = self.events.mirrored_channel();
         let events = events.with_turn_id(id.clone());
-        self.backend
+        let turn = self
+            .backend
             .submit(BackendPrompt {
                 key,
                 prompt,
@@ -525,8 +651,32 @@ impl Agent {
                 cancel_on_admission: false,
                 events,
             })
-            .await
-            .map(drop)
+            .await?;
+        drop(tracked(Some(claim), turn.result));
+        Ok(())
+    }
+
+    async fn claim_request(&self, id: &str) -> RequestClaim {
+        loop {
+            let signal = Signal::new();
+            let previous = self.requests.0.rcu(|requests| {
+                let mut requests = std::collections::HashMap::clone(requests);
+                requests
+                    .entry(id.to_owned())
+                    .or_insert_with(|| Arc::clone(&signal));
+                requests
+            });
+            match previous.get(id) {
+                Some(running) => running.wait().await,
+                None => {
+                    return RequestClaim {
+                        requests: Arc::clone(&self.requests),
+                        id: id.to_owned(),
+                        signal,
+                    };
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -597,6 +747,10 @@ impl Agent {
             ));
         }
         self.resume_interrupted(request_id.as_deref()).await?;
+        let request = match request_id.as_deref() {
+            Some(id) => Some(self.claim_request(id).await),
+            None => None,
+        };
         let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (events, event_stream) = self.events.mirrored_channel();
         let turn_id = nanocode_platform::uuid_v7().to_string();
@@ -613,7 +767,7 @@ impl Agent {
             })
             .await;
         let BackendTurn { request_id, result } = submitted?;
-        let result = self.settle_seed(claimed, result);
+        let result = self.settle_seed(claimed, tracked(request, result));
         let turn_id = self.canonical_turn_id(turn_id, request_id.as_deref());
         Ok(Turn {
             result: Self::turn_result(&turn_id, result),
@@ -668,6 +822,10 @@ impl Agent {
             ));
         }
         self.resume_interrupted(request_id.as_deref()).await?;
+        let request = match request_id.as_deref() {
+            Some(id) => Some(self.claim_request(id).await),
+            None => None,
+        };
         let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (events, event_stream) = self.events.mirrored_channel();
         let turn_id = nanocode_platform::uuid_v7().to_string();
@@ -685,7 +843,7 @@ impl Agent {
             .await;
         match routed {
             Ok(BackendPromptRoute::Started(BackendTurn { request_id, result })) => {
-                let result = self.settle_seed(claimed, result);
+                let result = self.settle_seed(claimed, tracked(request, result));
                 let turn_id = self.canonical_turn_id(turn_id, request_id.as_deref());
                 Ok(PromptRoute::Started(Turn {
                     result: Self::turn_result(&turn_id, result),

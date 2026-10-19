@@ -520,15 +520,15 @@ mod store {
 
         pub async fn list(&self) -> Result<Vec<SessionSummary>> {
             let ids = self.store.clone().list_states(usize::MAX).await?;
-            let mut sessions = Vec::new();
-            for id in ids {
-                if is_auxiliary_state(&id) {
-                    continue;
-                }
-                if let Some(summary) = self.summary(&id).await? {
-                    sessions.push(summary);
-                }
-            }
+            let mut sessions: Vec<_> = futures_util::future::try_join_all(
+                ids.iter()
+                    .filter(|id| !is_auxiliary_state(id))
+                    .map(|id| self.summary(id)),
+            )
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
             sessions.sort_by_key(|session| std::cmp::Reverse(session.record.updated_at_ms));
             Ok(sessions)
         }

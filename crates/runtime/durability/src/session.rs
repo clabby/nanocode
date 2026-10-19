@@ -279,6 +279,9 @@ enum Command {
     Acquire {
         result: oneshot::Sender<Result<()>>,
     },
+    CurrentOwner {
+        result: oneshot::Sender<Result<bool>>,
+    },
     State {
         result: oneshot::Sender<Result<DurableState>>,
     },
@@ -455,6 +458,7 @@ impl Command {
             }
             Self::RecoverFailure { result, .. } => drop(result.send(Err(error))),
             Self::State { result } => drop(result.send(Err(error))),
+            Self::CurrentOwner { result } => drop(result.send(Err(error))),
             Self::LatestCheckpoint { result } => drop(result.send(Err(error))),
             Self::AcquireAgent { result, .. } => drop(result.send(Err(error))),
             Self::Admit { result, .. } => drop(result.send(Err(error))),
@@ -575,7 +579,10 @@ impl Driver {
 
     async fn handle_command(&mut self, command: Command) {
         if self.owner.is_none()
-            && !matches!(command, Command::AcquireAgent { .. })
+            && !matches!(
+                command,
+                Command::AcquireAgent { .. } | Command::CurrentOwner { .. }
+            )
             && let Err(error) = self.acquire(None, None, None).await
         {
             command.reject(error);
@@ -675,6 +682,18 @@ impl Driver {
                 drop(result.send(outcome));
             }
             Command::Acquire { result } => drop(result.send(Ok(()))),
+            Command::CurrentOwner { result } => {
+                let outcome = match &self.owner {
+                    None => Ok(true),
+                    Some(owner) => self
+                        .store
+                        .owner(&self.state_id)
+                        .await
+                        .map(|current| current.as_ref() == Some(owner))
+                        .map_err(Error::from),
+                };
+                drop(result.send(outcome));
+            }
             Command::State { result } => drop(result.send(Ok(self.state.clone()))),
             Command::LatestCheckpoint { result } => {
                 let outcome = match self.state.latest_checkpoint() {
@@ -2087,6 +2106,28 @@ pub(crate) fn reduce_peeked(stored: StoredState) -> Result<DurableState> {
     reduce(stored)
 }
 
+#[derive(Clone)]
+pub struct WeakDurableSession {
+    commands: mpsc::WeakSender<CommandRequest>,
+}
+
+impl WeakDurableSession {
+    pub async fn is_current_owner(&self) -> Result<bool> {
+        let Some(commands) = self.commands.upgrade() else {
+            return Ok(false);
+        };
+        let (result, receiver) = oneshot::channel();
+        commands
+            .send(Command::CurrentOwner { result }.into())
+            .await
+            .map_err(|_| Error::DriverStopped)?;
+        match receive(receiver).await {
+            Err(Error::DriverStopped) => Ok(false),
+            outcome => outcome,
+        }
+    }
+}
+
 pub struct DurableSession {
     state_id: Arc<str>,
     store: SharedStore,
@@ -2285,6 +2326,19 @@ impl DurableSession {
             self.terminal_receipt_limit,
         )
         .await
+    }
+
+    pub async fn is_current_owner(&self) -> Result<bool> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::CurrentOwner { result }).await?;
+        receive(receiver).await
+    }
+
+    #[must_use]
+    pub fn downgrade(&self) -> WeakDurableSession {
+        WeakDurableSession {
+            commands: self.commands.downgrade(),
+        }
     }
 
     #[must_use]

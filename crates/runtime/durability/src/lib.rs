@@ -32,7 +32,7 @@ pub use paged::{PagedWriter, PayloadReader, Prepared, Sequence, SequenceCache, l
 pub use session::{
     Admission, AutomaticAdmission, BeginStep, DurableOwner, DurableSession, InitialAcquisition,
     MetadataExpectation, MetadataWrite, OwnerWrite, SessionReceipt, SessionWrite, StoredSteer,
-    TitleChange, WriteOutcome,
+    TitleChange, WeakDurableSession, WriteOutcome,
 };
 pub use shared_store::SharedStore;
 pub use state::{

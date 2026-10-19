@@ -111,6 +111,7 @@ pub type BackendFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
 pub struct BackendTurnKey(pub u64);
 
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct BackendPrompt {
     pub key: BackendTurnKey,
 
@@ -388,6 +389,17 @@ pub trait LifecycleBackend: Send + Sync + 'static {
     fn is_stopped(&self) -> bool {
         false
     }
+
+    fn owns_session(&self) -> BackendFuture<Result<bool>> {
+        Box::pin(async { Ok(true) })
+    }
+
+    fn reopen(
+        &self,
+        _events: nanocode_types::events::AgentEventPublisher,
+    ) -> BackendFuture<Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[doc(hidden)]
@@ -463,6 +475,8 @@ impl BackendRuntime {
             driver_turn_ids: self.driver_turn_ids,
             seed: Arc::default(),
             interrupted: Arc::default(),
+            requests: Arc::default(),
+            ownership: None,
         }
     }
 }

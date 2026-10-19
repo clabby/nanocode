@@ -328,6 +328,24 @@ impl Database {
             })
     }
 
+    fn owner(&self, state_id: &str) -> Result<Option<OwnerToken>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT owner_id, fence FROM nanocode_durable_owners WHERE state_id = ?1",
+                [state_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(backend)?
+            .map(|(owner_id, fence)| {
+                Ok(OwnerToken::new(
+                    OwnerId::from(owner_id),
+                    parse_u64(&fence, "SQLite owner fence")?,
+                ))
+            })
+            .transpose()
+    }
+
     fn list_states(&self, limit: usize) -> Result<Vec<String>, StoreError> {
         let mut statement = self
             .connection
@@ -413,6 +431,14 @@ impl StateStore for SqliteStore {
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         self.read(move |database| database.list_states(limit))
+    }
+
+    fn owner<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
+        let state_id = state_id.to_owned();
+        self.read(move |database| database.owner(&state_id))
     }
 
     fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {

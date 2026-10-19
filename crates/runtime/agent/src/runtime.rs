@@ -429,20 +429,32 @@ fn assemble(
         router = router.default_settings(model, thinking);
     }
     services.activate();
-    Ok(AgentRuntime {
-        inner: Arc::new(RuntimeState {
-            harness: router.build_tracked(Arc::downgrade(&ownership)),
-            recipes,
-            model,
-            thinking,
-            ownership,
-            services,
+    let inner = Arc::new(RuntimeState {
+        harness: router.build_tracked(Arc::downgrade(&ownership)),
+        recipes,
+        model,
+        thinking,
+        ownership,
+        services,
 
-            durability,
-            subagents: subagent_control,
-            subagent_updates,
-        }),
-    })
+        durability,
+        subagents: subagent_control,
+        subagent_updates,
+    });
+    if inner.durability.is_some() {
+        let runtime = Arc::downgrade(&inner);
+        let _ = inner
+            .ownership
+            .reopener
+            .set(Arc::new(move |session_id: String| {
+                let runtime = runtime.clone();
+                Box::pin(async move {
+                    let inner = runtime.upgrade().ok_or(NanocodeError::AgentStopped)?;
+                    AgentRuntime { inner }.reconstruct(&session_id).await
+                })
+            }));
+    }
+    Ok(AgentRuntime { inner })
 }
 
 impl<D: RuntimeDefaults> RuntimeBuilder<Unselected, D> {
@@ -701,7 +713,23 @@ fn persistent_recipe(
                 spec.durable_state =
                     Some(store.prepare_session(record).await.map_err(catalog_error)?);
             }
+            let durable = spec
+                .durable_state
+                .as_ref()
+                .map(crate::durability::DurableSession::downgrade);
             let (agent, events) = recipe(spec).await?;
+            let agent = match durable {
+                Some(durable) => agent.with_ownership_probe(move || {
+                    let durable = durable.clone();
+                    Box::pin(async move {
+                        durable
+                            .is_current_owner()
+                            .await
+                            .map_err(crate::durability::agent_error)
+                    })
+                }),
+                None => agent,
+            };
             Ok((agent.with_interrupted_turns(interrupted), events))
         })
     })
@@ -785,7 +813,7 @@ impl AgentRuntime {
                 .await
             {
                 Opened::Live(agent) => return Ok(attached(agent)),
-                Opened::Vacant(opening, _) => Some(opening),
+                Opened::Vacant(opening) => Some(opening),
             },
             None => None,
         };
@@ -823,10 +851,10 @@ impl AgentRuntime {
         let configured = self.configured_store(store)?;
         let opening = match self.inner.ownership.open_session(session_id).await {
             Opened::Live(agent) => return Ok(attached(agent)),
-            Opened::Vacant(opening, _) => opening,
+            Opened::Vacant(opening) => opening,
         };
         let stored = configured.load(session_id).await.map_err(catalog_error)?;
-        self.open_stored(configured, &stored, opening).await
+        self.open_stored(configured, &stored, Some(opening)).await
     }
 
     pub async fn open_loaded(
@@ -836,22 +864,27 @@ impl AgentRuntime {
     ) -> AgentResult {
         let configured = self.configured_store(store)?;
         let session_id = &stored.summary.record.session_id;
-        let (opening, replaced) = match self.inner.ownership.open_session(session_id).await {
+        let opening = match self.inner.ownership.open_session(session_id).await {
             Opened::Live(agent) => return Ok(attached(agent)),
-            Opened::Vacant(opening, replaced) => (opening, replaced),
+            Opened::Vacant(opening) => opening,
         };
-        if replaced {
-            let reloaded = configured.load(session_id).await.map_err(catalog_error)?;
-            return self.open_stored(configured, &reloaded, opening).await;
-        }
-        self.open_stored(configured, stored, opening).await
+        self.open_stored(configured, stored, Some(opening)).await
+    }
+
+    async fn reconstruct(&self, session_id: &str) -> AgentResult {
+        let configured = self.inner.durability.as_ref().ok_or_else(|| {
+            NanocodeError::InvalidRequest("runtime durability is not configured".into())
+        })?;
+        let _opening = self.inner.ownership.claim_opening(session_id).await;
+        let stored = configured.load(session_id).await.map_err(catalog_error)?;
+        self.open_stored(configured, &stored, None).await
     }
 
     async fn open_stored(
         &self,
         configured: &crate::durability::SessionStore,
         stored: &crate::durability::StoredSession,
-        _opening: SessionOpening,
+        opening: Option<SessionOpening>,
     ) -> AgentResult {
         let model = stored.summary.record.model.clone();
         let thinking = stored
@@ -884,21 +917,23 @@ impl AgentRuntime {
                 .map_err(catalog_error)?,
             None => None,
         };
-        let (agent, events) = self
-            .construct(AgentSpec {
-                parent: None,
-                options: SpawnOptions::new()
-                    .harness_model(model.clone())
-                    .thinking(thinking),
-                model,
-                thinking,
-                settings: Settings::default(),
-                spawn_factory: self.spawn_factory(),
-                host_context: None,
-                checkpoint: None,
-                durable_state: Some(durable_state),
-            })
-            .await?;
+        let spec = AgentSpec {
+            parent: None,
+            options: SpawnOptions::new()
+                .harness_model(model.clone())
+                .thinking(thinking),
+            model,
+            thinking,
+            settings: Settings::default(),
+            spawn_factory: self.spawn_factory(),
+            host_context: None,
+            checkpoint: None,
+            durable_state: Some(durable_state),
+        };
+        let (agent, events) = match opening {
+            Some(_) => self.construct(spec).await?,
+            None => self.inner.recipe(spec.model.family())?(spec).await?,
+        };
         let agent = agent.with_interrupted_turns(
             stored
                 .turns
@@ -1261,6 +1296,8 @@ pub(crate) fn catalog_error(error: crate::durability::Error) -> NanocodeError {
 
 const CLOSED: usize = 1 << (usize::BITS - 1);
 
+type Reopener = Arc<dyn Fn(String) -> BackendFuture<AgentResult> + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct Ownership {
     admissions: AtomicUsize,
@@ -1269,6 +1306,7 @@ pub(crate) struct Ownership {
     children: ArcSwap<Vec<WeakAgent>>,
     opening: ArcSwap<HashMap<String, Arc<Opening>>>,
     services: OnceLock<std::sync::Weak<dyn HostServices>>,
+    reopener: OnceLock<Reopener>,
     idle: tokio::sync::Notify,
     stopped: tokio::sync::OnceCell<Option<Arc<ShutdownError>>>,
 }
@@ -1312,7 +1350,7 @@ impl Drop for SessionOpening {
 
 enum Opened {
     Live(Agent),
-    Vacant(SessionOpening, bool),
+    Vacant(SessionOpening),
 }
 
 struct Admission<'a>(&'a Ownership);
@@ -1336,7 +1374,7 @@ impl Ownership {
             .find_map(|(_, agent)| agent.upgrade())
     }
 
-    async fn open_session(self: &Arc<Self>, session_id: &str) -> Opened {
+    async fn claim_opening(self: &Arc<Self>, session_id: &str) -> SessionOpening {
         loop {
             let opening = Opening::new();
             let previous = self.opening.rcu(|current| {
@@ -1349,26 +1387,30 @@ impl Ownership {
                 let _ = concurrent.finished.clone().await;
                 continue;
             }
-            let opening = SessionOpening {
+            return SessionOpening {
                 ownership: Arc::clone(self),
                 session_id: session_id.to_owned(),
                 opening,
             };
-            return match self.agent(session_id) {
-                Some(live) if !live.is_stopped() => Opened::Live(live),
-                Some(stopped) => {
-                    if let Err(error) = stopped.shutdown().await {
-                        tracing::warn!(
-                            session.id = session_id,
-                            %error,
-                            "the session's stopped agent failed to shut down before reopening"
-                        );
-                    }
-                    Opened::Vacant(opening, true)
-                }
-                None => Opened::Vacant(opening, false),
-            };
         }
+    }
+
+    async fn open_session(self: &Arc<Self>, session_id: &str) -> Opened {
+        let opening = self.claim_opening(session_id).await;
+        let Some(live) = self.agent(session_id) else {
+            return Opened::Vacant(opening);
+        };
+        drop(opening);
+        if (live.is_stopped() || !live.owns_session().await.unwrap_or(true))
+            && let Err(error) = live.reopen().await
+        {
+            tracing::warn!(
+                session.id = session_id,
+                %error,
+                "the session's agent no longer owns it and could not reopen; its next prompt retries"
+            );
+        }
+        Opened::Live(live)
     }
 
     fn admission(&self) -> Result<Admission<'_>> {
@@ -1524,6 +1566,15 @@ impl AgentOwner for Ownership {
             }));
         }
         true
+    }
+
+    fn reopen(&self, session_id: &str) -> Option<BackendFuture<AgentResult>> {
+        if self.admissions.load(Ordering::Acquire) & CLOSED != 0 {
+            return None;
+        }
+        self.reopener
+            .get()
+            .map(|reopen| reopen(session_id.to_owned()))
     }
 
     fn release(&self, key: usize) {

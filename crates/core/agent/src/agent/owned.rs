@@ -1,7 +1,9 @@
 use super::backend::{
     BackendFuture, BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey, LifecycleBackend,
 };
+use super::handle::{Interrupted, OwnershipProbe, Signal};
 use super::*;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use std::sync::atomic::AtomicBool;
 
 #[doc(hidden)]
@@ -13,17 +15,28 @@ pub trait AgentOwner: Send + Sync + 'static {
     fn adopt(&self, key: usize, agent: Agent) -> bool;
 
     fn release(&self, key: usize);
+
+    fn reopen(&self, _session_id: &str) -> Option<BackendFuture<Result<(Agent, AgentEvents)>>> {
+        None
+    }
 }
 
 #[doc(hidden)]
 pub async fn adopt(agent: Agent, owner: &Arc<dyn AgentOwner>) -> Result<Agent> {
     let key = Arc::as_ptr(&agent.backend).cast::<()>() as usize;
-    let backend: Arc<dyn LifecycleBackend> = Arc::new(Owned {
-        inner: Arc::clone(&agent.backend),
+    let backend: Arc<dyn LifecycleBackend> = Arc::new(Owned(Arc::new(Shared {
+        inner: ArcSwap::from_pointee(Arc::clone(&agent.backend)),
+        probe: ArcSwapOption::from(agent.ownership.clone().map(Arc::new)),
         owner: Arc::downgrade(owner),
         key,
-        stopped: Arc::default(),
-    });
+        session_id: Arc::from(agent.session_id()),
+        events: agent.events.downgrade(),
+        interrupted: Arc::clone(&agent.interrupted),
+        next_turn: Arc::clone(&agent.next_turn),
+        healing: ArcSwapOption::empty(),
+        stopped: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+    })));
     let owned = Agent {
         backend,
         events: agent.events.clone(),
@@ -33,6 +46,8 @@ pub async fn adopt(agent: Agent, owner: &Arc<dyn AgentOwner>) -> Result<Agent> {
         driver_turn_ids: agent.driver_turn_ids,
         seed: Arc::clone(&agent.seed),
         interrupted: Arc::clone(&agent.interrupted),
+        requests: Arc::clone(&agent.requests),
+        ownership: None,
     };
     if owner.adopt(key, owned.clone()) {
         return Ok(owned);
@@ -65,12 +80,165 @@ async fn adopt_created(
     Ok((agent, events))
 }
 
-struct Owned {
-    inner: Arc<dyn LifecycleBackend>,
+struct Shared {
+    inner: ArcSwap<Arc<dyn LifecycleBackend>>,
+    probe: ArcSwapOption<OwnershipProbe>,
     owner: std::sync::Weak<dyn AgentOwner>,
     key: usize,
-    stopped: Arc<AtomicBool>,
+    session_id: Arc<str>,
+    events: nanocode_types::events::WeakAgentEventPublisher,
+    interrupted: Arc<Interrupted>,
+    next_turn: Arc<AtomicU64>,
+    healing: ArcSwapOption<Signal>,
+    stopped: AtomicBool,
+    closed: AtomicBool,
 }
+
+impl Shared {
+    fn backend(&self) -> Arc<dyn LifecycleBackend> {
+        Arc::clone(&self.inner.load())
+    }
+
+    fn observe<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result
+            && requires_reopen(error)
+        {
+            self.stopped.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn observed_turn(self: &Arc<Self>, turn: BackendTurn) -> BackendTurn {
+        let shared = Arc::clone(self);
+        let result = turn.result;
+        BackendTurn {
+            request_id: turn.request_id,
+            result: Box::pin(async move { shared.observe(result.await) }),
+        }
+    }
+
+    fn heals(&self, error: &NanocodeError, prompt: &BackendPrompt) -> bool {
+        requires_reopen(error)
+            && !self.closed.load(Ordering::Acquire)
+            && !prompt.events.turn_is_terminal()
+    }
+
+    async fn heal(
+        &self,
+        failed: &Arc<dyn LifecycleBackend>,
+        events: &nanocode_types::events::AgentEventPublisher,
+        mut retry: Option<&mut BackendPrompt>,
+    ) -> Result<Arc<dyn LifecycleBackend>> {
+        loop {
+            let current = self.backend();
+            if !Arc::ptr_eq(&current, failed) {
+                return Ok(current);
+            }
+            let signal = Signal::new();
+            let previous = self
+                .healing
+                .rcu(|healing| healing.clone().or_else(|| Some(Arc::clone(&signal))));
+            if let Some(running) = previous {
+                running.wait().await;
+                continue;
+            }
+            let outcome = self.reopen(events, retry.take()).await;
+            self.healing.store(None);
+            signal.fire();
+            return outcome;
+        }
+    }
+
+    async fn reopen(
+        &self,
+        events: &nanocode_types::events::AgentEventPublisher,
+        retry: Option<&mut BackendPrompt>,
+    ) -> Result<Arc<dyn LifecycleBackend>> {
+        let owner = self.owner.upgrade().ok_or(NanocodeError::AgentStopped)?;
+        let reopened = owner
+            .reopen(&self.session_id)
+            .ok_or(NanocodeError::AgentStopped)?;
+        let (agent, agent_events) = reopened.await?;
+        let backend = Arc::clone(&agent.backend);
+        let previous = self.inner.swap(Arc::new(Arc::clone(&backend)));
+        self.probe.store(agent.ownership.clone().map(Arc::new));
+        self.stopped.store(false, Ordering::Release);
+        forward_events(agent_events, self.events.clone());
+        spawn_detached(async move {
+            let _ = previous.shutdown().await;
+        });
+        let mut turns = agent.interrupted.take_turns();
+        let Some(retry) = retry else {
+            self.interrupted.replace(turns);
+            return Ok(backend);
+        };
+        let mut prompts = Vec::with_capacity(turns.len());
+        for (_, input) in &turns {
+            prompts.push(backend.decode_durable_prompt(input.clone())?);
+        }
+        let retried = serde_json::to_value(&retry.prompt).ok();
+        let matched =
+            turns
+                .iter()
+                .zip(&prompts)
+                .position(|((id, _), prompt)| match &retry.request_id {
+                    Some(request_id) => request_id == id,
+                    None => serde_json::to_value(prompt).ok() == retried,
+                });
+        let later = match matched {
+            Some(position) => {
+                let later = turns.split_off(position + 1);
+                if let Some((id, _)) = turns.pop() {
+                    retry.request_id = Some(id);
+                }
+                later
+            }
+            None => Vec::new(),
+        };
+        for ((id, _), prompt) in turns.into_iter().zip(prompts) {
+            let (turn_events, _turn) = events.mirrored_channel();
+            backend
+                .submit(BackendPrompt {
+                    key: BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed)),
+                    prompt,
+                    request_id: Some(id.clone()),
+                    cancel_on_admission: false,
+                    events: turn_events.with_turn_id(id),
+                })
+                .await?;
+        }
+        self.interrupted.replace(later);
+        Ok(backend)
+    }
+}
+
+fn forward_events(
+    mut events: AgentEvents,
+    publisher: nanocode_types::events::WeakAgentEventPublisher,
+) {
+    spawn_detached(async move {
+        while let Some(event) = events.recv().await {
+            let Some(publisher) = publisher.upgrade() else {
+                return;
+            };
+            let _ = publisher.publish_next(event.kind, event.payload);
+        }
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn spawn_detached(future: impl Future<Output = ()> + Send + 'static) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        drop(runtime.spawn(future));
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn spawn_detached(future: impl Future<Output = ()> + 'static) {
+    nanocode_platform::spawn_local(future);
+}
+
+struct Owned(Arc<Shared>);
 
 fn requires_reopen(error: &NanocodeError) -> bool {
     matches!(
@@ -81,61 +249,86 @@ fn requires_reopen(error: &NanocodeError) -> bool {
     ) || error.execution_policy_disposition() == Some(crate::ExecutionPolicyDisposition::Reopen)
 }
 
-fn observe<T>(stopped: &AtomicBool, result: Result<T>) -> Result<T> {
-    if let Err(error) = &result
-        && requires_reopen(error)
-    {
-        stopped.store(true, Ordering::Release);
-    }
-    result
-}
-
-fn observed_turn(stopped: &Arc<AtomicBool>, turn: BackendTurn) -> BackendTurn {
-    let stopped = Arc::clone(stopped);
-    let result = turn.result;
-    BackendTurn {
-        request_id: turn.request_id,
-        result: Box::pin(async move { observe(&stopped, result.await) }),
-    }
-}
-
 impl LifecycleBackend for Owned {
     fn decode_durable_prompt(&self, input: serde_json::Value) -> Result<Prompt> {
-        self.inner.decode_durable_prompt(input)
+        self.0.backend().decode_durable_prompt(input)
     }
     fn harness_family(&self) -> crate::HarnessFamily {
-        self.inner.harness_family()
+        self.0.backend().harness_family()
     }
     fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
+        self.0.backend().capabilities()
     }
     fn persistence(&self) -> Option<Persistence> {
-        self.inner.persistence()
+        self.0.backend().persistence()
     }
     fn submit(&self, prompt: BackendPrompt) -> BackendFuture<Result<BackendTurn>> {
-        let submitted = self.inner.submit(prompt);
-        let stopped = Arc::clone(&self.stopped);
+        let shared = Arc::clone(&self.0);
+        let mut retry = prompt.clone();
+        let backend = shared.backend();
+        let submitted = backend.submit(prompt);
         Box::pin(async move {
-            observe(&stopped, submitted.await).map(|turn| observed_turn(&stopped, turn))
+            let turn = match submitted.await {
+                Err(error) if shared.heals(&error, &retry) => {
+                    let events = retry.events.clone();
+                    match shared.heal(&backend, &events, Some(&mut retry)).await {
+                        Ok(backend) => backend.submit(retry).await,
+                        Err(_) => Err(error),
+                    }
+                }
+                outcome => outcome,
+            };
+            shared.observe(turn).map(|turn| shared.observed_turn(turn))
         })
     }
     fn route(&self, prompt: BackendPrompt) -> BackendFuture<Result<BackendPromptRoute>> {
-        let routed = self.inner.route(prompt);
-        let stopped = Arc::clone(&self.stopped);
+        let shared = Arc::clone(&self.0);
+        let mut retry = prompt.clone();
+        let backend = shared.backend();
+        let routed = backend.route(prompt);
         Box::pin(async move {
-            observe(&stopped, routed.await).map(|route| match route {
+            let route = match routed.await {
+                Err(error) if shared.heals(&error, &retry) => {
+                    let events = retry.events.clone();
+                    match shared.heal(&backend, &events, Some(&mut retry)).await {
+                        Ok(backend) => backend.route(retry).await,
+                        Err(_) => Err(error),
+                    }
+                }
+                outcome => outcome,
+            };
+            shared.observe(route).map(|route| match route {
                 BackendPromptRoute::Started(turn) => {
-                    BackendPromptRoute::Started(observed_turn(&stopped, turn))
+                    BackendPromptRoute::Started(shared.observed_turn(turn))
                 }
                 BackendPromptRoute::Steered => BackendPromptRoute::Steered,
             })
         })
     }
     fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire) || self.inner.is_stopped()
+        self.0.stopped.load(Ordering::Acquire) || self.0.backend().is_stopped()
+    }
+    fn owns_session(&self) -> BackendFuture<Result<bool>> {
+        match self.0.probe.load_full() {
+            Some(probe) => probe(),
+            None => self.0.backend().owns_session(),
+        }
+    }
+    fn reopen(
+        &self,
+        events: nanocode_types::events::AgentEventPublisher,
+    ) -> BackendFuture<Result<()>> {
+        let shared = Arc::clone(&self.0);
+        Box::pin(async move {
+            if shared.closed.load(Ordering::Acquire) {
+                return Err(NanocodeError::AgentStopped);
+            }
+            let backend = shared.backend();
+            shared.heal(&backend, &events, None).await.map(drop)
+        })
     }
     fn steer(&self, key: BackendTurnKey, prompt: Prompt) -> BackendFuture<Result<()>> {
-        self.inner.steer(key, prompt)
+        self.0.backend().steer(key, prompt)
     }
     fn steer_with_id(
         &self,
@@ -143,85 +336,86 @@ impl LifecycleBackend for Owned {
         id: String,
         prompt: Prompt,
     ) -> BackendFuture<Result<()>> {
-        self.inner.steer_with_id(key, id, prompt)
+        self.0.backend().steer_with_id(key, id, prompt)
     }
     fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
-        self.inner.withdraw_steer(key, id)
+        self.0.backend().withdraw_steer(key, id)
     }
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>> {
-        self.inner.cancel(key)
+        self.0.backend().cancel(key)
     }
     fn cancel_active(&self) -> BackendFuture<Result<()>> {
-        self.inner.cancel_active()
+        self.0.backend().cancel_active()
     }
     fn set_harness_model(&self, model: crate::ModelSelection) -> BackendFuture<Result<()>> {
-        self.inner.set_harness_model(model)
+        self.0.backend().set_harness_model(model)
     }
     fn set_thinking(&self, thinking: Thinking) -> BackendFuture<Result<()>> {
-        self.inner.set_thinking(thinking)
+        self.0.backend().set_thinking(thinking)
     }
     fn set_fast_mode(&self, enabled: bool) -> BackendFuture<Result<()>> {
-        self.inner.set_fast_mode(enabled)
+        self.0.backend().set_fast_mode(enabled)
     }
     fn set_service_tier(&self, service_tier: ServiceTier) -> BackendFuture<Result<()>> {
-        self.inner.set_service_tier(service_tier)
+        self.0.backend().set_service_tier(service_tier)
     }
     fn compact(&self) -> BackendFuture<Result<()>> {
-        self.inner.compact()
+        self.0.backend().compact()
     }
     fn preconnect(&self) -> BackendFuture<Result<()>> {
-        self.inner.preconnect()
+        self.0.backend().preconnect()
     }
     fn append_developer_message(
         &self,
         text: String,
     ) -> BackendFuture<Result<crate::AgentSessionContext>> {
-        self.inner.append_developer_message(text)
+        self.0.backend().append_developer_message(text)
     }
     fn append_developer_notice(
         &self,
         text: String,
         prefix: Option<String>,
     ) -> BackendFuture<Result<bool>> {
-        self.inner.append_developer_notice(text, prefix)
+        self.0.backend().append_developer_notice(text, prefix)
     }
     fn context(&self) -> BackendFuture<Result<crate::AgentSessionContext>> {
-        self.inner.context()
+        self.0.backend().context()
     }
     fn side_question(&self, question: String) -> BackendFuture<Result<crate::SideAnswer>> {
-        self.inner.side_question(question)
+        self.0.backend().side_question(question)
     }
     fn transcript(&self) -> BackendFuture<Result<Vec<nanocode_types::PromptMessage>>> {
-        self.inner.transcript()
+        self.0.backend().transcript()
     }
     fn checkpoint(&self) -> BackendFuture<Result<SessionCheckpoint>> {
-        self.inner.checkpoint()
+        self.0.backend().checkpoint()
     }
     fn persist_initial(&self) -> BackendFuture<Result<()>> {
-        self.inner.persist_initial()
+        self.0.backend().persist_initial()
     }
     fn discard_initial(&self) -> BackendFuture<Result<()>> {
-        self.inner.discard_initial()
+        self.0.backend().discard_initial()
     }
     fn spawn(&self, options: SpawnOptions) -> BackendFuture<Result<(Agent, AgentEvents)>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(adopt_created(self.owner.clone(), move || {
+        let inner = self.0.backend();
+        Box::pin(adopt_created(self.0.owner.clone(), move || {
             inner.spawn(options)
         }))
     }
     fn fork(&self, request: ForkRequest) -> BackendFuture<Result<(Agent, AgentEvents)>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(adopt_created(self.owner.clone(), move || {
+        let inner = self.0.backend();
+        Box::pin(adopt_created(self.0.owner.clone(), move || {
             inner.fork(request)
         }))
     }
     fn flush(&self) -> BackendFuture<Result<()>> {
-        self.inner.flush()
+        self.0.backend().flush()
     }
     fn disconnect(&self) -> BackendFuture<Result<()>> {
-        let disconnected = self.inner.disconnect();
-        let owner = self.owner.clone();
-        let key = self.key;
+        self.0.closed.store(true, Ordering::Release);
+        let disconnected = self.0.backend().disconnect();
+        let owner = self.0.owner.clone();
+        let key = self.0.key;
         Box::pin(async move {
             let result = disconnected.await;
             if let Some(owner) = owner.upgrade() {
@@ -231,9 +425,10 @@ impl LifecycleBackend for Owned {
         })
     }
     fn shutdown(&self) -> BackendFuture<Result<()>> {
-        let stopped = self.inner.shutdown();
-        let owner = self.owner.clone();
-        let key = self.key;
+        self.0.closed.store(true, Ordering::Release);
+        let stopped = self.0.backend().shutdown();
+        let owner = self.0.owner.clone();
+        let key = self.0.key;
         Box::pin(async move {
             let result = stopped.await;
             if let Some(owner) = owner.upgrade() {

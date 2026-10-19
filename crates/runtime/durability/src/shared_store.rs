@@ -68,6 +68,10 @@ enum Command {
         state_id: String,
         result: oneshot::Sender<Result<crate::StoredState, StoreError>>,
     },
+    Owner {
+        state_id: String,
+        result: oneshot::Sender<Result<Option<OwnerToken>, StoreError>>,
+    },
     ListStates {
         limit: usize,
         result: oneshot::Sender<Result<Vec<String>, StoreError>>,
@@ -502,6 +506,9 @@ async fn run<S: StateStore + ?Sized>(store: &mut S, request: StoreRequest) {
             Command::Peek { state_id, result } => {
                 drop(result.send(store.peek(&state_id).await));
             }
+            Command::Owner { state_id, result } => {
+                drop(result.send(store.owner(&state_id).await));
+            }
             Command::ListStates { limit, result } => {
                 drop(result.send(store.list_states(limit).await));
             }
@@ -795,6 +802,33 @@ impl StateStore for SharedStore {
             self.commands
                 .send(StoreRequest {
                     command: Command::Peek {
+                        state_id: state_id.to_owned(),
+                        result,
+                    },
+                    span,
+                    queued: Instant::now(),
+                })
+                .await
+                .map_err(|_| stopped())?;
+            receiver.await.map_err(|_| stopped())?
+        })
+    }
+
+    fn owner<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
+        let span = tracing::info_span!(
+            "durability.store",
+            operation = "owner",
+            state.id = state_id,
+            queue.duration_ms = tracing::field::Empty
+        );
+        Box::pin(async move {
+            let (result, receiver) = oneshot::channel();
+            self.commands
+                .send(StoreRequest {
+                    command: Command::Owner {
                         state_id: state_id.to_owned(),
                         result,
                     },

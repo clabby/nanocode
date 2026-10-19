@@ -13,7 +13,8 @@ use nanocode_agent_core::backend::{BackendFuture, ChildJournal, ChildJournalStor
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    EncodedPayload, OwnedState, OwnerId, OwnerToken, StateStore, shared_store::SharedStore,
+    EncodedPayload, OwnedState, OwnerId, OwnerToken, StateStore, StoreError,
+    shared_store::SharedStore,
 };
 
 pub(crate) struct Seed {
@@ -122,10 +123,18 @@ impl Fenced {
             .owner
             .clone()
             .ok_or_else(|| std::io::Error::other("journal owner was not acquired"))?;
-        let revision = store
+        let revision = match store
             .replace(state_id, &owner, revision, &payload, &staged)
             .await
-            .map_err(std::io::Error::other)?;
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                if !matches!(error, StoreError::NotCommitted(_) | StoreError::Fenced) {
+                    self.owner = None;
+                }
+                return Err(std::io::Error::other(error));
+            }
+        };
         self.owner = Some((owner, revision));
         self.committed
             .extend(staged.into_iter().map(|record| record.key));

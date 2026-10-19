@@ -18,6 +18,12 @@ impl OwnerId {
     }
 }
 
+impl From<String> for OwnerId {
+    fn from(id: String) -> Self {
+        Self(id)
+    }
+}
+
 impl Default for OwnerId {
     fn default() -> Self {
         Self::new()
@@ -393,6 +399,13 @@ pub trait StateStore: Send {
         Box::pin(async { Err(read_only_unsupported()) })
     }
 
+    fn owner<'a>(
+        &'a mut self,
+        _state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
+        Box::pin(async { Err(read_only_unsupported()) })
+    }
+
     fn acquire<'a>(
         &'a mut self,
         state_id: &'a str,
@@ -510,6 +523,13 @@ pub trait StateStore {
         &'a mut self,
         _limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(async { Err(read_only_unsupported()) })
+    }
+
+    fn owner<'a>(
+        &'a mut self,
+        _state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Option<OwnerToken>, StoreError>> {
         Box::pin(async { Err(read_only_unsupported()) })
     }
 

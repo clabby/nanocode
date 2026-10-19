@@ -50,6 +50,7 @@ pub struct TimedAgentEvent {
 pub struct AgentEvents {
     request_id: Arc<str>,
     receiver: mpsc::UnboundedReceiver<TimedAgentEvent>,
+    unread: Option<Arc<AtomicU64>>,
 }
 
 impl AgentEvents {
@@ -62,21 +63,34 @@ impl AgentEvents {
         self.recv_timed().await.map(|event| event.event)
     }
 
+    fn received(&self, event: Option<TimedAgentEvent>) -> Option<TimedAgentEvent> {
+        if event.is_some()
+            && let Some(unread) = &self.unread
+        {
+            unread.fetch_sub(1, Ordering::Relaxed);
+        }
+        event
+    }
+
     #[doc(hidden)]
     pub async fn recv_timed(&mut self) -> Option<TimedAgentEvent> {
-        self.receiver.recv().await
+        let event = self.receiver.recv().await;
+        self.received(event)
     }
 
     pub fn poll_recv_timed(
         &mut self,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<TimedAgentEvent>> {
-        self.receiver.poll_recv(context)
+        self.receiver
+            .poll_recv(context)
+            .map(|event| self.received(event))
     }
 
     #[doc(hidden)]
     pub fn try_recv_timed(&mut self) -> Option<TimedAgentEvent> {
-        self.receiver.try_recv().ok()
+        let event = self.receiver.try_recv().ok();
+        self.received(event)
     }
 
     pub async fn write_jsonl(mut self, mut output: impl Write) -> Result<(), EventError> {
@@ -105,8 +119,7 @@ impl Stream for AgentEvents {
         mut self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.receiver
-            .poll_recv(context)
+        self.poll_recv_timed(context)
             .map(|event| event.map(|event| event.event))
     }
 }
@@ -119,42 +132,85 @@ fn write_jsonl_event(output: &mut impl Write, event: &AgentEvent) -> Result<(), 
         .map_err(EventError::Write)
 }
 
-struct Subscribers(ArcSwap<Vec<mpsc::UnboundedSender<TimedAgentEvent>>>);
+const UNREAD_WARNING: u64 = 1024;
+
+#[derive(Clone)]
+struct Subscriber {
+    sender: mpsc::UnboundedSender<TimedAgentEvent>,
+    unread: Arc<AtomicU64>,
+}
+
+impl Subscriber {
+    fn channel(request_id: &Arc<str>) -> (Self, AgentEvents) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let unread = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                sender,
+                unread: Arc::clone(&unread),
+            },
+            AgentEvents {
+                request_id: Arc::clone(request_id),
+                receiver,
+                unread: Some(unread),
+            },
+        )
+    }
+}
+
+struct Subscribers(ArcSwap<Vec<Subscriber>>);
 
 impl Subscribers {
-    fn channel() -> (Arc<Self>, mpsc::UnboundedReceiver<TimedAgentEvent>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    fn channel(request_id: &Arc<str>) -> (Arc<Self>, AgentEvents) {
+        let (subscriber, events) = Subscriber::channel(request_id);
         (
-            Arc::new(Self(ArcSwap::from_pointee(vec![sender]))),
-            receiver,
+            Arc::new(Self(ArcSwap::from_pointee(vec![subscriber]))),
+            events,
         )
     }
 
-    fn subscribe(&self) -> mpsc::UnboundedReceiver<TimedAgentEvent> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.0.rcu(|senders| {
-            let mut senders = Vec::clone(senders);
-            senders.retain(|sender| !sender.is_closed());
-            senders.push(sender.clone());
-            senders
+    fn subscribe(&self, request_id: &Arc<str>) -> AgentEvents {
+        let (subscriber, events) = Subscriber::channel(request_id);
+        self.0.rcu(|subscribers| {
+            subscribers
+                .iter()
+                .filter(|subscriber| !subscriber.sender.is_closed())
+                .cloned()
+                .chain(std::iter::once(subscriber.clone()))
+                .collect::<Vec<_>>()
         });
-        receiver
+        events
     }
 
     fn is_closed(&self) -> bool {
-        self.0.load().iter().all(mpsc::UnboundedSender::is_closed)
+        self.0
+            .load()
+            .iter()
+            .all(|subscriber| subscriber.sender.is_closed())
     }
 
     fn send(&self, event: &TimedAgentEvent) {
         let mut closed = false;
-        for sender in self.0.load().iter() {
-            closed |= sender.send(event.clone()).is_err();
+        for subscriber in self.0.load().iter() {
+            let unread = subscriber.unread.fetch_add(1, Ordering::Relaxed) + 1;
+            if subscriber.sender.send(event.clone()).is_err() {
+                subscriber.unread.fetch_sub(1, Ordering::Relaxed);
+                closed = true;
+                continue;
+            }
+            if unread >= UNREAD_WARNING && unread.is_power_of_two() {
+                tracing::warn!(
+                    request_id = %event.event.request_id,
+                    unread,
+                    "an AgentEvents stream is not being read; drain it or drop it"
+                );
+            }
         }
         if closed {
-            self.0.rcu(|senders| {
-                senders
+            self.0.rcu(|subscribers| {
+                subscribers
                     .iter()
-                    .filter(|sender| !sender.is_closed())
+                    .filter(|subscriber| !subscriber.sender.is_closed())
                     .cloned()
                     .collect::<Vec<_>>()
             });
@@ -264,20 +320,17 @@ impl Drop for TerminalClaim<'_> {
 
 impl EventChannel {
     fn channel(request_id: Arc<str>) -> (Self, AgentEvents) {
-        let (session, receiver) = Subscribers::channel();
+        let (session, events) = Subscribers::channel(&request_id);
         (
             Self {
-                request_id: Arc::clone(&request_id),
+                request_id,
                 next_seq: Arc::new(AtomicU64::new(1)),
                 session,
                 turn: None,
                 turn_admission: None,
                 pending: Arc::default(),
             },
-            AgentEvents {
-                request_id,
-                receiver,
-            },
+            events,
         )
     }
 
@@ -295,6 +348,7 @@ impl EventChannel {
             AgentEvents {
                 request_id: Arc::clone(&self.request_id),
                 receiver,
+                unread: None,
             },
         )
     }
@@ -601,10 +655,7 @@ impl AgentEventPublisher {
 
     #[must_use]
     pub fn subscribe(&self) -> AgentEvents {
-        AgentEvents {
-            request_id: Arc::clone(&self.channel.request_id),
-            receiver: self.channel.session.subscribe(),
-        }
+        self.channel.session.subscribe(&self.channel.request_id)
     }
 
     #[must_use]
