@@ -6,8 +6,8 @@ mod index;
 pub use compact::CompactionStats;
 
 use nanocode_durability_core::{
-    OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoreRecord,
-    StoreReplacement, StoreUpdate, StoredState,
+    Committed, OwnedCommit, OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture,
+    StoreRecord, StoreReplacement, StoreUpdate, StoredState,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeStruct};
 use sha2::{Digest, Sha256};
@@ -75,6 +75,67 @@ fn replacement(entries: Vec<Entry>) -> Option<StoreReplacement> {
         } => Some(StoreReplacement { payload, records }),
         Entry::Acquire { .. } => None,
     })
+}
+
+fn encode(
+    entries: &[Entry],
+    batch: Option<&Batch>,
+    spans: &Spans,
+) -> Result<(Vec<u8>, Vec<usize>), StoreError> {
+    let mut bytes = Vec::new();
+    let mut lengths = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let start = bytes.len();
+        let line = match entry {
+            Entry::Acquire { state_id, owner } => Line::Acquire {
+                state_id,
+                owner,
+                batch,
+            },
+            Entry::Replace {
+                state_id,
+                owner,
+                revision,
+                payload,
+                records,
+            } => Line::Replace {
+                state_id,
+                owner,
+                revision: *revision,
+                payload,
+                records: Spanned {
+                    value: records,
+                    spans,
+                },
+                batch,
+            },
+        };
+        serde_json::to_writer(
+            Counted {
+                bytes: &mut bytes,
+                spans,
+            },
+            &line,
+        )
+        .map_err(backend)?;
+        bytes.push(b'\n');
+        lengths.push(bytes.len() - start);
+    }
+    Ok((bytes, lengths))
+}
+
+struct Replacement {
+    state_id: String,
+    owner: OwnerToken,
+    expected: u64,
+    payload: String,
+    records: Vec<StoreRecord>,
+}
+
+enum Judged {
+    Committed,
+    Stale(Entry),
+    Sealed(Entry),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1228,46 +1289,8 @@ impl Journal {
             id: OwnerId::new().as_str().to_owned(),
             count: entries.len(),
         });
-        let mut bytes = Vec::new();
-        let mut lengths = Vec::with_capacity(entries.len());
         let spans = Spans::default();
-        for entry in &entries {
-            let start = bytes.len();
-            let line = match entry {
-                Entry::Acquire { state_id, owner } => Line::Acquire {
-                    state_id,
-                    owner,
-                    batch: batch.as_ref(),
-                },
-                Entry::Replace {
-                    state_id,
-                    owner,
-                    revision,
-                    payload,
-                    records,
-                } => Line::Replace {
-                    state_id,
-                    owner,
-                    revision: *revision,
-                    payload,
-                    records: Spanned {
-                        value: records,
-                        spans: &spans,
-                    },
-                    batch: batch.as_ref(),
-                },
-            };
-            serde_json::to_writer(
-                Counted {
-                    bytes: &mut bytes,
-                    spans: &spans,
-                },
-                &line,
-            )
-            .map_err(backend)?;
-            bytes.push(b'\n');
-            lengths.push(bytes.len() - start);
-        }
+        let (bytes, lengths) = encode(&entries, batch.as_ref(), &spans)?;
         span.record("log.bytes", bytes.len());
         span.record(
             "encode.duration_ms",
@@ -1351,6 +1374,98 @@ impl Journal {
         );
         span.record("outcome", "committed");
         Ok(Outcome::Committed)
+    }
+
+    fn commit_each(&mut self, entries: Vec<Entry>) -> Result<Vec<Judged>, StoreError> {
+        let span = tracing::info_span!(
+            "durability.jsonl.append",
+            entry.count = entries.len(),
+            log.bytes = tracing::field::Empty,
+            encode.duration_ms = tracing::field::Empty,
+            fsync.duration_ms = tracing::field::Empty,
+            index.duration_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty
+        );
+        let _entered = span.enter();
+        let started = Instant::now();
+        let spans = Spans::default();
+        let (bytes, lengths) = encode(&entries, None, &spans)?;
+        span.record("log.bytes", bytes.len());
+        span.record(
+            "encode.duration_ms",
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        let origin = self.append_raw(&bytes)?;
+        self.consume(Some(origin))?;
+        if self.index.offset != origin {
+            return Err(backend("JSONL journal did not reach its appended entries"));
+        }
+        let started = Instant::now();
+        let sealed = self.sealed.is_some();
+        let mut values = spans.values.into_inner().into_iter();
+        let mut judged = Vec::with_capacity(entries.len());
+        for (entry, length) in entries.into_iter().zip(lengths) {
+            let location = Location {
+                position: self.index.offset,
+                length,
+            };
+            let spans = match &entry {
+                Entry::Acquire { .. } => Vec::new(),
+                Entry::Replace { records, .. } => values.by_ref().take(records.len()).collect(),
+            };
+            let verdict = if sealed {
+                Verdict::Stale
+            } else {
+                judge(&self.index, &[entry.claim()])?
+            };
+            judged.push(match (verdict, sealed) {
+                (Verdict::Stale, true) => Judged::Sealed(entry),
+                (Verdict::Stale, false) => Judged::Stale(entry),
+                (Verdict::Valid, _) => {
+                    match entry {
+                        Entry::Acquire { state_id, owner } => self.acquired(&state_id, owner)?,
+                        Entry::Replace {
+                            state_id,
+                            owner,
+                            revision,
+                            records,
+                            ..
+                        } => {
+                            self.check_replacement(&state_id, &owner, revision)?;
+                            self.replaced(
+                                &state_id,
+                                revision,
+                                location,
+                                records.iter().zip(spans).map(|(record, span)| {
+                                    (
+                                        record.key.as_str(),
+                                        Record::value(
+                                            &state_id,
+                                            &record.key,
+                                            origin + span.start as u64,
+                                            &bytes[span],
+                                        ),
+                                    )
+                                }),
+                            );
+                        }
+                    }
+                    Judged::Committed
+                }
+            });
+            self.index.last = Some(location);
+            self.index.offset = self
+                .index
+                .offset
+                .checked_add(length as u64)
+                .ok_or_else(|| backend("JSONL offset overflow"))?;
+        }
+        span.record(
+            "index.duration_ms",
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        span.record("outcome", if sealed { "sealed" } else { "committed" });
+        Ok(judged)
     }
 }
 
@@ -1567,6 +1682,130 @@ impl Journal {
             }
         }
     }
+
+    fn replace_many(
+        &mut self,
+        replacements: Vec<Result<Replacement, StoreError>>,
+    ) -> Vec<Result<u64, StoreError>> {
+        let mut results: Vec<Option<Result<u64, StoreError>>> =
+            Vec::with_capacity(replacements.len());
+        let mut pending = Vec::new();
+        for (slot, replacement) in replacements.into_iter().enumerate() {
+            match replacement {
+                Ok(replacement) => {
+                    results.push(None);
+                    pending.push((slot, replacement));
+                }
+                Err(error) => results.push(Some(Err(error))),
+            }
+        }
+        while !pending.is_empty() {
+            if let Err(error) = self.writable() {
+                for (slot, _) in pending.drain(..) {
+                    results[slot] = Some(Err(error.clone()));
+                }
+                break;
+            }
+            let mut entries = Vec::with_capacity(pending.len());
+            let mut slots = Vec::with_capacity(pending.len());
+            for (slot, replacement) in pending.drain(..) {
+                let Replacement {
+                    state_id,
+                    owner,
+                    expected,
+                    payload,
+                    records,
+                } = replacement;
+                let validated = self.rebuilt(|store| {
+                    if store.index.owners.get(&state_id) != Some(&owner) {
+                        return Err(StoreError::Fenced);
+                    }
+                    let actual = store.revision(&state_id);
+                    if actual != expected {
+                        return Err(StoreError::Conflict { expected, actual });
+                    }
+                    let revision = actual.checked_add(1).ok_or_else(|| {
+                        StoreError::NotCommitted("JSONL revision overflow".into())
+                    })?;
+                    let fresh = store.validate_records(&state_id, &records)?;
+                    Ok((revision, fresh))
+                });
+                match validated {
+                    Ok((revision, fresh)) => {
+                        entries.push(Entry::Replace {
+                            state_id,
+                            owner,
+                            revision,
+                            payload,
+                            records: records
+                                .into_iter()
+                                .zip(fresh)
+                                .filter_map(|(record, fresh)| fresh.then_some(record))
+                                .collect(),
+                        });
+                        slots.push((slot, expected, revision));
+                    }
+                    Err(error) => results[slot] = Some(Err(error)),
+                }
+            }
+            if entries.is_empty() {
+                break;
+            }
+            let judged = match self.commit_each(entries) {
+                Ok(judged) => judged,
+                Err(error) => {
+                    for (slot, _, _) in slots {
+                        results[slot] = Some(Err(error.clone()));
+                    }
+                    break;
+                }
+            };
+            for ((slot, expected, revision), judged) in slots.into_iter().zip(judged) {
+                match judged {
+                    Judged::Committed => results[slot] = Some(Ok(revision)),
+                    Judged::Sealed(Entry::Replace {
+                        state_id,
+                        owner,
+                        payload,
+                        records,
+                        ..
+                    }) => pending.push((
+                        slot,
+                        Replacement {
+                            state_id,
+                            owner,
+                            expected,
+                            payload,
+                            records,
+                        },
+                    )),
+                    Judged::Stale(Entry::Replace {
+                        state_id, owner, ..
+                    }) => {
+                        results[slot] =
+                            Some(Err(if self.index.owners.get(&state_id) == Some(&owner) {
+                                StoreError::Conflict {
+                                    expected,
+                                    actual: self.revision(&state_id),
+                                }
+                            } else {
+                                StoreError::Fenced
+                            }));
+                    }
+                    Judged::Sealed(Entry::Acquire { .. })
+                    | Judged::Stale(Entry::Acquire { .. }) => {
+                        results[slot] = Some(Err(backend("JSONL replacement entry disappeared")));
+                    }
+                }
+            }
+        }
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| Err(backend("JSONL replacement was not attempted")))
+            })
+            .collect()
+    }
 }
 pub struct JsonlStore {
     jobs: mpsc::Sender<Job>,
@@ -1769,6 +2008,46 @@ impl StateStore for JsonlStore {
             records.to_vec(),
         );
         self.write(move |journal| journal.replace(&id, &owner, expected, payload, records))
+    }
+
+    fn commit_many(
+        &mut self,
+        commits: Vec<OwnedCommit>,
+    ) -> StoreFuture<'_, Vec<Result<Committed, StoreError>>> {
+        let count = commits.len();
+        let replacements = commits
+            .into_iter()
+            .map(|commit| {
+                if commit.events.is_empty() {
+                    Ok(Replacement {
+                        state_id: commit.state_id,
+                        owner: commit.owner,
+                        expected: commit.expected_revision,
+                        payload: commit.payload,
+                        records: commit.records,
+                    })
+                } else {
+                    Err(StoreError::NotCommitted(
+                        "this store does not record state events".to_owned(),
+                    ))
+                }
+            })
+            .collect();
+        let replaced = self.write(move |journal| Ok(journal.replace_many(replacements)));
+        Box::pin(async move {
+            match replaced.await {
+                Ok(results) => results
+                    .into_iter()
+                    .map(|result| {
+                        result.map(|revision| Committed {
+                            revision,
+                            first_event: None,
+                        })
+                    })
+                    .collect(),
+                Err(error) => vec![Err(error); count],
+            }
+        })
     }
 
     fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {

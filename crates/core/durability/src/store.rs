@@ -133,6 +133,28 @@ pub struct StateCommit<'a> {
     pub summary: &'a SummaryUpdate,
 }
 
+#[derive(Clone, Debug)]
+pub struct OwnedCommit {
+    pub state_id: String,
+    pub owner: OwnerToken,
+    pub expected_revision: u64,
+    pub payload: String,
+    pub records: Vec<StoreRecord>,
+    pub events: Vec<StoreEvent>,
+    pub summary: SummaryUpdate,
+}
+
+impl OwnedCommit {
+    pub fn commit(&self) -> StateCommit<'_> {
+        StateCommit {
+            payload: &self.payload,
+            records: &self.records,
+            events: &self.events,
+            summary: &self.summary,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Committed {
     pub revision: u64,
@@ -288,6 +310,26 @@ async fn commit_replaced<S: StateStore + ?Sized>(
     })
 }
 
+async fn commit_each<S: StateStore + ?Sized>(
+    store: &mut S,
+    commits: Vec<OwnedCommit>,
+) -> Vec<Result<Committed, StoreError>> {
+    let mut results = Vec::with_capacity(commits.len());
+    for commit in &commits {
+        results.push(
+            store
+                .commit(
+                    &commit.state_id,
+                    &commit.owner,
+                    commit.expected_revision,
+                    commit.commit(),
+                )
+                .await,
+        );
+    }
+    results
+}
+
 async fn acquire_companion<S: StateStore + ?Sized>(
     store: &mut S,
     state_id: &str,
@@ -423,6 +465,13 @@ pub trait StateStore: Send {
         ))
     }
 
+    fn commit_many(
+        &mut self,
+        commits: Vec<OwnedCommit>,
+    ) -> StoreFuture<'_, Vec<Result<Committed, StoreError>>> {
+        Box::pin(commit_each(self, commits))
+    }
+
     fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
         Box::pin(async { Ok(()) })
     }
@@ -532,6 +581,13 @@ pub trait StateStore {
             expected_revision,
             commit,
         ))
+    }
+
+    fn commit_many(
+        &mut self,
+        commits: Vec<OwnedCommit>,
+    ) -> StoreFuture<'_, Vec<Result<Committed, StoreError>>> {
+        Box::pin(commit_each(self, commits))
     }
 
     fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {

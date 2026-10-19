@@ -115,6 +115,41 @@ enum StoredBeginStep {
     Replay(EncodedPayload),
 }
 
+impl From<StoredBeginStep> for BeginStep {
+    fn from(step: StoredBeginStep) -> Self {
+        match step {
+            StoredBeginStep::Execute => Self::Execute,
+            StoredBeginStep::Interrupted => Self::Interrupted,
+            StoredBeginStep::Replay(output) => Self::Replay(output),
+        }
+    }
+}
+
+pub enum OwnerWrite {
+    Advance {
+        continuation: EncodedPayload,
+    },
+
+    BeginStep {
+        step_id: String,
+        kind: String,
+        input: EncodedPayload,
+    },
+
+    CompleteStep {
+        step_id: String,
+        output: EncodedPayload,
+    },
+}
+
+pub enum WriteOutcome {
+    Advanced,
+
+    Began(BeginStep),
+
+    Completed,
+}
+
 #[derive(Clone)]
 pub struct StoredSteer {
     pub index: u32,
@@ -328,6 +363,12 @@ enum Command {
         output: EncodedPayload,
         result: oneshot::Sender<Result<()>>,
     },
+    CommitWrites {
+        caller: Caller,
+        operation_id: String,
+        writes: Vec<OwnerWrite>,
+        result: oneshot::Sender<Result<Vec<WriteOutcome>>>,
+    },
     Complete {
         caller: Caller,
         operation_id: String,
@@ -421,6 +462,7 @@ impl Command {
             Self::IdentifiedSteerAccepted { result, .. } => drop(result.send(Err(error))),
             Self::RetainedSteers { result, .. } => drop(result.send(Err(error))),
             Self::BeginStep { result, .. } => drop(result.send(Err(error))),
+            Self::CommitWrites { result, .. } => drop(result.send(Err(error))),
             Self::Describe { result, .. } => drop(result.send(Err(error))),
         }
     }
@@ -455,6 +497,7 @@ struct Driver {
     poisoned: bool,
     staged: Vec<SessionWrite>,
     preview: Option<(String, Option<String>)>,
+    batch: Option<u64>,
 
     committed_records: HashSet<String>,
     commands: mpsc::Receiver<CommandRequest>,
@@ -866,6 +909,18 @@ impl Driver {
                         self.complete_step(&caller, operation_id, step_id, output)
                             .await
                     }
+                    Err(error) => Err(error),
+                };
+                drop(result.send(outcome));
+            }
+            Command::CommitWrites {
+                caller,
+                operation_id,
+                writes,
+                result,
+            } => {
+                let outcome = match self.authorize(&caller) {
+                    Ok(()) => self.commit_writes(&caller, operation_id, writes).await,
                     Err(error) => Err(error),
                 };
                 drop(result.send(outcome));
@@ -1607,8 +1662,80 @@ impl Driver {
     }
 
     async fn apply(&mut self, entry: Transition) -> Result<()> {
+        if let Some(revision) = self.batch {
+            return if self.state.revision() == revision {
+                self.state.apply_within(revision, entry)
+            } else {
+                self.state.apply_transition(revision, entry)
+            };
+        }
         self.applied(entry).await?;
         Ok(())
+    }
+
+    async fn commit_writes(
+        &mut self,
+        caller: &Caller,
+        operation_id: String,
+        writes: Vec<OwnerWrite>,
+    ) -> Result<Vec<WriteOutcome>> {
+        let revision = self.state.revision().checked_add(1).ok_or_else(|| {
+            Error::InvalidState("state revision exceeded the u64 range".to_owned())
+        })?;
+        let base = self.state.clone();
+        self.batch = Some(revision);
+        let mut outcomes = Vec::with_capacity(writes.len());
+        let mut failure = None;
+        for write in writes {
+            let outcome = match write {
+                OwnerWrite::Advance { continuation } => {
+                    match self
+                        .require_claimed(caller, &operation_id)
+                        .and_then(|()| self.require_running(&operation_id))
+                    {
+                        Ok(()) => self
+                            .apply(Transition::ExecutionAdvanced {
+                                operation_id: operation_id.clone(),
+                                continuation,
+                            })
+                            .await
+                            .map(|()| WriteOutcome::Advanced),
+                        Err(error) => Err(error),
+                    }
+                }
+                OwnerWrite::BeginStep {
+                    step_id,
+                    kind,
+                    input,
+                } => self
+                    .begin_step(caller, operation_id.clone(), step_id, kind, input)
+                    .await
+                    .map(|step| WriteOutcome::Began(step.into())),
+                OwnerWrite::CompleteStep { step_id, output } => self
+                    .complete_step(caller, operation_id.clone(), step_id, output)
+                    .await
+                    .map(|()| WriteOutcome::Completed),
+            };
+            match outcome {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        self.batch = None;
+        let mut next = std::mem::replace(&mut self.state, base);
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if next.revision() == revision {
+            if let Some(limit) = self.terminal_receipt_limit {
+                let _ = next.retain_terminal_receipts(limit);
+            }
+            self.persist(next).await?;
+        }
+        Ok(outcomes)
     }
 
     async fn applied(&mut self, entry: Transition) -> Result<SessionReceipt> {
@@ -2104,6 +2231,7 @@ impl DurableSession {
             poisoned: false,
             staged: Vec::new(),
             preview: None,
+            batch: None,
             committed_records: HashSet::new(),
             commands: receiver,
             releases: release_receiver,
@@ -2977,6 +3105,22 @@ impl DurableOwner {
             operation_id,
             step_id,
             output: EncodedPayload::encode(output)?,
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn commit_writes(
+        &self,
+        operation_id: String,
+        writes: Vec<OwnerWrite>,
+    ) -> Result<Vec<WriteOutcome>> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::CommitWrites {
+            caller: self.caller()?,
+            operation_id,
+            writes,
             result,
         })
         .await?;

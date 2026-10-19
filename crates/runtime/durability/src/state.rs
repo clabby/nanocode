@@ -107,6 +107,16 @@ impl DurableState {
         Ok(())
     }
 
+    pub(crate) fn apply_within(&mut self, revision: u64, entry: Transition) -> Result<()> {
+        let pin =
+            self.operations().is_empty() && matches!(entry, Transition::CheckpointCommitted { .. });
+        self.journal.apply_within(revision, entry)?;
+        if pin && let Some(checkpoint) = self.journal.latest_checkpoint() {
+            pin_start(self.session.as_mut(), checkpoint);
+        }
+        Ok(())
+    }
+
     pub(crate) fn retracted(revision: u64) -> Self {
         Self {
             journal: JournalState::retracted(revision),

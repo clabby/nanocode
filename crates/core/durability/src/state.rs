@@ -546,6 +546,27 @@ impl JournalState {
         Ok(())
     }
 
+    pub fn apply_within(&mut self, revision: u64, entry: Transition) -> Result<()> {
+        if revision == 0 || revision != self.revision {
+            return Err(Error::InvalidState(format!(
+                "expected revision {}, found {revision}",
+                self.revision
+            )));
+        }
+        if matches!(entry, Transition::OperationAccepted { .. })
+            && self
+                .operations
+                .values()
+                .any(|operation| operation.accepted_order == revision)
+        {
+            return Err(Error::InvalidState(
+                "one revision accepted more than one operation".to_owned(),
+            ));
+        }
+        self.validate(&entry)?;
+        self.apply(revision, entry)
+    }
+
     pub fn retracted(revision: u64) -> Self {
         Self {
             revision,

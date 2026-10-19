@@ -71,6 +71,25 @@ pub struct Prepared {
     pub keys: HashSet<String>,
 }
 
+#[derive(Clone, Default)]
+pub struct SequenceCache {
+    items: Vec<EncodedPayload>,
+    pages: Vec<EncodedPayload>,
+    durable_items: usize,
+    durable_pages: usize,
+}
+
+impl SequenceCache {
+    pub fn committed(&mut self) {
+        self.durable_items = self.items.len();
+        self.durable_pages = self.pages.len();
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 pub struct PagedWriter<'a> {
     known: &'a HashSet<String>,
     keys: HashSet<String>,
@@ -110,6 +129,39 @@ impl<'a> PagedWriter<'a> {
             })?);
         }
         Ok(Sequence { tail: previous })
+    }
+
+    pub fn sequence_cached<T: Serialize>(
+        &mut self,
+        items: &[T],
+        unchanged: usize,
+        cache: &mut SequenceCache,
+    ) -> Result<Sequence> {
+        let reused = unchanged
+            .min(items.len())
+            .min(cache.durable_items)
+            .min(cache.items.len());
+        let pages = (reused / PAGE_ITEMS)
+            .min(cache.durable_pages)
+            .min(cache.pages.len());
+        cache.items.truncate(reused);
+        cache.pages.truncate(pages);
+        cache.durable_items = cache.durable_items.min(reused);
+        cache.durable_pages = cache.durable_pages.min(pages);
+        for item in &items[reused..] {
+            let reference = self.record(item)?;
+            cache.items.push(reference);
+        }
+        for chunk in cache.items[pages * PAGE_ITEMS..].chunks(PAGE_ITEMS) {
+            let page = self.record(&Page {
+                previous: cache.pages.last().cloned(),
+                items: chunk.to_vec(),
+            })?;
+            cache.pages.push(page);
+        }
+        Ok(Sequence {
+            tail: cache.pages.last().cloned(),
+        })
     }
 
     pub fn finish<T: Serialize>(self, value: &T) -> Result<Prepared> {

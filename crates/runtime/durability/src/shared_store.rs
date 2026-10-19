@@ -5,9 +5,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
 
 use crate::{
-    Committed, EventHits, EventPage, EventQuery, EventRange, OwnedState, OwnerId, OwnerToken,
-    StateCommit, StatePage, StateQuery, StateReader, StateStore, StoreError, StoreEvent,
-    StoreFuture, StoredState, SummaryUpdate,
+    Committed, EventHits, EventPage, EventQuery, EventRange, OwnedCommit, OwnedState, OwnerId,
+    OwnerToken, StateCommit, StatePage, StateQuery, StateReader, StateStore, StoreError,
+    StoreEvent, StoreFuture, StoredState, SummaryUpdate,
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::{Error, StoreUpdate};
@@ -123,137 +123,52 @@ impl SharedStore {
         let supports_summaries = store.supports_summaries();
         let (commands, mut receiver) = mpsc::channel(COMMAND_CAPACITY);
         spawn_driver(async move {
-            while let Some(StoreRequest {
-                command,
-                span,
-                queued,
-            }) = receiver.recv().await
-            {
-                span.record(
-                    "queue.duration_ms",
-                    queued.elapsed().as_secs_f64() * 1_000.0,
-                );
-                async {
-                    match command {
-                        Command::ReadRecords {
-                            state_id,
-                            keys,
-                            result,
-                        } => {
-                            drop(result.send(store.read_records(&state_id, &keys).await));
+            let mut next = None;
+            loop {
+                let request = match next.take() {
+                    Some(request) => request,
+                    None => match receiver.recv().await {
+                        Some(request) => request,
+                        None => break,
+                    },
+                };
+                let first = match Grouped::from_request(request) {
+                    Ok(grouped) => grouped,
+                    Err(request) => {
+                        run(&mut store, request).await;
+                        continue;
+                    }
+                };
+                let mut group = vec![first];
+                while let Ok(request) = receiver.try_recv() {
+                    match Grouped::from_request(request) {
+                        Ok(grouped)
+                            if group
+                                .iter()
+                                .all(|other| other.commit.state_id != grouped.commit.state_id) =>
+                        {
+                            group.push(grouped);
                         }
-                        Command::ReadRecord {
-                            state_id,
-                            key,
-                            result,
-                        } => {
-                            drop(result.send(store.read_record(&state_id, &key).await));
+                        Ok(grouped) => {
+                            next = Some(grouped.into_request());
+                            break;
                         }
-
-                        Command::Acquire {
-                            state_id,
-                            owner_id,
-                            result,
-                        } => {
-                            drop(result.send(store.acquire(&state_id, owner_id).await));
-                        }
-                        Command::Replace {
-                            state_id,
-                            owner,
-                            expected_revision,
-                            payload,
-                            records: new_records,
-                            result,
-                        } => {
-                            drop(
-                                result.send(
-                                    store
-                                        .replace(
-                                            &state_id,
-                                            &owner,
-                                            expected_revision,
-                                            &payload,
-                                            &new_records,
-                                        )
-                                        .await,
-                                ),
-                            );
-                        }
-                        Command::Commit {
-                            state_id,
-                            owner,
-                            expected_revision,
-                            payload,
-                            records: new_records,
-                            events,
-                            summary,
-                            result,
-                        } => {
-                            drop(
-                                result.send(
-                                    store
-                                        .commit(
-                                            &state_id,
-                                            &owner,
-                                            expected_revision,
-                                            StateCommit {
-                                                payload: &payload,
-                                                records: &new_records,
-                                                events: &events,
-                                                summary: &summary,
-                                            },
-                                        )
-                                        .await,
-                                ),
-                            );
-                        }
-                        #[cfg(not(target_family = "wasm"))]
-                        Command::AcquireWith {
-                            state_id,
-                            owner_id,
-                            update,
-                            result,
-                        } => {
-                            drop(
-                                result.send(store.acquire_with(&state_id, owner_id, update).await),
-                            );
-                        }
-                        #[cfg(not(target_family = "wasm"))]
-                        Command::AcquireWithCompanion {
-                            state_id,
-                            owner_id,
-                            update,
-                            companion_id,
-                            companion_owner,
-                            result,
-                        } => {
-                            drop(
-                                result.send(
-                                    store
-                                        .acquire_with_companion(
-                                            &state_id,
-                                            owner_id,
-                                            update,
-                                            &companion_id,
-                                            companion_owner,
-                                        )
-                                        .await,
-                                ),
-                            );
-                        }
-                        Command::Peek { state_id, result } => {
-                            drop(result.send(store.peek(&state_id).await));
-                        }
-                        Command::ListStates { limit, result } => {
-                            drop(result.send(store.list_states(limit).await));
-                        }
-                        Command::Flush { result } => {
-                            drop(result.send(store.flush().await));
+                        Err(request) => {
+                            next = Some(request);
+                            break;
                         }
                     }
                 }
-                .instrument(span)
-                .await;
+                match group.pop() {
+                    Some(single) if group.is_empty() => {
+                        run(&mut store, single.into_request()).await;
+                    }
+                    Some(last) => {
+                        group.push(last);
+                        run_group(&mut store, group).await;
+                    }
+                    None => {}
+                }
             }
         })?;
         Ok(Self {
@@ -263,6 +178,288 @@ impl SharedStore {
             supports_summaries,
         })
     }
+}
+
+enum Reply {
+    Replace(oneshot::Sender<Result<u64, StoreError>>),
+    Commit(oneshot::Sender<Result<Committed, StoreError>>),
+}
+
+impl Reply {
+    fn send(self, result: Result<Committed, StoreError>) {
+        match self {
+            Self::Replace(sender) => drop(sender.send(result.map(|committed| committed.revision))),
+            Self::Commit(sender) => drop(sender.send(result)),
+        }
+    }
+}
+
+struct Grouped {
+    commit: OwnedCommit,
+    reply: Reply,
+    span: tracing::Span,
+    queued: Instant,
+}
+
+impl Grouped {
+    fn from_request(request: StoreRequest) -> Result<Self, StoreRequest> {
+        let StoreRequest {
+            command,
+            span,
+            queued,
+        } = request;
+        let (commit, reply) = match command {
+            Command::Replace {
+                state_id,
+                owner,
+                expected_revision,
+                payload,
+                records,
+                result,
+            } => (
+                OwnedCommit {
+                    state_id,
+                    owner,
+                    expected_revision,
+                    payload,
+                    records,
+                    events: Vec::new(),
+                    summary: SummaryUpdate::Unchanged,
+                },
+                Reply::Replace(result),
+            ),
+            Command::Commit {
+                state_id,
+                owner,
+                expected_revision,
+                payload,
+                records,
+                events,
+                summary,
+                result,
+            } => (
+                OwnedCommit {
+                    state_id,
+                    owner,
+                    expected_revision,
+                    payload,
+                    records,
+                    events,
+                    summary,
+                },
+                Reply::Commit(result),
+            ),
+            command => {
+                return Err(StoreRequest {
+                    command,
+                    span,
+                    queued,
+                });
+            }
+        };
+        Ok(Self {
+            commit,
+            reply,
+            span,
+            queued,
+        })
+    }
+
+    fn into_request(self) -> StoreRequest {
+        let OwnedCommit {
+            state_id,
+            owner,
+            expected_revision,
+            payload,
+            records,
+            events,
+            summary,
+        } = self.commit;
+        let command = match self.reply {
+            Reply::Replace(result) => Command::Replace {
+                state_id,
+                owner,
+                expected_revision,
+                payload,
+                records,
+                result,
+            },
+            Reply::Commit(result) => Command::Commit {
+                state_id,
+                owner,
+                expected_revision,
+                payload,
+                records,
+                events,
+                summary,
+                result,
+            },
+        };
+        StoreRequest {
+            command,
+            span: self.span,
+            queued: self.queued,
+        }
+    }
+}
+
+async fn run_group<S: StateStore>(store: &mut S, group: Vec<Grouped>) {
+    let count = group.len();
+    let mut commits = Vec::with_capacity(count);
+    let mut replies = Vec::with_capacity(count);
+    for grouped in group {
+        grouped.span.record(
+            "queue.duration_ms",
+            grouped.queued.elapsed().as_secs_f64() * 1_000.0,
+        );
+        commits.push(grouped.commit);
+        replies.push(grouped.reply);
+    }
+    let results = store
+        .commit_many(commits)
+        .instrument(tracing::info_span!(
+            "durability.store.group",
+            commit.count = count
+        ))
+        .await;
+    if results.len() != count {
+        let error = StoreError::Backend(format!(
+            "durability store answered {} of {count} grouped commits",
+            results.len()
+        ));
+        for reply in replies {
+            reply.send(Err(error.clone()));
+        }
+        return;
+    }
+    for (reply, result) in replies.into_iter().zip(results) {
+        reply.send(result);
+    }
+}
+
+async fn run<S: StateStore>(store: &mut S, request: StoreRequest) {
+    let StoreRequest {
+        command,
+        span,
+        queued,
+    } = request;
+    span.record(
+        "queue.duration_ms",
+        queued.elapsed().as_secs_f64() * 1_000.0,
+    );
+    async {
+        match command {
+            Command::ReadRecords {
+                state_id,
+                keys,
+                result,
+            } => {
+                drop(result.send(store.read_records(&state_id, &keys).await));
+            }
+            Command::ReadRecord {
+                state_id,
+                key,
+                result,
+            } => {
+                drop(result.send(store.read_record(&state_id, &key).await));
+            }
+
+            Command::Acquire {
+                state_id,
+                owner_id,
+                result,
+            } => {
+                drop(result.send(store.acquire(&state_id, owner_id).await));
+            }
+            Command::Replace {
+                state_id,
+                owner,
+                expected_revision,
+                payload,
+                records: new_records,
+                result,
+            } => {
+                drop(
+                    result.send(
+                        store
+                            .replace(&state_id, &owner, expected_revision, &payload, &new_records)
+                            .await,
+                    ),
+                );
+            }
+            Command::Commit {
+                state_id,
+                owner,
+                expected_revision,
+                payload,
+                records: new_records,
+                events,
+                summary,
+                result,
+            } => {
+                drop(
+                    result.send(
+                        store
+                            .commit(
+                                &state_id,
+                                &owner,
+                                expected_revision,
+                                StateCommit {
+                                    payload: &payload,
+                                    records: &new_records,
+                                    events: &events,
+                                    summary: &summary,
+                                },
+                            )
+                            .await,
+                    ),
+                );
+            }
+            #[cfg(not(target_family = "wasm"))]
+            Command::AcquireWith {
+                state_id,
+                owner_id,
+                update,
+                result,
+            } => {
+                drop(result.send(store.acquire_with(&state_id, owner_id, update).await));
+            }
+            #[cfg(not(target_family = "wasm"))]
+            Command::AcquireWithCompanion {
+                state_id,
+                owner_id,
+                update,
+                companion_id,
+                companion_owner,
+                result,
+            } => {
+                drop(
+                    result.send(
+                        store
+                            .acquire_with_companion(
+                                &state_id,
+                                owner_id,
+                                update,
+                                &companion_id,
+                                companion_owner,
+                            )
+                            .await,
+                    ),
+                );
+            }
+            Command::Peek { state_id, result } => {
+                drop(result.send(store.peek(&state_id).await));
+            }
+            Command::ListStates { limit, result } => {
+                drop(result.send(store.list_states(limit).await));
+            }
+            Command::Flush { result } => {
+                drop(result.send(store.flush().await));
+            }
+        }
+    }
+    .instrument(span)
+    .await;
 }
 
 impl StateStore for SharedStore {
