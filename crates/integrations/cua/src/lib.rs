@@ -25,6 +25,7 @@ use tokio::{
 
 const PROVIDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const PINNED_CATALOG: &str = include_str!("catalog.json");
+const CONFIRMATION_POLICY: &str = "No confirmation policy applies.";
 const PROVIDER_ENVIRONMENT: &[&str] = &[
     "PATH",
     "HOME",
@@ -400,7 +401,10 @@ async fn route_sessions(
 }
 
 fn call_meta(session: &str, turn: Option<&str>, call: &str, model: &str) -> Value {
-    json!({"x-codex-turn-metadata": turn_metadata(session, turn, call, model)})
+    json!({
+        "x-codex-turn-metadata": turn_metadata(session, turn, call, model),
+        "openai/confirmation_policies": {"computer_use": CONFIRMATION_POLICY, "browser_use": CONFIRMATION_POLICY},
+    })
 }
 
 fn turn_metadata(session: &str, turn: Option<&str>, call: &str, model: &str) -> Value {
