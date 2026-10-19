@@ -90,20 +90,41 @@ pub(crate) fn render_with(
     theme: &Theme,
     highlights: &mut Highlights,
 ) -> Layout {
+    render_from(markdown, 0, 0, width, theme, highlights).0
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Checkpoint {
+    pub(crate) bytes: usize,
+    pub(crate) lines: usize,
+    pub(crate) blocks: usize,
+}
+
+pub(crate) fn render_from(
+    markdown: &str,
+    start: usize,
+    blocks: usize,
+    width: u16,
+    theme: &Theme,
+    highlights: &mut Highlights,
+) -> (Layout, Option<Checkpoint>) {
+    let text = &markdown[start..];
     let span = tracing::info_span!(
         "tui.markdown.render",
         width,
-        text.bytes = markdown.len(),
+        text.bytes = text.len(),
+        text.start = start,
         code.blocks = tracing::field::Empty,
         code.highlighted = tracing::field::Empty
     );
     let _entered = span.enter();
     if width == 0 {
-        return Layout {
+        let layout = Layout {
             lines: Vec::new(),
             links: Vec::new(),
             sources: Vec::new(),
         };
+        return (layout, None);
     }
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
@@ -111,9 +132,23 @@ pub(crate) fn render_with(
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_SMART_PUNCTUATION
         | Options::ENABLE_GFM;
-    let mut renderer = Renderer::new(markdown, width, theme, highlights);
-    let mut events = Parser::new_ext(markdown, options).into_offset_iter();
+    let mut renderer = Renderer::new(text, width, theme, highlights);
+    renderer.block = blocks;
+    renderer.continued = start > 0;
+    let mut depth = 0_usize;
+    let mut boundary = None;
+    let mut events = Parser::new_ext(text, options).into_offset_iter();
     while let Some((event, range)) = events.next() {
+        if depth == 0
+            && matches!(event, Event::Start(_) | Event::Rule)
+            && memchr::memchr(b'\n', &text.as_bytes()[range.start..]).is_some()
+        {
+            boundary = Some(Checkpoint {
+                bytes: start + text[..range.start].rfind('\n').map_or(0, |index| index + 1),
+                lines: renderer.lines.len(),
+                blocks: renderer.block,
+            });
+        }
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
                 renderer.flush();
@@ -124,6 +159,11 @@ pub(crate) fn render_with(
                 renderer.table(range, &mut events);
             }
             event => {
+                match event {
+                    Event::Start(_) => depth += 1,
+                    Event::End(_) => depth -= 1,
+                    _ => {}
+                }
                 renderer.range = range;
                 renderer.event(event);
             }
@@ -131,7 +171,26 @@ pub(crate) fn render_with(
     }
     span.record("code.blocks", renderer.block);
     span.record("code.highlighted", renderer.highlighted);
-    renderer.finish()
+    let mut layout = renderer.finish();
+    for range in layout.sources.iter_mut().flatten() {
+        range.start += start;
+        range.end += start;
+    }
+    let boundary =
+        boundary.filter(|boundary| boundary.lines > 0 && boundary.lines < layout.lines.len());
+    (layout, boundary)
+}
+
+pub(crate) fn self_contained(markdown: &str) -> bool {
+    memchr::memmem::find(markdown.as_bytes(), b"[^").is_none()
+        && !markdown.split_inclusive('\n').any(|line| {
+            let label = line.trim_start_matches(|character: char| {
+                matches!(character, ' ' | '\t' | '>' | '-' | '*' | '+' | '.' | ')')
+                    || character.is_ascii_digit()
+            });
+            label.starts_with('[')
+                && (label.contains("]:") || line.ends_with('\n') && !label.contains(']'))
+        })
 }
 
 pub fn wrap_plain(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
@@ -216,6 +275,7 @@ struct Renderer<'a> {
     highlights: &'a mut Highlights,
     block: usize,
     highlighted: usize,
+    continued: bool,
 }
 
 struct ListState {
@@ -257,6 +317,7 @@ impl<'a> Renderer<'a> {
             highlights,
             block: 0,
             highlighted: 0,
+            continued: false,
         }
     }
 
@@ -851,7 +912,11 @@ impl<'a> Renderer<'a> {
     }
 
     fn blank(&mut self) {
-        if self.lines.last().is_some_and(|line| line.width() == 0) {
+        if self
+            .lines
+            .last()
+            .map_or(self.continued, |line| line.width() == 0)
+        {
             return;
         }
         self.push_line(Line::default(), None);

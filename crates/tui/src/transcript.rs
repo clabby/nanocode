@@ -165,6 +165,7 @@ pub enum CellKind {
 struct Cell {
     kind: CellKind,
     revision: u64,
+    appended: bool,
 }
 
 const SPINNER_SLOT: &str = "\u{0}";
@@ -182,12 +183,21 @@ struct Layout {
     rows: usize,
     lines: Option<Rows>,
     highlights: markdown::Highlights,
+    stable: Option<Stable>,
+}
+
+struct Stable {
+    rows: Rc<Output>,
+    spinners: Vec<(usize, usize)>,
+    body: usize,
+    bytes: usize,
+    blocks: usize,
 }
 
 #[derive(Clone)]
 struct Rows {
-    lines: Rc<Vec<Line<'static>>>,
-    sources: Rc<[Option<Source>]>,
+    head: Rc<Output>,
+    tail: Rc<Output>,
     spinners: Rc<[(usize, usize)]>,
 }
 
@@ -213,8 +223,33 @@ impl Selection {
 }
 
 impl Rows {
-    fn line(&self, row: usize, spinner: &str) -> Line<'static> {
-        let mut line = self.lines[row].clone();
+    fn len(&self) -> usize {
+        self.head.lines.len() + self.tail.lines.len()
+    }
+
+    fn part(&self, row: usize) -> (&Output, usize) {
+        match row.checked_sub(self.head.lines.len()) {
+            Some(row) => (&self.tail, row),
+            None => (&self.head, row),
+        }
+    }
+
+    fn line(&self, row: usize) -> &Line<'static> {
+        let (part, row) = self.part(row);
+        &part.lines[row]
+    }
+
+    fn source(&self, row: usize) -> Option<&Option<Source>> {
+        let (part, row) = self.part(row);
+        part.sources.get(row)
+    }
+
+    fn sources(&self) -> impl Iterator<Item = &Option<Source>> {
+        self.head.sources.iter().chain(&self.tail.sources)
+    }
+
+    fn animated(&self, row: usize, spinner: &str) -> Line<'static> {
+        let mut line = self.line(row).clone();
         for (_, span) in self.spinners.iter().filter(|(slot, _)| *slot == row) {
             line.spans[*span].content = Cow::Owned(spinner.to_owned());
         }
@@ -296,6 +331,7 @@ impl Transcript {
         self.cells.push(Cell {
             kind,
             revision: self.revision,
+            appended: false,
         });
         self.cache.push(None);
         self.last_total = None;
@@ -312,6 +348,26 @@ impl Transcript {
             return false;
         };
         change(&mut cell.kind);
+        self.revision += 1;
+        cell.revision = self.revision;
+        cell.appended = false;
+        self.last_total = None;
+        true
+    }
+
+    pub fn append(&mut self, index: usize, text: &str) -> bool {
+        let Some(cell) = self.cells.get_mut(index) else {
+            return false;
+        };
+        let (CellKind::Assistant(existing)
+        | CellKind::Reasoning(existing)
+        | CellKind::Btw {
+            answer: existing, ..
+        }) = &mut cell.kind
+        else {
+            return false;
+        };
+        existing.push_str(text);
         self.revision += 1;
         cell.revision = self.revision;
         self.last_total = None;
@@ -544,13 +600,13 @@ impl Transcript {
             let last = if index == end.cell {
                 end.row
             } else {
-                rows.sources.len().saturating_sub(1)
+                rows.len().saturating_sub(1)
             };
-            let text = raw_rows(
-                &self.cells[index].kind,
-                self.mode,
-                rows.sources.get(first..=last).unwrap_or_default(),
-            );
+            let sources = (last < rows.len())
+                .then(|| rows.sources().take(last + 1).skip(first))
+                .into_iter()
+                .flatten();
+            let text = raw_rows(&self.cells[index].kind, self.mode, sources);
             if !text.is_empty() {
                 cells.push(text);
             }
@@ -582,8 +638,7 @@ impl Transcript {
         let Some(rows) = self.cell_rows(point.cell) else {
             return (point, point);
         };
-        let sources = &rows.sources;
-        let Some(Some(source)) = sources.get(point.row) else {
+        let Some(Some(source)) = rows.source(point.row) else {
             return (point, point);
         };
         let same = |other: &Option<Source>| {
@@ -596,11 +651,11 @@ impl Transcript {
             })
         };
         let mut start = point.row;
-        while start > 0 && same(&sources[start - 1]) {
+        while start > 0 && rows.source(start - 1).is_some_and(same) {
             start -= 1;
         }
         let mut end = point.row;
-        while end + 1 < sources.len() && same(&sources[end + 1]) {
+        while rows.source(end + 1).is_some_and(same) {
             end += 1;
         }
         (
@@ -627,15 +682,15 @@ impl Transcript {
     fn rows(&mut self, index: usize, width: u16, theme: &Theme) -> usize {
         match &self.cache[index] {
             Some(layout) if layout.key == self.key(index, width) => layout.rows,
-            _ => self.layout(index, width, theme).lines.len(),
+            _ => self.layout(index, width, theme).len(),
         }
     }
 
     fn evict(&mut self, index: usize) {
+        let live = self.cells[index].revision == self.revision;
         if let Some(Some(layout)) = self.cache.get_mut(index)
-            && layout.lines.take().is_some()
+            && layout.release(live)
         {
-            layout.highlights.shrink_to_fit();
             self.resident.retain(|&resident| resident != index);
         }
     }
@@ -668,11 +723,13 @@ impl Transcript {
         {
             self.resident.push(index);
         }
-        let mut highlights = previous.map(|layout| layout.highlights).unwrap_or_default();
-        let mut out = Output::default();
-        if index > 0 {
-            out.push(Line::default(), None);
-        }
+        let (mut highlights, stable) = previous.map_or_else(Default::default, |layout| {
+            let reusable = cell.appended
+                && layout.key.width == width
+                && layout.key.mode == key.mode
+                && layout.key.reasoning == key.reasoning;
+            (layout.highlights, layout.stable.filter(|_| reusable))
+        });
         let context = RenderContext {
             width,
             theme,
@@ -681,30 +738,29 @@ impl Transcript {
             preview: self.policy.collapsed_preview_lines,
             diff_preview: self.policy.collapsed_diff_lines,
         };
-        context.render(&cell.kind, &mut out, &mut highlights);
-        let spinners = out
-            .lines
-            .iter()
-            .enumerate()
-            .flat_map(|(row, line)| {
-                line.spans
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, span)| span.content == SPINNER_SLOT)
-                    .map(move |(span, _)| (row, span))
-            })
-            .collect::<Rc<[_]>>();
-        let rows = Rows {
-            lines: Rc::new(out.lines),
-            sources: out.sources.into(),
-            spinners,
-        };
-        span.record("layout.lines", rows.lines.len());
+        let (rows, stable) = context
+            .stream(&cell.kind, index, stable, &mut highlights)
+            .unwrap_or_else(|| {
+                let mut out = Output::default();
+                if index > 0 {
+                    out.push(Line::default(), None);
+                }
+                context.render(&cell.kind, &mut out);
+                let rows = Rows {
+                    head: Rc::default(),
+                    spinners: spinners(&out.lines, 0).collect(),
+                    tail: Rc::new(out),
+                };
+                (rows, None)
+            });
+        span.record("layout.lines", rows.len());
+        self.cells[index].appended = true;
         self.cache[index] = Some(Layout {
             key,
-            rows: rows.lines.len(),
+            rows: rows.len(),
             lines: Some(rows.clone()),
             highlights,
+            stable,
         });
         rows
     }
@@ -812,7 +868,7 @@ impl Transcript {
                 break;
             }
         }
-        let cache = &mut self.cache;
+        let (cells, cache, revision) = (&self.cells, &mut self.cache, self.revision);
         let shown = match (visible.first(), visible.last()) {
             (Some(&(top, _)), Some(&(bottom, _))) => top..bottom + 1,
             _ => 0..0,
@@ -820,8 +876,7 @@ impl Transcript {
         self.resident.retain(|index| {
             let keep = shown.contains(index);
             if !keep && let Some(Some(layout)) = cache.get_mut(*index) {
-                layout.lines = None;
-                layout.highlights.shrink_to_fit();
+                layout.release(cells[*index].revision == revision);
             }
             keep
         });
@@ -829,7 +884,7 @@ impl Transcript {
         self.screen.clear();
         'layouts: for (index, offset) in visible {
             let layout = self.layout(index, width, theme);
-            let count = layout.lines.len();
+            let count = layout.len();
             let from = start.saturating_sub(offset);
             let to = (end - offset).min(count);
             for row in from..to {
@@ -837,9 +892,9 @@ impl Transcript {
                     break 'layouts;
                 };
                 if layout.spinners.iter().any(|(slot, _)| *slot == row) {
-                    render_line(&layout.line(row, spinner), row_area, buffer);
+                    render_line(&layout.animated(row, spinner), row_area, buffer);
                 } else {
-                    render_line(&layout.lines[row], row_area, buffer);
+                    render_line(layout.line(row), row_area, buffer);
                 }
                 self.screen.push(Point { cell: index, row });
             }
@@ -884,6 +939,19 @@ impl Transcript {
     }
 }
 
+impl Layout {
+    fn release(&mut self, live: bool) -> bool {
+        if !live {
+            self.stable = None;
+        }
+        let released = self.lines.take().is_some();
+        if released {
+            self.highlights.shrink_to_fit();
+        }
+        released
+    }
+}
+
 struct Gutter {
     first: String,
     rest: String,
@@ -921,7 +989,7 @@ const fn whole(part: Part) -> Option<Source> {
     })
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Output {
     lines: Vec<Line<'static>>,
     sources: Vec<Option<Source>>,
@@ -940,21 +1008,46 @@ impl Output {
             } else {
                 rest.clone()
             };
-            let mut spans = Vec::with_capacity(line.spans.len() + 1);
-            spans.push(prefix);
-            spans.extend(line.spans);
-            self.push(Line::from(spans).style(line.style), source);
+            self.push(prefixed(line, prefix), source);
         }
     }
 }
 
+fn prefixed(line: Line<'static>, prefix: Span<'static>) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(prefix);
+    spans.extend(line.spans);
+    Line::from(spans).style(line.style)
+}
+
+fn spinners(lines: &[Line<'_>], offset: usize) -> impl Iterator<Item = (usize, usize)> {
+    lines.iter().enumerate().flat_map(move |(row, line)| {
+        line.spans
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| span.content == SPINNER_SLOT)
+            .map(move |(span, _)| (offset + row, span))
+    })
+}
+
 fn plain(text: &str, width: u16, style: Style, preserve_whitespace: bool, part: &Part) -> Vec<Row> {
+    plain_from(text, width, style, preserve_whitespace, part, 0)
+}
+
+fn plain_from(
+    text: &str,
+    width: u16,
+    style: Style,
+    preserve_whitespace: bool,
+    part: &Part,
+    first: usize,
+) -> Vec<Row> {
     markdown::wrap_plain_rows(text, width, style, preserve_whitespace, |line, index| {
         (
             line,
             Some(Source {
                 part: part.clone(),
-                extent: Extent::Line(index),
+                extent: Extent::Line(first + index),
             }),
         )
     })
@@ -987,7 +1080,175 @@ struct RenderContext<'a> {
 }
 
 impl RenderContext<'_> {
-    fn render(&self, kind: &CellKind, out: &mut Output, highlights: &mut markdown::Highlights) {
+    fn stream(
+        &self,
+        kind: &CellKind,
+        index: usize,
+        stable: Option<Stable>,
+        highlights: &mut markdown::Highlights,
+    ) -> Option<(Rows, Option<Stable>)> {
+        let theme = self.theme;
+        let thinking = Style::default()
+            .fg(theme.muted())
+            .add_modifier(Modifier::ITALIC);
+        let bar = Style::default().fg(theme.thinking_medium());
+        let (text, plain, first, rest) = match kind {
+            CellKind::Assistant(text) => (
+                text,
+                None,
+                Span::styled("● ", Style::default().fg(theme.text())),
+                Span::raw("  "),
+            ),
+            CellKind::Reasoning(text) if self.reasoning => (
+                text,
+                Some(thinking),
+                Span::styled("∴ ", thinking),
+                Span::raw("  "),
+            ),
+            CellKind::Btw { answer, .. } => (
+                answer,
+                None,
+                Span::styled("┃ ", bar),
+                Span::styled("┃ ", bar),
+            ),
+            _ => return None,
+        };
+        let width = self.width.saturating_sub(2);
+        let contained =
+            |stable: &Stable| plain.is_some() || markdown::self_contained(&text[stable.bytes..]);
+        let mut stable = stable
+            .filter(contained)
+            .unwrap_or_else(|| self.frame(kind, index, text));
+        let commit = width > 0 && contained(&stable);
+        let (body, boundary) = match plain {
+            None => {
+                let (layout, boundary) = markdown::render_from(
+                    text,
+                    stable.bytes,
+                    stable.blocks,
+                    width,
+                    theme,
+                    highlights,
+                );
+                (rendered(layout, &Part::Text), boundary.filter(|_| commit))
+            }
+            Some(style) => {
+                let tail = text[stable.bytes..].trim_end();
+                let complete = memchr::memrchr(b'\n', tail.as_bytes()).filter(|&end| {
+                    commit && memchr::memchr2(0x1b, b'\r', &tail.as_bytes()[..end]).is_none()
+                });
+                match complete {
+                    Some(end) => {
+                        let lines = memchr::memchr_iter(b'\n', &tail.as_bytes()[..end]).count() + 1;
+                        let mut rows = plain_from(
+                            &tail[..end],
+                            width,
+                            style,
+                            false,
+                            &Part::Text,
+                            stable.blocks,
+                        );
+                        let boundary = markdown::Checkpoint {
+                            bytes: stable.bytes + end + 1,
+                            lines: rows.len(),
+                            blocks: stable.blocks + lines,
+                        };
+                        rows.extend(plain_from(
+                            &tail[end + 1..],
+                            width,
+                            style,
+                            false,
+                            &Part::Text,
+                            boundary.blocks,
+                        ));
+                        (rows, Some(boundary))
+                    }
+                    None => (
+                        plain_from(tail, width, style, false, &Part::Text, stable.blocks),
+                        None,
+                    ),
+                }
+            }
+        };
+        let opening = stable.body == 0;
+        let mut body = body.into_iter().enumerate().map(|(row, (line, source))| {
+            let prefix = if opening && row == 0 {
+                first.clone()
+            } else {
+                rest.clone()
+            };
+            (prefixed(line, prefix), source)
+        });
+        if let Some(boundary) = boundary {
+            let head = Rc::make_mut(&mut stable.rows);
+            let before = head.lines.len();
+            for (line, source) in body.by_ref().take(boundary.lines) {
+                head.push(line, source);
+            }
+            stable
+                .spinners
+                .extend(spinners(&head.lines[before..], before));
+            stable.body += boundary.lines;
+            stable.bytes = boundary.bytes;
+            stable.blocks = boundary.blocks;
+        }
+        let mut tail = Output::default();
+        for (line, source) in body {
+            tail.push(line, source);
+        }
+        let offset = stable.rows.lines.len();
+        let rows = Rows {
+            head: Rc::clone(&stable.rows),
+            spinners: stable
+                .spinners
+                .iter()
+                .copied()
+                .chain(spinners(&tail.lines, offset))
+                .collect(),
+            tail: Rc::new(tail),
+        };
+        Some((rows, (stable.body > 0).then_some(stable)))
+    }
+
+    fn frame(&self, kind: &CellKind, index: usize, text: &str) -> Stable {
+        let mut rows = Output::default();
+        if index > 0 {
+            rows.push(Line::default(), None);
+        }
+        if let CellKind::Btw { question, done, .. } = kind {
+            rows.push(self.btw_header(question, *done), whole(Part::Question));
+        }
+        let bytes = match kind {
+            CellKind::Reasoning(_) => text.len() - text.trim_start().len(),
+            _ => 0,
+        };
+        Stable {
+            spinners: spinners(&rows.lines, 0).collect(),
+            rows: Rc::new(rows),
+            body: 0,
+            bytes,
+            blocks: 0,
+        }
+    }
+
+    fn btw_header(&self, question: &str, done: bool) -> Line<'static> {
+        let bar = Style::default().fg(self.theme.thinking_medium());
+        let mut header = vec![
+            Span::styled("┃ ", bar),
+            Span::styled("btw", bar.add_modifier(Modifier::BOLD)),
+        ];
+        if !done {
+            header.push(Span::raw(" "));
+            header.push(Span::styled(SPINNER_SLOT, bar.add_modifier(Modifier::BOLD)));
+        }
+        header.push(Span::styled(
+            format!("  {}", sanitize_terminal_text_inline(question)),
+            Style::default().fg(self.theme.muted()),
+        ));
+        Line::from(header)
+    }
+
+    fn render(&self, kind: &CellKind, out: &mut Output) {
         let theme = self.theme;
         match kind {
             CellKind::User(text) => {
@@ -1011,51 +1272,29 @@ impl RenderContext<'_> {
                     Span::raw("  "),
                 );
             }
-            CellKind::Assistant(text) => {
-                let body = rendered(
-                    markdown::render_with(text, self.width.saturating_sub(2), theme, highlights),
-                    &Part::Text,
-                );
-                out.prefixed(
-                    body,
-                    Span::styled("● ", Style::default().fg(theme.text())),
-                    Span::raw("  "),
-                );
-            }
+            CellKind::Assistant(_) | CellKind::Btw { .. } => {}
             CellKind::Reasoning(text) => {
                 let style = Style::default()
                     .fg(theme.muted())
                     .add_modifier(Modifier::ITALIC);
-                if self.reasoning {
-                    let body = plain(
-                        text.trim(),
-                        self.width.saturating_sub(2),
-                        style,
-                        false,
-                        &Part::Text,
-                    );
-                    out.prefixed(body, Span::styled("∴ ", style), Span::raw("  "));
-                } else {
-                    let summary = sanitize_terminal_text_inline(
-                        text.trim().lines().next().unwrap_or_default(),
-                    )
-                    .into_owned();
-                    let summary = summary.trim_matches('*').trim().to_owned();
-                    let mut collapsed = vec![Span::styled("∴ thinking", style)];
-                    if !summary.is_empty() {
-                        collapsed.push(Span::styled(format!(" · {summary}"), style));
-                    }
-                    collapsed.push(Span::styled(
-                        "  (ctrl+o)",
-                        Style::default().fg(theme.border()),
-                    ));
-                    let line = Line::from(collapsed);
-                    for line in markdown::wrap_spans(&line.spans, self.width, true)
-                        .into_iter()
-                        .take(1)
-                    {
-                        out.push(line, whole(Part::Text));
-                    }
+                let summary =
+                    sanitize_terminal_text_inline(text.trim().lines().next().unwrap_or_default())
+                        .into_owned();
+                let summary = summary.trim_matches('*').trim().to_owned();
+                let mut collapsed = vec![Span::styled("∴ thinking", style)];
+                if !summary.is_empty() {
+                    collapsed.push(Span::styled(format!(" · {summary}"), style));
+                }
+                collapsed.push(Span::styled(
+                    "  (ctrl+o)",
+                    Style::default().fg(theme.border()),
+                ));
+                let line = Line::from(collapsed);
+                for line in markdown::wrap_spans(&line.spans, self.width, true)
+                    .into_iter()
+                    .take(1)
+                {
+                    out.push(line, whole(Part::Text));
                 }
             }
             CellKind::Tool(tool) => self.tool(tool, tool.depth, false, out, &mut 0),
@@ -1077,38 +1316,6 @@ impl RenderContext<'_> {
                     Span::styled(icon, Style::default().fg(color)),
                     Span::raw("  "),
                 );
-            }
-            CellKind::Btw {
-                question,
-                answer,
-                done,
-            } => {
-                let bar = Style::default().fg(theme.thinking_medium());
-                let mut header = vec![
-                    Span::styled("┃ ", bar),
-                    Span::styled("btw", bar.add_modifier(Modifier::BOLD)),
-                ];
-                if !*done {
-                    header.push(Span::raw(" "));
-                    header.push(Span::styled(SPINNER_SLOT, bar.add_modifier(Modifier::BOLD)));
-                }
-                header.push(Span::styled(
-                    format!("  {}", sanitize_terminal_text_inline(question)),
-                    Style::default().fg(theme.muted()),
-                ));
-                out.push(Line::from(header), whole(Part::Question));
-                if !answer.is_empty() {
-                    let body = rendered(
-                        markdown::render_with(
-                            answer,
-                            self.width.saturating_sub(2),
-                            theme,
-                            highlights,
-                        ),
-                        &Part::Text,
-                    );
-                    out.prefixed(body, Span::styled("┃ ", bar), Span::styled("┃ ", bar));
-                }
             }
             CellKind::Summary(text) => {
                 let label = format!(" {} ", sanitize_terminal_text_inline(text));
@@ -1432,9 +1639,13 @@ struct Selected<'a> {
     lines: Option<(usize, usize)>,
 }
 
-fn raw_rows(kind: &CellKind, mode: DisplayMode, sources: &[Option<Source>]) -> String {
+fn raw_rows<'a>(
+    kind: &CellKind,
+    mode: DisplayMode,
+    sources: impl Iterator<Item = &'a Option<Source>>,
+) -> String {
     let mut selected = Vec::<Selected<'_>>::new();
-    for source in sources.iter().flatten() {
+    for source in sources.flatten() {
         if selected
             .last()
             .is_none_or(|selected| *selected.part != source.part)
