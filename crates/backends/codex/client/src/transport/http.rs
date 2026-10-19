@@ -1,3 +1,5 @@
+#[cfg(not(target_family = "wasm"))]
+use crate::client::OpenAiAuthMode;
 use crate::client::{
     OpenAiAuthSnapshot, monotonic_now_ns,
     transport::host::{HostConnectRequest, HostError, HostHttpBody, HostTransport},
@@ -12,6 +14,8 @@ use crate::client::{EncodedRequest, ResponsesError, socket::ReceivedText};
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 #[cfg(not(target_family = "wasm"))]
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+#[cfg(not(target_family = "wasm"))]
+const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Clone)]
 pub(crate) struct ResponsesHttp {
@@ -99,8 +103,22 @@ impl ResponsesHttp {
             .header(
                 header::USER_AGENT,
                 concat!("nanocode/", env!("CARGO_PKG_VERSION")),
-            )
-            .body(request.raw().get().to_owned());
+            );
+        let body = request.raw().get().to_owned();
+        builder = if auth.mode() == OpenAiAuthMode::ChatGpt && self.gateway.is_none() {
+            let encoded = tokio::task::spawn_blocking(move || {
+                zstd::stream::encode_all(body.as_bytes(), ZSTD_LEVEL)
+            })
+            .await
+            .map_err(|error| encode_error(&error))?
+            .map_err(|error| encode_error(&error))?;
+            tracing::Span::current().record("request.zstd_bytes", encoded.len());
+            builder
+                .header(header::CONTENT_ENCODING, "zstd")
+                .body(encoded)
+        } else {
+            builder.body(body)
+        };
         if auth.sends_bearer() {
             builder = builder.bearer_auth(auth.bearer());
         }
@@ -349,6 +367,15 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<RetryAfter> {
         .get(header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(RetryAfter::from_header)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn encode_error(error: &dyn std::error::Error) -> ResponsesError {
+    ResponsesError::HttpRequest {
+        retryable: false,
+        timeout: false,
+        detail: format!("zstd request body: {error}"),
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]

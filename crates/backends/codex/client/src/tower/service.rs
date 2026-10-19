@@ -957,6 +957,7 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 model.input.item_count = tracing::field::Empty,
                 request.queue.duration_ns = tracing::field::Empty,
                 request.bytes = tracing::field::Empty,
+                request.zstd_bytes = tracing::field::Empty,
                 request.encode.duration_ns = tracing::field::Empty,
                 request.send.duration_ns = tracing::field::Empty,
                 response.event.count = tracing::field::Empty,
