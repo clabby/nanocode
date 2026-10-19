@@ -233,10 +233,7 @@ impl Tool for WebSearchHandler {
 
 fn body_preview(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
-    let mut end = text.len().min(ERROR_BODY_LIMIT);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(ERROR_BODY_LIMIT);
     let suffix = if end < text.len() { "…" } else { "" };
     format!("{}{suffix}", &text[..end])
 }

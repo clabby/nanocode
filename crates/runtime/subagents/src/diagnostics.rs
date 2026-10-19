@@ -51,13 +51,7 @@ impl CompletionError {
             .into_iter()
             .take(4)
             .map(|mut detail| {
-                if detail.len() > 512 {
-                    let mut end = 512;
-                    while !detail.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    detail.truncate(end);
-                }
+                detail.truncate(detail.floor_char_boundary(512));
                 detail
             })
             .collect();

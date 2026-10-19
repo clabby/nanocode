@@ -1,7 +1,10 @@
 pub use nanocode_agent_config::HarnessRequest;
 use std::{collections::HashMap, future::Future, sync::Arc};
 
-use crate::{Agent, AgentEvents, HarnessFamily, ModelSelection, NanocodeError, Thinking};
+use crate::{
+    Agent, AgentEvents, HarnessFamily, ModelSelection, NanocodeError, Thinking,
+    runtime::catalog_error,
+};
 use nanocode_agent_core::{
     AgentHandle, ForkRequest, SessionCheckpoint, SpawnOptions,
     backend::{AgentFactory, BackendFuture},
@@ -473,18 +476,6 @@ impl AgentFactory for RoutedFactory {
                 })
                 .await
         })
-    }
-}
-
-fn catalog_error(error: crate::durability::Error) -> NanocodeError {
-    match error {
-        crate::durability::Error::SessionNotFound { .. } => {
-            NanocodeError::InvalidRequest(error.to_string())
-        }
-        error => NanocodeError::Backend {
-            backend: "durability",
-            source: Arc::new(error),
-        },
     }
 }
 

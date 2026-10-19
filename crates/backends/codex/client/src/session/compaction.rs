@@ -437,31 +437,16 @@ pub fn truncate_middle_with_token_budget(text: &str, max_tokens: usize) -> Strin
     }
     let left_budget = max_bytes / 2;
     let right_budget = max_bytes - left_budget;
-    let prefix_end = floor_char_boundary(text, left_budget);
-    let suffix_start =
-        ceil_char_boundary(text, text.len().saturating_sub(right_budget)).max(prefix_end);
+    let prefix_end = text.floor_char_boundary(left_budget);
+    let suffix_start = text
+        .ceil_char_boundary(text.len().saturating_sub(right_budget))
+        .max(prefix_end);
     let removed = approx_tokens(text.len().saturating_sub(max_bytes));
     format!(
         "{}…{removed} tokens truncated…{}",
         &text[..prefix_end],
         &text[suffix_start..]
     )
-}
-
-fn floor_char_boundary(text: &str, target: usize) -> usize {
-    let mut boundary = target.min(text.len());
-    while !text.is_char_boundary(boundary) {
-        boundary = boundary.saturating_sub(1);
-    }
-    boundary
-}
-
-fn ceil_char_boundary(text: &str, target: usize) -> usize {
-    let mut boundary = target.min(text.len());
-    while !text.is_char_boundary(boundary) {
-        boundary = boundary.saturating_add(1);
-    }
-    boundary
 }
 
 #[must_use]

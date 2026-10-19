@@ -140,10 +140,7 @@ impl TranscriptItem {
 
     #[must_use]
     pub fn tool_result(call_id: impl Into<String>, output: &str, outcome: ToolOutcome) -> Self {
-        let mut end = output.len().min(Self::MAX_TOOL_OUTPUT_BYTES);
-        while !output.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = output.floor_char_boundary(Self::MAX_TOOL_OUTPUT_BYTES);
         let mut bounded = output[..end].to_owned();
         if end < output.len() {
             bounded.push_str("\n[output truncated]");

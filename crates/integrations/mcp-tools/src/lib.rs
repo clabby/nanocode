@@ -931,9 +931,5 @@ fn search_description(servers: &[NamedServer]) -> String {
 }
 
 fn take_bytes_at_char_boundary(value: &str, max_bytes: usize) -> &str {
-    let mut end = value.len().min(max_bytes);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
+    &value[..value.floor_char_boundary(max_bytes)]
 }

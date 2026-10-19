@@ -1104,11 +1104,7 @@ async fn serve_socket(stream: TcpStream, runners: Runners) {
 }
 
 fn close_reason(reason: &str) -> &str {
-    let mut end = reason.len().min(WEBSOCKET_CLOSE_REASON_LIMIT);
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
-    &reason[..end]
+    &reason[..reason.floor_char_boundary(WEBSOCKET_CLOSE_REASON_LIMIT)]
 }
 
 fn parse_catalog(

@@ -1192,7 +1192,7 @@ fn not_configured(family: HarnessFamily) -> NanocodeError {
     ))
 }
 
-fn catalog_error(error: crate::durability::Error) -> NanocodeError {
+pub(crate) fn catalog_error(error: crate::durability::Error) -> NanocodeError {
     match error {
         crate::durability::Error::SessionNotFound { .. } => {
             NanocodeError::InvalidRequest(error.to_string())

@@ -76,9 +76,10 @@ pub(super) fn redact_and_limit(
     let total_lines = output.lines().count();
     let left_budget = limit / 2;
     let right_budget = limit.saturating_sub(left_budget);
-    let prefix_end = floor_char_boundary(&output, left_budget);
-    let suffix_start =
-        ceil_char_boundary(&output, output.len().saturating_sub(right_budget)).max(prefix_end);
+    let prefix_end = output.floor_char_boundary(left_budget);
+    let suffix_start = output
+        .ceil_char_boundary(output.len().saturating_sub(right_budget))
+        .max(prefix_end);
     let removed_tokens = output.len().saturating_sub(limit).saturating_add(3) / BYTES_PER_TOKEN;
     let truncated = format!(
         "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{}…{removed_tokens} tokens truncated…{}",
@@ -86,20 +87,4 @@ pub(super) fn redact_and_limit(
         &output[suffix_start..],
     );
     (truncated, true)
-}
-
-fn floor_char_boundary(output: &str, target: usize) -> usize {
-    let mut boundary = target.min(output.len());
-    while !output.is_char_boundary(boundary) {
-        boundary = boundary.saturating_sub(1);
-    }
-    boundary
-}
-
-fn ceil_char_boundary(output: &str, target: usize) -> usize {
-    let mut boundary = target.min(output.len());
-    while !output.is_char_boundary(boundary) {
-        boundary = boundary.saturating_add(1);
-    }
-    boundary
 }

@@ -207,9 +207,5 @@ fn cap_utf8(value: &str, max: usize) -> (&str, bool) {
     if value.len() <= max {
         return (value, false);
     }
-    let mut end = max;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&value[..end], true)
+    (&value[..value.floor_char_boundary(max)], true)
 }

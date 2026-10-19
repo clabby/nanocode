@@ -1584,11 +1584,7 @@ fn encoded_len(value: Option<&Value>) -> usize {
 }
 
 fn utf8_prefix(text: &str, bytes: usize) -> &str {
-    let mut end = text.len().min(bytes);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+    &text[..text.floor_char_boundary(bytes)]
 }
 
 fn event_image_reference(value: Option<&Value>) -> Value {
@@ -2232,11 +2228,7 @@ impl Conversation {
         const LIMIT: usize = 64 * 1024;
         const TRUNCATED: &str = "\n[provider transcript truncated; omitted effects remain unknown]";
         if evidence.len() > LIMIT {
-            let mut end = LIMIT - TRUNCATED.len();
-            while !evidence.is_char_boundary(end) {
-                end -= 1;
-            }
-            evidence.truncate(end);
+            evidence.truncate(evidence.floor_char_boundary(LIMIT - TRUNCATED.len()));
             evidence.push_str(TRUNCATED);
         }
         let notice = format!(
@@ -5672,11 +5664,9 @@ impl State {
                         let mut evidence = serde_json::to_string(&response.content)
                             .expect("content blocks serialize");
                         if evidence.len() > EVIDENCE_LIMIT {
-                            let mut end = EVIDENCE_LIMIT - TRUNCATED.len();
-                            while !evidence.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            evidence.truncate(end);
+                            evidence.truncate(
+                                evidence.floor_char_boundary(EVIDENCE_LIMIT - TRUNCATED.len()),
+                            );
                             evidence.push_str(TRUNCATED);
                         }
                         let notice = format!(

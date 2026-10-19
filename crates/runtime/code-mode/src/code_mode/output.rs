@@ -137,9 +137,10 @@ fn truncate_middle(text: &str, byte_budget: usize, use_tokens: bool) -> String {
     }
     let left_budget = byte_budget / 2;
     let right_budget = byte_budget.saturating_sub(left_budget);
-    let prefix_end = floor_char_boundary(text, left_budget);
-    let suffix_start =
-        ceil_char_boundary(text, text.len().saturating_sub(right_budget)).max(prefix_end);
+    let prefix_end = text.floor_char_boundary(left_budget);
+    let suffix_start = text
+        .ceil_char_boundary(text.len().saturating_sub(right_budget))
+        .max(prefix_end);
     let removed = &text[prefix_end..suffix_start];
     let marker = truncation_marker(
         use_tokens,
@@ -159,20 +160,4 @@ fn truncation_marker(use_tokens: bool, removed_bytes: usize, removed_chars: usiz
 
 const fn approx_tokens(bytes: usize) -> usize {
     bytes.saturating_add(APPROX_BYTES_PER_TOKEN - 1) / APPROX_BYTES_PER_TOKEN
-}
-
-fn floor_char_boundary(text: &str, target: usize) -> usize {
-    let mut boundary = target.min(text.len());
-    while !text.is_char_boundary(boundary) {
-        boundary = boundary.saturating_sub(1);
-    }
-    boundary
-}
-
-fn ceil_char_boundary(text: &str, target: usize) -> usize {
-    let mut boundary = target.min(text.len());
-    while !text.is_char_boundary(boundary) {
-        boundary = boundary.saturating_add(1);
-    }
-    boundary
 }

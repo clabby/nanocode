@@ -113,30 +113,14 @@ fn truncate_middle(text: &str, max_tokens: usize) -> String {
     if max_bytes == 0 {
         return format!("…{} tokens truncated…", approx_tokens(text.len()));
     }
-    let left_end = floor_char_boundary(text, max_bytes / 2);
-    let right_start =
-        ceil_char_boundary(text, text.len().saturating_sub(max_bytes - max_bytes / 2))
-            .max(left_end);
+    let left_end = text.floor_char_boundary(max_bytes / 2);
+    let right_start = text
+        .ceil_char_boundary(text.len().saturating_sub(max_bytes - max_bytes / 2))
+        .max(left_end);
     let removed = approx_tokens(right_start.saturating_sub(left_end));
     format!(
         "{}…{removed} tokens truncated…{}",
         &text[..left_end],
         &text[right_start..]
     )
-}
-
-fn floor_char_boundary(text: &str, target: usize) -> usize {
-    let mut boundary = target.min(text.len());
-    while !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
-
-fn ceil_char_boundary(text: &str, target: usize) -> usize {
-    let mut boundary = target.min(text.len());
-    while !text.is_char_boundary(boundary) {
-        boundary += 1;
-    }
-    boundary
 }

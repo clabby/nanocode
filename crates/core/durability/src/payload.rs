@@ -57,10 +57,7 @@ fn chunk_end(content: &str) -> usize {
         }
         index += 1;
     }
-    while cut < length && !content.is_char_boundary(cut) {
-        cut += 1;
-    }
-    cut
+    content.ceil_char_boundary(cut)
 }
 
 fn chunk_key(hash: &str) -> String {

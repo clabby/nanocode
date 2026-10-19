@@ -219,12 +219,5 @@ fn valid_host(host: &str) -> bool {
 }
 
 fn cap_utf8(value: &str, max: usize) -> &str {
-    if value.len() <= max {
-        return value;
-    }
-    let mut end = max;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
+    &value[..value.floor_char_boundary(max)]
 }
