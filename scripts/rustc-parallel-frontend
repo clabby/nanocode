@@ -1,0 +1,2 @@
+#!/bin/sh
+RUSTC_BOOTSTRAP=1 exec "$@" -Zthreads=0
