@@ -549,6 +549,24 @@ impl CacheLayout {
 }
 
 impl MessagesRequest {
+    pub fn apply_cache_ttl(&mut self) {
+        let Some(ttl) = self.cache_control.as_ref().and_then(|control| control.ttl) else {
+            return;
+        };
+        let Some(Value::Array(blocks)) = self.system.as_mut() else {
+            return;
+        };
+        for control in blocks
+            .iter_mut()
+            .filter_map(|block| block.get_mut("cache_control"))
+            .filter_map(Value::as_object_mut)
+        {
+            control
+                .entry("ttl")
+                .or_insert_with(|| serde_json::to_value(ttl).expect("cache TTL serializes"));
+        }
+    }
+
     pub fn validate_cache_control(&self) -> Result<(), ClaudeError> {
         let mut layout = CacheLayout::default();
         for tool in &self.tools {
@@ -968,6 +986,11 @@ impl ClaudeClient {
     pub fn subscription(http: HttpClient, provider: Arc<dyn ClaudeAuthProvider>) -> Self {
         Self::with_auth_provider(http, ANTHROPIC_SUBSCRIPTION_MESSAGES_URL, provider)
             .subscription_compatibility()
+    }
+
+    #[must_use]
+    pub const fn uses_subscription(&self) -> bool {
+        self.subscription_compatibility
     }
 
     pub fn subscription_compatibility(mut self) -> Self {

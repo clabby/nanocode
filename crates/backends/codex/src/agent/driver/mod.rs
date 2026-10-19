@@ -84,6 +84,9 @@ impl AgentDriver {
             )
         };
         model.set_before_compaction(self.spawner.before_compaction.clone());
+        if let Some(connect) = model.preconnect() {
+            super::executor::spawn_driver(connect)?;
+        }
         let mut turn_index = 0_u64;
         let mut logical_turn_index = 0_u64;
         let mut latest_fork_checkpoint = inherited_checkpoint;

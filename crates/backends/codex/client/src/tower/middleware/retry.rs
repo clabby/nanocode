@@ -72,6 +72,9 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
         request: &mut ResponsesAttempt,
         result: &mut Result<ResponsesServiceResponse, ResponsesServiceError>,
     ) -> Option<Self::Future> {
+        if matches!(request.kind, ResponsesAttemptKind::Connect) {
+            return None;
+        }
         request.limit_attempts(self.max_attempts);
         let failure = result.as_ref().err()?;
         let checkpoint_missing =

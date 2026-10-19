@@ -3890,14 +3890,16 @@ impl State {
         .then(|| json!({"type":"adaptive","display":"summarized"}))
     }
     fn request_template(&self, speed: Option<crate::Speed>) -> MessagesRequest {
-        MessagesRequest {
+        let mut request = MessagesRequest {
             model: self.model(),
             max_tokens: self.max_tokens.unwrap_or_else(|| {
                 model_max_tokens(&self.model()).expect("model validated by builder")
             }),
             cache_control: self.automatic_cache.then(|| crate::CacheControl {
                 kind: crate::CacheType::Ephemeral,
-                ttl: self.cache_one_hour.then_some(crate::CacheTtl::OneHour),
+                ttl: (self.cache_one_hour
+                    || (self.lineage.depth == 0 && self.client.uses_subscription()))
+                .then_some(crate::CacheTtl::OneHour),
             }),
             output_config: self.effort().map(|effort| crate::OutputConfig { effort }),
             speed,
@@ -3913,7 +3915,9 @@ impl State {
             messages: Vec::new(),
             container: None,
             tools: self.available_tools(),
-        }
+        };
+        request.apply_cache_ttl();
+        request
     }
     async fn response(
         &self,

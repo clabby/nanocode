@@ -33,6 +33,8 @@ pub enum ResponsesAttemptKind {
     Generation,
 
     Compaction,
+
+    Connect,
 }
 
 impl ResponsesAttemptKind {
@@ -41,6 +43,7 @@ impl ResponsesAttemptKind {
             Self::Warmup => "warmup",
             Self::Generation => "generation",
             Self::Compaction => "compaction",
+            Self::Connect => "connect",
         }
     }
 }
@@ -275,7 +278,10 @@ impl ResponsesAttempt {
     }
 
     pub(crate) fn input(&self) -> ResponsesInput<'_> {
-        if matches!(self.kind, ResponsesAttemptKind::Warmup) {
+        if matches!(
+            self.kind,
+            ResponsesAttemptKind::Warmup | ResponsesAttemptKind::Connect
+        ) {
             return ResponsesInput::new(self.profile.prefix(), &[], None);
         }
         if self.full_replay {
@@ -399,6 +405,8 @@ pub enum ResponsesOutput {
     Generation(GenerationOutput),
 
     Compaction(CompactionOutput),
+
+    Connected,
 }
 
 pub struct ResponsesServiceResponse {
@@ -545,6 +553,18 @@ impl ResponsesAttemptFactory {
             Arc::clone(&self.session_transport),
         );
         attempt.logical_turn = self.logical_turn;
+        attempt
+    }
+
+    #[must_use]
+    pub fn connect(
+        &self,
+        model: Model,
+        thinking: Thinking,
+        service_tier: impl Into<ServiceTier>,
+    ) -> ResponsesAttempt {
+        let mut attempt = self.warmup(model, thinking, service_tier);
+        attempt.kind = ResponsesAttemptKind::Connect;
         attempt
     }
 

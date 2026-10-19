@@ -20,9 +20,12 @@ pub(crate) async fn run(
     request: &ResponsesAttempt,
     started_at: Instant,
 ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
-    if matches!(request.kind, ResponsesAttemptKind::Warmup) {
+    if matches!(
+        request.kind,
+        ResponsesAttemptKind::Warmup | ResponsesAttemptKind::Connect
+    ) {
         return Err(ResponsesServiceError::invalid_attempt_state(
-            "HTTPS Responses transport does not perform a warmup request",
+            "HTTPS Responses transport does not perform a warmup or connect request",
             FailurePhase::Protocol,
             0,
         ));
@@ -96,12 +99,16 @@ pub(crate) async fn run(
             )
             .await?,
         ),
-        ResponsesAttemptKind::Warmup => unreachable!("warmup rejected above"),
+        ResponsesAttemptKind::Warmup | ResponsesAttemptKind::Connect => {
+            unreachable!("warmup and connect rejected above")
+        }
     };
     let pipeline_stats = match &output {
         ResponsesOutput::Generation(result) => result.pipeline_stats,
         ResponsesOutput::Compaction(result) => result.pipeline_stats,
-        ResponsesOutput::Warmup(_) => unreachable!("warmup rejected above"),
+        ResponsesOutput::Warmup(_) | ResponsesOutput::Connected => {
+            unreachable!("warmup and connect rejected above")
+        }
     };
     record_pipeline_stats(
         &span,

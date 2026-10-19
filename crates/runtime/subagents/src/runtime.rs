@@ -107,8 +107,8 @@ pub(super) fn completion_instructions(schema: &str) -> String {
 
 pub(super) fn completion_reminder() -> String {
     format!(
-        "{COMPLETION_INSTRUCTIONS_LEAD} with output matching the output schema given earlier in \
-         this turn."
+        "{COMPLETION_INSTRUCTIONS_LEAD} with output matching the output schema from your \
+         assignment."
     )
 }
 
@@ -613,7 +613,7 @@ impl RegistryState {
             .into());
         }
         let (output, decoded_json_text) =
-            validate_submitted_output(&session.output_validator, output)?;
+            validate_submitted_output(&session.output_validator, &session.output_schema, output)?;
         session.submitted_output = Some(output);
         Ok(SubmissionOutcome::Accepted { decoded_json_text })
     }
@@ -4295,6 +4295,7 @@ fn complete_session(session: &mut ChildSession, output: Option<Value>) -> AgentS
 
 fn validate_submitted_output(
     validator: &Validator,
+    schema: &Value,
     output: Value,
 ) -> Result<(Value, bool), CompletionError> {
     if validator.is_valid(&output) {
@@ -4307,7 +4308,7 @@ fn validate_submitted_output(
     {
         return Ok((decoded, true));
     }
-    let errors = validator
+    let mut errors = validator
         .iter_errors(&output)
         .take(4)
         .map(|error| {
@@ -4318,6 +4319,7 @@ fn validate_submitted_output(
             )
         })
         .collect::<Vec<_>>();
+    errors.push(format!("required schema: {schema}"));
     Err(CompletionError::new(
         CompletionErrorCode::SchemaValidation,
         true,

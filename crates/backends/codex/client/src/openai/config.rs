@@ -163,7 +163,7 @@ impl ModelConfig {
             service_tier: ServiceTier::Standard,
             context_window_tokens: CONTEXT_WINDOW_TOKENS,
             responses_transport: ResponsesTransport::default(),
-            websocket_warmup: true,
+            websocket_warmup: false,
             raw_api_events: true,
             responses_history: ResponsesHistory::default(),
             store_responses: false,

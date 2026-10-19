@@ -467,9 +467,10 @@ impl ResponsesService {
                 .await
                 .map_err(|error| error.with_connection_generation(generation))?,
             ),
+            ResponsesAttemptKind::Connect => ResponsesOutput::Connected,
         };
         let pipeline_stats = match &output {
-            ResponsesOutput::Warmup(_) => None,
+            ResponsesOutput::Warmup(_) | ResponsesOutput::Connected => None,
             ResponsesOutput::Generation(result) => Some(result.pipeline_stats),
             ResponsesOutput::Compaction(result) => Some(result.pipeline_stats),
         };
@@ -606,6 +607,13 @@ impl ResponsesService {
                 &request.profile,
                 connection.turn_state.as_deref(),
             )),
+            ResponsesAttemptKind::Connect => {
+                return Err(ResponsesServiceError::invalid_attempt_state(
+                    "a connect attempt does not encode a request",
+                    FailurePhase::Encode,
+                    connection.generation,
+                ));
+            }
             ResponsesAttemptKind::Generation | ResponsesAttemptKind::Compaction => {
                 EncodedRequest::new(&ResponseCreate::generation_with_policy(
                     &self.config,
@@ -981,6 +989,19 @@ impl Service<ResponsesAttempt> for ResponsesService {
                     && connection.socket_needs_renewal()
                 {
                     connection.invalidate(ConnectionPurpose::Reconnect);
+                }
+                if matches!(request.kind, ResponsesAttemptKind::Connect) {
+                    if matches!(transport, ResponsesTransport::WebSocket)
+                        && connection.socket.is_none()
+                    {
+                        service.connect(&mut connection, &request).await?;
+                    }
+                    return Ok(ResponsesServiceResponse {
+                        output: ResponsesOutput::Connected,
+                        attempt: request.attempt,
+                        connection_generation: connection.generation,
+                        server_reasoning_included: connection.server_reasoning_included,
+                    });
                 }
                 let replaces_websocket = matches!(transport, ResponsesTransport::WebSocket)
                     && connection.socket.is_none()

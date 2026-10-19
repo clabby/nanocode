@@ -414,6 +414,29 @@ impl ModelRun {
         self.client = client;
     }
 
+    pub(crate) fn preconnect(
+        &mut self,
+    ) -> Option<crate::agent::execution::ExecutionFuture<'static, ()>> {
+        if !matches!(
+            self.config.responses_transport,
+            ResponsesTransport::WebSocket
+        ) {
+            return None;
+        }
+        let factory = ResponsesAttemptFactory::new(
+            RequestProfile::new(
+                self.provider_session_id.to_string(),
+                String::new(),
+                Arc::from([]),
+            )
+            .with_thread_id(self.events.request_id()),
+            self.events.clone(),
+            Arc::clone(&self.transport_stats),
+        );
+        self.client
+            .preconnect(factory.connect(self.model, self.thinking, self.service_tier))
+    }
+
     pub(crate) async fn shutdown(&mut self) {
         if let Some(tools) = &self.active_tools {
             tools.cancel().await;

@@ -99,6 +99,7 @@ struct Harness {
     pending_deferred: VecDeque<AgentMessage>,
     pending_urgent: VecDeque<AgentMessage>,
     output_schema: String,
+    contract_delivered: bool,
     rehydrated_assignment: Option<String>,
     capacity: Capacity,
     capacity_revision: watch::Receiver<u64>,
@@ -246,6 +247,7 @@ pub(super) fn spawn(
             pending_deferred: VecDeque::new(),
             pending_urgent: VecDeque::new(),
             output_schema,
+            contract_delivered: false,
             rehydrated_assignment,
             capacity,
             capacity_revision,
@@ -618,10 +620,12 @@ impl Harness {
             Some(assignment) => format!("{assignment}\n\n{prompt}"),
             None => prompt,
         };
-        let prompt = format!(
-            "{prompt}\n\n{}",
+        let contract = if self.contract_delivered {
+            completion_reminder()
+        } else {
             completion_instructions(&self.output_schema)
-        );
+        };
+        let prompt = format!("{prompt}\n\n{contract}");
         let request = match pending {
             Some((id, input)) => {
                 let recovered = agent
@@ -650,6 +654,7 @@ impl Harness {
             }
         };
         self.rehydrated_assignment = None;
+        self.contract_delivered = true;
         let control = turn.control();
         let result = platform::spawn(turn);
         self.active = Some(ActiveTurn {
