@@ -13,7 +13,7 @@ use nanocode_agent_core::{
         AgentFactory, BackendFuture, BackendPrompt, BackendPromptRoute, BackendRuntime,
         BackendTurn, BackendTurnKey, BuilderBackend, LifecycleBackend, TurnBoundary,
     },
-    events::{AgentEvent, AgentEventKind, AgentEventPublisher},
+    events::{AgentEventKind, AgentEventPublisher, TextDeltaRef},
     input::Prompt,
 };
 use serde::{Deserialize, Serialize};
@@ -1545,7 +1545,6 @@ impl ClaudeBuilder {
             cancellations: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
             closing: AtomicBool::new(false),
-            sequence: std::sync::Mutex::new(1),
             accepted_turns: AtomicU64::new(accepted_turns),
             steering: Mutex::new(HashMap::new()),
             live_nested_starts: std::sync::Mutex::new(LiveNestedStarts::default()),
@@ -2767,7 +2766,6 @@ struct State {
     stopped: AtomicBool,
     closing: AtomicBool,
 
-    sequence: std::sync::Mutex<u64>,
     accepted_turns: AtomicU64,
     steering: Mutex<HashMap<BackendTurnKey, TurnSteering>>,
 
@@ -3515,13 +3513,6 @@ impl ServerRecovery {
         )
     }
 }
-struct PendingDisplay {
-    kind: AgentEventKind,
-    block: usize,
-    text: String,
-    model_elapsed_ns: u64,
-}
-
 struct ResponseFailure {
     error: NanocodeError,
     recovery: Option<ServerRecovery>,
@@ -3796,71 +3787,7 @@ impl State {
         let Ok(payload) = serde_json::value::to_raw_value(&payload) else {
             return;
         };
-        self.emit_raw(events, kind, payload);
-    }
-
-    fn flush_display(
-        &self,
-        events: &AgentEventPublisher,
-        index: u32,
-        message_id: Option<&str>,
-        pending: &PendingDisplay,
-        pipeline: &mut telemetry::CallPipeline,
-    ) {
-        #[derive(Serialize)]
-        struct DisplayDelta<'a> {
-            item_id: Option<&'a str>,
-            model_call_index: u32,
-            model_elapsed_ns: u64,
-            phase: Option<()>,
-            text: &'a str,
-            turn_id: &'a str,
-        }
-        let emit_started = Instant::now();
-        let thinking = (pending.kind == AgentEventKind::ReasoningSummaryDelta)
-            .then(|| message_id.map(|id| format!("{id}:thinking:{}", pending.block)));
-        let payload = serde_json::value::to_raw_value(&DisplayDelta {
-            item_id: thinking.as_ref().map_or(message_id, Option::as_deref),
-            model_call_index: index.saturating_add(1),
-            model_elapsed_ns: pending.model_elapsed_ns,
-            phase: None,
-            text: &pending.text,
-            turn_id: events.turn_id().unwrap_or(events.request_id()),
-        });
-        if let Ok(payload) = payload {
-            self.emit_raw(events, pending.kind, payload);
-        }
-        pipeline.display_delta_emit_ns = pipeline
-            .display_delta_emit_ns
-            .saturating_add(telemetry::elapsed_ns(emit_started));
-        pipeline.display_delta_count = pipeline.display_delta_count.saturating_add(1);
-        pipeline.display_delta_bytes = pipeline
-            .display_delta_bytes
-            .saturating_add(u64::try_from(pending.text.len()).unwrap_or(u64::MAX));
-    }
-
-    fn emit_raw(
-        &self,
-        events: &AgentEventPublisher,
-        kind: AgentEventKind,
-        payload: Box<serde_json::value::RawValue>,
-    ) {
-        let mut event = AgentEvent {
-            protocol_version: 1,
-            request_id: Arc::from(events.request_id()),
-            seq: 0,
-            kind,
-            payload: Arc::from(payload),
-        };
-
-        let mut sequence = self
-            .sequence
-            .lock()
-            .expect("Claude event sequence lock poisoned");
-        event.seq = *sequence;
-        if events.publish(event).is_ok() {
-            *sequence += 1;
-        }
+        let _ = events.publish_next(kind, Arc::from(payload));
     }
     fn model(&self) -> String {
         self.model.clone()
@@ -4157,7 +4084,10 @@ impl State {
         let mut journal = context.journal;
         let admitted = match &context.effect {
             Some(effect) => {
-                let writes = journal.as_deref_mut().map(Journal::take).unwrap_or_default();
+                let writes = journal
+                    .as_deref_mut()
+                    .map(Journal::take)
+                    .unwrap_or_default();
                 let advanced = writes
                     .iter()
                     .any(|write| matches!(write, crate::execution::JournalWrite::Advance(_)));
@@ -4299,7 +4229,7 @@ impl State {
                     let cancelled = cancel.cancelled();
                     tokio::pin!(cancelled);
                     let mut accumulator: Option<MessageAccumulator> = None;
-                    let mut display: Option<PendingDisplay> = None;
+                    let mut thinking_item: Option<(usize, String)> = None;
                     loop {
                         let receive_started = Instant::now();
                         let mut next = tokio::select! {
@@ -4353,23 +4283,44 @@ impl State {
                                 let model_elapsed_ns = elapsed_ns();
                                 first_output.get_or_insert(model_elapsed_ns);
                                 if let Some(events) = events {
-                                    match &mut display {
-                                        Some(pending) if pending.kind == kind && pending.block == block => {
-                                            pending.text.push_str(text);
-                                        }
-                                        _ => {
-                                            if let Some(pending) = display.take() {
-                                                self.flush_display(events, index, message_id.as_deref(), &pending, &mut pipeline);
-                                                published_text = true;
-                                            }
-                                            display = Some(PendingDisplay {
-                                                kind,
-                                                block,
-                                                text: text.clone(),
-                                                model_elapsed_ns,
-                                            });
-                                        }
+                                    if kind == AgentEventKind::ReasoningSummaryDelta
+                                        && let Some(id) = &message_id
+                                        && thinking_item
+                                            .as_ref()
+                                            .is_none_or(|(cached, _)| *cached != block)
+                                    {
+                                        thinking_item =
+                                            Some((block, format!("{id}:thinking:{block}")));
                                     }
+                                    let item_id = match (kind, &thinking_item) {
+                                        (
+                                            AgentEventKind::ReasoningSummaryDelta,
+                                            Some((_, item)),
+                                        ) => Some(item.as_str()),
+                                        _ => message_id.as_deref(),
+                                    };
+                                    let emit_started = Instant::now();
+                                    let _ = events.emit_text_delta(
+                                        kind,
+                                        TextDeltaRef {
+                                            model_call_index: index.saturating_add(1),
+                                            item_id: item_id.map(std::borrow::Cow::Borrowed),
+                                            phase: None,
+                                            text: std::borrow::Cow::Borrowed(text),
+                                            model_elapsed_ns: Some(model_elapsed_ns),
+                                        },
+                                        None,
+                                    );
+                                    published_text = true;
+                                    pipeline.display_delta_emit_ns = pipeline
+                                        .display_delta_emit_ns
+                                        .saturating_add(telemetry::elapsed_ns(emit_started));
+                                    pipeline.display_delta_count =
+                                        pipeline.display_delta_count.saturating_add(1);
+                                    pipeline.display_delta_bytes =
+                                        pipeline.display_delta_bytes.saturating_add(
+                                            u64::try_from(text.len()).unwrap_or(u64::MAX),
+                                        );
                                 }
                             }
                             let pushed = match &mut accumulator {
@@ -4384,9 +4335,10 @@ impl State {
                                 Ok(true) => {
                                     response_completed_ns = Some(elapsed_ns());
                                     let collect_started = Instant::now();
-                                    let collected = accumulator
-                                        .take()
-                                        .map_or(Err(ClaudeError::IncompleteStream), MessageAccumulator::finish);
+                                    let collected = accumulator.take().map_or(
+                                        Err(ClaudeError::IncompleteStream),
+                                        MessageAccumulator::finish,
+                                    );
                                     pipeline.collect_ns = telemetry::elapsed_ns(collect_started);
                                     break Some(collected);
                                 }
@@ -4402,9 +4354,12 @@ impl State {
                                 None => break None,
                             }
                         };
-                        if let (Some(events), Some(pending)) = (events, display.take()) {
-                            self.flush_display(events, index, message_id.as_deref(), &pending, &mut pipeline);
-                            published_text = true;
+                        if let Some(events) = events {
+                            let flush_started = Instant::now();
+                            let _ = events.flush_deltas();
+                            pipeline.display_delta_emit_ns = pipeline
+                                .display_delta_emit_ns
+                                .saturating_add(telemetry::elapsed_ns(flush_started));
                         }
                         if let Some(ended) = ended {
                             break ended;
@@ -5651,9 +5606,7 @@ impl State {
                 role: Role::Assistant,
                 content: std::mem::take(&mut response.content),
             });
-            self.publish_side_view(Some(
-                pending.iter().chain([&assistant]).cloned().collect(),
-            ));
+            self.publish_side_view(Some(pending.iter().chain([&assistant]).cloned().collect()));
             if cursor.model_step_offset == 0 {
                 cursor.model_step_offset = 1;
                 cursor.model_receipt_start = Some(index.saturating_add(2));
@@ -6009,7 +5962,8 @@ impl State {
                 self.refresh_dynamic_tools(&mut cursor);
                 if response.stop_reason == Some(StopReason::ToolUse) {
                     cursor.output_continuations = 0;
-                    self.defer_cursor(&mut cursor, conversation, journal).await?;
+                    self.defer_cursor(&mut cursor, conversation, journal)
+                        .await?;
                     continue;
                 }
             }
@@ -6030,7 +5984,8 @@ impl State {
                 cursor.usage = usage.clone();
 
                 cursor.output_continuations = 0;
-                self.defer_cursor(&mut cursor, conversation, journal).await?;
+                self.defer_cursor(&mut cursor, conversation, journal)
+                    .await?;
                 continue;
             }
             let exhausted = response.stop_reason == Some(StopReason::ModelContextWindowExceeded);
@@ -6079,7 +6034,8 @@ impl State {
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
                 self.refresh_dynamic_tools(&mut cursor);
-                self.defer_cursor(&mut cursor, conversation, journal).await?;
+                self.defer_cursor(&mut cursor, conversation, journal)
+                    .await?;
                 continue;
             }
             if exhausted {
@@ -6118,7 +6074,8 @@ impl State {
                 cursor.index = index + 1;
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
-                self.defer_cursor(&mut cursor, conversation, journal).await?;
+                self.defer_cursor(&mut cursor, conversation, journal)
+                    .await?;
                 continue;
             }
             if has_tool_calls || response.stop_reason != Some(StopReason::EndTurn) {
@@ -6179,7 +6136,8 @@ impl State {
                 cursor.index = index + 1;
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
-                self.defer_cursor(&mut cursor, conversation, journal).await?;
+                self.defer_cursor(&mut cursor, conversation, journal)
+                    .await?;
                 continue;
             }
 
@@ -6209,7 +6167,8 @@ impl State {
                 cursor.index = index + 1;
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
-                self.defer_cursor(&mut cursor, conversation, journal).await?;
+                self.defer_cursor(&mut cursor, conversation, journal)
+                    .await?;
                 continue;
             }
             conversation.messages = pending;
