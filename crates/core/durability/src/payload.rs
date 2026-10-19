@@ -17,6 +17,8 @@ const MANIFEST_PREFIX: char = '%';
 
 const SHA256_MANIFEST_PREFIX: char = '#';
 
+const TREE_PREFIX: char = '^';
+
 const KEY_PREFIX: &str = "b3:";
 
 const GEAR: [u64; 256] = gear_table();
@@ -82,28 +84,77 @@ pub struct EncodedPayload {
 
 #[derive(Debug)]
 struct Layout {
-    manifest: String,
+    hashes: String,
     ends: Vec<usize>,
+    nodes: Vec<(String, String)>,
+    root: String,
 }
 
 impl Layout {
     fn of(content: &str) -> Self {
-        let mut manifest = String::with_capacity(1 + content.len() / CHUNK_MIN * 64);
-        manifest.push(MANIFEST_PREFIX);
+        let mut hashes = String::with_capacity(content.len() / CHUNK_MIN * HASH_HEX);
         let mut ends = Vec::with_capacity(content.len() / CHUNK_AVG + 1);
         let mut offset = 0;
         while offset < content.len() {
             let end = offset + chunk_end(&content[offset..]);
-            manifest.push_str(&content_hash(&content[offset..end]));
+            hashes.push_str(&content_hash(&content[offset..end]));
             ends.push(end);
             offset = end;
         }
-        Self { manifest, ends }
+        let mut nodes = Vec::new();
+        let root = manifest_tree(MANIFEST_PREFIX, &hashes, &mut nodes);
+        Self {
+            hashes,
+            ends,
+            nodes,
+            root,
+        }
     }
 
     fn hash(&self, index: usize) -> &str {
-        &self.manifest[1 + index * 64..1 + (index + 1) * 64]
+        &self.hashes[index * HASH_HEX..(index + 1) * HASH_HEX]
     }
+}
+
+const HASH_HEX: usize = 64;
+
+fn manifest_tree(prefix: char, hashes: &str, nodes: &mut Vec<(String, String)>) -> String {
+    if 1 + hashes.len() < INLINE_BYTES {
+        return format!("{prefix}{hashes}");
+    }
+    let mut parents = String::new();
+    let mut group = String::from(prefix);
+    let mut count = 0;
+    for hash in hashes.as_bytes().chunks(HASH_HEX) {
+        let hash = std::str::from_utf8(hash).unwrap_or_default();
+        group.push_str(hash);
+        count += 1;
+        if count >= CHUNK_MAX / HASH_HEX || (count >= CHUNK_MIN / HASH_HEX && node_cut(hash)) {
+            close_group(&mut group, &mut parents, nodes, prefix);
+            count = 0;
+        }
+    }
+    if count > 0 {
+        close_group(&mut group, &mut parents, nodes, prefix);
+    }
+    manifest_tree(TREE_PREFIX, &parents, nodes)
+}
+
+fn node_cut(hash: &str) -> bool {
+    u32::from_str_radix(&hash[..8], 16)
+        .is_ok_and(|value| value % (CHUNK_AVG / HASH_HEX) as u32 == 0)
+}
+
+fn close_group(
+    group: &mut String,
+    parents: &mut String,
+    nodes: &mut Vec<(String, String)>,
+    prefix: char,
+) {
+    let text = std::mem::replace(group, String::from(prefix));
+    let hash = content_hash(&text);
+    parents.push_str(&hash);
+    nodes.push((hash, text));
 }
 
 fn keyed(json: &str) -> (Arc<str>, Option<Arc<Layout>>) {
@@ -111,7 +162,7 @@ fn keyed(json: &str) -> (Arc<str>, Option<Arc<Layout>>) {
         return (record_key(json).into(), None);
     }
     let layout = Layout::of(json);
-    (record_key(&layout.manifest).into(), Some(Arc::new(layout)))
+    (record_key(&layout.root).into(), Some(Arc::new(layout)))
 }
 
 impl EncodedPayload {
@@ -219,9 +270,18 @@ impl EncodedPayload {
             }
             offset = end;
         }
+        for (hash, text) in &layout.nodes {
+            let key = chunk_key(hash);
+            if !known(&key) {
+                records.push(crate::StoreRecord {
+                    key,
+                    value: text.clone(),
+                });
+            }
+        }
         records.push(crate::StoreRecord {
             key: self.key.to_string(),
-            value: layout.manifest.clone(),
+            value: layout.root.clone(),
         });
     }
 
@@ -282,14 +342,15 @@ impl EncodedPayload {
         let mut verified = false;
         let content = if let Some(content) = record.strip_prefix('=') {
             content
-        } else if let Some(hashes) = record.strip_prefix(MANIFEST_PREFIX) {
+        } else if record.starts_with(MANIFEST_PREFIX) || record.starts_with(TREE_PREFIX) {
             if record_key(&record) != self.key.as_ref() {
                 return Err(Error::InvalidState(format!(
                     "payload manifest checksum mismatch {}",
                     self.key
                 )));
             }
-            assembled = self.assemble(store, state_id, hashes, true).await?;
+            let hashes = self.leaf_hashes(store, state_id, record.clone()).await?;
+            assembled = self.assemble(store, state_id, &hashes, true).await?;
             verified = true;
             &assembled
         } else if let Some(hashes) = record.strip_prefix(SHA256_MANIFEST_PREFIX) {
@@ -328,6 +389,56 @@ impl EncodedPayload {
             layout: None,
             pending: Vec::new(),
         })
+    }
+
+    async fn leaf_hashes<S: RecordSource + ?Sized>(
+        &self,
+        store: &mut S,
+        state_id: &str,
+        root: String,
+    ) -> Result<String> {
+        let mut level = vec![root];
+        loop {
+            let leaves = level.iter().all(|text| text.starts_with(MANIFEST_PREFIX));
+            if !leaves && !level.iter().all(|text| text.starts_with(TREE_PREFIX)) {
+                return Err(Error::InvalidState(format!(
+                    "payload manifest tree mixes levels {}",
+                    self.key
+                )));
+            }
+            let hashes: String = level.iter().map(|text| &text[1..]).collect();
+            if hashes.is_empty()
+                || hashes.len() % HASH_HEX != 0
+                || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+            }
+            if leaves {
+                return Ok(hashes);
+            }
+            let keys: Vec<String> = hashes
+                .as_bytes()
+                .chunks(HASH_HEX)
+                .map(|hash| chunk_key(std::str::from_utf8(hash).unwrap_or_default()))
+                .collect();
+            let children = store.records(state_id, &keys).await?;
+            if children.len() != keys.len() {
+                return Err(Error::InvalidState("record batch length mismatch".into()));
+            }
+            level = Vec::with_capacity(keys.len());
+            for (index, (key, child)) in keys.iter().zip(children).enumerate() {
+                let child = child.ok_or_else(|| {
+                    Error::InvalidState(format!("missing payload manifest {key} of {}", self.key))
+                })?;
+                if content_hash(&child) != hashes[index * HASH_HEX..(index + 1) * HASH_HEX] {
+                    return Err(Error::InvalidState(format!(
+                        "payload manifest checksum mismatch {key} of {}",
+                        self.key
+                    )));
+                }
+                level.push(child);
+            }
+        }
     }
 
     async fn assemble<S: RecordSource + ?Sized>(
