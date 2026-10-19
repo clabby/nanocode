@@ -13,6 +13,25 @@ use crate::cli::{GatewayArg, GatewayArgs, RemoteArgs, RunnerModeArg};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+pub type WarmUp = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+#[derive(Clone)]
+pub struct ModelClients {
+    pub openai: std::sync::Arc<dyn Fn() -> nanocode::codex::OpenAiBuilder + Send + Sync>,
+    pub claude: std::sync::Arc<dyn Fn() -> ClaudeClient + Send + Sync>,
+    pub warm_up: Option<std::sync::Arc<dyn Fn() -> WarmUp + Send + Sync>>,
+}
+
+static MODEL_CLIENTS: std::sync::OnceLock<ModelClients> = std::sync::OnceLock::new();
+
+pub fn set_model_clients(clients: ModelClients) -> bool {
+    MODEL_CLIENTS.set(clients).is_ok()
+}
+
+pub fn model_clients() -> Option<&'static ModelClients> {
+    MODEL_CLIENTS.get()
+}
+
 #[derive(Clone)]
 pub struct HostConfig {
     pub workspace: PathBuf,
@@ -191,17 +210,21 @@ impl Host {
         model: &ModelSelection,
         thinking: Thinking,
     ) -> Result<Self> {
-        let openai = match &config.gateway {
-            Some(gateway) => {
+        let clients = model_clients();
+        let openai = match (clients, &config.gateway) {
+            (Some(clients), _) => (clients.openai)(),
+            (None, Some(gateway)) => {
                 gateway.check(model)?;
                 OpenAi::builder(gateway.auth.clone()).responses_gateway(gateway.route.clone())
             }
-            None => OpenAi::builder(nanocode::codex::OpenAiAuth::chatgpt()),
+            (None, None) => OpenAi::builder(nanocode::codex::OpenAiAuth::chatgpt()),
         }
         .raw_api_events(false)
         .build()?;
         let codex = CodexHarness::new(openai);
-        let claude = ClaudeHarness::new(ClaudeClient::default());
+        let claude = ClaudeHarness::new(
+            clients.map_or_else(ClaudeClient::default, |clients| (clients.claude)()),
+        );
         let mut builder = Nanocode::builder()
             .openai(codex)
             .claude(claude)

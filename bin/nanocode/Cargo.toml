@@ -12,6 +12,13 @@ homepage.workspace = true
 repository.workspace = true
 description = "Interactive terminal coding agent built on the Nanocode Rust crates"
 
+[lib]
+name = "nanocode_cli"
+path = "src/lib.rs"
+test = false
+bench = false
+doctest = false
+
 [[bin]]
 name = "nanocode"
 path = "src/main.rs"
