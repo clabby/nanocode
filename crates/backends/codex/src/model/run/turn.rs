@@ -580,6 +580,7 @@ impl ModelRun {
                 conversation,
                 context,
                 preserve_inherited_delta: false,
+                exec_history: None,
             };
             session
                 .conversation
@@ -997,7 +998,7 @@ impl ModelRun {
             let history = code_calls
                 .iter()
                 .any(|call| call.name == "exec")
-                .then(|| Arc::new(session.conversation.flattened_history()));
+                .then(|| session.exec_history());
             {
                 let tool_control = session.tools.control();
                 let tools = self.execute_model_tools(

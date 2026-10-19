@@ -7,9 +7,28 @@ pub(super) struct ModelSessionState {
     pub(super) conversation: ConversationState,
     pub(super) context: ContextState,
     pub(super) preserve_inherited_delta: bool,
+    pub(super) exec_history: Option<(ResponseHistory, Arc<Vec<ResponseItem>>)>,
 }
 
 impl ModelSessionState {
+    pub(super) fn exec_history(&mut self) -> (Arc<Vec<ResponseItem>>, usize) {
+        self.conversation.commit_tail();
+        let live = self.conversation.shared_history();
+        if let Some((cached, snapshot)) = &mut self.exec_history
+            && cached.shared_prefix_len(&live) == snapshot.len()
+            && let Some(items) = Arc::get_mut(snapshot)
+        {
+            let copied = live.len() - items.len();
+            items.extend(live.iter_from(items.len()).cloned());
+            *cached = live;
+            return (Arc::clone(snapshot), copied);
+        }
+        let snapshot = Arc::new(live.iter().cloned().collect::<Vec<_>>());
+        let copied = snapshot.len();
+        self.exec_history = Some((live, Arc::clone(&snapshot)));
+        (snapshot, copied)
+    }
+
     pub(super) fn validate_workspace(&self, requested: Option<&str>) -> Result<()> {
         let Some(requested) = requested else {
             return Ok(());
@@ -125,7 +144,7 @@ impl ConversationState {
         self.managed.active_context_tokens()
     }
 
-    pub(super) fn shared_history(&self) -> crate::client::responses::ResponseHistory {
+    pub(super) fn shared_history(&self) -> ResponseHistory {
         self.managed.shared_history()
     }
 

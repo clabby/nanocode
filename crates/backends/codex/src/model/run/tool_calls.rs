@@ -289,15 +289,21 @@ impl ModelRun {
         conversation: &mut ConversationState,
         call_index: u32,
         calls: Vec<CodeCall>,
-        history: Option<Arc<Vec<ResponseItem>>>,
+        history: Option<(Arc<Vec<ResponseItem>>, usize)>,
         turn_id: String,
     ) -> Result<()> {
         self.active_tool_batch_started_at = Some(Instant::now());
         let mut prepared = Vec::with_capacity(calls.len());
         for call in calls {
             let active = self.prepare_model_tool_call(call_index, &call)?;
+            if call.name == "exec"
+                && let Some((_, copied)) = &history
+            {
+                active.span.record("history.snapshot.items_copied", copied);
+            }
             prepared.push((call, active));
         }
+        let history = history.map(|(history, _)| history);
 
         let events = self.events.clone();
         let tool_call_indices = self.tool_call_indices.clone();

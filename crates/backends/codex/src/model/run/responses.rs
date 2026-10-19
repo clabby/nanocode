@@ -300,6 +300,7 @@ pub(super) fn model_tool_span(
         tool.call_id = %call.call_id,
         tool.arguments.bytes = call.input.len(),
         model.call_index = call_index,
+        history.snapshot.items_copied = tracing::field::Empty,
         status = tracing::field::Empty,
         duration_ns = tracing::field::Empty,
     )

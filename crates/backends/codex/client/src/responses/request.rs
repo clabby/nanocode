@@ -243,6 +243,24 @@ impl ResponseHistory {
         Arc::make_mut(&mut self.tail).extend(replacement);
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub fn shared_prefix_len(&self, other: &Self) -> usize {
+        let mut left = self.head.as_ref();
+        let mut right = other.head.as_ref();
+        while let (Some(segment), Some(other_segment)) = (left, right) {
+            if Arc::ptr_eq(segment, other_segment) {
+                return segment.len;
+            }
+            if segment.len >= other_segment.len {
+                left = segment.previous.as_ref();
+            } else {
+                right = other_segment.previous.as_ref();
+            }
+        }
+        0
+    }
+
     #[must_use]
     pub fn iter(&self) -> ResponseHistoryIter<'_> {
         ResponseHistoryIter::new(self, 0)

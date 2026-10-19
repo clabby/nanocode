@@ -29,7 +29,10 @@ use crate::client::{
     Model, Prompt, Thinking,
     events::AgentEventKind,
     pricing::{ServiceTier, estimate_for_model},
-    responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},
+    responses::{
+        ContentItem, MessageRole, RequestProfile, ResponseHistory, ResponseItem, ToolDefinition,
+        Usage,
+    },
     tower::{
         CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt, ResponsesOutput,
     },
@@ -374,6 +377,7 @@ impl ModelRun {
                 conversation: checkpoint.conversation,
                 context,
                 preserve_inherited_delta: checkpoint.preserve_inherited_delta,
+                exec_history: None,
             }),
             active_tools: Some(active_tools),
             active_tool_calls: Vec::new(),
@@ -564,6 +568,7 @@ impl ModelRun {
             conversation: ConversationState::empty(canonical_context),
             context,
             preserve_inherited_delta: false,
+            exec_history: None,
         })
     }
 
