@@ -104,6 +104,8 @@ fn disconnected(name: &str) -> CodeModeHostError {
     ))
 }
 
+pub const PLACEMENT_INSTRUCTIONS: &str = "Code Mode scripts run on one machine: the hand that sent the prompt, the only attached hand, or the session's configured executor. Inside a script any tool call runs on another attached hand when its arguments include hand: \"<name>\", so one script can work on several machines at once, for example with Promise.all; tools.hands() lists them. Relative paths resolve from each hand's working directory; query pwd through the shell when an absolute path is needed.";
+
 const HANDS_DESCRIPTION: &str = "List the hands attached to this session: whole machines, each with its own files, processes and tools. `here` names the hand this script runs on, or is null on the brain's own machine. Inside exec, any tool call runs on another hand when its arguments include `hand: \"<name>\"`, for example `await Promise.all(names.map(hand => tools.exec_command({ cmd: \"uptime\", hand })))`; a freeform tool takes `{ input, hand }`. Calls without `hand` run where the script runs. Naming a hand that is not attached fails without running anything, and a hand lost mid-call leaves that call's outcome unknown.";
 
 struct ExecutorCalls(Weak<Mutex<State>>);
@@ -284,6 +286,27 @@ impl CodeModeExecutors {
         match selection {
             Some(selection) => {
                 state.selections.insert(session_id.into(), selection);
+            }
+            None => {
+                state.selections.remove(session_id);
+            }
+        }
+    }
+
+    pub fn select_prompt_hand(&self, session_id: &str, sender: Option<&str>) {
+        let mut state = self.state();
+        let hand = sender.map(Arc::from).or_else(|| {
+            if state.default.is_none() && state.executors.len() == 1 {
+                state.executors.keys().next().cloned()
+            } else {
+                None
+            }
+        });
+        match hand {
+            Some(hand) => {
+                state
+                    .selections
+                    .insert(session_id.into(), ExecutorSelection::Executor(hand));
             }
             None => {
                 state.selections.remove(session_id);

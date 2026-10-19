@@ -15,4 +15,4 @@ pub use native::{
     serve_connect_with, serve_stream,
 };
 #[cfg(not(target_family = "wasm"))]
-pub(crate) use native::{LOCAL_CLOSED, PEER_CLOSED, SocketShutdown};
+pub(crate) use native::SocketShutdown;

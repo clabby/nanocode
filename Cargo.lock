@@ -1847,6 +1847,7 @@ dependencies = [
  "futures-util",
  "nanocode-code-mode-engine",
  "nanocode-media",
+ "nanocode-platform",
  "nanocode-tool-contracts",
  "nanocode-tools",
  "nanocode-types-core",

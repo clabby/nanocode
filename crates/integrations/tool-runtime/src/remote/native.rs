@@ -75,26 +75,9 @@ impl SocketShutdown {
 
 use super::RemoteFrame as Frame;
 
-struct CallbackState {
-    tools: Vec<Arc<dyn Tool>>,
-    context: RemoteContext,
-    generation: u64,
-    observer: Option<Box<dyn CodeModeObserver>>,
-}
-struct Client {
-    outgoing: mpsc::UnboundedSender<Frame>,
-    pending: Mutex<HashMap<u64, mpsc::UnboundedSender<Frame>>>,
-    callbacks: Mutex<HashMap<(String, String), CallbackState>>,
-    next: AtomicU64,
-    turns: Mutex<HashMap<String, u64>>,
-    operation_timeout: Option<Duration>,
-    failure: Mutex<Option<String>>,
-    closed: watch::Sender<Option<String>>,
-    hands: Mutex<Option<Arc<dyn HandCalls>>>,
-}
-
 pub struct SocketTransport {
-    client: Arc<Client>,
+    client: RemoteClient,
+    closed: Arc<watch::Sender<Option<String>>>,
     definitions: Vec<ToolDefinition>,
     name: Option<String>,
     workspace: Option<String>,
@@ -168,9 +151,6 @@ impl Liveness {
         }
     }
 }
-
-pub(crate) const PEER_CLOSED: &str = "runner disconnected";
-pub(crate) const LOCAL_CLOSED: &str = "remote connection closed";
 
 const UNRESPONSIVE: &str =
     "remote peer did not answer a WebSocket heartbeat ping within half of request_timeout";
@@ -430,7 +410,7 @@ impl SocketTransport {
         self.workspace.as_deref()
     }
     pub(crate) fn closed(&self) -> watch::Receiver<Option<String>> {
-        self.client.closed.subscribe()
+        self.closed.subscribe()
     }
     pub(crate) fn runtime_id(&self) -> Option<&str> {
         self.runtime_id.as_deref()
@@ -473,136 +453,37 @@ impl SocketTransport {
                 "runner published an invalid code mode catalog: {issue}"
             ))
         })?;
-        let (sink, mut socket) = socket.split();
+        let (sink, socket) = socket.split();
         let shutdown = SocketShutdown {
             token: CancellationToken::new(),
             reason: Arc::default(),
         };
-        let (wire, mut writer) = writer(
+        let (wire, writer) = writer(
             sink,
             policy,
             Arc::clone(&liveness),
             Arc::clone(&shutdown.reason),
         );
-        let (outgoing, mut incoming) = mpsc::unbounded_channel();
-        let client = Arc::new(Client {
-            outgoing,
-            pending: Mutex::new(HashMap::new()),
-            callbacks: Mutex::new(HashMap::new()),
-            next: AtomicU64::new(0),
+        let (client, driver) = RemoteClient::new(
+            SocketLink {
+                socket: tokio::sync::Mutex::new(socket),
+                wire: Mutex::new(Some(wire)),
+                writer: tokio::sync::Mutex::new(Some(writer)),
+                liveness,
+                window: policy.request_timeout / 2,
+                stopped: shutdown.token.clone(),
+            },
             operation_timeout,
-            turns: Mutex::new(HashMap::new()),
-            failure: Mutex::new(None),
-            closed: watch::channel(None).0,
-            hands: Mutex::new(None),
-        });
-        let weak = Arc::downgrade(&client);
-        let stopped = shutdown.token.clone();
+        );
+        let closed = Arc::new(watch::channel(None).0);
+        let published = Arc::clone(&closed);
         tokio::spawn(async move {
-            let watchdog = liveness.watch(policy.request_timeout / 2);
-            tokio::pin!(watchdog);
-            let mut callback_tasks = tokio::task::JoinSet::new();
-            let mut callback_aborts =
-                HashMap::<u64, (String, u64, tokio::task::AbortHandle)>::new();
-            let result: Result<(), CodeModeHostError> = async {
-                loop {
-                    tokio::select! {
-                        () = stopped.cancelled() => {
-                            drop(wire);
-                            return (&mut writer.0).await.map_err(error)?;
-                        },
-                        result = &mut writer.0 => return result.map_err(error)?,
-                        frame = incoming.recv() => match frame {
-                            Some(frame) => {
-                                if let Frame::Request { operation: RemoteOperation::Cancel { session_id }, .. } = &frame {
-                                    if let Some(client) = weak.upgrade() {
-                                        client.callbacks.lock().unwrap().retain(|(session, _), _| session != session_id);
-                                        client.turns.lock().unwrap().remove(session_id);
-                                    }
-                                    callback_aborts.retain(|_, (session, _, abort)| { if session == session_id { abort.abort(); false } else { true } });
-                                }
-                                wire.send(frame).map_err(error)?;
-                            }, None => return Ok(())
-                        },
-                        Some(completed) = callback_tasks.join_next(), if !callback_tasks.is_empty() => { if let Ok(id) = completed { callback_aborts.remove(&id); } },
-                        frame = read_live(&mut socket, &liveness, watchdog.as_mut()) => {
-                            let Some(frame) = frame.map_err(|issue| error(format!("runner connection failed: {issue}")))? else { return Err(error(PEER_CLOSED)); };
-                            let Some(client) = weak.upgrade() else { return Ok(()); };
-                            match frame {
-                                Frame::Reply { id, .. } | Frame::Update { id, .. } => {
-                                    if let Some(channel) = client.pending.lock().unwrap().get(&id) { let _ = channel.send(frame); }
-                                },
-                                Frame::CallbackCancel { id } => { if let Some((_, _, abort)) = callback_aborts.remove(&id) { abort.abort(); } },
-                                Frame::DetachedUpdate { session_id, origin_call_id, update } => {
-                                    if let Some(state) = client.callbacks.lock().unwrap().get_mut(&(session_id, origin_call_id)) { if let Some(observer) = state.observer.as_deref_mut() { deliver_update(observer, update)?; } }
-                                },
-                                Frame::DetachedComplete { session_id, origin_call_id } => { client.callbacks.lock().unwrap().remove(&(session_id, origin_call_id)); },
-                                Frame::Callback { id, name, input, context, hand: Some(hand), .. } => {
-                                    let authoritative = client.callbacks.lock().unwrap().get(&(context.session_id.clone(), context.call_id.rsplit_once("/code-").map_or(context.call_id.as_str(), |(origin, _)| origin).to_owned())).map(|state| (state.context.clone(), state.generation));
-                                    let callback_generation = authoritative.as_ref().map_or(0, |(_, generation)| *generation);
-                                    let hands = client.hands.lock().unwrap().clone();
-                                    let outgoing = client.outgoing.clone();
-                                    let callback_session = context.session_id.clone();
-                                    let abort = callback_tasks.spawn(async move {
-                                        let result = async {
-                                            let (mut authoritative, _) = authoritative.ok_or_else(|| error(format!("brain callback origin for `{name}` on hand `{hand}` unavailable")))?;
-                                            let hands = hands.ok_or_else(|| error("this brain does not route calls between hands"))?;
-                                            authoritative.call_id = context.call_id;
-                                            let owned = authoritative.owned();
-                                            let output = hands.call(&hand, &name, input, owned.as_context()).await;
-                                            serde_json::to_value(output.into_wire().map_err(error)?).map_err(error)
-                                        }.await.map_err(|e: CodeModeHostError| e.to_string());
-                                        let _ = outgoing.send(Frame::CallbackResult { id, result });
-                                        id
-                                    });
-                                    callback_aborts.insert(id, (callback_session, callback_generation, abort));
-                                },
-                                Frame::Callback { id, name, input, freeform, context, hand: None } => {
-                                    let local = client.callbacks.lock().unwrap().get(&(context.session_id.clone(), context.call_id.rsplit_once("/code-").map_or(context.call_id.as_str(), |(origin, _)| origin).to_owned())).and_then(|state| state.tools.iter().find(|t| t.definition().name() == name).map(|tool| (Arc::clone(tool), state.context.clone(), state.generation)));
-                                    let outgoing = client.outgoing.clone();
-                                    let callback_session = context.session_id.clone();
-                                    let callback_generation = local.as_ref().map_or(0, |(_, _, generation)| *generation);
-                                    let abort = callback_tasks.spawn(async move {
-                                        let result = async {
-                                            let (tool, mut authoritative, _) = local.ok_or_else(|| error(format!("brain callback tool `{name}` unavailable")))?;
-                                            authoritative.call_id = context.call_id;
-                                            let owned = authoritative.owned();
-                                            let input = if freeform { ToolInput::Freeform(input.as_str().ok_or_else(|| error("freeform callback must be a string"))?.into()) } else { ToolInput::Function(serde_json::value::to_raw_value(&input).map_err(error)?) };
-                                            let output = tool.execute(input, owned.as_context()).await.map_err(error)?;
-                                            serde_json::to_value(output.into_wire().map_err(error)?).map_err(error)
-                                        }.await.map_err(|e: CodeModeHostError| e.to_string());
-                                        let _ = outgoing.send(Frame::CallbackResult { id, result });
-                                        id
-                                    });
-                                    callback_aborts.insert(id, (callback_session, callback_generation, abort));
-                                },
-                                _ => return Err(error("unexpected runner frame")),
-                            }
-                        }
-                    }
-                }
-            }.await;
-            callback_tasks.abort_all();
-            if let Some(client) = weak.upgrade() {
-                client.callbacks.lock().unwrap().clear();
-                let message = result
-                    .err()
-                    .map_or_else(|| LOCAL_CLOSED.into(), |e| e.to_string());
-                let uncertain = format!(
-                    "{message}; the dispatched operation has an unknown outcome and was not retried"
-                );
-                *client.failure.lock().unwrap() = Some(message.clone());
-                for (id, channel) in client.pending.lock().unwrap().drain() {
-                    let _ = channel.send(Frame::Reply {
-                        id,
-                        result: Err(uncertain.clone()),
-                    });
-                }
-                client.closed.send_replace(Some(message));
-            }
+            let message = driver.await;
+            published.send_replace(Some(message));
         });
         Ok(Self {
             client,
+            closed,
             definitions,
             name,
             workspace,
@@ -613,28 +494,80 @@ impl SocketTransport {
     }
 }
 
-struct Pending {
-    client: Arc<Client>,
-    id: u64,
-    session_id: Option<String>,
-    origin: Option<(String, String)>,
-    complete: bool,
+struct SocketLink<S> {
+    socket: tokio::sync::Mutex<futures_util::stream::SplitStream<WebSocketStream<S>>>,
+    wire: Mutex<Option<mpsc::UnboundedSender<Frame>>>,
+    writer: tokio::sync::Mutex<Option<Writer>>,
+    liveness: Arc<Liveness>,
+    window: Duration,
+    stopped: CancellationToken,
 }
-impl Drop for Pending {
-    fn drop(&mut self) {
-        self.client.pending.lock().unwrap().remove(&self.id);
-        if !self.complete {
-            if let Some(origin) = self.origin.take() {
-                self.client.callbacks.lock().unwrap().remove(&origin);
+
+enum Received {
+    Stopped,
+    Written(Result<Result<(), CodeModeHostError>, tokio::task::JoinError>),
+    Frame(Result<Option<Frame>, CodeModeHostError>),
+    Unresponsive,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteLink for SocketLink<S> {
+    fn send(
+        &self,
+        frames: Vec<Frame>,
+        _delivery: RemoteDelivery,
+    ) -> HostFuture<'_, Result<(), CodeModeHostError>> {
+        let sent = match &*self.wire.lock().unwrap() {
+            Some(wire) => frames
+                .into_iter()
+                .try_for_each(|frame| wire.send(frame).map_err(error)),
+            None => Err(error(LOCAL_CLOSED)),
+        };
+        Box::pin(std::future::ready(sent))
+    }
+
+    fn receive(&self) -> HostFuture<'_, Result<Vec<Frame>, CodeModeHostError>> {
+        Box::pin(async move {
+            let mut socket = self.socket.lock().await;
+            let mut writer = self.writer.lock().await;
+            let Some(task) = writer.as_mut() else {
+                return Err(error(LOCAL_CLOSED));
+            };
+            let received = tokio::select! {
+                biased;
+                () = self.stopped.cancelled() => Received::Stopped,
+                result = &mut task.0 => Received::Written(result),
+                frame = read(&mut *socket, &self.liveness) => Received::Frame(frame),
+                () = self.liveness.watch(self.window) => Received::Unresponsive,
+            };
+            match received {
+                Received::Stopped => Err(error(LOCAL_CLOSED)),
+                Received::Written(result) => {
+                    *writer = None;
+                    Err(match result {
+                        Ok(Ok(())) => error(LOCAL_CLOSED),
+                        Ok(Err(issue)) => issue,
+                        Err(issue) => error(issue),
+                    })
+                }
+                Received::Frame(Ok(Some(frame))) => Ok(vec![frame]),
+                Received::Frame(Ok(None)) => Err(error(PEER_CLOSED)),
+                Received::Frame(Err(issue)) => {
+                    Err(error(format!("runner connection failed: {issue}")))
+                }
+                Received::Unresponsive => {
+                    Err(error(format!("runner connection failed: {UNRESPONSIVE}")))
+                }
             }
-            if let Some(session_id) = self.session_id.take() {
-                let id = self.client.next.fetch_add(1, Ordering::Relaxed);
-                let _ = self.client.outgoing.send(Frame::Request {
-                    id,
-                    operation: RemoteOperation::CancelTurn { session_id },
-                });
+        })
+    }
+
+    fn close<'a>(&'a self, _reason: &'a str) -> HostFuture<'a, ()> {
+        Box::pin(async move {
+            self.wire.lock().unwrap().take();
+            if let Some(mut writer) = self.writer.lock().await.take() {
+                let _ = (&mut writer.0).await;
             }
-        }
+        })
     }
 }
 
@@ -643,214 +576,25 @@ impl RemoteTransport for SocketTransport {
         &'a self,
         operation: RemoteOperation,
         tools: Vec<Arc<dyn Tool>>,
-        mut observer: Option<&'a mut dyn CodeModeObserver>,
+        observer: Option<&'a mut dyn CodeModeObserver>,
     ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
-        Box::pin(async move {
-            if let Some(failure) = self.client.failure.lock().unwrap().clone() {
-                return Err(error(format!(
-                    "{failure}; the operation was not dispatched"
-                )));
-            }
-            let origin_call_id = match &operation {
-                RemoteOperation::Execute { context, .. } => Some(context.call_id.clone()),
-                _ => None,
-            };
-            let session_id = match &operation {
-                RemoteOperation::Execute { context, .. } => {
-                    let generation = *self
-                        .client
-                        .turns
-                        .lock()
-                        .unwrap()
-                        .get(&context.session_id)
-                        .unwrap_or(&0);
-                    let mut callbacks = self.client.callbacks.lock().unwrap();
-                    let key = (context.session_id.clone(), context.call_id.clone());
-                    if callbacks.contains_key(&key) {
-                        return Err(error("callback origin is already active"));
-                    }
-                    callbacks.insert(
-                        key,
-                        CallbackState {
-                            tools,
-                            context: context.clone(),
-                            generation,
-                            observer: None,
-                        },
-                    );
-                    Some(context.session_id.clone())
-                }
-                RemoteOperation::Wait { context, .. } => Some(context.session_id.clone()),
-                _ => None,
-            };
-            let id = self.client.next.fetch_add(1, Ordering::Relaxed);
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            self.client.pending.lock().unwrap().insert(id, tx);
-            let mut guard = Pending {
-                client: Arc::clone(&self.client),
-                id,
-                session_id: session_id.clone(),
-                origin: session_id.clone().zip(origin_call_id.clone()),
-                complete: false,
-            };
-            self.client
-                .outgoing
-                .send(Frame::Request { id, operation })
-                .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
-            let reply = async {
-                while let Some(frame) = rx.recv().await {
-                    match frame {
-                        Frame::Reply { result, .. } => {
-                            return result
-                                .map_err(error)?
-                                .map(|value| serde_json::from_value(value).map_err(error))
-                                .transpose();
-                        }
-                        Frame::Update { update, .. } => {
-                            if let Some(observer) = observer.as_deref_mut() {
-                                deliver_update(observer, update)?;
-                            }
-                        }
-                        _ => return Err(error("unexpected operation reply")),
-                    }
-                }
-                Err(error(
-                    "remote reply channel closed; operation outcome unknown",
-                ))
-            };
-            let result: Result<Option<CodeModeExecution>, CodeModeHostError> = match self.client.operation_timeout {
-                Some(deadline) => tokio::time::timeout(deadline, reply).await.map_err(|_| error("remote operation deadline elapsed; outcome unknown; cancellation requested; no retry"))?,
-                None => reply.await,
-            };
-            if let (Some(session), Ok(Some(execution))) = (&session_id, &result) {
-                if let Some(cell) = &execution.cell {
-                    if cell.running {
-                        if let Some(state) = self
-                            .client
-                            .callbacks
-                            .lock()
-                            .unwrap()
-                            .get_mut(&(session.clone(), cell.origin_call_id.clone()))
-                        {
-                            state.generation =
-                                *self.client.turns.lock().unwrap().get(session).unwrap_or(&0);
-                        }
-                    }
-                }
-            }
-            if let Some(session_id) = session_id {
-                let completed_origin = match &result {
-                    Ok(Some(execution)) => match &execution.cell {
-                        Some(cell) if cell.running => None,
-                        Some(cell) => Some(cell.origin_call_id.clone()),
-                        None => origin_call_id,
-                    },
-                    Err(_) => origin_call_id,
-                    _ => None,
-                };
-                if let Some(origin) = completed_origin {
-                    self.client
-                        .callbacks
-                        .lock()
-                        .unwrap()
-                        .remove(&(session_id, origin));
-                }
-            }
-            guard.complete = true;
-            result
-        })
+        self.client.request(operation, tools, observer)
     }
     fn call(&self, operation: RemoteOperation) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
-        Box::pin(async move {
-            if let Some(failure) = self.client.failure.lock().unwrap().clone() {
-                return Err(error(format!(
-                    "{failure}; the operation was not dispatched"
-                )));
-            }
-            let id = self.client.next.fetch_add(1, Ordering::Relaxed);
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            self.client.pending.lock().unwrap().insert(id, tx);
-            let mut guard = Pending {
-                client: Arc::clone(&self.client),
-                id,
-                session_id: None,
-                origin: None,
-                complete: false,
-            };
-            self.client
-                .outgoing
-                .send(Frame::Request { id, operation })
-                .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
-            let reply = async {
-                while let Some(frame) = rx.recv().await {
-                    match frame {
-                        Frame::Reply { result, .. } => {
-                            return result
-                                .map_err(error)?
-                                .ok_or_else(|| error("hand omitted the tool result"));
-                        }
-                        Frame::Update { .. } => {}
-                        _ => return Err(error("unexpected operation reply")),
-                    }
-                }
-                Err(error(
-                    "remote reply channel closed; operation outcome unknown",
-                ))
-            };
-            let result = match self.client.operation_timeout {
-                Some(deadline) => tokio::time::timeout(deadline, reply).await.map_err(|_| {
-                    error("remote operation deadline elapsed; outcome unknown; no retry")
-                })?,
-                None => reply.await,
-            };
-            guard.complete = true;
-            result
-        })
+        self.client.call(operation)
     }
     fn route_hands(&self, hands: Arc<dyn HandCalls>) {
-        *self.client.hands.lock().unwrap() = Some(hands);
+        self.client.route_hands(hands);
     }
     fn notify(&self, operation: RemoteOperation) -> Result<(), CodeModeHostError> {
-        if let RemoteOperation::BeginTurn { session_id } = &operation {
-            *self
-                .client
-                .turns
-                .lock()
-                .unwrap()
-                .entry(session_id.clone())
-                .or_default() += 1;
-        }
-        if let Some(failure) = self.client.failure.lock().unwrap().clone() {
-            return Err(error(failure));
-        }
-        self.client
-            .outgoing
-            .send(Frame::Request {
-                id: self.client.next.fetch_add(1, Ordering::Relaxed),
-                operation,
-            })
-            .map_err(error)
+        self.client.notify(operation)
     }
     fn detach_turn(
         &self,
         session_id: &str,
         factory: &mut (dyn FnMut(&str) -> Box<dyn CodeModeObserver> + Send),
     ) -> Result<(), CodeModeHostError> {
-        let generation = *self
-            .client
-            .turns
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .unwrap_or(&0);
-        for ((session, origin), state) in self.client.callbacks.lock().unwrap().iter_mut() {
-            if session == session_id && state.generation == generation {
-                state.observer = Some(factory(origin));
-            }
-        }
-        self.notify(RemoteOperation::DetachTurn {
-            session_id: session_id.into(),
-        })
+        self.client.detach_turn(session_id, factory)
     }
 }
 

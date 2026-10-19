@@ -1,8 +1,14 @@
+mod client;
 mod executors;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-pub use executors::{CodeModeExecutors, ExecutorSelection, HandRoute, HandsTool, Placement};
+pub use client::{
+    LOCAL_CLOSED, PEER_CLOSED, RemoteActivity, RemoteClient, RemoteDelivery, RemoteLink,
+};
+pub use executors::{
+    CodeModeExecutors, ExecutorSelection, HandRoute, HandsTool, PLACEMENT_INSTRUCTIONS, Placement,
+};
 
 use crate::embedded::{CodeModeNotification, CodeModeUpdate, NestedToolCall};
 use serde::{Deserialize, Serialize};
