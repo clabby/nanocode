@@ -3,9 +3,9 @@ use std::{fmt, sync::Arc};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use nanocode_platform::UNIX_EPOCH;
+use nanocode_sync::SingleFlight;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
 use url::Url;
 
 use crate::{ClaudeAuthFuture, ClaudeAuthProvider, ClaudeAuthUnavailable};
@@ -200,7 +200,7 @@ struct Inner {
     key: String,
     config: ClaudeSubscriptionConfig,
     binding: String,
-    gate: Mutex<()>,
+    resolving: SingleFlight<Result<HeaderMap>>,
 }
 redacted_debug!(ClaudeSubscription);
 
@@ -303,7 +303,7 @@ impl ClaudeSubscription {
                 key,
                 config,
                 binding,
-                gate: Mutex::new(()),
+                resolving: SingleFlight::default(),
             }),
         })
     }
@@ -408,7 +408,6 @@ impl ClaudeSubscription {
     }
 
     pub async fn complete_login(&self, callback_or_code: &str) -> Result<ClaudeSubscriptionStatus> {
-        let _guard = self.inner.gate.lock().await;
         let (revision, state) = self.load().await?;
         match state {
             State::Validating { token, prior } => {
@@ -763,15 +762,17 @@ impl ClaudeSubscription {
     }
 
     async fn resolve_headers(&self) -> Result<HeaderMap> {
-        let _guard = self.inner.gate.lock().await;
-        self.resolve_loaded(None).await
+        let subscription = self.clone();
+        self.inner
+            .resolving
+            .run(|| async move { subscription.resolve_loaded(None).await })
+            .await
     }
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) async fn ready_headers(&self) -> Option<Result<HeaderMap>> {
-        let _guard = self.inner.gate.lock().await;
         match self.load().await {
-            Ok(loaded @ (_, State::Ready { .. })) => Some(self.resolve_loaded(Some(loaded)).await),
+            Ok((_, State::Ready { .. })) => Some(self.resolve_headers().await),
             _ => None,
         }
     }
@@ -806,7 +807,6 @@ impl ClaudeSubscription {
     }
 
     async fn reject(&self, rejected: &HeaderMap) -> Result<bool> {
-        let _guard = self.inner.gate.lock().await;
         for _ in 0..RETRIES {
             let (revision, state) = self.load().await?;
             let State::Ready {

@@ -9,6 +9,8 @@ license.workspace = true
 repository.workspace = true
 description = "Shared cached native TLS configuration"
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+arc-swap.workspace = true
+nanocode-sync.workspace = true
 rustls = { workspace = true, features = ["std"] }
 rustls-native-certs.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }

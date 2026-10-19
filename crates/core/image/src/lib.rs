@@ -3,9 +3,10 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Cursor,
     path::Path,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
 };
 
+use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use image::{
     ColorType, DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageFormat,
@@ -88,7 +89,7 @@ struct ImageCacheKey {
     limits: PromptImageResizeLimits,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ImageCache {
     entries: HashMap<ImageCacheKey, EncodedImage>,
     order: VecDeque<ImageCacheKey>,
@@ -135,8 +136,25 @@ impl ImageCache {
     }
 }
 
-static IMAGE_CACHE: LazyLock<Mutex<ImageCache>> =
-    LazyLock::new(|| Mutex::new(ImageCache::default()));
+static IMAGE_CACHE: LazyLock<ArcSwap<ImageCache>> = LazyLock::new(ArcSwap::default);
+
+fn cached_image(key: &ImageCacheKey) -> Option<EncodedImage> {
+    let mut image = None;
+    IMAGE_CACHE.rcu(|cache| {
+        let mut cache = ImageCache::clone(cache);
+        image = cache.get(key);
+        cache
+    });
+    image
+}
+
+fn cache_image(key: ImageCacheKey, image: EncodedImage) {
+    IMAGE_CACHE.rcu(|cache| {
+        let mut cache = ImageCache::clone(cache);
+        cache.insert(key, image.clone());
+        cache
+    });
+}
 
 #[derive(Debug, thiserror::Error)]
 enum ImagePreparationError {
@@ -573,11 +591,7 @@ fn load_for_prompt_bytes(
         digest: Sha1::digest(&file_bytes).into(),
         limits,
     };
-    let cached = match IMAGE_CACHE.lock() {
-        Ok(mut cache) => cache.get(&key),
-        Err(poisoned) => poisoned.into_inner().get(&key),
-    };
-    if let Some(image) = cached {
+    if let Some(image) = cached_image(&key) {
         return Ok(image);
     }
 
@@ -669,10 +683,7 @@ fn load_for_prompt_bytes(
         )?
     };
 
-    match IMAGE_CACHE.lock() {
-        Ok(mut cache) => cache.insert(key, image.clone()),
-        Err(poisoned) => poisoned.into_inner().insert(key, image.clone()),
-    }
+    cache_image(key, image.clone());
     Ok(image)
 }
 

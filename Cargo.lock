@@ -1655,6 +1655,7 @@ dependencies = [
 name = "nanocode-audio"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64",
  "base64-simd",
  "sha1",
@@ -1698,6 +1699,7 @@ dependencies = [
 name = "nanocode-backend-claude-client"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64",
  "blake3",
  "futures-util",
@@ -1708,6 +1710,7 @@ dependencies = [
  "nanocode-home",
  "nanocode-http",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-tls",
  "reqwest",
  "serde",
@@ -1742,6 +1745,7 @@ dependencies = [
 name = "nanocode-backend-codex"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64",
  "base64-simd",
@@ -1759,6 +1763,7 @@ dependencies = [
  "nanocode-platform",
  "nanocode-process",
  "nanocode-process-contracts",
+ "nanocode-sync",
  "nanocode-tls",
  "nanocode-tool-contracts",
  "nanocode-tool-host",
@@ -1794,6 +1799,7 @@ dependencies = [
  "nanocode-audio",
  "nanocode-home",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-tls",
  "nanocode-types",
  "reqwest",
@@ -1944,6 +1950,7 @@ dependencies = [
 name = "nanocode-image"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64",
  "base64-simd",
  "crc32fast",
@@ -1962,9 +1969,11 @@ dependencies = [
 name = "nanocode-mcp"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "base64",
  "futures-channel",
  "memchr",
+ "nanocode-sync",
  "serde",
  "serde_json",
  "sha2",
@@ -1976,12 +1985,14 @@ dependencies = [
 name = "nanocode-mcp-http"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "futures-util",
  "getrandom 0.4.3",
  "http",
  "nanocode-http",
  "nanocode-mcp",
+ "nanocode-sync",
  "nanocode-tls",
  "reqwest",
  "serde_json",
@@ -2143,9 +2154,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-sync"
+version = "0.6.7"
+dependencies = [
+ "arc-swap",
+ "futures-util",
+ "nanocode-platform",
+ "tokio",
+]
+
+[[package]]
 name = "nanocode-tls"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
+ "nanocode-sync",
  "rustls",
  "rustls-graviola",
  "rustls-native-certs",
@@ -2271,6 +2294,7 @@ dependencies = [
  "arc-swap",
  "futures-util",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-types-core",
  "serde",
  "serde_json",

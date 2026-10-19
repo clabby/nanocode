@@ -1,13 +1,14 @@
 #![cfg(not(target_family = "wasm"))]
 
+use arc_swap::ArcSwapOption;
+use nanocode_sync::SingleFlight;
 use rustls::{ClientConfig, RootCertStore};
 use std::{
     ffi::OsString,
     io,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
 
 const MAX_AGE: Duration = Duration::from_secs(300);
 type TrustEnvironment = (Option<OsString>, Option<OsString>);
@@ -21,29 +22,40 @@ impl Cached {
         now.duration_since(self.loaded) < MAX_AGE && &self.environment == environment
     }
 }
-static CACHE: Mutex<Option<Cached>> = Mutex::const_new(None);
+static CACHE: ArcSwapOption<Cached> = ArcSwapOption::const_empty();
+type Loaded = Result<Arc<ClientConfig>, (io::ErrorKind, String)>;
+static LOADING: LazyLock<SingleFlight<Loaded>> = LazyLock::new(SingleFlight::default);
 
 pub async fn native_client_config() -> io::Result<Arc<ClientConfig>> {
     let environment = (
         std::env::var_os("SSL_CERT_FILE"),
         std::env::var_os("SSL_CERT_DIR"),
     );
-    let mut cache = CACHE.lock().await;
-    if let Some(cached) = &*cache
-        && cached.matches(Instant::now(), &environment)
-    {
-        return Ok(cached.config.clone());
+    loop {
+        if let Some(cached) = &*CACHE.load()
+            && cached.matches(Instant::now(), &environment)
+        {
+            return Ok(cached.config.clone());
+        }
+        let loading = environment.clone();
+        LOADING
+            .run(|| async move {
+                let config = tokio::task::spawn_blocking(load)
+                    .await
+                    .map_err(io::Error::other)
+                    .and_then(|loaded| loaded)
+                    .map_err(|error| (error.kind(), error.to_string()))?;
+                let config = Arc::new(config);
+                CACHE.store(Some(Arc::new(Cached {
+                    loaded: Instant::now(),
+                    environment: loading,
+                    config: Arc::clone(&config),
+                })));
+                Ok(config)
+            })
+            .await
+            .map_err(|(kind, message)| io::Error::new(kind, message))?;
     }
-    let config = tokio::task::spawn_blocking(load)
-        .await
-        .map_err(io::Error::other)??;
-    let config = Arc::new(config);
-    *cache = Some(Cached {
-        loaded: Instant::now(),
-        environment,
-        config: config.clone(),
-    });
-    Ok(config)
 }
 
 fn load() -> io::Result<ClientConfig> {

@@ -9,8 +9,8 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use nanocode_platform::UNIX_EPOCH;
+use nanocode_sync::SingleFlight;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::sync::Mutex;
 
 use super::{
     OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
@@ -267,7 +267,7 @@ struct SubscriptionInner {
     host: Arc<dyn ChatGptSubscriptionHost>,
     key: Arc<str>,
     issuer: Arc<str>,
-    refresh: Mutex<()>,
+    refreshing: SingleFlight<Result<(), ChatGptSubscriptionError>>,
     known_authenticated: AtomicBool,
 }
 
@@ -375,7 +375,7 @@ impl ChatGptSubscription {
                 host: Arc::new(host),
                 key,
                 issuer,
-                refresh: Mutex::new(()),
+                refreshing: SingleFlight::default(),
                 known_authenticated: AtomicBool::new(false),
             }),
         };
@@ -668,7 +668,17 @@ impl ChatGptSubscription {
         &self,
         rejected_generation: u64,
     ) -> Result<(), ChatGptSubscriptionError> {
-        let _guard = self.inner.refresh.lock().await;
+        let subscription = self.clone();
+        self.inner
+            .refreshing
+            .run(|| async move { subscription.refresh_generation(rejected_generation).await })
+            .await
+    }
+
+    async fn refresh_generation(
+        &self,
+        rejected_generation: u64,
+    ) -> Result<(), ChatGptSubscriptionError> {
         let loaded = self.load().await?;
         let current = loaded
             .state

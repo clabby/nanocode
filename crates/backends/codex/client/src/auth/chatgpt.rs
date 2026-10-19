@@ -14,12 +14,12 @@ use super::{
 };
 use arc_swap::ArcSwap;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use nanocode_sync::SingleFlight;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::Mutex,
     time::{Duration, timeout},
 };
 use tracing::Instrument;
@@ -246,7 +246,7 @@ pub fn load_chatgpt_auth(auth_file: impl Into<PathBuf>) -> Result<OpenAiAuth, Ch
         issuer: Arc::from(AUTH_ISSUER),
         client: auth_client()?,
         state: ArcSwap::from_pointee(ManagedState::new(credentials, document, 0)),
-        refresh: Mutex::new(()),
+        refreshing: SingleFlight::default(),
     };
     Ok(OpenAiAuth::managed_chatgpt(Arc::new(ManagedChatGptAuth {
         inner: Arc::new(manager),
@@ -446,7 +446,7 @@ struct ManagedAuthInner {
     issuer: Arc<str>,
     client: reqwest::Client,
     state: ArcSwap<ManagedState>,
-    refresh: Mutex<()>,
+    refreshing: SingleFlight<Result<(), OpenAiAuthError>>,
 }
 
 enum CurrentSnapshot {
@@ -678,10 +678,19 @@ impl ManagedChatGptAuth {
         if self.inner.state().snapshot.revision() != rejected_revision {
             return Ok(());
         }
-        let refresh = Arc::clone(&self.inner).refresh_if_current(rejected_revision);
-        tokio::spawn(refresh.in_current_span())
+        let inner = Arc::clone(&self.inner);
+        self.inner
+            .refreshing
+            .run(|| async move {
+                tokio::spawn(
+                    inner
+                        .refresh_if_current(rejected_revision)
+                        .in_current_span(),
+                )
+                .await
+                .map_err(|error| OpenAiAuthError::Unavailable(Arc::from(error.to_string())))?
+            })
             .await
-            .map_err(|error| OpenAiAuthError::Unavailable(Arc::from(error.to_string())))?
     }
 }
 
@@ -707,7 +716,6 @@ impl ManagedAuthInner {
         self: Arc<Self>,
         rejected_revision: u64,
     ) -> Result<(), OpenAiAuthError> {
-        let _refresh = self.refresh.lock().await;
         if self.state().snapshot.revision() != rejected_revision {
             return Ok(());
         }

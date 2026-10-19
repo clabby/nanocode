@@ -1,8 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
+use arc_swap::ArcSwapOption;
 use http::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use nanocode_platform::SystemTime;
-use tokio::sync::Mutex;
+use nanocode_sync::SingleFlight;
 
 use crate::{ClaudeAuthFuture, ClaudeAuthProvider, ClaudeAuthUnavailable};
 
@@ -66,15 +67,20 @@ pub trait ClaudeTokenSource: Send + Sync {
 pub struct RefreshingClaudeAuth {
     source: Arc<dyn ClaudeTokenSource>,
     refresh_margin: Duration,
-    token: Mutex<Option<ClaudeAccessToken>>,
+    token: Arc<ArcSwapOption<ClaudeAccessToken>>,
+    refreshing: SingleFlight<Result<(), String>>,
 }
+
+const STALE_REFRESH: &str =
+    "the refreshed Claude access token is already expired or within its refresh margin";
 
 impl RefreshingClaudeAuth {
     pub fn new(source: Arc<dyn ClaudeTokenSource>, refresh_margin: Duration) -> Self {
         Self {
             source,
             refresh_margin,
-            token: Mutex::new(None),
+            token: Arc::default(),
+            refreshing: SingleFlight::default(),
         }
     }
 }
@@ -82,24 +88,35 @@ impl RefreshingClaudeAuth {
 impl ClaudeAuthProvider for RefreshingClaudeAuth {
     fn headers(&self) -> ClaudeAuthFuture<'_, Result<HeaderMap, ClaudeAuthUnavailable>> {
         Box::pin(async move {
-            let mut cached = self.token.lock().await;
-            if let Some(token) = cached
-                .as_ref()
-                .filter(|token| token.usable(self.refresh_margin))
-            {
-                return Ok(token.headers());
+            loop {
+                if let Some(token) = self
+                    .token
+                    .load()
+                    .as_ref()
+                    .filter(|token| token.usable(self.refresh_margin))
+                {
+                    return Ok(token.headers());
+                }
+                let (source, cache, margin) = (
+                    Arc::clone(&self.source),
+                    Arc::clone(&self.token),
+                    self.refresh_margin,
+                );
+                self.refreshing
+                    .run(|| async move {
+                        let token = source
+                            .refresh()
+                            .await
+                            .map_err(|error| error.reason().to_owned())?;
+                        if !token.usable(margin) {
+                            return Err(STALE_REFRESH.to_owned());
+                        }
+                        cache.store(Some(Arc::new(token)));
+                        Ok(())
+                    })
+                    .await
+                    .map_err(ClaudeAuthUnavailable::new)?;
             }
-
-            *cached = None;
-            let token = self.source.refresh().await?;
-            if !token.usable(self.refresh_margin) {
-                return Err(ClaudeAuthUnavailable::new(
-                    "the refreshed Claude access token is already expired or within its refresh margin",
-                ));
-            }
-            let headers = token.headers();
-            *cached = Some(token);
-            Ok(headers)
         })
     }
 
@@ -108,25 +125,35 @@ impl ClaudeAuthProvider for RefreshingClaudeAuth {
         rejected: &'a HeaderMap,
     ) -> ClaudeAuthFuture<'a, Result<bool, ClaudeAuthUnavailable>> {
         Box::pin(async move {
-            let mut cached = self.token.lock().await;
-
-            if cached
-                .as_ref()
-                .is_some_and(|token| rejected.get(AUTHORIZATION) == Some(&token.authorization))
-            {
-                *cached = None;
-            }
-            let Some(rejected) = rejected.get(AUTHORIZATION) else {
+            let rejected = rejected.get(AUTHORIZATION).cloned();
+            self.token.rcu(|cached| match cached {
+                Some(token) if rejected.as_ref() == Some(&token.authorization) => None,
+                other => other.clone(),
+            });
+            let Some(rejected) = rejected else {
                 return Ok(true);
             };
-            if let Some(token) = self.source.refresh_rejected(rejected).await? {
-                if !token.usable(self.refresh_margin) {
-                    return Err(ClaudeAuthUnavailable::new(
-                        "the refreshed Claude access token is already expired or within its refresh margin",
-                    ));
-                }
-                *cached = Some(token);
-            }
+            let (source, cache, margin) = (
+                Arc::clone(&self.source),
+                Arc::clone(&self.token),
+                self.refresh_margin,
+            );
+            self.refreshing
+                .run(|| async move {
+                    if let Some(token) = source
+                        .refresh_rejected(&rejected)
+                        .await
+                        .map_err(|error| error.reason().to_owned())?
+                    {
+                        if !token.usable(margin) {
+                            return Err(STALE_REFRESH.to_owned());
+                        }
+                        cache.store(Some(Arc::new(token)));
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(ClaudeAuthUnavailable::new)?;
             Ok(true)
         })
     }

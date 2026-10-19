@@ -1,0 +1,30 @@
+[package]
+name = "nanocode-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Lock-free coordination primitives for Nanocode crates"
+autotests = false
+autobenches = false
+
+[dependencies]
+arc-swap.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+nanocode-platform.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false

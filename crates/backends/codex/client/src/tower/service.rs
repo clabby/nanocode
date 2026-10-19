@@ -14,7 +14,8 @@ use crate::client::{
 };
 use ::tower::{Service, retry::Retry};
 use nanocode_platform::Instant;
-use tokio::sync::Mutex;
+use nanocode_sync::Actor;
+use std::sync::OnceLock;
 use tracing::{Instrument, info_span};
 
 mod https;
@@ -228,7 +229,7 @@ impl Drop for AttemptGuard<'_> {
 #[derive(Clone)]
 pub struct ResponsesService {
     config: Arc<ModelConfig>,
-    connection: Arc<Mutex<ConnectionState>>,
+    connection: Arc<OnceLock<Actor<ConnectionState>>>,
     max_attempts: NonZeroU32,
     platform: platform::ServicePlatform,
 }
@@ -239,10 +240,22 @@ impl ResponsesService {
         let platform = platform::ServicePlatform::new(&config);
         Self {
             config,
-            connection: Arc::new(Mutex::new(ConnectionState::new())),
+            connection: Arc::default(),
             max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
             platform,
         }
+    }
+
+    fn connection(&self) -> Result<&Actor<ConnectionState>, ResponsesServiceError> {
+        if let Some(connection) = self.connection.get() {
+            return Ok(connection);
+        }
+        let spawned = Actor::spawn(ConnectionState::new())
+            .map_err(|_| ResponsesServiceError::from(ResponsesError::HostUnavailable))?;
+        let _ = self.connection.set(spawned);
+        self.connection
+            .get()
+            .ok_or_else(|| ResponsesServiceError::from(ResponsesError::HostUnavailable))
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -254,7 +267,7 @@ impl ResponsesService {
         let platform = platform::ServicePlatform::with_http_client(&config, http_client);
         Self {
             config,
-            connection: Arc::new(Mutex::new(ConnectionState::new())),
+            connection: Arc::default(),
             max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
             platform,
         }
@@ -977,9 +990,34 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 status = tracing::field::Empty,
                 duration_ns = tracing::field::Empty,
             );
-            async move {
-                let queued_at = Instant::now();
-                let mut connection = service.connection.lock().await;
+            let queued_at = Instant::now();
+            let connection = service.connection()?.clone();
+            let attempt = connection.run(move |connection| {
+                Box::pin(
+                    service
+                        .attempt(connection, request, queued_at)
+                        .instrument(span),
+                )
+            });
+            attempt.await.map_err(|_| {
+                ResponsesServiceError::from(ResponsesError::Closed {
+                    detail: "because its connection owner stopped".to_owned(),
+                })
+            })?
+        })
+    }
+}
+
+impl ResponsesService {
+    async fn attempt(
+        self,
+        connection: &mut ConnectionState,
+        mut request: ResponsesAttempt,
+        queued_at: Instant,
+    ) -> Result<ResponsesServiceResponse, ResponsesServiceError> {
+        let service = self;
+        {
+            {
                 let queue_ns = elapsed_ns(queued_at);
                 tracing::Span::current().record("request.queue.duration_ns", queue_ns);
                 connection.enter_logical_turn(request.logical_turn);
@@ -998,7 +1036,7 @@ impl Service<ResponsesAttempt> for ResponsesService {
                     if matches!(transport, ResponsesTransport::WebSocket)
                         && connection.socket.is_none()
                     {
-                        service.connect(&mut connection, &request).await?;
+                        service.connect(connection, &request).await?;
                     }
                     return Ok(ResponsesServiceResponse {
                         output: ResponsesOutput::Connected,
@@ -1022,13 +1060,9 @@ impl Service<ResponsesAttempt> for ResponsesService {
                 tracing::Span::current().record("replay.mode", request.replay_mode());
                 tracing::Span::current()
                     .record("model.input.item_count", request.input_item_count());
-                service
-                    .run(&mut connection, &request, transport, queue_ns)
-                    .await
+                service.run(connection, &request, transport, queue_ns).await
             }
-            .instrument(span)
-            .await
-        })
+        }
     }
 }
 

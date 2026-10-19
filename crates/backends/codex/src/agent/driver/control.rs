@@ -3,32 +3,35 @@ use super::*;
 type SharedShutdownResult = std::result::Result<(), Arc<NanocodeError>>;
 
 #[derive(Default)]
-enum ShutdownPhase {
-    #[default]
-    Running,
-    Requested,
-    Complete(SharedShutdownResult),
+struct ShutdownState {
+    requested: std::sync::atomic::AtomicBool,
+    done: nanocode_sync::Signal,
+    outcome: arc_swap::ArcSwapOption<SharedShutdownResult>,
 }
 
-#[derive(Default)]
-struct ShutdownState {
-    phase: ShutdownPhase,
-    waiters: Vec<oneshot::Sender<SharedShutdownResult>>,
+impl ShutdownState {
+    async fn outcome(&self) -> SharedShutdownResult {
+        self.done.wait().await;
+        self.outcome.load_full().map_or_else(
+            || Err(Arc::new(NanocodeError::AgentStopped)),
+            |outcome| SharedShutdownResult::clone(&outcome),
+        )
+    }
 }
 
 #[derive(Clone, Default)]
 pub(in crate::agent) struct DriverShutdown {
-    state: Arc<std::sync::Mutex<ShutdownState>>,
+    state: Arc<ShutdownState>,
     execution_policy_owned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DriverShutdown {
     pub(in crate::agent) fn is_running(&self) -> bool {
-        let state = self
+        !self
             .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        matches!(state.phase, ShutdownPhase::Running)
+            .requested
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.state.outcome.load().is_none()
     }
 
     pub(in crate::agent) fn set_execution_policy_owned(&self, owned: bool) {
@@ -36,63 +39,28 @@ impl DriverShutdown {
             .store(owned, std::sync::atomic::Ordering::Release);
     }
 
-    pub(in crate::agent) fn request(&self) -> (bool, oneshot::Receiver<SharedShutdownResult>) {
-        let (result, receiver) = oneshot::channel();
-        let mut state = match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        match &state.phase {
-            ShutdownPhase::Running => {
-                state.phase = ShutdownPhase::Requested;
-                state.waiters.push(result);
-                (true, receiver)
-            }
-            ShutdownPhase::Requested => {
-                state.waiters.push(result);
-                (false, receiver)
-            }
-            ShutdownPhase::Complete(outcome) => {
-                drop(result.send(outcome.clone()));
-                (false, receiver)
-            }
-        }
+    pub(in crate::agent) fn request(&self) -> bool {
+        !self
+            .state
+            .requested
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            && self.state.outcome.load().is_none()
+    }
+
+    pub(in crate::agent) async fn outcome(&self) -> SharedShutdownResult {
+        self.state.outcome().await
     }
 
     pub(in crate::agent) fn complete(&self, outcome: Result<()>) {
-        let outcome = outcome.map_err(Arc::new);
-        let waiters = {
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            state.phase = ShutdownPhase::Complete(outcome.clone());
-            std::mem::take(&mut state.waiters)
-        };
-        for waiter in waiters {
-            drop(waiter.send(outcome.clone()));
-        }
+        self.state
+            .outcome
+            .store(Some(Arc::new(outcome.map_err(Arc::new))));
+        self.state.done.fire();
     }
 
     pub(in crate::agent) async fn stopped_error(&self) -> NanocodeError {
-        let receiver = {
-            let (result, receiver) = oneshot::channel();
-            let mut state = match self.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            match &state.phase {
-                ShutdownPhase::Complete(outcome) => {
-                    drop(result.send(outcome.clone()));
-                }
-                ShutdownPhase::Running | ShutdownPhase::Requested => {
-                    state.waiters.push(result);
-                }
-            }
-            receiver
-        };
-        let error = match receiver.await {
-            Ok(Err(error))
+        let error = match self.state.outcome().await {
+            Err(error)
                 if matches!(
                     error.execution_policy_disposition(),
                     Some(crate::ExecutionPolicyDisposition::Reopen)
@@ -100,7 +68,7 @@ impl DriverShutdown {
             {
                 NanocodeError::Shutdown(error)
             }
-            Ok(Ok(()) | Err(_)) | Err(_) => NanocodeError::AgentStopped,
+            Ok(()) | Err(_) => NanocodeError::AgentStopped,
         };
         if matches!(error, NanocodeError::AgentStopped)
             && self

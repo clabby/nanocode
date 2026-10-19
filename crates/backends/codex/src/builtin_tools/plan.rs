@@ -1,19 +1,19 @@
+use arc_swap::ArcSwapOption;
 use nanocode_tools::ToolDefinition;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Mutex;
 
 use super::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 pub struct UpdatePlanTool {
-    current: Mutex<Option<UpdatePlanArgs>>,
+    current: ArcSwapOption<UpdatePlanArgs>,
 }
 
 impl UpdatePlanTool {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            current: Mutex::const_new(None),
+            current: ArcSwapOption::const_empty(),
         }
     }
 }
@@ -45,7 +45,7 @@ impl Tool for UpdatePlanTool {
                 "updated plan item"
             );
         }
-        *self.current.lock().await = Some(plan);
+        self.current.store(Some(std::sync::Arc::new(plan)));
         Ok(ToolOutput::text("Plan updated").with_structured_result(json!({})))
     }
 }

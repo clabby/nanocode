@@ -14,6 +14,8 @@
 "metadata" = { "docs" = { "rs" = {  "rustdoc-args" = ["-D", "warnings"] } } }
 
 ["dependencies"]
+arc-swap.workspace = true
+nanocode-sync.workspace = true
 base64-simd.workspace = true
 nanocode-backend-codex-client.workspace = true
 nanocode-process-contracts.workspace = true

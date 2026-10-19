@@ -6,7 +6,7 @@ pub use preservation::{
 #[path = "disabled.rs"]
 mod platform;
 
-use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -1022,7 +1022,7 @@ pub(crate) struct ExecutionSteps {
 #[derive(Clone)]
 pub(crate) struct QueuedSteer {
     pub(crate) message_id: Option<String>,
-    pub(crate) delivery: Arc<tokio::sync::Mutex<SteerDelivery>>,
+    pub(crate) delivery: Arc<Delivery>,
     pub(crate) durable_index: Option<u32>,
     pub(crate) accepted_after_model_call_index: u32,
     pub(crate) model_call_index: Option<u32>,
@@ -1031,11 +1031,83 @@ pub(crate) struct QueuedSteer {
 
 pub(crate) struct SteerReceipt {
     pub(crate) durable_index: Option<u32>,
-    pub(crate) delivery: Arc<tokio::sync::Mutex<SteerDelivery>>,
+    pub(crate) delivery: Arc<Delivery>,
 }
 
-pub(crate) type SteerQueue = Arc<tokio::sync::Mutex<VecDeque<QueuedSteer>>>;
-pub(crate) type SteerSender = std::sync::Weak<tokio::sync::Mutex<VecDeque<QueuedSteer>>>;
+pub(crate) type SteerQueue = Arc<nanocode_sync::Inbox<QueuedSteer>>;
+pub(crate) type SteerSender = std::sync::Weak<nanocode_sync::Inbox<QueuedSteer>>;
+
+const DELIVERY_PENDING: u8 = 0;
+const DELIVERY_CONSUMED: u8 = 1;
+const DELIVERY_WITHDRAWN: u8 = 2;
+const DELIVERY_WITHDRAWING: u8 = 3;
+
+pub(crate) struct Delivery {
+    state: std::sync::atomic::AtomicU8,
+    settled: arc_swap::ArcSwap<nanocode_sync::Signal>,
+}
+
+impl Delivery {
+    pub(crate) fn pending() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::atomic::AtomicU8::new(DELIVERY_PENDING),
+            settled: arc_swap::ArcSwap::default(),
+        })
+    }
+
+    pub(crate) fn get(&self) -> SteerDelivery {
+        match self.state.load(std::sync::atomic::Ordering::Acquire) {
+            DELIVERY_CONSUMED => SteerDelivery::Consumed,
+            DELIVERY_WITHDRAWN => SteerDelivery::Withdrawn,
+            _ => SteerDelivery::Pending,
+        }
+    }
+
+    fn begin_withdraw(&self) -> bool {
+        self.settled.store(Arc::default());
+        self.state
+            .compare_exchange(
+                DELIVERY_PENDING,
+                DELIVERY_WITHDRAWING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn finish_withdraw(&self, withdrawn: bool) {
+        self.state.store(
+            if withdrawn {
+                DELIVERY_WITHDRAWN
+            } else {
+                DELIVERY_PENDING
+            },
+            std::sync::atomic::Ordering::Release,
+        );
+        self.settled.load().fire();
+    }
+
+    pub(crate) async fn consume(&self) -> bool {
+        loop {
+            match self.state.compare_exchange(
+                DELIVERY_PENDING,
+                DELIVERY_CONSUMED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(DELIVERY_WITHDRAWING) => {
+                    let settled = self.settled.load_full();
+                    if self.state.load(std::sync::atomic::Ordering::Acquire) == DELIVERY_WITHDRAWING
+                    {
+                        settled.wait().await;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SteerDelivery {
@@ -1205,7 +1277,7 @@ impl ExecutionTurn {
             .map(|(message_id, steer)| {
                 Ok(QueuedSteer {
                     message_id,
-                    delivery: Arc::new(tokio::sync::Mutex::new(SteerDelivery::Pending)),
+                    delivery: Delivery::pending(),
                     durable_index: Some(steer.index),
                     accepted_after_model_call_index: steer.accepted_after_model_call_index,
                     model_call_index: steer.model_call_index,
@@ -1216,17 +1288,17 @@ impl ExecutionTurn {
     }
 
     pub(crate) async fn withdraw_steer(&self, steer: &SteerReceipt) -> Result<bool> {
-        let mut delivery = steer.delivery.lock().await;
-        if *delivery != SteerDelivery::Pending {
+        if !steer.delivery.begin_withdraw() {
             return Ok(false);
         }
-        if let (Some(policy), Some(operation_id), Some(index)) =
-            (&self.policy, &self.operation_id, steer.durable_index)
-        {
-            policy.withdraw_steer(operation_id.clone(), index).await?;
-        }
-        *delivery = SteerDelivery::Withdrawn;
-        Ok(true)
+        let withdrawn = match (&self.policy, &self.operation_id, steer.durable_index) {
+            (Some(policy), Some(operation_id), Some(index)) => {
+                policy.withdraw_steer(operation_id.clone(), index).await
+            }
+            _ => Ok(()),
+        };
+        steer.delivery.finish_withdraw(withdrawn.is_ok());
+        withdrawn.map(|()| true)
     }
 
     pub(crate) fn supports_steer_receipts(&self) -> bool {
@@ -1269,7 +1341,7 @@ impl ExecutionTurn {
         };
         Ok(Some(QueuedSteer {
             message_id,
-            delivery: Arc::new(tokio::sync::Mutex::new(SteerDelivery::Pending)),
+            delivery: Delivery::pending(),
             durable_index,
             accepted_after_model_call_index,
             model_call_index: None,

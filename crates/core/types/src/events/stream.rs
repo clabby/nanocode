@@ -2,14 +2,15 @@ use std::{
     borrow::Cow,
     io::Write,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use arc_swap::ArcSwap;
 use futures_util::Stream;
 use nanocode_platform::Instant;
+use nanocode_sync::{Inbox, Slot};
 use nanocode_types_core::responses::MessagePhase;
 use serde::Serialize;
 use serde_json::value::{RawValue, to_raw_value};
@@ -225,7 +226,80 @@ struct EventChannel {
     session: Arc<Subscribers>,
     turn: Option<mpsc::UnboundedSender<TimedAgentEvent>>,
     turn_admission: Option<Arc<AtomicU64>>,
-    pending: Arc<Mutex<PendingDelta>>,
+    sequencer: Arc<Sequencer>,
+}
+
+#[derive(Clone)]
+struct OwnedDelta {
+    model_call_index: u32,
+    item_id: Option<String>,
+    phase: Option<MessagePhase>,
+    text: String,
+    model_elapsed_ns: Option<u64>,
+}
+
+impl OwnedDelta {
+    fn of(delta: &TextDeltaRef<'_>) -> Self {
+        Self {
+            model_call_index: delta.model_call_index,
+            item_id: delta.item_id.as_deref().map(str::to_owned),
+            phase: delta.phase,
+            text: delta.text.as_ref().to_owned(),
+            model_elapsed_ns: delta.model_elapsed_ns,
+        }
+    }
+
+    fn borrowed(&self) -> TextDeltaRef<'_> {
+        TextDeltaRef {
+            model_call_index: self.model_call_index,
+            item_id: self.item_id.as_deref().map(Cow::Borrowed),
+            phase: self.phase,
+            text: Cow::Borrowed(&self.text),
+            model_elapsed_ns: self.model_elapsed_ns,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Op {
+    Delta {
+        kind: AgentEventKind,
+        turn_id: Option<Arc<str>>,
+        delta: OwnedDelta,
+        source_received_ns: Option<u64>,
+    },
+    Flush,
+    Next {
+        kind: AgentEventKind,
+        payload: Arc<RawValue>,
+    },
+    Exact(TimedAgentEvent),
+    Sink {
+        kind: AgentEventKind,
+        payload: Arc<RawValue>,
+        source_received_ns: Option<u64>,
+    },
+}
+
+#[derive(Clone)]
+struct Queued {
+    op: Op,
+    done: Arc<Slot<Result<u64, EventError>>>,
+}
+
+#[derive(Default)]
+struct Sequencer {
+    busy: AtomicBool,
+    inbox: Inbox<Queued>,
+    pending: Slot<PendingDelta>,
+}
+
+impl Sequencer {
+    fn enter(&self) -> bool {
+        self.busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
 }
 
 struct DeltaKey {
@@ -328,7 +402,7 @@ impl EventChannel {
                 session,
                 turn: None,
                 turn_admission: None,
-                pending: Arc::default(),
+                sequencer: Arc::default(),
             },
             events,
         )
@@ -343,7 +417,7 @@ impl EventChannel {
                 session: Arc::clone(&self.session),
                 turn: Some(turn),
                 turn_admission: Some(Arc::new(AtomicU64::new(0))),
-                pending: Arc::default(),
+                sequencer: Arc::default(),
             },
             AgentEvents {
                 request_id: Arc::clone(&self.request_id),
@@ -498,8 +572,142 @@ impl EventChannel {
         }
     }
 
-    fn lock_pending(&self) -> MutexGuard<'_, PendingDelta> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    fn sequence(&self, op: Op) -> Result<u64, EventError> {
+        let sequencer = &*self.sequencer;
+        if sequencer.enter() {
+            let mut pending = sequencer.pending.take().unwrap_or_default();
+            self.drain(&mut pending);
+            let result = self.apply(op, &mut pending);
+            self.leave(pending);
+            return result;
+        }
+        let done = Arc::new(Slot::default());
+        sequencer.inbox.push(Queued {
+            op,
+            done: Arc::clone(&done),
+        });
+        let mut spins = 0;
+        loop {
+            if let Some(result) = done.take() {
+                return result;
+            }
+            if sequencer.enter() {
+                let mut pending = sequencer.pending.take().unwrap_or_default();
+                self.drain(&mut pending);
+                self.leave(pending);
+                continue;
+            }
+            back_off(&mut spins);
+        }
+    }
+
+    fn drain(&self, pending: &mut PendingDelta) {
+        for Queued { op, done } in self.sequencer.inbox.drain() {
+            drop(done.put(self.apply(op, pending)));
+        }
+    }
+
+    fn leave(&self, mut pending: PendingDelta) {
+        loop {
+            drop(self.sequencer.pending.put(pending));
+            self.sequencer.busy.store(false, Ordering::Release);
+            if self.sequencer.inbox.is_empty() || !self.sequencer.enter() {
+                return;
+            }
+            pending = self.sequencer.pending.take().unwrap_or_default();
+            self.drain(&mut pending);
+        }
+    }
+
+    fn apply(&self, op: Op, pending: &mut PendingDelta) -> Result<u64, EventError> {
+        match op {
+            Op::Delta {
+                kind,
+                turn_id,
+                delta,
+                source_received_ns,
+            } => self
+                .apply_delta(
+                    pending,
+                    kind,
+                    turn_id.as_ref(),
+                    &delta.borrowed(),
+                    source_received_ns,
+                )
+                .map(|()| 0),
+            Op::Flush => self.publish_pending(pending).map(|()| 0),
+            Op::Next { kind, payload } => {
+                self.publish_pending(pending)?;
+                let (seq, admission) = self.reserve_publisher_event(kind, None)?;
+                if !self.receivers_are_closed() {
+                    self.publish(TimedAgentEvent {
+                        event: AgentEvent {
+                            protocol_version: AGENT_EVENT_PROTOCOL_VERSION,
+                            request_id: Arc::clone(&self.request_id),
+                            seq,
+                            kind,
+                            payload,
+                        },
+                        timing: AgentEventTiming {
+                            emitted_ns: monotonic_now_ns(),
+                            source_received_ns: None,
+                        },
+                    });
+                }
+                drop(admission);
+                Ok(seq)
+            }
+            Op::Exact(event) => {
+                self.publish_pending(pending)?;
+                let seq = event.event.seq;
+                let (_, admission) = self.reserve_publisher_event(event.event.kind, Some(seq))?;
+                if !self.receivers_are_closed() {
+                    self.publish(event);
+                }
+                drop(admission);
+                Ok(seq)
+            }
+            Op::Sink {
+                kind,
+                payload,
+                source_received_ns,
+            } => {
+                self.publish_pending(pending)?;
+                let seq = self.allocate_sequence()?;
+                self.publish(TimedAgentEvent {
+                    event: AgentEvent {
+                        protocol_version: AGENT_EVENT_PROTOCOL_VERSION,
+                        request_id: Arc::clone(&self.request_id),
+                        seq,
+                        kind,
+                        payload,
+                    },
+                    timing: AgentEventTiming {
+                        emitted_ns: monotonic_now_ns(),
+                        source_received_ns,
+                    },
+                });
+                self.record_local_terminal(kind);
+                Ok(seq)
+            }
+        }
+    }
+
+    fn apply_delta(
+        &self,
+        pending: &mut PendingDelta,
+        kind: AgentEventKind,
+        turn_id: Option<&Arc<str>>,
+        delta: &TextDeltaRef<'_>,
+        source_received_ns: Option<u64>,
+    ) -> Result<(), EventError> {
+        if pending.extends(kind, turn_id, delta) {
+            pending.text.push_str(&delta.text);
+            return Ok(());
+        }
+        self.publish_pending(pending)?;
+        pending.start(kind, turn_id, delta, source_received_ns);
+        Ok(())
     }
 
     fn publish_pending(&self, pending: &mut PendingDelta) -> Result<(), EventError> {
@@ -547,18 +755,25 @@ impl EventChannel {
         if self.receivers_are_closed() {
             return Ok(());
         }
-        let mut pending = self.lock_pending();
-        if pending.extends(kind, turn_id, delta) {
-            pending.text.push_str(&delta.text);
-            return Ok(());
+        let sequencer = &*self.sequencer;
+        if sequencer.enter() {
+            let mut pending = sequencer.pending.take().unwrap_or_default();
+            self.drain(&mut pending);
+            let result = self.apply_delta(&mut pending, kind, turn_id, delta, source_received_ns);
+            self.leave(pending);
+            return result;
         }
-        self.publish_pending(&mut pending)?;
-        pending.start(kind, turn_id, delta, source_received_ns);
-        Ok(())
+        self.sequence(Op::Delta {
+            kind,
+            turn_id: turn_id.cloned(),
+            delta: OwnedDelta::of(delta),
+            source_received_ns,
+        })
+        .map(drop)
     }
 
     fn flush_deltas(&self) -> Result<(), EventError> {
-        self.publish_pending(&mut self.lock_pending())
+        self.sequence(Op::Flush).map(drop)
     }
 }
 
@@ -579,6 +794,16 @@ fn encode_payload<P: Serialize>(
         to_raw_value(payload)
     };
     encoded.map(Arc::from).map_err(EventError::Encode)
+}
+
+fn back_off(spins: &mut usize) {
+    if *spins < TERMINAL_SPINS_BEFORE_YIELD {
+        *spins += 1;
+        std::hint::spin_loop();
+    } else {
+        *spins = 0;
+        std::thread::yield_now();
+    }
 }
 
 fn wait_for_terminal_claim(state: &AtomicU64, observed: u64) {
@@ -670,7 +895,7 @@ impl AgentEventPublisher {
                 .as_ref()
                 .map(mpsc::UnboundedSender::downgrade),
             turn_admission: self.channel.turn_admission.clone(),
-            pending: Arc::clone(&self.channel.pending),
+            sequencer: Arc::clone(&self.channel.sequencer),
             turn_id: self.turn_id.clone(),
         }
     }
@@ -690,26 +915,7 @@ impl AgentEventPublisher {
         kind: AgentEventKind,
         payload: Arc<RawValue>,
     ) -> Result<u64, EventError> {
-        let mut pending = self.channel.lock_pending();
-        self.channel.publish_pending(&mut pending)?;
-        let (seq, admission) = self.channel.reserve_publisher_event(kind, None)?;
-        if !self.channel.receivers_are_closed() {
-            self.channel.publish(TimedAgentEvent {
-                event: AgentEvent {
-                    protocol_version: AGENT_EVENT_PROTOCOL_VERSION,
-                    request_id: Arc::clone(&self.channel.request_id),
-                    seq,
-                    kind,
-                    payload,
-                },
-                timing: AgentEventTiming {
-                    emitted_ns: monotonic_now_ns(),
-                    source_received_ns: None,
-                },
-            });
-        }
-        drop(admission);
-        Ok(seq)
+        self.channel.sequence(Op::Next { kind, payload })
     }
 
     pub fn emit_text_delta(
@@ -728,16 +934,7 @@ impl AgentEventPublisher {
 
     fn publish_timed(&self, event: TimedAgentEvent) -> Result<(), EventError> {
         self.validate(&event.event)?;
-        let mut pending = self.channel.lock_pending();
-        self.channel.publish_pending(&mut pending)?;
-        let (_, admission) = self
-            .channel
-            .reserve_publisher_event(event.event.kind, Some(event.event.seq))?;
-        if !self.channel.receivers_are_closed() {
-            self.channel.publish(event);
-        }
-        drop(admission);
-        Ok(())
+        self.channel.sequence(Op::Exact(event)).map(drop)
     }
 
     fn validate(&self, event: &AgentEvent) -> Result<(), EventError> {
@@ -764,7 +961,7 @@ pub struct WeakAgentEventPublisher {
     session: std::sync::Weak<Subscribers>,
     turn: Option<mpsc::WeakUnboundedSender<TimedAgentEvent>>,
     turn_admission: Option<Arc<AtomicU64>>,
-    pending: Arc<Mutex<PendingDelta>>,
+    sequencer: Arc<Sequencer>,
     turn_id: Option<Arc<str>>,
 }
 
@@ -787,7 +984,7 @@ impl WeakAgentEventPublisher {
                 session: self.session.upgrade()?,
                 turn,
                 turn_admission: self.turn_admission.clone(),
-                pending: Arc::clone(&self.pending),
+                sequencer: Arc::clone(&self.sequencer),
             },
             turn_id: self.turn_id.clone(),
         })
@@ -857,25 +1054,11 @@ impl EventSink {
         }
 
         let payload = encode_payload(kind, self.publisher.turn_id.as_deref(), &payload)?;
-        let mut pending = channel.lock_pending();
-        channel.publish_pending(&mut pending)?;
-        let seq = channel.allocate_sequence()?;
-        channel.publish(TimedAgentEvent {
-            event: AgentEvent {
-                protocol_version: AGENT_EVENT_PROTOCOL_VERSION,
-                request_id: Arc::clone(&channel.request_id),
-                seq,
-                kind,
-                payload,
-            },
-            timing: AgentEventTiming {
-                emitted_ns: monotonic_now_ns(),
-                source_received_ns,
-            },
-        });
-        channel.record_local_terminal(kind);
-        drop(pending);
-        Ok(seq)
+        channel.sequence(Op::Sink {
+            kind,
+            payload,
+            source_received_ns,
+        })
     }
 
     pub fn emit_text_delta(

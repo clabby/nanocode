@@ -1,8 +1,6 @@
-use std::{
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
+use arc_swap::ArcSwap;
 use futures_util::StreamExt;
 use http::{HeaderName, HeaderValue, Method};
 use nanocode_mcp::{
@@ -10,6 +8,7 @@ use nanocode_mcp::{
     protocol::{INITIALIZE, INITIALIZED},
     sse,
 };
+use nanocode_sync::{SingleFlight, Slot};
 use reqwest::{
     StatusCode,
     header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
@@ -63,9 +62,9 @@ struct Shared {
     client: reqwest::Client,
     auth: HttpAuth,
     inbound: Inbound,
-    session: Mutex<SessionState>,
-    reinitialize: tokio::sync::Mutex<()>,
-    listener: Mutex<Option<JoinHandle<()>>>,
+    session: ArcSwap<SessionState>,
+    reinitialize: SingleFlight<Result<(), String>>,
+    listener: Slot<JoinHandle<()>>,
 }
 
 enum PostError {
@@ -107,9 +106,9 @@ pub fn spawn(
         client,
         auth,
         inbound,
-        session: Mutex::new(SessionState::default()),
-        reinitialize: tokio::sync::Mutex::new(()),
-        listener: Mutex::new(None),
+        session: ArcSwap::default(),
+        reinitialize: SingleFlight::default(),
+        listener: Slot::default(),
     });
     drop(tokio::spawn(drive(shared, outgoing)));
 }
@@ -128,15 +127,15 @@ async fn drive(shared: Arc<Shared>, mut outgoing: Outgoing) {
         if !initialized {
             match &message {
                 Message::Request { id, method, .. }
-                    if method == INITIALIZE && shared.state().initialize.is_none() =>
+                    if method == INITIALIZE && shared.session.load().initialize.is_none() =>
                 {
                     match shared.post_initialize(&message).await {
                         Ok((response, session_id)) => {
-                            *shared.state() = SessionState {
+                            shared.session.store(Arc::new(SessionState {
                                 id: session_id,
                                 protocol_version: negotiated_version(&response),
                                 initialize: Some(message.clone()),
-                            };
+                            }));
                             shared.inbound.deliver(response);
                         }
                         Err(error) => shared.inbound.fail(id, SessionError::Transport(error)),
@@ -145,7 +144,7 @@ async fn drive(shared: Arc<Shared>, mut outgoing: Outgoing) {
                 }
                 Message::Notification { method, .. } if method == INITIALIZED => {
                     initialized = true;
-                    let state = shared.state().clone();
+                    let state = shared.state();
                     if let Err(error) = shared.post(&message, &state).await {
                         tracing::error!(
                             error = %String::from(error),
@@ -163,7 +162,7 @@ async fn drive(shared: Arc<Shared>, mut outgoing: Outgoing) {
         let shared = Arc::clone(&shared);
         tasks.spawn(async move { shared.dispatch(message).await });
     }
-    if let Some(listener) = shared.listener().take() {
+    if let Some(listener) = shared.listener.take() {
         listener.abort();
     }
     tasks.abort_all();
@@ -212,12 +211,8 @@ fn challenge_error(response: &reqwest::Response) -> Option<String> {
 }
 
 impl Shared {
-    fn state(&self) -> MutexGuard<'_, SessionState> {
-        self.session.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn listener(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
-        self.listener.lock().unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> SessionState {
+        SessionState::clone(&self.session.load())
     }
 
     async fn send(
@@ -355,14 +350,14 @@ impl Shared {
     }
 
     async fn post_with_recovery(self: &Arc<Self>, message: &Message) -> Result<(), String> {
-        let state = self.state().clone();
+        let state = self.state();
         match self.post(message, &state).await {
             Err(PostError::SessionExpired) if state.initialize.is_some() => {
                 tracing::info!(
                     "session expired (HTTP 404), attempting transparent re-initialization"
                 );
                 self.reinitialize(state.id.clone()).await?;
-                let state = self.state().clone();
+                let state = self.state();
                 self.post(message, &state).await.map_err(String::from)
             }
             result => result.map_err(String::from),
@@ -370,8 +365,14 @@ impl Shared {
     }
 
     async fn reinitialize(self: &Arc<Self>, stale: Option<Arc<str>>) -> Result<(), String> {
-        let _guard = self.reinitialize.lock().await;
-        let state = self.state().clone();
+        let shared = Arc::clone(self);
+        self.reinitialize
+            .run(|| async move { shared.renew(stale).await })
+            .await
+    }
+
+    async fn renew(self: Arc<Self>, stale: Option<Arc<str>>) -> Result<(), String> {
+        let state = self.state();
         if state.id != stale {
             return Ok(());
         }
@@ -390,7 +391,7 @@ impl Shared {
         self.post(&Message::notification(INITIALIZED, None), &state)
             .await
             .map_err(String::from)?;
-        *self.state() = state;
+        self.session.store(Arc::new(state));
         self.restart_listener();
         Ok(())
     }
@@ -618,7 +619,7 @@ impl Shared {
     }
 
     async fn get(&self, last_event_id: Option<&str>) -> Result<Option<reqwest::Response>, String> {
-        let state = self.state().clone();
+        let state = self.state();
         let session = Self::with_session(&state);
         let response = self
             .send(&Method::GET, |request| {
@@ -649,13 +650,13 @@ impl Shared {
     }
 
     fn restart_listener(self: &Arc<Self>) {
-        let has_session = self.state().id.is_some();
-        let mut listener = self.listener();
-        if let Some(previous) = listener.take() {
+        if let Some(previous) = self.listener.take() {
             previous.abort();
         }
-        if has_session {
-            *listener = Some(tokio::spawn(Arc::clone(self).listen()));
+        if self.session.load().id.is_some()
+            && let Some(raced) = self.listener.put(tokio::spawn(Arc::clone(self).listen()))
+        {
+            raced.abort();
         }
     }
 
@@ -694,7 +695,7 @@ impl Shared {
     }
 
     async fn delete_session(&self) {
-        let state = self.state().clone();
+        let state = self.state();
         let Some(session_id) = state.id.clone() else {
             return;
         };

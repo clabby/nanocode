@@ -9,31 +9,40 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use sha1::{Digest, Sha1};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::LazyLock;
+
+use arc_swap::ArcSwap;
 
 const AUDIO_TOKEN_ESTIMATE_CACHE_SIZE: usize = 32;
 const AUDIO_TOKENS_PER_SECOND: f64 = 10.0;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 
-static AUDIO_TOKEN_ESTIMATE_CACHE: Mutex<VecDeque<([u8; 20], usize)>> = Mutex::new(VecDeque::new());
+type AudioEstimates = VecDeque<([u8; 20], usize)>;
+static AUDIO_TOKEN_ESTIMATE_CACHE: LazyLock<ArcSwap<AudioEstimates>> =
+    LazyLock::new(ArcSwap::default);
 
-#[must_use]
-pub fn estimate_audio_token_count(audio_url: &str) -> usize {
-    let key: [u8; 20] = Sha1::digest(audio_url.as_bytes()).into();
-    if let Ok(mut cache) = AUDIO_TOKEN_ESTIMATE_CACHE.lock()
-        && let Some(index) = cache.iter().position(|(cached, _)| *cached == key)
-        && let Some(entry) = cache.remove(index)
-    {
-        cache.push_back(entry);
-        return entry.1;
-    }
-    let tokens = uncached_audio_token_count(audio_url);
-    if let Ok(mut cache) = AUDIO_TOKEN_ESTIMATE_CACHE.lock() {
+fn remember(key: [u8; 20], tokens: usize) {
+    AUDIO_TOKEN_ESTIMATE_CACHE.rcu(|cache| {
+        let mut cache = VecDeque::clone(cache);
+        cache.retain(|(cached, _)| *cached != key);
         if cache.len() >= AUDIO_TOKEN_ESTIMATE_CACHE_SIZE {
             cache.pop_front();
         }
         cache.push_back((key, tokens));
-    }
+        cache
+    });
+}
+
+#[must_use]
+pub fn estimate_audio_token_count(audio_url: &str) -> usize {
+    let key: [u8; 20] = Sha1::digest(audio_url.as_bytes()).into();
+    let cached = AUDIO_TOKEN_ESTIMATE_CACHE
+        .load()
+        .iter()
+        .find(|(cached, _)| *cached == key)
+        .map(|(_, tokens)| *tokens);
+    let tokens = cached.unwrap_or_else(|| uncached_audio_token_count(audio_url));
+    remember(key, tokens);
     tokens
 }
 

@@ -1,6 +1,8 @@
 use super::*;
 use crate::client::responses::FunctionOutputContent;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use nanocode_code_mode::contract::ToolOutputContent;
+use nanocode_sync::Slot;
 
 #[derive(Clone)]
 pub(super) struct ActiveToolCall {
@@ -9,18 +11,19 @@ pub(super) struct ActiveToolCall {
     pub(super) kind: CodeCallKind,
     pub(super) started_at: Instant,
     pub(super) shell_abort_format: bool,
-    pub(super) completion: Arc<Mutex<Option<CompletedToolCall>>>,
-    pub(super) progress: Arc<Mutex<ActiveToolProgress>>,
-    pub(super) execution_started_at: Arc<Mutex<Option<Instant>>>,
+    pub(super) completion: Arc<Slot<CompletedToolCall>>,
+    pub(super) progress: Arc<ArcSwap<ActiveToolProgress>>,
+    pub(super) execution_started_at: Arc<ArcSwapOption<Instant>>,
     pub(super) span: tracing::Span,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct ActiveToolProgress {
     pub(super) nested_tool_calls: u32,
     pub(super) active_nested_tool_calls: Vec<ActiveNestedToolCall>,
 }
 
+#[derive(Clone)]
 pub(super) struct ActiveNestedToolCall {
     pub(super) call_id: String,
     pub(super) tool: String,
@@ -215,7 +218,7 @@ fn restored_output(primary: &FunctionOutputBody) -> Option<ToolOutputBody> {
 pub(super) struct NestedToolEventObserver<'a> {
     events: &'a EventSink,
     tool_call_indices: &'a HashMap<Box<str>, u32>,
-    pub(super) progress: &'a Mutex<ActiveToolProgress>,
+    pub(super) progress: &'a ArcSwap<ActiveToolProgress>,
     fallback_call_index: u32,
     parent_call_id: &'a str,
     error: Option<NanocodeError>,
@@ -244,28 +247,24 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                     },
                 );
                 if result.is_ok() {
-                    let mut progress = self
-                        .progress
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    progress.nested_tool_calls += 1;
-                    progress
-                        .active_nested_tool_calls
-                        .push(ActiveNestedToolCall {
-                            call_id,
-                            tool: name.to_owned(),
-                            started_at,
-                        });
+                    let nested = ActiveNestedToolCall {
+                        call_id,
+                        tool: name.to_owned(),
+                        started_at,
+                    };
+                    self.progress.rcu(|progress| {
+                        let mut progress = ActiveToolProgress::clone(progress);
+                        progress.nested_tool_calls += 1;
+                        progress.active_nested_tool_calls.push(nested.clone());
+                        progress
+                    });
                 }
                 result
             }
             CodeModeUpdate::NestedCallCompleted(call) => {
                 let (call_id, _) = self.event_context(&call.call_id);
-                {
-                    let mut progress = self
-                        .progress
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.progress.rcu(|progress| {
+                    let mut progress = ActiveToolProgress::clone(progress);
                     if let Some(index) = progress
                         .active_nested_tool_calls
                         .iter()
@@ -273,7 +272,8 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                     {
                         progress.active_nested_tool_calls.remove(index);
                     }
-                }
+                    progress
+                });
 
                 self.events.emit(
                     AgentEventKind::ToolResult,
@@ -307,7 +307,7 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
 pub(super) struct DetachedNestedToolEvents {
     events: EventSink,
     tool_call_indices: HashMap<Box<str>, u32>,
-    progress: Mutex<ActiveToolProgress>,
+    progress: ArcSwap<ActiveToolProgress>,
     parent_call_id: String,
 }
 
@@ -320,7 +320,7 @@ impl DetachedNestedToolEvents {
         Self {
             events,
             tool_call_indices,
-            progress: Mutex::default(),
+            progress: ArcSwap::default(),
             parent_call_id: parent_call_id.to_owned(),
         }
     }
@@ -351,8 +351,8 @@ impl CodeModeObserver for DetachedNestedToolEvents {
 pub(super) struct TurnTeardownEvents<'a> {
     events: &'a EventSink,
     tool_call_indices: &'a HashMap<Box<str>, u32>,
-    active: Vec<Arc<Mutex<ActiveToolProgress>>>,
-    progress: Mutex<ActiveToolProgress>,
+    active: Vec<Arc<ArcSwap<ActiveToolProgress>>>,
+    progress: ArcSwap<ActiveToolProgress>,
 }
 
 impl<'a> TurnTeardownEvents<'a> {
@@ -365,7 +365,7 @@ impl<'a> TurnTeardownEvents<'a> {
             events,
             tool_call_indices,
             active: active.iter().map(|call| call.progress.clone()).collect(),
-            progress: Mutex::default(),
+            progress: ArcSwap::default(),
         }
     }
 }
@@ -384,8 +384,7 @@ impl CodeModeObserver for TurnTeardownEvents<'_> {
             let (call_id, _) = observer.event_context(&call.call_id);
             let owned_by_active_call = self.active.iter().any(|progress| {
                 progress
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .load()
                     .active_nested_tool_calls
                     .iter()
                     .any(|active| active.call_id == call_id)
@@ -515,9 +514,7 @@ impl ModelRun {
                         let dispatch = async {
                             active
                                 .execution_started_at
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .replace(Instant::now());
+                                .store(Some(Arc::new(Instant::now())));
                             Self::execute_model_tool_call(
                                 tools,
                                 &events,
@@ -552,11 +549,7 @@ impl ModelRun {
                                 }
                             }
                             Self::emit_completed_tool_result(&events, &completed)?;
-                            active
-                                .completion
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .replace(completed);
+                            drop(active.completion.put(completed));
                             Ok(active)
                         }
                         Err(error) => Err(error),
@@ -566,12 +559,7 @@ impl ModelRun {
             .collect::<FuturesOrdered<_>>();
         while let Some(active) = executions.next().await {
             let active = active?;
-            let Some(completed) = active
-                .completion
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            else {
+            let Some(completed) = active.completion.take() else {
                 return Err(NanocodeError::InvalidAttemptState {
                     detail: "completed tool call did not retain its output",
                 });
@@ -626,9 +614,9 @@ impl ModelRun {
             started_at,
             shell_abort_format: call.namespace.is_none()
                 && matches!(call.name.as_str(), "shell_command" | "unified_exec"),
-            completion: Arc::new(Mutex::new(None)),
-            progress: Arc::new(Mutex::new(ActiveToolProgress::default())),
-            execution_started_at: Arc::new(Mutex::new(None)),
+            completion: Arc::default(),
+            progress: Arc::default(),
+            execution_started_at: Arc::default(),
             span,
         };
         self.active_tool_calls.push(active.clone());
@@ -638,7 +626,7 @@ impl ModelRun {
     pub(super) fn finish_completed_tool_call(
         &mut self,
         completed: CompletedToolCall,
-        progress: &Mutex<ActiveToolProgress>,
+        progress: &ArcSwap<ActiveToolProgress>,
     ) -> Result<Vec<ResponseItem>> {
         if !completed
             .cell
@@ -659,13 +647,9 @@ impl ModelRun {
 
     pub(super) fn finish_active_tool_progress(
         &mut self,
-        progress: &Mutex<ActiveToolProgress>,
+        progress: &ArcSwap<ActiveToolProgress>,
     ) -> Vec<ActiveNestedToolCall> {
-        let progress = std::mem::take(
-            &mut *progress
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let progress = Arc::unwrap_or_clone(progress.swap(Arc::default()));
         self.stats.tool_calls += progress.nested_tool_calls;
         progress.active_nested_tool_calls
     }
@@ -673,20 +657,14 @@ impl ModelRun {
     pub(super) fn completed_tool_work_duration(active: &ActiveToolCall) -> u64 {
         active
             .execution_started_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .load()
             .as_ref()
-            .map_or(0, |started_at| elapsed_ns(*started_at))
+            .map_or(0, |started_at| elapsed_ns(**started_at))
     }
 
     pub(super) fn finish_cancelled_tool_work(&mut self, active: &ActiveToolCall) {
-        let started_at = active
-            .execution_started_at
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(started_at) = started_at {
-            self.stats.tool_work_duration_ns += elapsed_ns(started_at);
+        if let Some(started_at) = active.execution_started_at.swap(None) {
+            self.stats.tool_work_duration_ns += elapsed_ns(*started_at);
         }
     }
 
@@ -820,7 +798,7 @@ impl ModelRun {
         host_context: Option<&str>,
         instruction_revision: Option<u64>,
         started_at: Instant,
-        progress: &Mutex<ActiveToolProgress>,
+        progress: &ArcSwap<ActiveToolProgress>,
         tool_span: &tracing::Span,
     ) -> Result<CompletedToolCall> {
         let qualified_name = qualified_tool_name(&call);

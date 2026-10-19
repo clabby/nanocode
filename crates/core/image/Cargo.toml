@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 description = "Shared prompt image preparation"
 [dependencies]
+arc-swap.workspace = true
 memchr.workspace = true
 base64-simd.workspace = true
 tracing = { workspace = true  }

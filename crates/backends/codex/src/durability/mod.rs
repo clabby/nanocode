@@ -1,10 +1,13 @@
 use std::{
     collections::HashSet,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
+
+use arc_swap::{ArcSwap, ArcSwapOption};
+use nanocode_sync::Slot;
 
 use nanocode_agent_core::{ExecutionPolicyDisposition, NanocodeError, Result as AgentResult};
 use nanocode_durability::{
@@ -119,16 +122,10 @@ impl<F> DurableAgentExt for CodexBuilder<F> {
 
             builder = builder.default_prompt_cache_key(state_id.clone());
         }
-        let owner = Arc::new(Mutex::new(Some((owner, known_records, branches))));
+        let owner = Arc::new(Slot::new(Some((owner, known_records, branches))));
         Ok(builder
             .execution_policy_factory(move || {
                 let (owner, keys, branches) = owner
-                    .lock()
-                    .map_err(|_| {
-                        NanocodeError::InvalidExecutionPolicy(
-                            "the durability-attached builder owner lock was poisoned".to_owned(),
-                        )
-                    })?
                     .take()
                     .ok_or_else(|| {
                         NanocodeError::InvalidExecutionPolicy(
@@ -178,8 +175,8 @@ struct DurableExecution {
     owner: DurableOwner,
     state_id: String,
     branches: Option<Branches>,
-    context_records: Mutex<HashSet<String>>,
-    continuation_cache: tokio::sync::Mutex<context::ContinuationCache>,
+    context_records: ArcSwap<HashSet<String>>,
+    continuation_cache: Slot<context::ContinuationCache>,
 }
 
 impl DurableExecution {
@@ -188,8 +185,8 @@ impl DurableExecution {
             owner,
             state_id,
             branches,
-            context_records: Mutex::new(HashSet::new()),
-            continuation_cache: tokio::sync::Mutex::default(),
+            context_records: ArcSwap::default(),
+            continuation_cache: Slot::default(),
         }
     }
 
@@ -197,25 +194,20 @@ impl DurableExecution {
         &self,
         snapshot: SessionSnapshot,
     ) -> AgentResult<nanocode_durability::Prepared> {
-        let known = self
-            .context_records
-            .lock()
-            .map_err(|_| NanocodeError::InvalidExecutionPolicy("context cache poisoned".into()))?;
-        context::prepare_snapshot(snapshot, &known).map_err(agent_error)
+        context::prepare_snapshot(snapshot, &self.context_records.load()).map_err(agent_error)
     }
 
     fn remember(&self, keys: HashSet<String>) -> AgentResult<()> {
-        *self.context_records.lock().map_err(|_| {
-            NanocodeError::InvalidExecutionPolicy("context cache poisoned".into())
-        })? = keys;
+        self.context_records.store(Arc::new(keys));
         Ok(())
     }
 
     fn remember_more(&self, keys: HashSet<String>) -> AgentResult<()> {
-        self.context_records
-            .lock()
-            .map_err(|_| NanocodeError::InvalidExecutionPolicy("context cache poisoned".into()))?
-            .extend(keys);
+        self.context_records.rcu(|known| {
+            let mut known = HashSet::clone(known);
+            known.extend(keys.iter().cloned());
+            known
+        });
         Ok(())
     }
 }
@@ -537,12 +529,9 @@ impl ExecutionPolicy for DurableExecution {
         continuation: ExecutionContinuation,
     ) -> ExecutionFuture<'a, AgentResult<()>> {
         Box::pin(async move {
-            let prepared = {
-                let known = self.context_records.lock().map_err(|_| {
-                    NanocodeError::InvalidExecutionPolicy("context cache poisoned".into())
-                })?;
-                context::prepare_continuation(continuation, &known).map_err(agent_error)?
-            };
+            let prepared =
+                context::prepare_continuation(continuation, &self.context_records.load())
+                    .map_err(agent_error)?;
             self.owner
                 .advance(operation_id, prepared.payload)
                 .await
@@ -578,15 +567,19 @@ impl ExecutionPolicy for DurableExecution {
         next_step: Option<(String, String, String)>,
     ) -> ExecutionFuture<'a, AgentResult<Option<ExecutionStepAdmission>>> {
         Box::pin(async move {
-            let mut cache = self.continuation_cache.lock().await;
-            let prepared = {
-                let known = self.context_records.lock().map_err(|_| {
-                    NanocodeError::InvalidExecutionPolicy("context cache poisoned".into())
-                })?;
-                context::prepare_cached_continuation(
-                    state_json, &history, &prefix, &mut cache, &known,
-                )
-                .map_err(agent_error)?
+            let mut cache = self.continuation_cache.take().unwrap_or_default();
+            let prepared = match context::prepare_cached_continuation(
+                state_json,
+                &history,
+                &prefix,
+                &mut cache,
+                &self.context_records.load(),
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(self.continuation_cache.put(cache));
+                    return Err(agent_error(error));
+                }
             };
             let mut writes = vec![OwnerWrite::Advance {
                 continuation: prepared.payload,
@@ -602,13 +595,12 @@ impl ExecutionPolicy for DurableExecution {
                 }
                 None => None,
             };
-            let outcomes = self
-                .owner
-                .commit_writes(operation_id, writes)
-                .await
-                .map_err(agent_error)?;
-            cache.committed(history, prefix);
-            drop(cache);
+            let outcomes = self.owner.commit_writes(operation_id, writes).await;
+            if outcomes.is_ok() {
+                cache.committed(history, prefix);
+            }
+            drop(self.continuation_cache.put(cache));
+            let outcomes = outcomes.map_err(agent_error)?;
             self.remember_more(prepared.keys)?;
             let Some(kind) = kind else {
                 return Ok(None);
@@ -692,7 +684,7 @@ struct LazyExecution {
 
     initialized: std::sync::atomic::AtomicBool,
 
-    created_with: Mutex<Option<crate::execution::InitialSettings>>,
+    created_with: ArcSwapOption<crate::execution::InitialSettings>,
 
     existing: Option<Arc<AtomicBool>>,
 
@@ -709,7 +701,7 @@ impl LazyExecution {
             ready: tokio::sync::OnceCell::new(),
             reopened: std::sync::atomic::AtomicBool::new(false),
             initialized: std::sync::atomic::AtomicBool::new(false),
-            created_with: Mutex::new(None),
+            created_with: ArcSwapOption::empty(),
             existing: None,
             attempted: AtomicBool::new(false),
             journal: None,
@@ -743,8 +735,7 @@ impl LazyExecution {
             .get_or_try_init(|| async {
                 let mut record = self.record.clone();
                 let mut initial_settings = None;
-                if let Some(settings) = self.created_with.lock().ok().and_then(|settings| *settings)
-                {
+                if let Some(settings) = self.created_with.load_full().map(|settings| *settings) {
                     record.model = nanocode_agent_core::ModelSelection::new(
                         nanocode_agent_core::BackendId::Codex,
                         settings.model.as_str(),
@@ -894,9 +885,7 @@ impl ExecutionPolicy for LazyExecution {
                     "the deferred durable acquisition already failed".to_owned(),
                 ));
             }
-            if let Ok(mut created_with) = self.created_with.lock() {
-                *created_with = Some(settings);
-            }
+            self.created_with.store(Some(Arc::new(settings)));
 
             let (snapshot, prepared) = match snapshot {
                 Some(snapshot) if self.ready.get().is_none() => (

@@ -2,8 +2,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::client::{Model, Thinking, pricing::ServiceTier, responses::RequestProfile};
 use crate::model::run::ModelCheckpoint;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
 use crate::{NanocodeError, Result};
 
@@ -15,13 +16,13 @@ type WarmupEntries = HashMap<PrefixFingerprint, WarmupEntry>;
 pub(crate) struct ModelPromptCache {
     key: Arc<str>,
     shared: Option<SharedPromptCache>,
-    live: Arc<std::sync::Mutex<Option<ModelCheckpoint>>>,
-    request: Arc<std::sync::Mutex<Option<(Thinking, ServiceTier)>>>,
+    live: Arc<ArcSwapOption<ModelCheckpoint>>,
+    request: Arc<ArcSwapOption<(Thinking, ServiceTier)>>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct SharedPromptCache {
-    entries: Arc<Mutex<WarmupEntries>>,
+    entries: Arc<ArcSwap<WarmupEntries>>,
 }
 
 impl ModelPromptCache {
@@ -35,23 +36,19 @@ impl ModelPromptCache {
     }
 
     pub(crate) fn publish_request(&self, thinking: Thinking, service_tier: ServiceTier) {
-        *self.request.lock().expect("request settings lock poisoned") =
-            Some((thinking, service_tier));
+        self.request.store(Some(Arc::new((thinking, service_tier))));
     }
 
     pub(crate) fn request(&self) -> Option<(Thinking, ServiceTier)> {
-        *self.request.lock().expect("request settings lock poisoned")
+        self.request.load_full().map(|request| *request)
     }
 
     pub(crate) fn publish_live(&self, checkpoint: Option<ModelCheckpoint>) {
-        *self.live.lock().expect("live checkpoint lock poisoned") = checkpoint;
+        self.live.store(checkpoint.map(Arc::new));
     }
 
     pub(crate) fn live(&self) -> Option<ModelCheckpoint> {
-        self.live
-            .lock()
-            .expect("live checkpoint lock poisoned")
-            .clone()
+        self.live.load().as_deref().cloned()
     }
 
     pub(crate) fn key(&self) -> &str {
@@ -70,10 +67,15 @@ impl SharedPromptCache {
         profile: &RequestProfile,
     ) -> Result<WarmupEntry> {
         let fingerprint = prefix_fingerprint(model, profile)?;
-        let mut entries = self.entries.lock().await;
-        Ok(Arc::clone(
-            entries.entry(fingerprint).or_insert_with(Arc::default),
-        ))
+        let mut entry = None;
+        self.entries.rcu(|entries| {
+            let mut entries = WarmupEntries::clone(entries);
+            entry = Some(Arc::clone(
+                entries.entry(fingerprint).or_insert_with(Arc::default),
+            ));
+            entries
+        });
+        Ok(entry.unwrap_or_default())
     }
 }
 

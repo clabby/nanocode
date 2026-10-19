@@ -11,6 +11,7 @@ description = "Shared SDK contracts and event channels with compatible value ree
 
 [dependencies]
 arc-swap.workspace = true
+nanocode-sync.workspace = true
 nanocode-platform.workspace = true
 nanocode-types-core.workspace = true
 serde.workspace = true

@@ -1,4 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Weak},
+    time::Duration,
+};
+
+use arc_swap::ArcSwap;
+use nanocode_sync::SingleFlight;
 
 use nanocode_mcp::oauth::{ClientAuthentication, TokenError, TokenResponse};
 use tokio::time::timeout;
@@ -8,6 +15,30 @@ use super::{McpOAuthCredentials, OAuthRuntime, now_millis};
 const REFRESH_SKEW_MILLIS: u64 = 30_000;
 const REFRESH_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+type Refresh = SingleFlight<Result<(), String>>;
+
+static REFRESHES: LazyLock<ArcSwap<HashMap<String, Weak<Refresh>>>> =
+    LazyLock::new(ArcSwap::default);
+
+fn refresh_for(key: &str) -> Arc<Refresh> {
+    let mut refresh = None;
+    REFRESHES.rcu(|refreshes| {
+        let mut refreshes: HashMap<_, _> = refreshes
+            .iter()
+            .filter(|(_, refresh)| refresh.strong_count() > 0)
+            .map(|(key, refresh)| (key.clone(), refresh.clone()))
+            .collect();
+        let current = refreshes
+            .get(key)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(Refresh::default()));
+        refreshes.insert(key.to_owned(), Arc::downgrade(&current));
+        refresh = Some(current);
+        refreshes
+    });
+    refresh.unwrap_or_default()
+}
 
 impl McpOAuthCredentials {
     fn needs_refresh(&self) -> bool {
@@ -38,10 +69,9 @@ impl OAuthRuntime {
         Box::pin(async move {
             let refresh_needed = self
                 .credentials
-                .lock()
-                .await
+                .load()
                 .as_ref()
-                .is_none_or(McpOAuthCredentials::needs_refresh);
+                .is_none_or(|credentials| credentials.needs_refresh());
             if !refresh_needed {
                 return Ok(());
             }
@@ -64,26 +94,38 @@ impl OAuthRuntime {
         rejected_access_token: Option<String>,
     ) -> Result<(), String> {
         let runtime = Arc::clone(self);
-        let task = tokio::spawn(async move {
-            let result = runtime
-                .refresh_transaction(rejected_access_token.as_deref())
-                .await;
-            if let Err(error) = &result {
-                tracing::warn!(
-                    server = %runtime.server_name,
-                    refresh_reason = reason,
-                    %error,
-                    "MCP OAuth refresh transaction failed"
-                );
-            }
-            result
-        });
-        task.await.map_err(|error| {
-            format!(
-                "OAuth refresh task failed for MCP server `{}`: {error}",
-                self.server_name
-            )
-        })?
+        let refresh = refresh_for(&format!("{}\0{}", self.server_name, self.server_url));
+        refresh
+            .run(|| async move {
+                let server_name = runtime.server_name.clone();
+                let task = tokio::spawn(async move {
+                    let result = runtime
+                        .refresh_transaction(rejected_access_token.as_deref())
+                        .await;
+                    if let Err(error) = &result {
+                        tracing::warn!(
+                            server = %runtime.server_name,
+                            refresh_reason = reason,
+                            %error,
+                            "MCP OAuth refresh transaction failed"
+                        );
+                    }
+                    result
+                });
+                task.await.map_err(|error| {
+                    format!("OAuth refresh task failed for MCP server `{server_name}`: {error}")
+                })?
+            })
+            .await?;
+        if let Some(latest) = self
+            .store
+            .load(&self.server_name, &self.server_url)
+            .await
+            .map_err(|error| format!("failed to reread authoritative OAuth credentials: {error}"))?
+        {
+            self.credentials.store(Some(Arc::new(latest)));
+        }
+        Ok(())
     }
 
     async fn refresh_transaction(&self, rejected_access_token: Option<&str>) -> Result<(), String> {
@@ -108,7 +150,7 @@ impl OAuthRuntime {
                 format!("failed to reread authoritative OAuth credentials: {error}")
             })?;
         let Some(latest) = latest else {
-            *self.credentials.lock().await = None;
+            self.credentials.store(None);
             return Err(format!(
                 "OAuth credentials for `{}` were removed; authorization required",
                 self.server_name
@@ -151,7 +193,7 @@ impl OAuthRuntime {
 
         let rejected = rejected_access_token.is_some_and(|token| token == latest.access_token);
         if !latest.needs_refresh() && !rejected {
-            *self.credentials.lock().await = Some(latest);
+            self.credentials.store(Some(Arc::new(latest)));
             return Ok(());
         }
         let Some(refresh_token) = latest
@@ -165,7 +207,7 @@ impl OAuthRuntime {
             ));
         };
 
-        *self.credentials.lock().await = Some(latest.clone());
+        self.credentials.store(Some(Arc::new(latest.clone())));
         let mut scopes = latest.scopes.clone();
         metadata.add_offline_access(&mut scopes);
         let request = nanocode_mcp::oauth::refresh_token_request(
@@ -217,7 +259,7 @@ impl OAuthRuntime {
             ));
         }
 
-        *self.credentials.lock().await = Some(refreshed);
+        self.credentials.store(Some(Arc::new(refreshed)));
         Ok(())
     }
 }

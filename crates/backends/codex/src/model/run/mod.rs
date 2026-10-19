@@ -17,7 +17,7 @@ use std::{
     any::Any,
     collections::{HashMap, VecDeque},
     panic::AssertUnwindSafe,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use crate::client::{
@@ -112,7 +112,7 @@ pub(crate) struct TurnSteering {
     pub(crate) instant_tool_steering: bool,
     pub(crate) receiver: crate::agent::execution::SteerQueue,
     pub(crate) retained: Vec<QueuedSteer>,
-    pub(crate) model_call_index: Arc<tokio::sync::Mutex<u32>>,
+    pub(crate) model_call_index: Arc<std::sync::atomic::AtomicU32>,
 }
 
 pub(crate) enum ModelTurnOutcome {

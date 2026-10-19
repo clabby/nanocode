@@ -47,7 +47,7 @@ pub(super) struct LocalLifecycle {
     pub(super) shutdown: DriverShutdown,
     pub(super) checkpoints: Arc<CheckpointSource>,
 
-    pub(super) initial_ready: Arc<std::sync::Mutex<Option<oneshot::Receiver<Result<()>>>>>,
+    pub(super) initial_ready: Arc<nanocode_sync::Slot<oneshot::Receiver<Result<()>>>>,
 }
 
 const CODEX_CAPABILITIES: Capabilities = {
@@ -430,11 +430,7 @@ impl LifecycleBackend for LocalLifecycle {
     }
 
     fn persist_initial(&self) -> BackendFuture<Result<()>> {
-        let ready = self
-            .initial_ready
-            .lock()
-            .ok()
-            .and_then(|mut ready| ready.take());
+        let ready = self.initial_ready.take();
         Box::pin(async move {
             match ready {
                 Some(ready) => ready.await.map_err(|_| NanocodeError::AgentStopped)?,
@@ -484,19 +480,14 @@ impl LifecycleBackend for LocalLifecycle {
         let execution = self.execution.clone();
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
-            let (initiate, receiver) = shutdown.request();
-            if initiate && commands.send(Command::Shutdown).await.is_err() {
+            if shutdown.request() && commands.send(Command::Shutdown).await.is_err() {
                 let outcome = match execution.shutdown().await {
                     Ok(()) => Err(NanocodeError::AgentStopped),
                     Err(error) => Err(error),
                 };
                 shutdown.complete(outcome);
             }
-            match receiver.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(NanocodeError::Shutdown(error)),
-                Err(_) => Err(NanocodeError::AgentStopped),
-            }
+            shutdown.outcome().await.map_err(NanocodeError::Shutdown)
         })
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, OnceLock, Weak},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,9 +17,10 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::{Mutex, RwLock},
     task::JoinHandle,
 };
+
+use arc_swap::{ArcSwap, ArcSwapOption};
 use tracing::{Instrument, info_span};
 
 use crate::SecretSource;
@@ -31,25 +32,28 @@ const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 const MAX_OAUTH_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const OAUTH_CLIENT_NAME: &str = "Nanocode";
 
+type MetadataEntries = HashMap<(String, String), AuthorizationMetadata>;
+
 #[derive(Default)]
 pub struct OAuthMetadataCache {
-    entries: RwLock<HashMap<(String, String), AuthorizationMetadata>>,
+    entries: ArcSwap<MetadataEntries>,
 }
 
 impl OAuthMetadataCache {
     async fn get(&self, server_name: &str, server_url: &str) -> Option<AuthorizationMetadata> {
         self.entries
-            .read()
-            .await
+            .load()
             .get(&(server_name.to_owned(), server_url.to_owned()))
             .cloned()
     }
 
     async fn insert(&self, server_name: &str, server_url: &str, metadata: AuthorizationMetadata) {
-        self.entries
-            .write()
-            .await
-            .insert((server_name.to_owned(), server_url.to_owned()), metadata);
+        let key = (server_name.to_owned(), server_url.to_owned());
+        self.entries.rcu(|entries| {
+            let mut entries = MetadataEntries::clone(entries);
+            entries.insert(key.clone(), metadata.clone());
+            entries
+        });
     }
 }
 
@@ -170,28 +174,10 @@ pub trait McpOAuthStore: Send + Sync {
 
     async fn acquire_refresh_lock(
         &self,
-        server_name: &str,
-        server_url: &str,
+        _server_name: &str,
+        _server_url: &str,
     ) -> Result<Box<dyn McpOAuthRefreshGuard>, String> {
-        let key = format!("{server_name}\0{server_url}");
-        let lock = {
-            static LOCKS: OnceLock<
-                std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-            > = OnceLock::new();
-            let locks = LOCKS.get_or_init(Default::default);
-            let mut locks = locks
-                .lock()
-                .map_err(|_| "MCP OAuth refresh lock registry was poisoned".to_owned())?;
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-                lock
-            } else {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(key, Arc::downgrade(&lock));
-                lock
-            }
-        };
-        Ok(Box::new(lock.lock_owned().await))
+        Ok(Box::new(()))
     }
 }
 
@@ -201,7 +187,7 @@ pub struct OAuthRuntime {
     base_url: Url,
     http: reqwest::Client,
     store: Arc<dyn McpOAuthStore>,
-    credentials: Mutex<Option<McpOAuthCredentials>>,
+    credentials: ArcSwapOption<McpOAuthCredentials>,
 }
 
 impl OAuthRuntime {
@@ -216,8 +202,7 @@ impl OAuthRuntime {
 
     async fn current_access_token(&self) -> Result<String, String> {
         self.credentials
-            .lock()
-            .await
+            .load()
             .as_ref()
             .map(|credentials| credentials.access_token.clone())
             .ok_or_else(|| {
@@ -383,7 +368,7 @@ pub fn transport_from_credentials<'call>(
             base_url,
             http: http_client,
             store,
-            credentials: Mutex::new(Some(staged_credentials)),
+            credentials: ArcSwapOption::from_pointee(staged_credentials),
         });
         Ok(OAuthTransport {
             runtime,

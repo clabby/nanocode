@@ -1,8 +1,14 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
 };
+
+use arc_swap::{ArcSwap, ArcSwapOption};
+use nanocode_sync::Slot;
 
 use futures_channel::{mpsc, oneshot};
 use serde::{Serialize, de::DeserializeOwned};
@@ -54,40 +60,41 @@ type Reply = oneshot::Sender<Result<Value, Error>>;
 
 pub type Outgoing = mpsc::UnboundedReceiver<Message>;
 
-struct State {
-    next_id: u32,
-    pending: HashMap<RequestId, Reply>,
-    closed: bool,
-    server: Option<InitializeResult>,
-}
+type Pending = HashMap<RequestId, Arc<Slot<Reply>>>;
 
 struct Shared {
     outbound: mpsc::UnboundedSender<Message>,
-    state: Mutex<State>,
+    next_id: AtomicU32,
+    pending: ArcSwap<Pending>,
+    closed: AtomicBool,
+    server: ArcSwapOption<InitializeResult>,
 }
 
 impl Shared {
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn take_pending(&self, id: &RequestId) -> Option<Reply> {
+        let numeric = id.numeric_equivalent();
+        let mut taken = None;
+        self.pending.rcu(|pending| {
+            let mut pending = Pending::clone(pending);
+            taken = pending
+                .remove(id)
+                .or_else(|| numeric.as_ref().and_then(|id| pending.remove(id)));
+            pending
+        });
+        taken.and_then(|slot| slot.take())
     }
 
-    fn take_pending(&self, id: &RequestId) -> Option<Reply> {
-        let mut state = self.state();
-        if let Some(reply) = state.pending.remove(id) {
-            return Some(reply);
-        }
-        id.numeric_equivalent()
-            .and_then(|id| state.pending.remove(&id))
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     fn close(&self) {
-        let pending = {
-            let mut state = self.state();
-            state.closed = true;
-            std::mem::take(&mut state.pending)
-        };
-        for reply in pending.into_values() {
-            let _ = reply.send(Err(Error::Closed));
+        self.closed.store(true, Ordering::Release);
+        let pending = self.pending.swap(Arc::default());
+        for slot in pending.values() {
+            if let Some(reply) = slot.take() {
+                let _ = reply.send(Err(Error::Closed));
+            }
         }
         self.outbound.close_channel();
     }
@@ -114,10 +121,7 @@ impl Drop for PendingGuard<'_> {
         let Some(id) = self.id.take() else {
             return;
         };
-        let pending = {
-            let mut state = self.shared.state();
-            state.pending.remove(&id).is_some() && !state.closed
-        };
+        let pending = self.shared.take_pending(&id).is_some() && !self.shared.is_closed();
         if pending && self.cancellable {
             let _ = self.shared.outbound.unbounded_send(Message::notification(
                 CANCELLED,
@@ -133,12 +137,10 @@ impl Session {
         let (outbound, receiver) = mpsc::unbounded();
         let shared = Arc::new(Shared {
             outbound,
-            state: Mutex::new(State {
-                next_id: 0,
-                pending: HashMap::new(),
-                closed: false,
-                server: None,
-            }),
+            next_id: AtomicU32::new(0),
+            pending: ArcSwap::default(),
+            closed: AtomicBool::new(false),
+            server: ArcSwapOption::empty(),
         });
         let inbound = Inbound {
             shared: Arc::downgrade(&shared),
@@ -155,7 +157,7 @@ impl Session {
 
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.shared.state().closed
+        self.shared.is_closed()
     }
 
     pub fn close(&self) {
@@ -164,14 +166,14 @@ impl Session {
 
     #[must_use]
     pub fn server(&self) -> Option<InitializeResult> {
-        self.shared.state().server.clone()
+        self.shared.server.load().as_deref().cloned()
     }
 
     #[must_use]
     pub fn supports_tools(&self) -> bool {
         self.shared
-            .state()
             .server
+            .load()
             .as_ref()
             .is_some_and(|server| server.capabilities.supports_tools())
     }
@@ -179,24 +181,30 @@ impl Session {
     #[must_use]
     pub fn supports_resources(&self) -> bool {
         self.shared
-            .state()
             .server
+            .load()
             .as_ref()
             .is_some_and(|server| server.capabilities.supports_resources())
     }
 
     pub async fn request_value(&self, method: &str, params: Option<Value>) -> Result<Value, Error> {
         let (reply, response) = oneshot::channel();
-        let id = {
-            let mut state = self.shared.state();
-            if state.closed {
-                return Err(Error::Closed);
-            }
-            let id = RequestId::Number(i64::from(state.next_id));
-            state.next_id = state.next_id.wrapping_add(1);
-            state.pending.insert(id.clone(), reply);
-            id
-        };
+        if self.shared.is_closed() {
+            return Err(Error::Closed);
+        }
+        let id = RequestId::Number(i64::from(
+            self.shared.next_id.fetch_add(1, Ordering::Relaxed),
+        ));
+        let slot = Arc::new(Slot::new(Some(reply)));
+        self.shared.pending.rcu(|pending| {
+            let mut pending = Pending::clone(pending);
+            pending.insert(id.clone(), Arc::clone(&slot));
+            pending
+        });
+        if self.shared.is_closed() {
+            drop(self.shared.take_pending(&id));
+            return Err(Error::Closed);
+        }
         let mut guard = PendingGuard {
             shared: &self.shared,
             id: Some(id.clone()),
@@ -228,7 +236,7 @@ impl Session {
     }
 
     pub fn notify(&self, method: &str, params: Option<Value>) -> Result<(), Error> {
-        if self.shared.state().closed {
+        if self.shared.is_closed() {
             return Err(Error::Closed);
         }
         self.shared
@@ -241,7 +249,7 @@ impl Session {
         let result: InitializeResult = self
             .request(INITIALIZE, &InitializeParams::new(client_info))
             .await?;
-        self.shared.state().server = Some(result.clone());
+        self.shared.server.store(Some(Arc::new(result.clone())));
         self.notify(INITIALIZED, None)?;
         Ok(result)
     }
@@ -353,11 +361,11 @@ impl Inbound {
     #[must_use]
     pub fn is_pending(&self, id: &RequestId) -> bool {
         self.shared.upgrade().is_some_and(|shared| {
-            let state = shared.state();
-            state.pending.contains_key(id)
+            let pending = shared.pending.load();
+            pending.contains_key(id)
                 || id
                     .numeric_equivalent()
-                    .is_some_and(|id| state.pending.contains_key(&id))
+                    .is_some_and(|id| pending.contains_key(&id))
         })
     }
 

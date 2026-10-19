@@ -729,11 +729,7 @@ impl ModelRun {
     pub(super) fn commit_interrupted_checkpoint(&mut self) -> Result<ModelCheckpoint> {
         let mut aborted_outputs = Vec::with_capacity(self.active_tool_calls.len());
         for call in std::mem::take(&mut self.active_tool_calls) {
-            let completed = call
-                .completion
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let completed = call.completion.take();
             if let Some(completed) = completed {
                 aborted_outputs.extend(self.finish_completed_tool_call(completed, &call.progress)?);
                 continue;
@@ -854,17 +850,15 @@ impl ModelRun {
                         .is_some_and(|index| index <= next_call)
             })
             .collect::<VecDeque<_>>();
-        *model_call_index.lock().await = next_call;
+        model_call_index.store(next_call, std::sync::atomic::Ordering::Release);
         self.prompt_cache.publish_live(None);
         let mut first_batch = true;
         loop {
             let call_index = self.stats.model_calls + 1;
             if can_drain_steers {
                 let delivered = self.stats.steers;
-                let mut current_call_index = model_call_index.lock().await;
-                *current_call_index = call_index;
-                pending_steers.extend(steers.lock().await.drain(..));
-                drop(current_call_index);
+                model_call_index.store(call_index, std::sync::atomic::Ordering::Release);
+                pending_steers.extend(steers.drain());
                 self.drain_steers(&mut session.conversation, &mut pending_steers, call_index)
                     .await?;
                 if self.stats.steers != delivered {
@@ -955,18 +949,17 @@ impl ModelRun {
                 loop {
                     let mut live_steers = VecDeque::new();
                     while let Some(steer) = pending_steers.pop_front() {
-                        if *steer.delivery.lock().await
-                            != crate::agent::execution::SteerDelivery::Withdrawn
+                        if steer.delivery.get() != crate::agent::execution::SteerDelivery::Withdrawn
                         {
                             live_steers.push_back(steer);
                         }
                     }
                     pending_steers = live_steers;
-                    let mut queued = steers.lock().await;
+                    let queued = steers.drain();
                     if queued.is_empty() {
                         break;
                     }
-                    pending_steers.extend(queued.drain(..));
+                    pending_steers.extend(queued);
                 }
                 if !pending_steers.is_empty() {
                     session.conversation.clear_delta();
@@ -1021,12 +1014,9 @@ impl ModelRun {
                         changed = preempt.changed(), if instant_tool_steering => {
                             if changed.is_err() { break tools.await?; }
 
-                            let deliveries = steers.lock().await.iter()
-                                .map(|steer| Arc::clone(&steer.delivery)).collect::<Vec<_>>();
-                            let mut pending = false;
-                            for delivery in deliveries {
-                                pending |= *delivery.lock().await == crate::agent::execution::SteerDelivery::Pending;
-                            }
+                            let pending = steers.any(|steer| {
+                                steer.delivery.get() == crate::agent::execution::SteerDelivery::Pending
+                            });
                             if pending {
                                 tool_control.preempt_turn().await;
                             }
@@ -1071,12 +1061,9 @@ impl ModelRun {
             let steer = pending_steers
                 .pop_front()
                 .expect("eligible steering input disappeared");
-            let mut delivery = steer.delivery.lock().await;
-            if *delivery == crate::agent::execution::SteerDelivery::Withdrawn {
+            if !steer.delivery.consume().await {
                 continue;
             }
-            *delivery = crate::agent::execution::SteerDelivery::Consumed;
-            drop(delivery);
             if steer.model_call_index.is_none()
                 && let (Some(steps), Some(index)) = (&self.execution_steps, steer.durable_index)
             {

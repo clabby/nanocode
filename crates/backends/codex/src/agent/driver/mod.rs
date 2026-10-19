@@ -1275,7 +1275,7 @@ impl AgentDriver {
                 .map(|_| latest_fork_checkpoint.clone());
             let execution_steps = execution_turn.steps();
             let (steer_preempt, steer_preempt_rx) = watch::channel(0_u64);
-            let steer_rx: SteerQueue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+            let steer_rx: SteerQueue = Arc::default();
             let steers = Arc::downgrade(&steer_rx);
             let mut accepted_steers = retained_steers
                 .iter()
@@ -1291,7 +1291,7 @@ impl AgentDriver {
                 })
                 .collect();
             let mut steer_ids = std::collections::HashMap::<String, (String, bool)>::new();
-            let model_call_index = Arc::new(tokio::sync::Mutex::new(1_u32));
+            let model_call_index = Arc::new(std::sync::atomic::AtomicU32::new(1));
             let (cancel, cancel_rx) = oneshot::channel();
             let (fork_snapshots, mut fork_snapshot_rx) = watch::channel(None);
             let mut fork_snapshots_open = true;
@@ -1482,11 +1482,7 @@ impl AgentDriver {
                                     if let Some((_, withdrawn)) = steer_ids.get_mut(&id) {
                                         *withdrawn = true;
                                     }
-                                    if let Some((_, receipt)) = accepted_steers.pop()
-                                        && let Some(queue) = steers.upgrade()
-                                    {
-                                        queue.lock().await.retain(|steer| !Arc::ptr_eq(&steer.delivery, &receipt.delivery));
-                                    }
+                                    accepted_steers.pop();
                                 }
                                 let reopen = outcome_requires_reopen(&outcome);
                                 drop(result.send(outcome));
@@ -2132,21 +2128,15 @@ async fn accept_turn_steer(
     accepted: &mut Vec<(Option<String>, SteerReceipt)>,
     id: Option<String>,
     execution_turn: &ExecutionTurn,
-    model_call_index: &tokio::sync::Mutex<u32>,
+    model_call_index: &std::sync::atomic::AtomicU32,
     prompt: Prompt,
 ) -> Result<()> {
     let steers = steers.upgrade().ok_or(NanocodeError::TurnNotSteerable)?;
-    let mut pending = Vec::new();
-    for receipt in accepted.drain(..) {
-        if *receipt.1.delivery.lock().await == SteerDelivery::Pending {
-            pending.push(receipt);
-        }
-    }
-    *accepted = pending;
+    accepted.retain(|receipt| receipt.1.delivery.get() == SteerDelivery::Pending);
 
-    let call_index = model_call_index.lock().await;
+    let call_index = model_call_index.load(std::sync::atomic::Ordering::Acquire);
     let Some(steer) = execution_turn
-        .accept_steer(prompt.clone(), id.clone(), *call_index)
+        .accept_steer(prompt.clone(), id.clone(), call_index)
         .await?
     else {
         return Ok(());
@@ -2161,7 +2151,7 @@ async fn accept_turn_steer(
             delivery: Arc::clone(&steer.delivery),
         },
     ));
-    steers.lock().await.push_back(steer);
+    steers.push(steer);
     preempt.send_modify(|generation| *generation = generation.wrapping_add(1));
     Ok(())
 }

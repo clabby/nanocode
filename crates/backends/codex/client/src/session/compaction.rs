@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{LazyLock, Mutex},
+    sync::LazyLock,
 };
+
+use arc_swap::ArcSwap;
 
 use crate::client::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, ImageDetail, ResponseItem,
@@ -28,24 +30,17 @@ const ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE: usize = 32;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct OriginalImageEstimateCache {
     entries: HashMap<[u8; 32], Option<usize>>,
     order: VecDeque<[u8; 32]>,
 }
 
 impl OriginalImageEstimateCache {
-    fn get_or_insert_with(
-        &mut self,
-        key: [u8; 32],
-        estimate: impl FnOnce() -> Option<usize>,
-    ) -> Option<usize> {
-        if let Some(value) = self.entries.get(&key).copied() {
+    fn remember(&mut self, key: [u8; 32], value: Option<usize>) {
+        if self.entries.contains_key(&key) {
             self.order.retain(|candidate| candidate != &key);
-            self.order.push_back(key);
-            return value;
         }
-        let value = estimate();
         self.entries.insert(key, value);
         self.order.push_back(key);
         while self.entries.len() > ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE {
@@ -54,12 +49,11 @@ impl OriginalImageEstimateCache {
             };
             self.entries.remove(&oldest);
         }
-        value
     }
 }
 
-static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<Mutex<OriginalImageEstimateCache>> =
-    LazyLock::new(|| Mutex::new(OriginalImageEstimateCache::default()));
+static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<ArcSwap<OriginalImageEstimateCache>> =
+    LazyLock::new(ArcSwap::default);
 
 #[must_use]
 pub fn auto_compact_token_limit(model: &str, context_window_tokens: u64) -> Option<u64> {
@@ -492,10 +486,16 @@ fn original_image_bytes_estimate(image_url: &str) -> Option<usize> {
             .min(ORIGINAL_IMAGE_MAX_PATCHES);
         Some(patches.saturating_mul(APPROX_BYTES_PER_TOKEN))
     };
-    match ORIGINAL_IMAGE_ESTIMATE_CACHE.lock() {
-        Ok(mut cache) => cache.get_or_insert_with(key, estimate),
-        Err(poisoned) => poisoned.into_inner().get_or_insert_with(key, estimate),
-    }
+    let value = match ORIGINAL_IMAGE_ESTIMATE_CACHE.load().entries.get(&key) {
+        Some(value) => *value,
+        None => estimate(),
+    };
+    ORIGINAL_IMAGE_ESTIMATE_CACHE.rcu(|cache| {
+        let mut cache = OriginalImageEstimateCache::clone(cache);
+        cache.remember(key, value);
+        cache
+    });
+    value
 }
 
 const fn approx_tokens(bytes: usize) -> usize {

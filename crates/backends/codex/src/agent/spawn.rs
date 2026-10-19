@@ -217,7 +217,7 @@ pub(super) fn spawn_agent_driver(
         execution: execution.clone(),
         shutdown: shutdown.clone(),
         checkpoints: Arc::clone(&checkpoints),
-        initial_ready: Arc::new(std::sync::Mutex::new(Some(initial_ready))),
+        initial_ready: Arc::new(nanocode_sync::Slot::new(Some(initial_ready))),
     });
 
     tools.start_providers();
