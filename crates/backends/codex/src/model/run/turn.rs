@@ -457,16 +457,26 @@ impl ModelRun {
             self.context_source.execution_environment(),
         );
         let canonical_context = current_context.full_item();
+        let host_instructions = self.config.host_instructions();
         if let Some(update) = session.context.update(current_context) {
             if update.full {
                 session.conversation.append_canonical_context(
                     developer_context(&self.config, &self.tools),
                     update.item,
                 );
-            } else {
                 session
-                    .conversation
-                    .append([update.item, host_context(&self.config)]);
+                    .context
+                    .observe_host_instructions(&host_instructions);
+            } else {
+                session.conversation.append([update.item]);
+                if session
+                    .context
+                    .observe_host_instructions(&host_instructions)
+                {
+                    session
+                        .conversation
+                        .append([host_context(host_instructions)]);
+                }
                 session
                     .conversation
                     .set_canonical_context(canonical_context);
@@ -475,7 +485,14 @@ impl ModelRun {
             session
                 .conversation
                 .set_canonical_context(canonical_context);
-            session.conversation.append([host_context(&self.config)]);
+            if session
+                .context
+                .observe_host_instructions(&host_instructions)
+            {
+                session
+                    .conversation
+                    .append([host_context(host_instructions)]);
+            }
         }
         let user_content = prepare_user_input(&task.instruction).await;
         session
@@ -529,6 +546,7 @@ impl ModelRun {
             let factory = self.attempt_factory(&tools)?.for_logical_turn(logical_turn);
             let user_content = prepare_user_input(&task.instruction).await;
             let mut context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
+            context.observe_host_instructions(&self.config.host_instructions());
             let context_snapshot = context.capture(
                 tools.working_directory(),
                 tools.default_shell_name(),

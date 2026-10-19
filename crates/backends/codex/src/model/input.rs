@@ -85,10 +85,10 @@ fn code_mode_instructions(tools: &Tools) -> String {
     )
 }
 
-pub(in crate::model) fn host_context(config: &ModelConfig) -> ResponseItem {
+pub(in crate::model) fn host_context(instructions: String) -> ResponseItem {
     ResponseItem::message(
         MessageRole::Developer,
-        [ContentItem::input_text(config.host_instructions())],
+        [ContentItem::input_text(instructions)],
     )
 }
 

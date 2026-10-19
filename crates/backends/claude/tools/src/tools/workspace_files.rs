@@ -612,7 +612,8 @@ impl ClaudeWorkspaceFiles {
                 if !emit[index] {
                     continue;
                 }
-                if let Some(prev) = previous
+                if (before > 0 || after > 0)
+                    && let Some(prev) = previous
                     && index > prev + 1
                     && !push_bounded(&mut out, "--\n")
                 {

@@ -348,6 +348,11 @@ impl ModelRun {
         let context_source =
             context_source.with_fallback_global(checkpoint.global_instructions.clone());
         let global_instructions = context_source.global_instructions();
+        let mut context = ContextState::new(selected_agents_md, checkpoint.context_baseline);
+        context.restore_host_instructions(
+            checkpoint.conversation.managed.history(),
+            &config.host_instructions(),
+        );
         Self {
             events,
             provider_session_id,
@@ -367,7 +372,7 @@ impl ModelRun {
                 tools: runtime,
                 factory,
                 conversation: checkpoint.conversation,
-                context: ContextState::new(selected_agents_md, checkpoint.context_baseline),
+                context,
                 preserve_inherited_delta: checkpoint.preserve_inherited_delta,
             }),
             active_tools: Some(active_tools),

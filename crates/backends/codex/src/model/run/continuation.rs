@@ -147,6 +147,10 @@ impl ModelRun {
                 .map(Arc::<str>::from),
             saved.context_baseline,
         );
+        session.context.restore_host_instructions(
+            session.conversation.managed.history(),
+            &self.config.host_instructions(),
+        );
         saved.stats.last_response_id = None;
         saved.stats.usage.reported = saved.usage_reported;
         saved.stats.usage.estimated_cost = saved.usage_cost;

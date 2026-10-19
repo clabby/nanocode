@@ -309,13 +309,35 @@ struct SendMessageTask {
 
 #[derive(Serialize)]
 struct WaitReport {
-    agents: Vec<AgentSummary>,
+    agents: Vec<Value>,
     timed_out: bool,
 }
 
 #[derive(Serialize)]
 struct LifecycleReport {
+    agents: Vec<Value>,
+}
+
+fn agent_reports(
     agents: Vec<AgentSummary>,
+    delivered: &std::collections::HashSet<AgentId>,
+) -> serde_json::Result<Vec<Value>> {
+    agents
+        .into_iter()
+        .map(|agent| {
+            let id = agent.agent_id;
+            let mut report = serde_json::to_value(AgentSummary {
+                task: crate::runtime::bounded_summary(&agent.task),
+                ..agent
+            })?;
+            if delivered.contains(&id)
+                && let Some(status) = report.get_mut("status").and_then(Value::as_object_mut)
+            {
+                status.remove("output");
+            }
+            Ok(report)
+        })
+        .collect()
 }
 
 fn json_output(value: &impl Serialize) -> ToolResult {
@@ -1179,7 +1201,7 @@ struct WaitAgent {
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl Tool for WaitAgent {
     fn definition(&self) -> ToolDefinition {
-        let mut description = "Waits until any requested subagent reaches a terminal status and returns a snapshot of every requested agent. The result includes pending, running, and closing agents; consumers must preserve those nonterminal agents and act only on completed, failed, interrupted, or closed entries. Each entry's status is an object; read its terminal state from status.state. Only results this caller has not yet received end the wait: already-reported terminal agents do not, so waiting again with the same IDs blocks for the next result. When every requested agent is terminal and already reported, the snapshot returns immediately; repeating that identical call errors because nothing is left to wait for. Use one call with multiple IDs instead of polling the workspace.".to_owned();
+        let mut description = "Waits until any requested subagent reaches a terminal status and returns a snapshot of every requested agent. The result includes pending, running, and closing agents; consumers must preserve those nonterminal agents and act only on completed, failed, interrupted, or closed entries. Each entry's status is an object; read its terminal state from status.state. Only results this caller has not yet received end the wait: already-reported terminal agents do not, so waiting again with the same IDs blocks for the next result. When every requested agent is terminal and already reported, the snapshot returns immediately; repeating that identical call errors because nothing is left to wait for. Use one call with multiple IDs instead of polling the workspace. Tasks are abbreviated. A completed entry omits status.output when this caller already received that result from an earlier wait_agent call or a completion notice; list_agents with include_completed=true returns it again.".to_owned();
         if self
             .registry
             .upgrade()
@@ -1224,10 +1246,13 @@ impl Tool for WaitAgent {
         let duration = timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_WAIT_TIMEOUT);
-        let (agents, timed_out) = registry
+        let (agents, delivered, timed_out) = registry
             .wait(context.session_id(), &agent_ids, duration)
             .await?;
-        json_output(&WaitReport { agents, timed_out })
+        json_output(&WaitReport {
+            agents: agent_reports(agents, &delivered)?,
+            timed_out,
+        })
     }
 }
 
@@ -1293,7 +1318,9 @@ impl Tool for ChangeAgentLifecycle {
             }
             LifecycleOperation::Close => registry.close(context.session_id(), agent_id).await?,
         };
-        json_output(&LifecycleReport { agents })
+        json_output(&LifecycleReport {
+            agents: agent_reports(agents, &std::collections::HashSet::new())?,
+        })
     }
 }
 
@@ -1437,7 +1464,7 @@ fn agent_status_schema() -> Value {
             "state": { "type": "string", "const": "completed" },
             "output": {}
         },
-        "required": ["state", "output"],
+        "required": ["state"],
         "additionalProperties": false
     }));
     variants.push(json!({

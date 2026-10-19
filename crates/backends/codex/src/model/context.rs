@@ -12,6 +12,7 @@ pub(crate) use crate::session::{
 const REPLACEMENT_NOTICE: &str =
     "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.";
 const REMOVAL_NOTICE: &str = "The previously provided AGENTS.md instructions no longer apply.";
+const HOST_INSTRUCTIONS_END: &str = "</runtime_model_identity>";
 
 impl ContextBaseline {
     pub(crate) fn reconstruct(history: &[ResponseItem]) -> Self {
@@ -28,6 +29,7 @@ impl ContextBaseline {
 pub(crate) struct ContextState {
     selected_agents_md: Option<Arc<str>>,
     visible: Option<ContextSnapshot>,
+    host_instructions: Option<String>,
 }
 
 pub(crate) struct ContextUpdate {
@@ -43,6 +45,7 @@ impl ContextState {
                 ContextBaseline::Missing => None,
                 ContextBaseline::Known(snapshot) => Some(snapshot),
             },
+            host_instructions: None,
         }
     }
 
@@ -76,6 +79,40 @@ impl ContextState {
 
     pub(crate) fn require_full_reinjection(&mut self) {
         self.visible = None;
+        self.host_instructions = None;
+    }
+
+    pub(crate) fn observe_host_instructions(&mut self, current: &str) -> bool {
+        if self.host_instructions.as_deref() == Some(current) {
+            return false;
+        }
+        self.host_instructions = Some(current.to_owned());
+        true
+    }
+
+    pub(crate) fn restore_host_instructions<'a>(
+        &mut self,
+        history: impl Iterator<Item = &'a ResponseItem>,
+        current: &str,
+    ) {
+        let latest = history
+            .filter_map(|item| match item {
+                ResponseItem::Message {
+                    role: MessageRole::Developer,
+                    content,
+                    ..
+                } => content.iter().rev().find_map(|content| match content {
+                    ContentItem::InputText { text } if text.ends_with(HOST_INSTRUCTIONS_END) => {
+                        Some(text)
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .last();
+        self.host_instructions = latest
+            .filter(|text| text.ends_with(current))
+            .map(|_| current.to_owned());
     }
 
     pub(crate) const fn snapshot(&self) -> Option<&ContextSnapshot> {

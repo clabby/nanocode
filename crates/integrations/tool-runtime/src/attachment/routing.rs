@@ -463,10 +463,8 @@ impl RoutedTool {
 impl Tool for RoutedTool {
     fn definition(&self) -> ToolDefinition {
         let mut definition = self.local.definition();
-        let mut guidance = if self.pool.is_some() {
-            " Workspace routing: omitted workdir uses the configured default host. An attached runner is selected by /<runner-name>/...; paths below that root map to its workspace. Runner availability and mounts are announced in conversation messages.".to_owned()
-        } else {
-            format!(
+        if self.pool.is_none() {
+            let mut guidance = format!(
                 " Workspace routing: default cwd executes {}. Remote mounts: {}. Paths under a mount map to its workspace.",
                 if self
                     .routes
@@ -486,28 +484,22 @@ impl Tool for RoutedTool {
                     ))
                     .collect::<Vec<_>>()
                     .join(", ")
-            )
-        };
-        if let Some(name) = &self.guidance.process_input {
-            guidance.push_str(&if self.pool.is_some() {
-                format!(" {name} uses the returned logical session_id.")
-            } else {
-                format!(" {name} routes by the returned session_id.")
-            });
-        }
-        if let Some(name) = &self.guidance.patch {
-            guidance.push_str(&if self.pool.is_some() {
-                format!(" {name} uses absolute paths within a single host.")
-            } else {
-                format!(" {name} routes by absolute file paths; do not mix machines in one patch.")
-            });
-        }
-        match &mut definition {
-            ToolDefinition::Function { description, .. }
-            | ToolDefinition::Custom { description, .. } => {
-                *description = format!("{description}{guidance}").into();
+            );
+            if let Some(name) = &self.guidance.process_input {
+                guidance.push_str(&format!(" {name} routes by the returned session_id."));
             }
-            _ => {}
+            if let Some(name) = &self.guidance.patch {
+                guidance.push_str(&format!(
+                    " {name} routes by absolute file paths; do not mix machines in one patch."
+                ));
+            }
+            match &mut definition {
+                ToolDefinition::Function { description, .. }
+                | ToolDefinition::Custom { description, .. } => {
+                    *description = format!("{description}{guidance}").into();
+                }
+                _ => {}
+            }
         }
         if let ToolDefinition::Function { parameters, .. } = &mut definition {
             let mut schema = parameters.as_value().clone();

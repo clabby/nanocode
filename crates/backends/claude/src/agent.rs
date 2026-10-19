@@ -4637,6 +4637,7 @@ impl State {
         cursor: &Cursor,
         step: &str,
     ) -> Result<Usage> {
+        let summarized_notices = context.recovery_notices.len();
         let mut messages = context.packed_messages();
         if messages.is_empty() {
             return Err(unsupported("Claude cannot compact empty history"));
@@ -4768,6 +4769,7 @@ impl State {
         context.messages = retained;
         context.previous_message_id = Some(response.id);
         context.summary = summary;
+        context.recovery_notices.drain(..summarized_notices);
 
         let packed = json!({
             "system": cursor.template.system,

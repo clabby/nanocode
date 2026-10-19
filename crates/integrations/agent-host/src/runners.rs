@@ -16,6 +16,7 @@ pub(crate) struct RunnerAgents {
 }
 
 const NOTICE_PREFIX: &str = "Runner ";
+const NO_RUNNERS: &str = "Runner mounts and hands: none connected.";
 
 struct RunnerAgentState {
     code_mode_hosts: HashMap<String, bool>,
@@ -132,7 +133,7 @@ impl RunnerAgents {
             .clone()
     }
 
-    fn summary(&self) -> String {
+    fn summary(&self) -> Option<String> {
         let runners = self.pool.list();
         let ready = |protocol| {
             runners.iter().filter(move |runner| {
@@ -161,10 +162,16 @@ impl RunnerAgents {
                 )
             })
             .collect::<Vec<_>>();
+        if mounts.is_empty() && executors.is_empty() {
+            return None;
+        }
         let mut summary = if mounts.is_empty() {
-            "Runner mounts: no remote runners are currently available.".to_owned()
+            "Runner mounts: none.".to_owned()
         } else {
-            format!("Runner mounts currently available: {}.", mounts.join("; "))
+            format!(
+                "Runner mounts currently available: {}. Workspace tools accept an optional workdir: omit it for the default host or select an attached runner with /<runner-name>/...; paths below that root map to its workspace. Process input uses the returned logical session_id, and patches use absolute paths within one host.",
+                mounts.join("; ")
+            )
         };
         if !executors.is_empty() {
             summary.push_str(&format!(
@@ -172,7 +179,7 @@ impl RunnerAgents {
                 executors.join("; ")
             ));
         }
-        summary
+        Some(summary)
     }
 
     fn notify(&self, event: RunnerEvent) {
@@ -184,20 +191,20 @@ impl RunnerAgents {
                             "Runner /{} status: {:?}. {}",
                             info.name,
                             info.status,
-                            self.summary()
+                            self.status_summary()
                         ),
                         RunnerProtocol::CodeMode => format!(
                             "Hand {} status: {:?}. {}",
                             info.name,
                             info.status,
-                            self.summary()
+                            self.status_summary()
                         ),
                     }
                 }
                 RunnerStatus::Connecting => return,
             },
             RunnerEvent::Failed { name, error } => {
-                format!("Runner /{name} failed: {error}. {}", self.summary())
+                format!("Runner /{name} failed: {error}. {}", self.status_summary())
             }
         };
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -206,7 +213,7 @@ impl RunnerAgents {
                 && notices
                     .send(Notice {
                         text: notice.clone(),
-                        prefix: None,
+                        prefix: Some(NOTICE_PREFIX.to_owned()),
                         completed: None,
                     })
                     .is_ok()
@@ -236,7 +243,11 @@ impl RunnerAgents {
                 parent_session_id.and_then(|parent| state.code_mode_hosts.get(parent).copied())
             })
             .unwrap_or(false);
-        (!configured).then(|| self.summary())
+        if configured { None } else { self.summary() }
+    }
+
+    fn status_summary(&self) -> String {
+        self.summary().unwrap_or_else(|| NO_RUNNERS.to_owned())
     }
 
     pub(crate) fn initial_notice_committed(&self, agent: &crate::Agent, text: String) {
@@ -309,12 +320,17 @@ impl RunnerAgents {
                 .iter()
                 .position(|(id, _, _)| id == agent.session_id())
                 .map(|index| state.folded.swap_remove(index).2);
-            awaited = await_initial && folded.is_none();
-            let summary = self.summary();
-            if folded.as_ref() != Some(&summary) {
+            let folded_initial = folded.is_some();
+            let text = match (folded, self.summary()) {
+                (Some(folded), Some(summary)) if folded == summary => None,
+                (Some(_), None) => Some(NO_RUNNERS.to_owned()),
+                (None, summary) | (Some(_), summary) => summary,
+            };
+            awaited = await_initial && !folded_initial && text.is_some();
+            if let Some(text) = text {
                 notices
                     .send(Notice {
-                        text: summary,
+                        text,
                         prefix: Some(NOTICE_PREFIX.to_owned()),
                         completed: awaited.then_some(completed),
                     })
@@ -325,7 +341,12 @@ impl RunnerAgents {
                 .push((agent.session_id().to_owned(), weak, notices));
         }
         tokio::spawn(async move {
-            while let Some(notice) = receiver.recv().await {
+            while let Some(mut notice) = receiver.recv().await {
+                while notice.completed.is_none()
+                    && let Ok(next) = receiver.try_recv()
+                {
+                    notice = next;
+                }
                 let outcome = worker
                     .append_developer_notice(notice.text, notice.prefix)
                     .await

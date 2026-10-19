@@ -23,7 +23,7 @@ use nanocode_schema::Validator;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Weak,
         atomic::{AtomicUsize, Ordering},
@@ -85,7 +85,7 @@ impl OutputContract {
     pub(super) fn compile(schema: &Value) -> std::io::Result<Self> {
         let validator = nanocode_schema::validator_for(schema)
             .map_err(|error| std::io::Error::other(format!("invalid output_schema: {error}")))?;
-        let schema = serde_json::to_string_pretty(schema)
+        let schema = serde_json::to_string(schema)
             .map_err(|error| std::io::Error::other(format!("could not render schema: {error}")))?;
         Ok(Self { validator, schema })
     }
@@ -102,6 +102,13 @@ pub(super) fn completion_instructions(schema: &str) -> String {
          incorporate the pending instructions and submit an updated result without repeating \
          completed task side effects. Finish after acceptance. A turn that ends without an \
          accepted result fails.\n\nOutput schema:\n{schema}"
+    )
+}
+
+pub(super) fn completion_reminder() -> String {
+    format!(
+        "{COMPLETION_INSTRUCTIONS_LEAD} with output matching the output schema given earlier in \
+         this turn."
     )
 }
 
@@ -180,18 +187,18 @@ pub fn completion_continuation_prompt(id: AgentId, status: &AgentStatus) -> Stri
              user. Do not repeat side effects the subagent already completed.\n\n\
              <subagent_completion agent_id=\"{id}\" status=\"failed\" />"
         ),
-        AgentStatus::Interrupted => format!(
+        AgentStatus::Completed { output } => format!(
+            "Subagent {id} completed with this structured result:\n{output}\n\nContinue the \
+             current task using only the result fields needed for the next step. Integrate or \
+             verify them as appropriate, perform any remaining work, and then respond to the \
+             user. Do not merely repeat the raw result.\n\n<subagent_completion \
+             agent_id=\"{id}\" status=\"completed\" />"
+        ),
+        _ => format!(
             "Subagent {id} was interrupted before finishing. Continue the current task: call \
              list_agents with include_completed=true to inspect agent {id}, decide whether to \
              resume it with a message, replace it, or finish without it, and then respond to the \
              user.\n\n<subagent_completion agent_id=\"{id}\" status=\"interrupted\" />"
-        ),
-        _ => format!(
-            "Subagent {id} completed. Continue the current task by inspecting its structured \
-             result: call list_agents with include_completed=true, find agent {id}, and use only \
-             the result fields needed for the next step. Integrate or verify them as appropriate, \
-             perform any remaining work, and then respond to the user. Do not merely repeat the \
-             raw result.\n\n<subagent_completion agent_id=\"{id}\" status=\"completed\" />"
         ),
     }
 }
@@ -3332,6 +3339,10 @@ impl Registry {
             .await
         {
             Ok(_) => {
+                lock_unpoisoned(&self.wait_reported).insert(
+                    (root_session_id.to_owned(), id),
+                    wait_mark(&status, revision),
+                );
                 self.acknowledge_completion(root_session_id, id, revision)
                     .await;
                 if self.store_for(root_session_id).is_some()
@@ -3794,7 +3805,7 @@ impl Registry {
         session_id: &str,
         ids: &[AgentId],
         duration: Duration,
-    ) -> std::io::Result<(Vec<AgentSummary>, bool)> {
+    ) -> std::io::Result<(Vec<AgentSummary>, HashSet<AgentId>, bool)> {
         self.wait_inner(session_id, ids, duration)
             .instrument(tracing::info_span!(
                 "subagent.wait",
@@ -3809,7 +3820,7 @@ impl Registry {
         session_id: &str,
         ids: &[AgentId],
         duration: Duration,
-    ) -> std::io::Result<(Vec<AgentSummary>, bool)> {
+    ) -> std::io::Result<(Vec<AgentSummary>, HashSet<AgentId>, bool)> {
         self.await_restored(session_id).await?;
         if ids.is_empty() {
             return Err(std::io::Error::other("agent_ids must not be empty"));
@@ -3845,19 +3856,25 @@ impl Registry {
             let all_terminal = terminal.len() == snapshot.len();
             let summaries = snapshot.into_iter().map(|(summary, _)| summary).collect();
 
-            let fresh = {
+            let mut fresh = false;
+            let mut delivered = HashSet::new();
+            {
                 let mut reported = lock_unpoisoned(&self.wait_reported);
-                terminal.iter().fold(false, |fresh, &(id, mark)| {
-                    reported.insert((session_id.to_owned(), id), mark) != Some(mark) || fresh
-                })
-            };
+                for &(id, mark) in &terminal {
+                    if reported.insert((session_id.to_owned(), id), mark) == Some(mark) {
+                        delivered.insert(id);
+                    } else {
+                        fresh = true;
+                    }
+                }
+            }
             if fresh {
                 lock_unpoisoned(&self.idle_waits).remove(session_id);
                 if root == session_id {
                     let ids = terminal.iter().map(|(id, _)| *id).collect::<Vec<_>>();
                     self.observe_completions(&root, &ids).await;
                 }
-                return Ok((summaries, false));
+                return Ok((summaries, delivered, false));
             }
             if all_terminal {
                 let mut key = ids.to_vec();
@@ -3881,7 +3898,7 @@ impl Registry {
                         ),
                     ));
                 }
-                return Ok((summaries, false));
+                return Ok((summaries, delivered, false));
             }
             lock_unpoisoned(&self.idle_waits).remove(session_id);
             let timed_out = match deadline {
@@ -3893,7 +3910,7 @@ impl Registry {
             };
             if timed_out {
                 let summaries = self.state.lock().await.summaries(session_id, ids)?;
-                return Ok((summaries, true));
+                return Ok((summaries, delivered, true));
             }
         }
     }
@@ -4313,7 +4330,7 @@ fn first_error(results: Vec<std::io::Result<()>>) -> std::io::Result<()> {
     results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
 }
 
-fn bounded_summary(value: &str) -> String {
+pub(crate) fn bounded_summary(value: &str) -> String {
     const MAX_BYTES: usize = 160;
     if value.len() <= MAX_BYTES {
         return value.to_owned();

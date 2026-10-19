@@ -2,7 +2,7 @@ use super::{
     capacity::{Capacity, TurnCapacity},
     model::{AgentContext, AgentId, AgentMessage, MessageDisposition, MessageId, MessagePriority},
     platform::{self, Task, TaskError},
-    runtime::{DelegationChange, Registry, completion_instructions},
+    runtime::{DelegationChange, Registry, completion_instructions, completion_reminder},
 };
 use nanocode_agent_core::input::Prompt;
 use nanocode_agent_core::{
@@ -380,11 +380,7 @@ impl Harness {
         };
         if let Some(steer) = steer {
             let delegation = self.begin_delegation(command.message.id).await;
-            let prompt = format!(
-                "{}\n\n{}",
-                command.message.prompt(),
-                completion_instructions(&self.output_schema)
-            );
+            let prompt = format!("{}\n\n{}", command.message.prompt(), completion_reminder());
             let result = self
                 .active
                 .as_ref()
