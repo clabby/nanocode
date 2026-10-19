@@ -385,18 +385,20 @@ impl Sequencer {
         Self::default()
     }
 
-    fn ticket(&self) -> Turn {
-        Turn {
-            line: Arc::clone(&self.0),
-            ticket: self
-                .0
-                .tickets
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        }
+    fn ticket(&self) -> u64 {
+        self.0
+            .tickets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn enter(&self) -> Turn {
-        let turn = self.ticket();
+        if let Some(turn) = self.try_enter() {
+            return turn;
+        }
+        let turn = Turn {
+            line: Arc::clone(&self.0),
+            ticket: self.ticket(),
+        };
         let admitted = Arc::new(Signal::new());
         let immediate = self.0.queue.update(|queue| {
             if queue.holder.is_none() && queue.waiting.is_empty() {
@@ -417,14 +419,24 @@ impl Sequencer {
 
     #[must_use]
     pub fn try_enter(&self) -> Option<Turn> {
-        let turn = self.ticket();
+        if self
+            .0
+            .queue
+            .read(|queue| queue.holder.is_some() || !queue.waiting.is_empty())
+        {
+            return None;
+        }
+        let ticket = self.ticket();
         self.0
             .queue
             .try_update(|queue| {
                 (queue.holder.is_none() && queue.waiting.is_empty())
-                    .then(|| queue.holder = Some(turn.ticket))
+                    .then(|| queue.holder = Some(ticket))
             })
-            .map(|()| turn)
+            .map(|()| Turn {
+                line: Arc::clone(&self.0),
+                ticket,
+            })
     }
 }
 

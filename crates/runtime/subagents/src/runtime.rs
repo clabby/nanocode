@@ -2031,10 +2031,22 @@ impl Registry {
     }
 
     fn release_recorded(&self, root_session_id: &str, key: &Arc<str>) {
+        let retained = |root: &String, checkpoint: &durable::JournalCheckpoint| {
+            root == root_session_id
+                && checkpoint.key == *key
+                && checkpoint.pending.is_none()
+                && checkpoint.checkpoint.is_some()
+        };
+        if !self.checkpoints.read(|checkpoints| {
+            checkpoints
+                .iter()
+                .any(|((root, _), checkpoint)| retained(root, checkpoint))
+        }) {
+            return;
+        }
         self.checkpoints.update(|checkpoints| {
             for ((root, _), checkpoint) in checkpoints.iter_mut() {
-                if root == root_session_id && checkpoint.key == *key && checkpoint.pending.is_none()
-                {
+                if retained(root, checkpoint) {
                     checkpoint.checkpoint = None;
                 }
             }
@@ -2045,12 +2057,21 @@ impl Registry {
         if records.is_empty() {
             return;
         }
+        let acknowledged = |root: &String, checkpoint: &durable::JournalCheckpoint| {
+            root == root_session_id
+                && checkpoint.pending.is_some()
+                && records.iter().any(|(key, _)| *key == checkpoint.key)
+        };
+        if !self.checkpoints.read(|checkpoints| {
+            checkpoints
+                .iter()
+                .any(|((root, _), checkpoint)| acknowledged(root, checkpoint))
+        }) {
+            return;
+        }
         self.checkpoints.update(|checkpoints| {
             for ((root, _), checkpoint) in checkpoints.iter_mut() {
-                if root == root_session_id
-                    && checkpoint.pending.is_some()
-                    && records.iter().any(|(key, _)| *key == checkpoint.key)
-                {
+                if acknowledged(root, checkpoint) {
                     checkpoint.pending = None;
                 }
             }
@@ -2100,7 +2121,10 @@ impl Registry {
             loop {
                 let progressed = registry
                     .completed_tools
-                    .update(|completed| completed.remove(&key));
+                    .read(|completed| completed.contains(&key))
+                    && registry
+                        .completed_tools
+                        .update(|completed| completed.remove(&key));
                 let harness = registry.running_harness(&key.0, key.1).await;
 
                 let commits = registry.committable_calls(&key.0, key.1).await;
@@ -4005,22 +4029,29 @@ impl Registry {
             let all_terminal = terminal.len() == snapshot.len();
             let summaries = snapshot.into_iter().map(|(summary, _)| summary).collect();
 
-            let (fresh, delivered) = self.wait_reported.update(|reported| {
-                let mut fresh = false;
-                let mut delivered = HashSet::new();
-                for &(id, mark) in &terminal {
-                    if reported.insert((session_id.to_owned(), id), mark) == Some(mark) {
-                        delivered.insert(id);
-                    } else {
-                        fresh = true;
+            let reported = |reported: &HashMap<(String, AgentId), u64>| {
+                terminal
+                    .iter()
+                    .all(|&(id, mark)| reported.get(&(session_id.to_owned(), id)) == Some(&mark))
+            };
+            let (fresh, delivered) = if self.wait_reported.read(reported) {
+                (false, terminal.iter().map(|&(id, _)| id).collect())
+            } else {
+                self.wait_reported.update(|reported| {
+                    let mut fresh = false;
+                    let mut delivered = HashSet::new();
+                    for &(id, mark) in &terminal {
+                        if reported.insert((session_id.to_owned(), id), mark) == Some(mark) {
+                            delivered.insert(id);
+                        } else {
+                            fresh = true;
+                        }
                     }
-                }
-                (fresh, delivered)
-            });
+                    (fresh, delivered)
+                })
+            };
             if fresh {
-                self.idle_waits.update(|idle| {
-                    idle.remove(session_id);
-                });
+                self.forget_idle_wait(session_id);
                 if root == session_id {
                     let ids = terminal.iter().map(|(id, _)| *id).collect::<Vec<_>>();
                     self.observe_completions(&root, &ids).await;
@@ -4053,9 +4084,7 @@ impl Registry {
                 }
                 return Ok((summaries, delivered, false));
             }
-            self.idle_waits.update(|idle| {
-                idle.remove(session_id);
-            });
+            self.forget_idle_wait(session_id);
             let timed_out = match deadline {
                 Some(deadline) => timeout_at(deadline, revision.changed()).await.is_err(),
                 None => {
@@ -4067,6 +4096,14 @@ impl Registry {
                 let summaries = self.state.acquire().await.summaries(session_id, ids)?;
                 return Ok((summaries, delivered, true));
             }
+        }
+    }
+
+    fn forget_idle_wait(&self, session_id: &str) {
+        if self.idle_waits.read(|idle| idle.contains_key(session_id)) {
+            self.idle_waits.update(|idle| {
+                idle.remove(session_id);
+            });
         }
     }
 
