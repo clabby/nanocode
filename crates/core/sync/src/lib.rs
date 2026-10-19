@@ -136,6 +136,59 @@ impl<T> Slot<T> {
     }
 }
 
+struct Draining<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Draining<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub struct Ordered<T> {
+    pending: Atom<std::collections::BTreeMap<u64, Arc<Slot<T>>>>,
+    next: std::sync::atomic::AtomicU64,
+    draining: std::sync::atomic::AtomicBool,
+}
+
+impl<T> Ordered<T> {
+    #[must_use]
+    pub fn new(first: u64) -> Self {
+        Self {
+            pending: Atom::default(),
+            next: std::sync::atomic::AtomicU64::new(first),
+            draining: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn publish(&self, ticket: u64, value: T, deliver: impl Fn(T)) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let value = Arc::new(Slot::new(Some(value)));
+        self.pending.update(|pending| {
+            pending.insert(ticket, Arc::clone(&value));
+        });
+        while !self.draining.swap(true, SeqCst) {
+            {
+                let _draining = Draining(&self.draining);
+                loop {
+                    let next = self.next.load(SeqCst);
+                    let Some(ready) = self.pending.try_update(|pending| pending.remove(&next))
+                    else {
+                        break;
+                    };
+                    self.next.store(next.wrapping_add(1), SeqCst);
+                    if let Some(value) = ready.take() {
+                        deliver(value);
+                    }
+                }
+            }
+            let next = self.next.load(SeqCst);
+            if !self.pending.read(|pending| pending.contains_key(&next)) {
+                return;
+            }
+        }
+    }
+}
+
 struct Node<T> {
     value: T,
     next: Option<Arc<Self>>,

@@ -11,9 +11,14 @@ use std::{
     collections::{BTreeMap, HashSet},
     fmt,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
+
+use nanocode_sync::{Atom, Ordered, Slot};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, watch},
@@ -234,18 +239,29 @@ impl Default for RunnerPool {
         }
     }
 }
-#[derive(Default)]
 struct PoolInner {
-    state: Mutex<PoolState>,
+    state: Atom<PoolState>,
+    events: Ordered<Vec<RunnerEvent>>,
+    subscribers: Atom<Vec<mpsc::UnboundedSender<RunnerEvent>>>,
     code_mode: CodeModeExecutors,
 }
-#[derive(Default)]
+impl Default for PoolInner {
+    fn default() -> Self {
+        Self {
+            state: Atom::default(),
+            events: Ordered::new(1),
+            subscribers: Atom::default(),
+            code_mode: CodeModeExecutors::default(),
+        }
+    }
+}
+#[derive(Clone, Default)]
 struct PoolState {
-    runners: BTreeMap<String, Entry>,
-    executors: BTreeMap<String, ExecutorEntry>,
+    revision: u64,
+    runners: BTreeMap<String, Arc<Entry>>,
+    executors: BTreeMap<String, Arc<ExecutorEntry>>,
     revocations: HashSet<(String, Box<str>)>,
     servers: Vec<Arc<ServerInner>>,
-    subscribers: Vec<mpsc::UnboundedSender<RunnerEvent>>,
     closed: bool,
 }
 struct ExecutorEntry {
@@ -260,7 +276,7 @@ struct ExecutorEntry {
     shutdown: SocketShutdown,
     closed: watch::Receiver<Option<String>>,
     host: Arc<dyn CodeModeHost>,
-    monitor: Option<AbortHandle>,
+    monitor: Slot<AbortHandle>,
 }
 impl Drop for ExecutorEntry {
     fn drop(&mut self) {
@@ -288,11 +304,11 @@ struct Entry {
     endpoint: String,
     mode: RemoteMode,
     status: watch::Sender<RunnerStatus>,
-    connection: Option<RunnerConnection>,
+    connection: Slot<RunnerConnection>,
     cancel: CancellationToken,
-    monitor: Option<AbortHandle>,
+    monitor: Slot<AbortHandle>,
     identity: Arc<()>,
-    active: bool,
+    active: AtomicBool,
     workspace: Option<PathBuf>,
 }
 impl Drop for Entry {
@@ -304,16 +320,53 @@ impl Drop for Entry {
     }
 }
 impl PoolInner {
-    fn state(&self) -> MutexGuard<'_, PoolState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn commit<R>(&self, mut change: impl FnMut(&mut PoolState) -> (R, Vec<RunnerEvent>)) -> R {
+        let (output, revision, events) = self.state.update(|state| {
+            state.revision += 1;
+            let (output, events) = change(state);
+            (output, state.revision, events)
+        });
+        self.publish(revision, events);
+        output
+    }
+    fn try_commit<R, E>(
+        &self,
+        mut change: impl FnMut(&mut PoolState) -> Result<(R, Vec<RunnerEvent>), E>,
+    ) -> Result<R, E> {
+        let (output, revision, events) = self.state.modify(|state| {
+            let (output, events) = change(state)?;
+            state.revision += 1;
+            Ok((output, state.revision, events))
+        })?;
+        self.publish(revision, events);
+        Ok(output)
+    }
+    fn publish(&self, revision: u64, events: Vec<RunnerEvent>) {
+        self.events.publish(revision, events, |events| {
+            if events.is_empty() {
+                return;
+            }
+            let mut stale = false;
+            for subscriber in self.subscribers.get().iter() {
+                for event in &events {
+                    stale |= subscriber.send(event.clone()).is_err();
+                }
+            }
+            if stale {
+                self.subscribers
+                    .update(|subscribers| subscribers.retain(|sender| !sender.is_closed()));
+            }
+        });
+    }
+    fn emit(&self, event: RunnerEvent) {
+        self.commit(|_| ((), vec![event.clone()]));
     }
     fn update(&self, name: &str, status: RunnerStatus, identity: &Arc<()>) {
-        let mut state = self.state();
-        let Some(entry) = state.runners.get_mut(name) else {
+        let Some(entry) = self.state.read(|state| state.runners.get(name).cloned()) else {
             return;
         };
         if !Arc::ptr_eq(&entry.identity, identity)
-            || !entry.active
+            || !entry.active.load(Ordering::SeqCst)
             || *entry.status.borrow() == status
         {
             return;
@@ -321,16 +374,14 @@ impl PoolInner {
         entry.status.send_replace(status.clone());
         let info = entry.info(name);
         tracing::info!(target: "nanocode_code_mode::attachment", runner = name, ?status, "runner status changed");
-        emit(&mut state, RunnerEvent::StatusChanged { info });
+        let mut events = vec![RunnerEvent::StatusChanged { info }];
         if let RunnerStatus::Failed(error) = status {
-            emit(
-                &mut state,
-                RunnerEvent::Failed {
-                    name: name.into(),
-                    error,
-                },
-            );
+            events.push(RunnerEvent::Failed {
+                name: name.into(),
+                error,
+            });
         }
+        self.commit(|_| ((), events.clone()));
     }
 }
 impl Entry {
@@ -351,10 +402,10 @@ impl Entry {
         }
     }
 }
-fn emit(state: &mut PoolState, event: RunnerEvent) {
-    state
-        .subscribers
-        .retain(|sender| sender.send(event.clone()).is_ok());
+enum Refusal {
+    Revoked,
+    Duplicate,
+    Failed(AttachmentError),
 }
 fn error(value: impl fmt::Display) -> AttachmentError {
     AttachmentError::Transport(value.to_string().into())
@@ -375,24 +426,22 @@ impl RunnerPool {
         self.inner.code_mode.clone()
     }
     pub fn report_failure(&self, name: impl Into<String>, failure: impl Into<String>) {
-        emit(
-            &mut self.inner.state(),
-            RunnerEvent::Failed {
-                name: name.into(),
-                error: failure.into(),
-            },
-        );
+        self.inner.emit(RunnerEvent::Failed {
+            name: name.into(),
+            error: failure.into(),
+        });
     }
     pub fn servers(&self) -> Vec<RunnerServer> {
-        self.inner
-            .state()
-            .servers
-            .iter()
-            .filter(|server| !server.cancel.is_cancelled())
-            .map(|inner| RunnerServer {
-                inner: inner.clone(),
-            })
-            .collect()
+        self.inner.state.read(|state| {
+            state
+                .servers
+                .iter()
+                .filter(|server| !server.cancel.is_cancelled())
+                .map(|inner| RunnerServer {
+                    inner: inner.clone(),
+                })
+                .collect()
+        })
     }
     pub fn start(&self, config: Runner) -> Result<RunnerHandle, AttachmentError> {
         let name = config.name.clone();
@@ -415,18 +464,20 @@ impl RunnerPool {
         if let Some(timeout) = config.timeout {
             remote = remote.with_call_timeout(timeout)?;
         }
-        let mut state = self.inner.state();
-        validate_registration(&state, &config.name, config.mode)?;
-        if config.mode == RemoteMode::Replace
-            && state
-                .servers
-                .iter()
-                .any(|server| server.mode == RemoteMode::Replace && !server.cancel.is_cancelled())
-        {
-            return Err(AttachmentError::Catalog(
-                "a replacement listener is already configured".into(),
-            ));
-        }
+        let admissible = |state: &PoolState| {
+            validate_registration(state, &config.name, config.mode)?;
+            if config.mode == RemoteMode::Replace
+                && state.servers.iter().any(|server| {
+                    server.mode == RemoteMode::Replace && !server.cancel.is_cancelled()
+                })
+            {
+                return Err(AttachmentError::Catalog(
+                    "a replacement listener is already configured".into(),
+                ));
+            }
+            Ok(())
+        };
+        self.inner.state.read(admissible)?;
         let connection = remote.connect_established(target, initial)?;
         let status = watch::channel(RunnerStatus::Connecting).0;
         let identity = Arc::new(());
@@ -446,23 +497,26 @@ impl RunnerPool {
             remote.clone(),
             identity.clone(),
         );
-        state.runners.insert(
-            config.name.clone(),
-            Entry {
-                remote,
-                endpoint: config.endpoint,
-                mode: config.mode,
-                status,
-                connection: Some(connection),
-                cancel: CancellationToken::new(),
-                monitor: Some(monitor),
-                identity,
-                active: true,
-                workspace: config.workspace,
-            },
-        );
-        let info = state.runners[&config.name].info(&config.name);
-        emit(&mut state, RunnerEvent::StatusChanged { info });
+        let entry = Arc::new(Entry {
+            remote,
+            endpoint: config.endpoint,
+            mode: config.mode,
+            status,
+            connection: Slot::new(Some(connection)),
+            cancel: CancellationToken::new(),
+            monitor: Slot::new(Some(monitor)),
+            identity,
+            active: AtomicBool::new(true),
+            workspace: config.workspace,
+        });
+        let info = entry.info(&config.name);
+        self.inner.try_commit(|state| {
+            admissible(state)?;
+            state
+                .runners
+                .insert(config.name.clone(), Arc::clone(&entry));
+            Ok::<_, AttachmentError>(((), vec![RunnerEvent::StatusChanged { info: info.clone() }]))
+        })?;
         Ok(handle)
     }
     pub fn keep_connected(&self, config: Runner) -> Result<(), AttachmentError> {
@@ -488,7 +542,9 @@ impl RunnerPool {
         config.validate()?;
         tokio::runtime::Handle::try_current().map_err(error)?;
         super::install_default_rustls_crypto_provider();
-        validate_registration(&self.inner.state(), &config.name, config.mode)?;
+        self.inner
+            .state
+            .read(|state| validate_registration(state, &config.name, config.mode))?;
         let target = AttachmentTarget::new(&config.endpoint, config.token.clone())?;
         let (socket, first) = dial(&target).await?;
         if code_mode_catalog(&first) {
@@ -498,7 +554,9 @@ impl RunnerPool {
                     .map_err(|failure| AttachmentError::Catalog(failure.to_string().into()))?;
             let name = match transport.name() {
                 Some(advertised) if !config.named => {
-                    validate_registration(&self.inner.state(), advertised, config.mode)?;
+                    self.inner
+                        .state
+                        .read(|state| validate_registration(state, advertised, config.mode))?;
                     advertised.to_owned()
                 }
                 _ => config.name.clone(),
@@ -556,48 +614,6 @@ impl RunnerPool {
         let shutdown = transport.shutdown_handle();
         let host: Arc<dyn CodeModeHost> = Arc::new(transport.into_host());
         let identity = Arc::new(());
-        let mut state = self.inner.state();
-        if state.closed {
-            return Err(AttachmentError::Closed);
-        }
-        if reconnect {
-            if let Some(runtime_id) = &runtime_id
-                && state
-                    .revocations
-                    .contains(&(name.clone(), runtime_id.clone()))
-            {
-                shutdown.revoke();
-                return Err(AttachmentError::Fenced(
-                    super::driver::ATTACHMENT_REVOKED_REASON.into(),
-                ));
-            }
-        } else {
-            state.revocations.retain(|(revoked, _)| *revoked != name);
-        }
-        let duplicate = state.runners.get(&name).is_some_and(|entry| entry.active)
-            || state.executors.get(&name).is_some_and(|entry| {
-                *entry.status.borrow() == RunnerStatus::Ready
-                    && !(reconnect && runtime_id.is_some() && entry.runtime_id == runtime_id)
-            });
-        if duplicate {
-            if reconnect {
-                shutdown.reject(DUPLICATE_EXECUTOR);
-            }
-            return Err(AttachmentError::Catalog(
-                format!("runner `{name}` is already registered").into(),
-            ));
-        }
-        if mode == RemoteMode::Replace
-            && self
-                .inner
-                .code_mode
-                .default_executor()
-                .is_some_and(|current| *current != *name)
-        {
-            return Err(AttachmentError::Catalog(
-                "a replacement Code Mode executor is already configured".into(),
-            ));
-        }
         let status = watch::channel(RunnerStatus::Ready).0;
         let handle = RunnerHandle {
             pool: self.clone(),
@@ -616,45 +632,108 @@ impl RunnerPool {
             Arc::clone(&host),
             closed.clone(),
         );
-        state.executors.insert(
-            name.clone(),
-            ExecutorEntry {
-                config,
-                endpoint,
-                mode,
-                status,
-                workspace,
-                tool_count,
-                identity,
-                runtime_id,
-                shutdown,
-                closed,
-                host: Arc::clone(&host),
-                monitor: Some(monitor),
-            },
-        );
+        let entry = Arc::new(ExecutorEntry {
+            config,
+            endpoint,
+            mode,
+            status,
+            workspace,
+            tool_count,
+            identity,
+            runtime_id: runtime_id.clone(),
+            shutdown: shutdown.clone(),
+            closed,
+            host: Arc::clone(&host),
+            monitor: Slot::new(Some(monitor)),
+        });
+        let registered = self.inner.state.modify(|state| {
+            if state.closed {
+                return Err(Refusal::Failed(AttachmentError::Closed));
+            }
+            if reconnect {
+                if let Some(runtime_id) = &runtime_id
+                    && state
+                        .revocations
+                        .contains(&(name.clone(), runtime_id.clone()))
+                {
+                    return Err(Refusal::Revoked);
+                }
+            } else {
+                state.revocations.retain(|(revoked, _)| *revoked != name);
+            }
+            let duplicate = state
+                .runners
+                .get(&name)
+                .is_some_and(|entry| entry.active.load(Ordering::SeqCst))
+                || state.executors.get(&name).is_some_and(|entry| {
+                    *entry.status.borrow() == RunnerStatus::Ready
+                        && !(reconnect && runtime_id.is_some() && entry.runtime_id == runtime_id)
+                });
+            if duplicate {
+                return Err(Refusal::Duplicate);
+            }
+            if mode == RemoteMode::Replace
+                && self
+                    .inner
+                    .code_mode
+                    .default_executor()
+                    .is_some_and(|current| *current != *name)
+            {
+                return Err(Refusal::Failed(AttachmentError::Catalog(
+                    "a replacement Code Mode executor is already configured".into(),
+                )));
+            }
+            state.revision += 1;
+            state.executors.insert(name.clone(), Arc::clone(&entry));
+            Ok(state.revision)
+        });
+        let revision = match registered {
+            Ok(revision) => revision,
+            Err(refusal) => {
+                if let Some(monitor) = entry.monitor.take() {
+                    monitor.abort();
+                }
+                return Err(match refusal {
+                    Refusal::Revoked => {
+                        shutdown.revoke();
+                        AttachmentError::Fenced(super::driver::ATTACHMENT_REVOKED_REASON.into())
+                    }
+                    Refusal::Duplicate => {
+                        if reconnect {
+                            shutdown.reject(DUPLICATE_EXECUTOR);
+                        }
+                        AttachmentError::Catalog(
+                            format!("runner `{name}` is already registered").into(),
+                        )
+                    }
+                    Refusal::Failed(error) => error,
+                });
+            }
+        };
+        self.inner.publish(revision, Vec::new());
         self.inner.code_mode.insert(name.as_str(), host);
         if mode == RemoteMode::Replace {
             self.inner
                 .code_mode
                 .set_default(Some(Arc::from(name.as_str())));
         }
-        let info = state.executors[&name].info(&name);
+        let info = entry.info(&name);
         tracing::info!(target: "nanocode_code_mode::attachment", runner = name, "Code Mode executor registered");
-        emit(&mut state, RunnerEvent::StatusChanged { info });
+        self.inner.emit(RunnerEvent::StatusChanged { info });
         Ok(handle)
     }
     pub fn connected_hands(&self) -> Vec<RunnerSpec> {
-        self.inner
-            .state()
-            .executors
-            .values()
-            .filter(|entry| *entry.status.borrow() == RunnerStatus::Ready)
-            .filter_map(|entry| entry.config.as_ref().map(Runner::spec))
-            .collect()
+        self.inner.state.read(|state| {
+            state
+                .executors
+                .values()
+                .filter(|entry| *entry.status.borrow() == RunnerStatus::Ready)
+                .filter_map(|entry| entry.config.as_ref().map(Runner::spec))
+                .collect()
+        })
     }
     pub fn list(&self) -> Vec<RunnerInfo> {
-        let state = self.inner.state();
+        let state = self.inner.state.get();
         let mut runners = state
             .runners
             .iter()
@@ -666,7 +745,9 @@ impl RunnerPool {
     }
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<RunnerEvent> {
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.inner.state().subscribers.push(sender);
+        self.inner
+            .subscribers
+            .update(|subscribers| subscribers.push(sender.clone()));
         receiver
     }
     pub fn disconnect<'call>(
@@ -692,10 +773,9 @@ impl RunnerPool {
         identity: Option<&Arc<()>>,
         revoke: bool,
     ) -> Result<Option<watch::Receiver<Option<String>>>, AttachmentError> {
-        let entry = {
-            let mut state = self.inner.state();
+        let entry = self.inner.try_commit(|state| {
             let Some(entry) = state.executors.get(name) else {
-                return Ok(None);
+                return Ok((None, Vec::new()));
             };
             if identity.is_some_and(|identity| !Arc::ptr_eq(&entry.identity, identity)) {
                 return Err(error(format!(
@@ -703,18 +783,21 @@ impl RunnerPool {
                 )));
             }
             let Some(entry) = state.executors.remove(name) else {
-                return Ok(None);
+                return Ok((None, Vec::new()));
             };
-            entry.status.send_replace(RunnerStatus::Disconnected);
-            let info = entry.info(name);
+            let mut info = entry.info(name);
+            info.status = RunnerStatus::Disconnected;
             if revoke && let Some(runtime_id) = &entry.runtime_id {
                 state
                     .revocations
                     .insert((name.to_owned(), runtime_id.clone()));
             }
-            emit(&mut state, RunnerEvent::StatusChanged { info });
-            entry
+            Ok((Some(entry), vec![RunnerEvent::StatusChanged { info }]))
+        })?;
+        let Some(entry) = entry else {
+            return Ok(None);
         };
+        entry.status.send_replace(RunnerStatus::Disconnected);
         self.inner.code_mode.remove_host(name, &entry.host);
         self.inner.code_mode.clear_selections(name);
         if revoke {
@@ -732,35 +815,32 @@ impl RunnerPool {
         name: &str,
         identity: Option<&Arc<()>>,
     ) -> Result<RemoteRunner, AttachmentError> {
-        let remote = {
-            let mut state = self.inner.state();
+        let entry = self.inner.try_commit(|state| {
             let entry = state
                 .runners
-                .get_mut(name)
+                .get(name)
+                .cloned()
                 .ok_or_else(|| error(format!("runner `{name}` is not registered")))?;
             if identity.is_some_and(|identity| !Arc::ptr_eq(&entry.identity, identity)) {
                 return Err(error(format!(
                     "runner handle `{name}` is stale; the name belongs to a newer registration"
                 )));
             }
-            entry.active = false;
-            entry.cancel.cancel();
-            if let Some(monitor) = entry.monitor.take() {
-                monitor.abort();
+            entry.active.store(false, Ordering::SeqCst);
+            if let Some(runtime_id) = entry.remote.runtime_id() {
+                state.revocations.insert((name.to_owned(), runtime_id));
             }
-            entry.connection.take();
-            entry.status.send_replace(RunnerStatus::Disconnected);
-            let remote = entry.remote.clone();
-            let revoked = remote
-                .runtime_id()
-                .map(|runtime_id| (name.to_owned(), runtime_id));
-            let info = entry.info(name);
-            if let Some(revoked) = revoked {
-                state.revocations.insert(revoked);
-            }
-            emit(&mut state, RunnerEvent::StatusChanged { info });
-            remote
-        };
+            let mut info = entry.info(name);
+            info.status = RunnerStatus::Disconnected;
+            Ok((entry, vec![RunnerEvent::StatusChanged { info }]))
+        })?;
+        entry.cancel.cancel();
+        if let Some(monitor) = entry.monitor.take() {
+            monitor.abort();
+        }
+        entry.connection.take();
+        entry.status.send_replace(RunnerStatus::Disconnected);
+        let remote = entry.remote.clone();
         remote.revoke();
         Ok(remote)
     }
@@ -776,15 +856,17 @@ impl RunnerPool {
         &'call self,
     ) -> futures_util::future::BoxFuture<'call, Result<(), AttachmentError>> {
         Box::pin(async move {
-            let (names, executors, servers) = {
-                let mut state = self.inner.state();
+            let (names, executors, servers) = self.inner.commit(|state| {
                 state.closed = true;
                 (
-                    state.runners.keys().cloned().collect::<Vec<_>>(),
-                    state.executors.keys().cloned().collect::<Vec<_>>(),
-                    std::mem::take(&mut state.servers),
+                    (
+                        state.runners.keys().cloned().collect::<Vec<_>>(),
+                        state.executors.keys().cloned().collect::<Vec<_>>(),
+                        std::mem::take(&mut state.servers),
+                    ),
+                    Vec::new(),
                 )
-            };
+            });
             for inner in &servers {
                 inner.cancel.cancel();
             }
@@ -805,34 +887,37 @@ impl RunnerPool {
             for inner in servers {
                 RunnerServer { inner }.stop().await?;
             }
-            self.inner.state().subscribers.clear();
+            self.inner.subscribers.set(Vec::new());
             Ok(())
         })
     }
     pub(crate) fn routes(&self) -> Vec<Route> {
-        self.inner
-            .state()
-            .runners
-            .values()
-            .filter(|entry| entry.active && entry.remote.is_connected())
-            .filter_map(|entry| {
-                let tools = entry.remote.tools_snapshot()?;
-                Some(Route {
-                    workspace: entry
-                        .workspace
-                        .clone()
-                        .or_else(|| tools.workspace().map(PathBuf::from))?,
-                    tools,
-                    mode: entry.mode,
+        self.inner.state.read(|state| {
+            state
+                .runners
+                .values()
+                .filter(|entry| entry.active.load(Ordering::SeqCst) && entry.remote.is_connected())
+                .filter_map(|entry| {
+                    let tools = entry.remote.tools_snapshot()?;
+                    Some(Route {
+                        workspace: entry
+                            .workspace
+                            .clone()
+                            .or_else(|| tools.workspace().map(PathBuf::from))?,
+                        tools,
+                        mode: entry.mode,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
     }
     pub(crate) fn reserved_mounts(&self) -> Vec<String> {
-        self.inner.state().runners.keys().cloned().collect()
+        self.inner
+            .state
+            .read(|state| state.runners.keys().cloned().collect())
     }
     pub(crate) fn replacement(&self) -> Option<String> {
-        let state = self.inner.state();
+        let state = self.inner.state.get();
         state
             .runners
             .iter()
@@ -878,23 +963,26 @@ impl RunnerPool {
             let endpoint = format!("ws://{address}/");
             let cancel = CancellationToken::new();
             let weak = Arc::downgrade(&self.inner);
-            let mut state = self.inner.state();
-            if state.closed {
-                return Err(AttachmentError::Closed);
-            }
-            if config.mode == RemoteMode::Replace
-                && (state
-                    .runners
-                    .values()
-                    .any(|entry| entry.mode == RemoteMode::Replace)
-                    || state.servers.iter().any(|server| {
-                        server.mode == RemoteMode::Replace && !server.cancel.is_cancelled()
-                    }))
-            {
-                return Err(AttachmentError::Catalog(
-                    "a replacement runner or listener is already configured".into(),
-                ));
-            }
+            let admissible = |state: &PoolState| {
+                if state.closed {
+                    return Err(AttachmentError::Closed);
+                }
+                if config.mode == RemoteMode::Replace
+                    && (state
+                        .runners
+                        .values()
+                        .any(|entry| entry.mode == RemoteMode::Replace)
+                        || state.servers.iter().any(|server| {
+                            server.mode == RemoteMode::Replace && !server.cancel.is_cancelled()
+                        }))
+                {
+                    return Err(AttachmentError::Catalog(
+                        "a replacement runner or listener is already configured".into(),
+                    ));
+                }
+                Ok(())
+            };
+            self.inner.state.read(admissible)?;
             let task = tokio::spawn(accept(
                 listener,
                 weak,
@@ -902,18 +990,22 @@ impl RunnerPool {
                 endpoint.clone(),
                 config.timeout,
                 config.mode,
-                config.workspace,
+                config.workspace.clone(),
                 cancel.clone(),
             ));
             let inner = Arc::new(ServerInner {
                 endpoint,
                 token,
                 cancel,
-                task: Mutex::new(Some(task)),
+                task: Slot::new(Some(task)),
                 pool: Arc::downgrade(&self.inner),
                 mode: config.mode,
             });
-            state.servers.push(inner.clone());
+            self.inner.try_commit(|state| {
+                admissible(state)?;
+                state.servers.push(Arc::clone(&inner));
+                Ok::<_, AttachmentError>(((), Vec::new()))
+            })?;
             Ok(RunnerServer { inner })
         })
     }
@@ -926,7 +1018,10 @@ fn validate_registration(
     if state.closed {
         return Err(AttachmentError::Closed);
     }
-    if state.runners.get(name).is_some_and(|entry| entry.active)
+    if state
+        .runners
+        .get(name)
+        .is_some_and(|entry| entry.active.load(Ordering::SeqCst))
         || state
             .executors
             .get(name)
@@ -984,11 +1079,12 @@ async fn supervise(pool: Weak<PoolInner>, config: Runner) {
                 let Some(inner) = pool.upgrade() else {
                     return;
                 };
-                let dropped = inner
-                    .state()
-                    .executors
-                    .get(&name)
-                    .is_some_and(|entry| Arc::ptr_eq(&entry.identity, &identity));
+                let dropped = inner.state.read(|state| {
+                    state
+                        .executors
+                        .get(&name)
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.identity, &identity))
+                });
                 if !dropped {
                     return;
                 }
@@ -1024,8 +1120,7 @@ fn executor_monitor(
             return;
         };
         pool.code_mode.remove_host(&name, &host);
-        let mut state = pool.state();
-        let Some(entry) = state.executors.get_mut(&name) else {
+        let Some(entry) = pool.state.read(|state| state.executors.get(&name).cloned()) else {
             return;
         };
         if !Arc::ptr_eq(&entry.identity, &identity) {
@@ -1042,7 +1137,7 @@ fn executor_monitor(
         tracing::info!(target: "nanocode_code_mode::attachment", runner = name, ?status, "Code Mode executor closed");
         entry.status.send_replace(status);
         let info = entry.info(&name);
-        emit(&mut state, RunnerEvent::StatusChanged { info });
+        pool.emit(RunnerEvent::StatusChanged { info });
     })
     .abort_handle()
 }
@@ -1233,19 +1328,14 @@ struct ServerInner {
     endpoint: String,
     token: String,
     cancel: CancellationToken,
-    task: Mutex<Option<JoinHandle<()>>>,
+    task: Slot<JoinHandle<()>>,
     pool: Weak<PoolInner>,
     mode: RemoteMode,
 }
 impl Drop for ServerInner {
     fn drop(&mut self) {
         self.cancel.cancel();
-        if let Some(task) = self
-            .task
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+        if let Some(task) = self.task.take() {
             task.abort();
         }
     }
@@ -1262,13 +1352,7 @@ impl RunnerServer {
     ) -> futures_util::future::BoxFuture<'call, Result<(), AttachmentError>> {
         Box::pin(async move {
             self.inner.cancel.cancel();
-            let task = self
-                .inner
-                .task
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            if let Some(task) = task {
+            if let Some(task) = self.inner.task.take() {
                 task.await.map_err(error)?;
             }
             if let Some(inner) = self.inner.pool.upgrade() {
@@ -1317,7 +1401,7 @@ async fn accept(
                     connections.spawn(async move {
                         if let Err(error) = incoming(socket, pool.clone(), token, endpoint, timeout, mode, workspace).await {
                             tracing::warn!(target: "nanocode_code_mode::attachment", %error, "runner listener connection failed");
-                            if let Some(pool) = pool.upgrade() { emit(&mut pool.state(), RunnerEvent::Failed { name: String::new(), error: error.to_string() }); }
+                            if let Some(pool) = pool.upgrade() { pool.emit(RunnerEvent::Failed { name: String::new(), error: error.to_string() }); }
                         }
                     });
                 },
@@ -1409,24 +1493,32 @@ async fn incoming(
         .to_owned();
     let registration = (|| {
         let pool = pool.upgrade().ok_or(AttachmentError::Closed)?;
-        let mut state = pool.state();
-        if catalog
-            .get("runtime_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|runtime_id| {
-                state
-                    .revocations
-                    .contains(&(name.clone(), runtime_id.into()))
+        let admissible = |state: &PoolState| {
+            if catalog
+                .get("runtime_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|runtime_id| {
+                    state
+                        .revocations
+                        .contains(&(name.clone(), runtime_id.into()))
+                })
+            {
+                return Err(AttachmentError::Fenced(
+                    super::driver::ATTACHMENT_REVOKED_REASON.into(),
+                ));
+            }
+            validate_registration(state, &name, mode)
+        };
+        let existing = pool.state.read(|state| {
+            admissible(state)?;
+            Ok::<_, AttachmentError>(match state.runners.get(&name) {
+                Some(entry) if !entry.cancel.is_cancelled() => Some(entry.remote.clone()),
+                _ => None,
             })
-        {
-            return Err(AttachmentError::Fenced(
-                super::driver::ATTACHMENT_REVOKED_REASON.into(),
-            ));
-        }
-        validate_registration(&state, &name, mode)?;
-        let mut remote = match state.runners.get(&name) {
-            Some(entry) if !entry.cancel.is_cancelled() => entry.remote.clone(),
-            _ => RemoteRunner::new(&name)?,
+        })?;
+        let mut remote = match existing {
+            Some(remote) => remote,
+            None => RemoteRunner::new(&name)?,
         };
         if let Some(timeout) = timeout {
             remote = remote.with_call_timeout(timeout)?;
@@ -1441,23 +1533,30 @@ async fn incoming(
             remote.clone(),
             identity.clone(),
         );
-        state.runners.insert(
-            name.clone(),
-            Entry {
-                remote: remote.clone(),
-                endpoint,
-                mode,
-                status,
-                connection: None,
-                cancel: cancel.clone(),
-                monitor: Some(monitor),
-                identity: identity.clone(),
-                active: true,
-                workspace,
-            },
-        );
-        let info = state.runners[&name].info(&name);
-        emit(&mut state, RunnerEvent::StatusChanged { info });
+        let entry = Arc::new(Entry {
+            remote: remote.clone(),
+            endpoint: endpoint.clone(),
+            mode,
+            status,
+            connection: Slot::default(),
+            cancel: cancel.clone(),
+            monitor: Slot::new(Some(monitor)),
+            identity: identity.clone(),
+            active: AtomicBool::new(true),
+            workspace: workspace.clone(),
+        });
+        let info = entry.info(&name);
+        let registered = pool.try_commit(|state| {
+            admissible(state)?;
+            state.runners.insert(name.clone(), Arc::clone(&entry));
+            Ok::<_, AttachmentError>(((), vec![RunnerEvent::StatusChanged { info: info.clone() }]))
+        });
+        if let Err(error) = registered {
+            if let Some(monitor) = entry.monitor.take() {
+                monitor.abort();
+            }
+            return Err(error);
+        }
         Ok((remote, cancel, identity))
     })();
     let (remote, cancel, identity) = match registration {
@@ -1490,10 +1589,10 @@ async fn incoming(
             },
             &identity,
         );
-        if let Some(entry) = pool.state().runners.get_mut(&name) {
-            if Arc::ptr_eq(&entry.identity, &identity) {
-                entry.active = false;
-            }
+        if let Some(entry) = pool.state.read(|state| state.runners.get(&name).cloned())
+            && Arc::ptr_eq(&entry.identity, &identity)
+        {
+            entry.active.store(false, Ordering::SeqCst);
         }
     }
     result

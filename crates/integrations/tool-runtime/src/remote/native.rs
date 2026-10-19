@@ -11,11 +11,13 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
+
+use nanocode_sync::{Atom, Owned, Slot};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -55,7 +57,7 @@ pub struct ExecutorOptions {
 #[derive(Clone)]
 pub(crate) struct SocketShutdown {
     token: CancellationToken,
-    reason: Arc<Mutex<Option<&'static str>>>,
+    reason: Arc<Atom<Option<&'static str>>>,
 }
 
 impl SocketShutdown {
@@ -64,7 +66,7 @@ impl SocketShutdown {
     }
 
     pub(crate) fn reject(&self, reason: &'static str) {
-        *self.reason.lock().unwrap() = Some(reason);
+        self.reason.set(Some(reason));
         self.token.cancel();
     }
 
@@ -327,7 +329,7 @@ fn writer<S: Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static>
     mut sink: S,
     policy: SocketPolicy,
     liveness: Arc<Liveness>,
-    reason: Arc<Mutex<Option<&'static str>>>,
+    reason: Arc<Atom<Option<&'static str>>>,
 ) -> (mpsc::UnboundedSender<Frame>, Writer) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
@@ -339,7 +341,7 @@ fn writer<S: Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static>
                 frame = rx.recv() => match frame {
                     Some(frame) => write(&mut sink, frame, policy).await?,
                     None => {
-                        let reason = *reason.lock().unwrap();
+                        let reason = *reason.get();
                         let close = reason.map(|reason| tungstenite::protocol::CloseFrame {
                             code: tungstenite::protocol::frame::coding::CloseCode::Policy,
                             reason: reason.into(),
@@ -466,9 +468,11 @@ impl SocketTransport {
         );
         let (client, driver) = RemoteClient::new(
             SocketLink {
-                socket: tokio::sync::Mutex::new(socket),
-                wire: Mutex::new(Some(wire)),
-                writer: tokio::sync::Mutex::new(Some(writer)),
+                reader: Owned::new(SocketReader {
+                    socket,
+                    writer: Some(writer),
+                }),
+                wire: Atom::new(Some(wire)),
                 liveness,
                 window: policy.request_timeout / 2,
                 stopped: shutdown.token.clone(),
@@ -494,10 +498,14 @@ impl SocketTransport {
     }
 }
 
+struct SocketReader<S> {
+    socket: futures_util::stream::SplitStream<WebSocketStream<S>>,
+    writer: Option<Writer>,
+}
+
 struct SocketLink<S> {
-    socket: tokio::sync::Mutex<futures_util::stream::SplitStream<WebSocketStream<S>>>,
-    wire: Mutex<Option<mpsc::UnboundedSender<Frame>>>,
-    writer: tokio::sync::Mutex<Option<Writer>>,
+    reader: Owned<SocketReader<S>>,
+    wire: Atom<Option<mpsc::UnboundedSender<Frame>>>,
     liveness: Arc<Liveness>,
     window: Duration,
     stopped: CancellationToken,
@@ -516,7 +524,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteLink for SocketLi
         frames: Vec<Frame>,
         _delivery: RemoteDelivery,
     ) -> HostFuture<'_, Result<(), CodeModeHostError>> {
-        let sent = match &*self.wire.lock().unwrap() {
+        let sent = match &*self.wire.get() {
             Some(wire) => frames
                 .into_iter()
                 .try_for_each(|frame| wire.send(frame).map_err(error)),
@@ -527,8 +535,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteLink for SocketLi
 
     fn receive(&self) -> HostFuture<'_, Result<Vec<Frame>, CodeModeHostError>> {
         Box::pin(async move {
-            let mut socket = self.socket.lock().await;
-            let mut writer = self.writer.lock().await;
+            let mut reader = self.reader.acquire().await;
+            let SocketReader { socket, writer } = &mut *reader;
             let Some(task) = writer.as_mut() else {
                 return Err(error(LOCAL_CLOSED));
             };
@@ -536,7 +544,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteLink for SocketLi
                 biased;
                 () = self.stopped.cancelled() => Received::Stopped,
                 result = &mut task.0 => Received::Written(result),
-                frame = read(&mut *socket, &self.liveness) => Received::Frame(frame),
+                frame = read(socket, &self.liveness) => Received::Frame(frame),
                 () = self.liveness.watch(self.window) => Received::Unresponsive,
             };
             match received {
@@ -563,8 +571,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteLink for SocketLi
 
     fn close<'a>(&'a self, _reason: &'a str) -> HostFuture<'a, ()> {
         Box::pin(async move {
-            self.wire.lock().unwrap().take();
-            if let Some(mut writer) = self.writer.lock().await.take() {
+            self.wire.set(None);
+            if let Some(mut writer) = self.reader.acquire().await.writer.take() {
                 let _ = (&mut writer.0).await;
             }
         })
@@ -652,9 +660,11 @@ impl CodeModeObserver for DetachedObserver {
     }
 }
 
+type CallbackReply = Arc<Slot<oneshot::Sender<Result<Value, String>>>>;
+
 struct CallbackBus {
     outgoing: mpsc::UnboundedSender<Frame>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
+    pending: Atom<HashMap<u64, CallbackReply>>,
     next: AtomicU64,
     timeout: Option<Duration>,
 }
@@ -664,7 +674,12 @@ struct CallbackPending {
 }
 impl Drop for CallbackPending {
     fn drop(&mut self) {
-        if self.bus.pending.lock().unwrap().remove(&self.id).is_some() {
+        if self
+            .bus
+            .pending
+            .update(|pending| pending.remove(&self.id))
+            .is_some()
+        {
             let _ = self
                 .bus
                 .outgoing
@@ -676,7 +691,10 @@ impl Drop for CallbackPending {
 async fn callback(bus: &Arc<CallbackBus>, frame: impl FnOnce(u64) -> Frame) -> ToolResult {
     let id = bus.next.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel();
-    bus.pending.lock().unwrap().insert(id, tx);
+    let tx = Arc::new(Slot::new(Some(tx)));
+    bus.pending.update(|pending| {
+        pending.insert(id, Arc::clone(&tx));
+    });
     let _pending = CallbackPending {
         bus: Arc::clone(bus),
         id,
@@ -725,12 +743,12 @@ impl Tool for CallbackTool {
 
 struct HandCallbacks {
     bus: Arc<CallbackBus>,
-    name: Mutex<Option<String>>,
+    name: Atom<Option<String>>,
 }
 
 impl HandCalls for HandCallbacks {
     fn here(&self, hand: &str) -> bool {
-        self.name.lock().unwrap().as_deref() == Some(hand)
+        self.name.read(|name| name.as_deref() == Some(hand))
     }
 
     fn call<'a>(
@@ -756,13 +774,14 @@ impl HandCalls for HandCallbacks {
     }
 }
 
+#[derive(Clone)]
 struct CallbackOrigin {
     id: String,
     turn: u64,
     definitions: Vec<ToolDefinition>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CallbackCatalogState {
     turn: u64,
     origins: Vec<CallbackOrigin>,
@@ -771,7 +790,7 @@ struct CallbackCatalogState {
 #[derive(Clone)]
 struct CallbackCatalog {
     session_id: Arc<str>,
-    state: Arc<Mutex<CallbackCatalogState>>,
+    state: Arc<Atom<CallbackCatalogState>>,
     bus: Arc<CallbackBus>,
 }
 
@@ -781,44 +800,43 @@ impl CallbackCatalog {
         origin: &str,
         definitions: Vec<ToolDefinition>,
     ) -> Result<(), CodeModeHostError> {
-        let mut state = self.state.lock().unwrap();
-        if state.origins.iter().any(|entry| entry.id == origin) {
-            return Err(error("callback origin is already active"));
-        }
-        let turn = state.turn;
-        state.origins.push(CallbackOrigin {
-            id: origin.into(),
-            turn,
-            definitions,
-        });
-        Ok(())
+        self.state.modify(|state| {
+            if state.origins.iter().any(|entry| entry.id == origin) {
+                return Err(error("callback origin is already active"));
+            }
+            let turn = state.turn;
+            state.origins.push(CallbackOrigin {
+                id: origin.into(),
+                turn,
+                definitions: definitions.clone(),
+            });
+            Ok(())
+        })
     }
 
     fn turn(&self) -> u64 {
-        self.state.lock().unwrap().turn
+        self.state.read(|state| state.turn)
     }
 
     fn begin_turn(&self) {
-        self.state.lock().unwrap().turn += 1;
+        self.state.update(|state| state.turn += 1);
     }
 
     fn adopt(&self, origin: &str, turn: u64) {
-        if let Some(entry) = self
-            .state
-            .lock()
-            .unwrap()
-            .origins
-            .iter_mut()
-            .find(|entry| entry.id == origin)
-        {
-            entry.turn = turn;
-        }
+        self.state.update(|state| {
+            if let Some(entry) = state.origins.iter_mut().find(|entry| entry.id == origin) {
+                entry.turn = turn;
+            }
+        });
     }
 
     fn finish(&self, origin: &str) {
-        let mut state = self.state.lock().unwrap();
-        if let Some(index) = state.origins.iter().position(|entry| entry.id == origin) {
+        let removed = self.state.try_update(|state| {
+            let index = state.origins.iter().position(|entry| entry.id == origin)?;
             state.origins.remove(index);
+            Some(())
+        });
+        if removed.is_some() {
             let _ = self.bus.outgoing.send(Frame::DetachedComplete {
                 session_id: self.session_id.to_string(),
                 origin_call_id: origin.into(),
@@ -827,15 +845,14 @@ impl CallbackCatalog {
     }
 
     fn finish_turn(&self, turn: Option<u64>) {
-        let origins = self
-            .state
-            .lock()
-            .unwrap()
-            .origins
-            .iter()
-            .filter(|entry| turn.is_none_or(|turn| entry.turn == turn))
-            .map(|entry| entry.id.clone())
-            .collect::<Vec<_>>();
+        let origins = self.state.read(|state| {
+            state
+                .origins
+                .iter()
+                .filter(|entry| turn.is_none_or(|turn| entry.turn == turn))
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>()
+        });
         for origin in origins {
             self.finish(&origin);
         }
@@ -863,7 +880,7 @@ impl crate::runtime::DynamicToolProvider for CallbackCatalog {
         Vec::new()
     }
     fn available_definitions(&self) -> Vec<ToolDefinition> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.get();
         let mut names = HashSet::new();
         state
             .origins
@@ -884,17 +901,16 @@ impl crate::runtime::DynamicToolProvider for CallbackCatalog {
             .call_id()
             .rsplit_once("/code-")
             .map_or(context.call_id(), |(origin, _)| origin);
-        let definition = self
-            .state
-            .lock()
-            .unwrap()
-            .origins
-            .iter()
-            .find(|entry| entry.id == origin)?
-            .definitions
-            .iter()
-            .find(|definition| definition.name() == name)
-            .cloned()?;
+        let definition = self.state.read(|state| {
+            state
+                .origins
+                .iter()
+                .find(|entry| entry.id == origin)?
+                .definitions
+                .iter()
+                .find(|definition| definition.name() == name)
+                .cloned()
+        })?;
         let input = match &definition {
             ToolDefinition::Custom { .. } => match input.as_str() {
                 Some(source) => ToolInput::Freeform(source.into()),
@@ -1039,13 +1055,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let (outgoing, mut writer) = writer(sink, policy, Arc::clone(&liveness), Arc::default());
     let bus = Arc::new(CallbackBus {
         outgoing: outgoing.clone(),
-        pending: Mutex::new(HashMap::new()),
+        pending: Atom::default(),
         next: AtomicU64::new(0),
         timeout: options.callback_timeout,
     });
     let callbacks = Arc::new(HandCallbacks {
         bus: Arc::clone(&bus),
-        name: Mutex::new(options.name),
+        name: Atom::new(options.name),
     });
     let hands: Arc<dyn HandCalls> = callbacks.clone();
     let mut runtimes = Sessions(HashMap::new());
@@ -1057,13 +1073,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 frame = read_live(&mut socket, &liveness, watchdog.as_mut()) => {
                     let Some(frame) = frame? else { return Ok(()); };
                     match frame {
-                        Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.lock().unwrap().remove(&id) { let _ = tx.send(result); } },
+                        Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.update(|pending| pending.remove(&id)).and_then(|tx| tx.take()) { let _ = tx.send(result); } },
                         Frame::Request { id, operation } => {
                             let session_id = match &operation { RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } | RemoteOperation::Call { context, .. } => &context.session_id, RemoteOperation::Cancel { session_id } | RemoteOperation::CancelTurn { session_id } | RemoteOperation::DetachTurn { session_id } | RemoteOperation::BeginTurn { session_id } | RemoteOperation::Preempt { session_id } | RemoteOperation::SettlePreempt { session_id } => session_id }.clone();
                             if matches!(&operation, RemoteOperation::Execute { .. } | RemoteOperation::Call { .. }) && !runtimes.contains_key(&session_id) {
                                 let catalog = CallbackCatalog {
                                     session_id: Arc::from(session_id.as_str()),
-                                    state: Arc::new(Mutex::new(CallbackCatalogState::default())),
+                                    state: Arc::default(),
                                     bus: Arc::clone(&bus),
                                 };
                                 match tools.clone().into_builder().provider(catalog.clone()).hand_calls(Arc::clone(&hands)).build() {
@@ -1075,7 +1091,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 }
                             }
                             if let RemoteOperation::Execute { hand: Some(hand), .. } = &operation {
-                                *callbacks.name.lock().unwrap() = Some(hand.clone());
+                                callbacks.name.set(Some(hand.clone()));
                             }
                             if let RemoteOperation::Execute { local_tools, context, .. } = &operation
                                 && let Some((_, catalog)) = runtimes.get(&session_id)
@@ -1144,7 +1160,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
     }.await;
     tasks.abort_all();
-    bus.pending.lock().unwrap().clear();
+    bus.pending.set(HashMap::new());
     for (_, (runtime, _)) in runtimes.0.drain() {
         runtime.control().cancel().await;
     }

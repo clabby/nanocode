@@ -1,8 +1,10 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use nanocode_sync::Atom;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -440,7 +442,7 @@ impl ConnectionEnd {
 enum Completion {
     Diagnostic {
         call_id: Box<str>,
-        timing: Arc<Mutex<CallClock>>,
+        timing: Arc<Atom<CallClock>>,
     },
     Result {
         call_id: Box<str>,
@@ -448,6 +450,7 @@ enum Completion {
     },
 }
 
+#[derive(Clone)]
 struct CallClock {
     received: Instant,
     task_started: Option<Instant>,
@@ -459,8 +462,8 @@ struct CallClock {
 }
 
 impl CallClock {
-    fn received() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
+    fn received() -> Arc<Atom<Self>> {
+        Arc::new(Atom::new(Self {
             received: Instant::now(),
             task_started: None,
             execution_started: None,
@@ -506,7 +509,7 @@ impl CallClock {
 struct RetainedCall {
     identity: CallIdentity,
     task: Option<tokio::task::AbortHandle>,
-    timing: Arc<Mutex<CallClock>>,
+    timing: Arc<Atom<CallClock>>,
     receipt: Option<String>,
 }
 
@@ -519,7 +522,7 @@ impl RetainedCall {
                 &self.timing,
             )?);
             self.task = None;
-            let span = self.timing.lock().unwrap().span.clone();
+            let span = self.timing.read(|clock| clock.span.clone());
             span.in_scope(|| {
                 tracing::info!(target: "nanocode_code_mode::attachment",
                 stage = "attachment.result_retained",
@@ -675,7 +678,7 @@ fn start_call(
     runtime: &Arc<PreparedToolRuntime>,
     active: &mut Vec<InFlight>,
     identity: CallIdentity,
-    timing: Arc<Mutex<CallClock>>,
+    timing: Arc<Atom<CallClock>>,
     tool_timeout: u64,
     events: CallEvents,
     completed: mpsc::UnboundedSender<Completion>,
@@ -689,7 +692,8 @@ fn start_call(
     };
     let task = tokio::spawn(
         async move {
-            timing.lock().unwrap().task_started = Some(Instant::now());
+            let started = Instant::now();
+            timing.update(|clock| clock.task_started = Some(started));
             let task_identity = identity;
             let remaining = task_identity.deadline_at.saturating_sub(now_ms());
             let (outcome, observed) = if remaining == 0 {
@@ -756,7 +760,8 @@ fn start_call(
                 call.complete(&events.events, observed);
             }
 
-            timing.lock().unwrap().result_queued = Some(Instant::now());
+            let queued = Instant::now();
+            timing.update(|clock| clock.result_queued = Some(queued));
             let _ = completed.send(Completion::Result {
                 call_id: task_identity.call_id,
                 outcome,
@@ -770,18 +775,19 @@ fn start_call(
 }
 
 struct ExecutionPhase<'a> {
-    timing: &'a Arc<Mutex<CallClock>>,
+    timing: &'a Arc<Atom<CallClock>>,
     completed: &'a mpsc::UnboundedSender<Completion>,
     call_id: &'a str,
 }
 
 impl<'a> ExecutionPhase<'a> {
     fn start(
-        timing: &'a Arc<Mutex<CallClock>>,
+        timing: &'a Arc<Atom<CallClock>>,
         completed: &'a mpsc::UnboundedSender<Completion>,
         call_id: &'a str,
     ) -> Self {
-        timing.lock().unwrap().execution_started = Some(Instant::now());
+        let started = Instant::now();
+        timing.update(|clock| clock.execution_started = Some(started));
         let phase = Self {
             timing,
             completed,
@@ -793,7 +799,7 @@ impl<'a> ExecutionPhase<'a> {
     }
 
     fn trace(&self, stage: DiagnosticStage) {
-        let clock = self.timing.lock().unwrap();
+        let clock = self.timing.get();
         let elapsed_ms =
             (clock.received.elapsed().as_secs_f64() * 1000.0).min(9_007_199_254_740_991.0);
         clock.span.in_scope(|| tracing::info!(target: "nanocode_code_mode::attachment", stage = stage.name(), elapsed_ms, "attachment execution phase"));
@@ -809,7 +815,9 @@ impl<'a> ExecutionPhase<'a> {
 
 impl Drop for ExecutionPhase<'_> {
     fn drop(&mut self) {
-        self.timing.lock().unwrap().execution_finished = Some(Instant::now());
+        let finished = Instant::now();
+        self.timing
+            .update(|clock| clock.execution_finished = Some(finished));
         self.trace(DiagnosticStage::ExecutionFinished);
         self.notify();
     }
@@ -1023,7 +1031,7 @@ where
                         let phase_span = tracing::info_span!(target: "nanocode_code_mode::attachment", "attachment.call.phases",
                             transport_call_id = call_id.as_str(), session_id = session_id.as_str(),
                             host_turn_id = turn_id.as_deref().filter(|id| id.len() <= 256 && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))).unwrap_or(""));
-                        timing.lock().unwrap().span = phase_span;
+                        timing.update(|clock| clock.span = phase_span.clone());
                         if let Err(error) = send_diagnostics(&mut socket, &call_id, &timing, false).await { break ConnectionEnd::Failed(error); }
                         let call_events = begin_call_events(
                             events,
@@ -1061,14 +1069,14 @@ where
                         if let Some(call) = journal.get_mut(call_id.as_str()) {
                             let replayed = call.receipt.is_some();
 
-                            if call.timing.lock().unwrap().result_queued.is_some() { continue; }
+                            if call.timing.read(|clock| clock.result_queued.is_some()) { continue; }
                             if let Some(task) = call.task.take() {
                                 task.abort();
                                 if let Some(index) = active.iter().position(|active| active.task.id() == task.id()) {
                                     let _ = active.swap_remove(index).task.await;
                                 }
 
-                                if call.timing.lock().unwrap().result_queued.is_some() { continue; }
+                                if call.timing.read(|clock| clock.result_queued.is_some()) { continue; }
                                 if let Err(error) = call.finish(&ambiguous("tool execution was cancelled after dispatch")) { break ConnectionEnd::Failed(error); }
                             }
                             if call.receipt.is_some()
@@ -1256,15 +1264,14 @@ where
 async fn send_diagnostics<S>(
     socket: &mut tokio_tungstenite::WebSocketStream<S>,
     call_id: &str,
-    clock: &Arc<Mutex<CallClock>>,
+    clock: &Arc<Atom<CallClock>>,
     prepared: bool,
 ) -> Result<(), AttachmentError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let phases = {
-        let mut clock = clock.lock().unwrap();
-        let now = Instant::now();
+    let now = Instant::now();
+    let phases = clock.update(|clock| {
         let phases = [
             (DiagnosticStage::Received, Some(clock.received)),
             (DiagnosticStage::ExecutionStarted, clock.execution_started),
@@ -1284,7 +1291,7 @@ where
             }
         }
         pending
-    };
+    });
     let pending_count = phases.len();
     for (stage, elapsed_ms, span) in phases {
         if matches!(
@@ -1322,7 +1329,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let started = Instant::now();
-    let received = call.timing.lock().unwrap().received;
+    let received = call.timing.read(|clock| clock.received);
     tracing::info!(target: "nanocode_code_mode::attachment",
         stage = "attachment.result_send_started", transport_call_id = call.identity.call_id.as_ref(),
         replayed, elapsed_ms = started.duration_since(received).as_secs_f64() * 1000.0,
@@ -1364,10 +1371,10 @@ where
 fn encode_result(
     call_id: &str,
     outcome: &Value,
-    clock: &Arc<Mutex<CallClock>>,
+    clock: &Arc<Atom<CallClock>>,
 ) -> Result<String, AttachmentError> {
     let encode_started = Instant::now();
-    let mut timing = clock.lock().unwrap().snapshot(encode_started);
+    let mut timing = clock.read(|clock| clock.snapshot(encode_started));
 
     let mut text = serde_json::to_string(&ExecutorFrame::Result {
         call_id,

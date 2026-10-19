@@ -2,12 +2,13 @@ use std::{
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
+use nanocode_sync::{Atom, Slot};
 use serde::Deserialize;
 use serde_json::{Value, json, value::RawValue};
 use tokio::{
@@ -44,16 +45,16 @@ struct Inner {
     catalog: watch::Sender<Option<Arc<[Arc<RemoteSpec>]>>>,
     failure: watch::Sender<Option<AttachmentError>>,
     connected: watch::Sender<bool>,
-    state: Mutex<State>,
+    state: Atom<State>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     revoked: bool,
     generation: u64,
     connection: Option<Connection>,
     runtime_id: Option<Box<str>>,
-    catalog: Option<Value>,
+    catalog: Option<Arc<Value>>,
     pending: HashMap<Box<str>, Pending>,
     last_turn_ended: Option<[Box<str>; 3]>,
     deferred_frames: Vec<String>,
@@ -61,15 +62,27 @@ struct State {
     workspace: Option<PathBuf>,
 }
 
+#[derive(Clone)]
 struct Connection {
     generation: u64,
     outbound: mpsc::UnboundedSender<Outbound>,
 }
 
+type Reply = oneshot::Sender<(Value, Option<Box<str>>)>;
+
+#[derive(Clone)]
 struct Pending {
     frame: Arc<str>,
     sent: bool,
-    result: oneshot::Sender<(Value, Option<Box<str>>)>,
+    result: Arc<Slot<Reply>>,
+}
+
+impl Pending {
+    fn resolve(&self, outcome: Value, runtime_id: Option<Box<str>>) {
+        if let Some(result) = self.result.take() {
+            let _ = result.send((outcome, runtime_id));
+        }
+    }
 }
 
 enum Outbound {
@@ -164,7 +177,7 @@ impl RemoteRunner {
                 catalog: watch::channel(None).0,
                 failure: watch::channel(None).0,
                 connected: watch::channel(false).0,
-                state: Mutex::default(),
+                state: Atom::default(),
             }),
         })
     }
@@ -177,7 +190,9 @@ impl RemoteRunner {
         {
             return Err(AttachmentError::Transport("call timeout must be positive whole milliseconds within the protocol integer range".into()));
         }
-        self.inner.state().call_timeout_ms = Some(timeout_ms);
+        self.inner
+            .state
+            .update(|state| state.call_timeout_ms = Some(timeout_ms));
         Ok(self)
     }
 
@@ -188,11 +203,11 @@ impl RemoteRunner {
 
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.inner.state().connection.is_some()
+        self.inner.state.read(|state| state.connection.is_some())
     }
 
     pub(crate) fn runtime_id(&self) -> Option<Box<str>> {
-        self.inner.state().runtime_id.clone()
+        self.inner.state.read(|state| state.runtime_id.clone())
     }
 
     pub(crate) fn connection_status(&self) -> watch::Receiver<bool> {
@@ -204,11 +219,10 @@ impl RemoteRunner {
     }
 
     pub(crate) fn revoke(&self) {
-        let pending = {
-            let mut state = self.inner.state();
+        let pending = self.inner.state.update(|state| {
             state.revoked = true;
             std::mem::take(&mut state.pending)
-        };
+        });
         for (_, pending) in pending {
             let (status, message) = if pending.sent {
                 (
@@ -221,9 +235,7 @@ impl RemoteRunner {
                     "runner was disconnected before the call was dispatched",
                 )
             };
-            let _ = pending
-                .result
-                .send((json!({"status": status, "message": message}), None));
+            pending.resolve(json!({"status": status, "message": message}), None);
         }
     }
 
@@ -231,7 +243,7 @@ impl RemoteRunner {
         let specs = self.inner.catalog.borrow().clone()?;
         Some(RemoteTools {
             namespace: self.inner.namespace.clone(),
-            workspace: self.inner.state().workspace.clone(),
+            workspace: self.inner.state.read(|state| state.workspace.clone()),
             tools: specs
                 .iter()
                 .map(|spec| RemoteTool {
@@ -248,7 +260,7 @@ impl RemoteRunner {
         Box::pin(async move {
             let mut catalog = self.inner.catalog.subscribe();
             let mut failure = self.inner.failure.subscribe();
-            let timeout_ms = self.inner.state().call_timeout_ms;
+            let timeout_ms = self.inner.state.read(|state| state.call_timeout_ms);
             let wait = async {
                 tokio::select! {
                     result = catalog.wait_for(Option::is_some) => result.map_err(|_| AttachmentError::Closed)?.clone().ok_or(AttachmentError::Closed),
@@ -263,7 +275,7 @@ impl RemoteRunner {
         };
             Ok(RemoteTools {
                 namespace: self.inner.namespace.clone(),
-                workspace: self.inner.state().workspace.clone(),
+                workspace: self.inner.state.read(|state| state.workspace.clone()),
                 tools: specs
                     .iter()
                     .map(|spec| RemoteTool {
@@ -421,10 +433,6 @@ impl RemoteRunner {
 }
 
 impl Inner {
-    fn state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn attach(
         &self,
         runtime_id: &str,
@@ -432,83 +440,88 @@ impl Inner {
         workspace: Option<PathBuf>,
     ) -> Result<(u64, mpsc::UnboundedReceiver<Outbound>, Vec<String>), AttachmentError> {
         let specs = parse_catalog(&self.namespace, &tools)?;
-        let mut state = self.state();
-        if state.revoked {
-            return Err(AttachmentError::Closed);
-        }
-        if state.connection.is_some() {
-            return Err(AttachmentError::Catalog(
-                "runner already has a live connection".into(),
-            ));
-        }
-        if state.catalog.is_some() && state.workspace != workspace {
-            return Err(AttachmentError::Catalog(
-                "runner workspace differs from its pinned catalog".into(),
-            ));
-        }
-        if state
-            .catalog
-            .as_ref()
-            .is_some_and(|pinned| pinned != &tools)
-        {
-            return Err(AttachmentError::Catalog(
-                format!(
-                    "runner `{}` published a catalog that differs from the pinned catalog",
-                    self.namespace
-                )
-                .into(),
-            ));
-        }
-        if state
-            .runtime_id
-            .as_deref()
-            .is_some_and(|previous| previous != runtime_id)
-        {
-            let lost: Vec<_> = state
-                .pending
-                .iter()
-                .filter(|(_, pending)| pending.sent)
-                .map(|(call_id, _)| call_id.clone())
-                .collect();
-            for call_id in lost {
-                if let Some(pending) = state.pending.remove(&call_id) {
-                    let _ = pending.result.send((
-                        json!({
-                            "status": "ambiguous",
-                            "message": "runner restarted before returning a receipt",
-                        }),
-                        None,
-                    ));
+        let tools = Arc::new(tools);
+        let (generation, receiver, backlog, first, lost) = self.state.modify(|state| {
+            if state.revoked {
+                return Err(AttachmentError::Closed);
+            }
+            if state.connection.is_some() {
+                return Err(AttachmentError::Catalog(
+                    "runner already has a live connection".into(),
+                ));
+            }
+            if state.catalog.is_some() && state.workspace != workspace {
+                return Err(AttachmentError::Catalog(
+                    "runner workspace differs from its pinned catalog".into(),
+                ));
+            }
+            if state
+                .catalog
+                .as_ref()
+                .is_some_and(|pinned| **pinned != *tools)
+            {
+                return Err(AttachmentError::Catalog(
+                    format!(
+                        "runner `{}` published a catalog that differs from the pinned catalog",
+                        self.namespace
+                    )
+                    .into(),
+                ));
+            }
+            let mut lost = Vec::new();
+            if state
+                .runtime_id
+                .as_deref()
+                .is_some_and(|previous| previous != runtime_id)
+            {
+                let sent: Vec<_> = state
+                    .pending
+                    .iter()
+                    .filter(|(_, pending)| pending.sent)
+                    .map(|(call_id, _)| call_id.clone())
+                    .collect();
+                lost.extend(
+                    sent.into_iter()
+                        .filter_map(|call_id| state.pending.remove(&call_id)),
+                );
+            }
+            state.runtime_id = Some(runtime_id.into());
+            state.generation += 1;
+            let generation = state.generation;
+            let (outbound, receiver) = mpsc::unbounded_channel();
+            state.connection = Some(Connection {
+                generation,
+                outbound,
+            });
+            let mut backlog = std::mem::take(&mut state.deferred_frames);
+            let mut recover = Vec::new();
+            for (call_id, pending) in &mut state.pending {
+                if pending.sent {
+                    recover.push(call_id.clone());
+                } else {
+                    pending.sent = true;
+                    backlog.push(pending.frame.to_string());
                 }
             }
-        }
-        state.runtime_id = Some(runtime_id.into());
-        state.generation += 1;
-        let generation = state.generation;
-        let (outbound, receiver) = mpsc::unbounded_channel();
-        state.connection = Some(Connection {
-            generation,
-            outbound,
-        });
-        let mut backlog = std::mem::take(&mut state.deferred_frames);
-        let mut recover = Vec::new();
-        for (call_id, pending) in &mut state.pending {
-            if pending.sent {
-                recover.push(call_id.clone());
-            } else {
-                pending.sent = true;
-                backlog.push(pending.frame.to_string());
+            for batch in recover.chunks(RECOVER_BATCH_LIMIT) {
+                backlog.push(json!({"type": "recover", "call_ids": batch}).to_string());
             }
+            let first = state.catalog.is_none();
+            if first {
+                state.catalog = Some(Arc::clone(&tools));
+                state.workspace.clone_from(&workspace);
+            }
+            Ok((generation, receiver, backlog, first, lost))
+        })?;
+        for pending in lost {
+            pending.resolve(
+                json!({
+                    "status": "ambiguous",
+                    "message": "runner restarted before returning a receipt",
+                }),
+                None,
+            );
         }
-        for batch in recover.chunks(RECOVER_BATCH_LIMIT) {
-            backlog.push(json!({"type": "recover", "call_ids": batch}).to_string());
-        }
-        let first = state.catalog.is_none();
-        if first {
-            state.catalog = Some(tools);
-            state.workspace = workspace;
-        }
-        drop(state);
         if first {
             self.catalog.send_replace(Some(specs));
         }
@@ -518,71 +531,93 @@ impl Inner {
     }
 
     fn detach(&self, generation: u64) {
-        let mut state = self.state();
-        if state
-            .connection
-            .as_ref()
-            .is_some_and(|connection| connection.generation == generation)
-        {
-            state.connection = None;
+        let detached = self.state.try_update(|state| {
+            state
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.generation == generation)
+                .then(|| state.connection = None)
+        });
+        if detached.is_some() {
             self.connected.send_replace(false);
         }
     }
 
     fn claim(&self, generation: u64, call_id: &str) -> Option<String> {
-        let mut state = self.state();
-        if state
-            .connection
-            .as_ref()
-            .is_none_or(|connection| connection.generation != generation)
-        {
-            return None;
-        }
-        let pending = state
-            .pending
-            .get_mut(call_id)
-            .filter(|pending| !pending.sent)?;
-        pending.sent = true;
-        Some(pending.frame.to_string())
+        self.state.try_update(|state| {
+            if state
+                .connection
+                .as_ref()
+                .is_none_or(|connection| connection.generation != generation)
+            {
+                return None;
+            }
+            let pending = state
+                .pending
+                .get_mut(call_id)
+                .filter(|pending| !pending.sent)?;
+            pending.sent = true;
+            Some(pending.frame.to_string())
+        })
     }
 
     fn resend(&self, generation: u64, call_id: &str) -> Option<String> {
-        let mut state = self.state();
-        let current = state
-            .connection
-            .as_ref()
-            .is_some_and(|connection| connection.generation == generation);
-        if !current {
-            return None;
-        }
-        let pending = state.pending.get_mut(call_id)?;
-        pending.sent = true;
-        current.then(|| pending.frame.to_string())
+        self.state.try_update(|state| {
+            if state
+                .connection
+                .as_ref()
+                .is_none_or(|connection| connection.generation != generation)
+            {
+                return None;
+            }
+            let pending = state.pending.get_mut(call_id)?;
+            pending.sent = true;
+            Some(pending.frame.to_string())
+        })
     }
 
     fn deliver(&self, generation: u64, call_id: &str, outcome: Value) {
-        let mut state = self.state();
-        if state.generation != generation {
-            return;
+        let delivered = self.state.try_update(|state| {
+            if state.generation != generation {
+                return None;
+            }
+            let runtime_id = state.runtime_id.clone();
+            state
+                .pending
+                .remove(call_id)
+                .map(|pending| (pending, runtime_id))
+        });
+        if let Some((pending, runtime_id)) = delivered {
+            pending.resolve(outcome, runtime_id);
         }
-        let runtime_id = state.runtime_id.clone();
-        if let Some(pending) = state.pending.remove(call_id) {
-            let _ = pending.result.send((outcome, runtime_id));
+    }
+
+    fn send_or_defer(&self, frame: String, change: impl Fn(&mut State) -> bool) {
+        let connection = self.state.try_update(|state| {
+            if !change(state) {
+                return None;
+            }
+            match &state.connection {
+                Some(connection) => Some(Some(connection.outbound.clone())),
+                None => {
+                    state.deferred_frames.push(frame.clone());
+                    Some(None)
+                }
+            }
+        });
+        if let Some(Some(outbound)) = connection {
+            let _ = outbound.send(Outbound::Frame(frame));
         }
     }
 
     fn cancel(&self, call_id: &str) {
-        let mut state = self.state();
-        if let Some(pending) = state.pending.remove(call_id)
-            && pending.sent
-        {
-            let frame = json!({"type": "cancel", "call_id": call_id}).to_string();
-            if let Some(connection) = &state.connection {
-                let _ = connection.outbound.send(Outbound::Frame(frame));
-            } else {
-                state.deferred_frames.push(frame);
-            }
-        }
+        let frame = json!({"type": "cancel", "call_id": call_id}).to_string();
+        self.send_or_defer(frame, |state| {
+            state
+                .pending
+                .remove(call_id)
+                .is_some_and(|pending| pending.sent)
+        });
     }
 
     async fn call(
@@ -621,8 +656,8 @@ impl Inner {
         let call_id: Box<str> = uuid::Uuid::new_v4().to_string().into();
         let now = now_ms();
         let timeout_ms = self
-            .state()
-            .call_timeout_ms
+            .state
+            .read(|state| state.call_timeout_ms)
             .map_or(spec.timeout_ms, |policy| policy.min(spec.timeout_ms));
         let deadline_at = if timeout_ms == JSON_SAFE_INTEGER_MAX {
             JSON_SAFE_INTEGER_MAX
@@ -650,22 +685,23 @@ impl Inner {
             frame["turn_id"] = turn_id.into();
         }
         let (result, receipt) = oneshot::channel();
-        {
-            let mut state = self.state();
+        let pending = Pending {
+            frame: frame.to_string().into(),
+            sent: false,
+            result: Arc::new(Slot::new(Some(result))),
+        };
+        let outbound = self.state.modify(|state| {
             if state.revoked {
                 return Err(AttachmentError::Closed);
             }
-            state.pending.insert(
-                call_id.clone(),
-                Pending {
-                    frame: frame.to_string().into(),
-                    sent: false,
-                    result,
-                },
-            );
-            if let Some(connection) = &state.connection {
-                let _ = connection.outbound.send(Outbound::Call(call_id.clone()));
-            }
+            state.pending.insert(call_id.clone(), pending.clone());
+            Ok(state
+                .connection
+                .as_ref()
+                .map(|connection| connection.outbound.clone()))
+        })?;
+        if let Some(outbound) = outbound {
+            let _ = outbound.send(Outbound::Call(call_id.clone()));
         }
         let guard = CancelOnDrop {
             inner: Arc::clone(self),
@@ -676,11 +712,12 @@ impl Inner {
             receipt,
         )
         .await;
-        let dispatched = self
-            .state()
-            .pending
-            .get(&guard.call_id)
-            .is_some_and(|pending| pending.sent);
+        let dispatched = self.state.read(|state| {
+            state
+                .pending
+                .get(&guard.call_id)
+                .is_some_and(|pending| pending.sent)
+        });
         let call_id = guard.call_id.clone();
         drop(guard);
         match waited {
@@ -731,18 +768,15 @@ impl Inner {
                 "turn end is not expressible in the attachment protocol".into(),
             ));
         }
-        let mut state = self.state();
-        let key = [session_id.into(), turn_id.into(), hook_event_name.into()];
-        if state.last_turn_ended.as_ref() == Some(&key) {
-            return Ok(());
-        }
-        state.last_turn_ended = Some(key);
+        let key: [Box<str>; 3] = [session_id.into(), turn_id.into(), hook_event_name.into()];
         let frame = json!({"type": "turn_ended", "session_id": session_id, "turn_id": turn_id, "hook_event_name": hook_event_name}).to_string();
-        if let Some(connection) = &state.connection {
-            let _ = connection.outbound.send(Outbound::Frame(frame));
-        } else {
-            state.deferred_frames.push(frame);
-        }
+        self.send_or_defer(frame, |state| {
+            if state.last_turn_ended.as_ref() == Some(&key) {
+                return false;
+            }
+            state.last_turn_ended = Some(key.clone());
+            true
+        });
         Ok(())
     }
 }
@@ -821,7 +855,7 @@ impl fmt::Debug for RemoteTool {
 
 impl RemoteTool {
     pub(crate) fn runtime_id(&self) -> Option<Box<str>> {
-        self.runner.state().runtime_id.clone()
+        self.runner.state.read(|state| state.runtime_id.clone())
     }
     pub(crate) fn native_definition(&self) -> ToolDefinition {
         let mut definition = self.spec.definition.clone();
@@ -933,7 +967,7 @@ impl RemoteTool {
     }
 }
 
-type Runners = Arc<Mutex<HashMap<Box<str>, RemoteRunner>>>;
+type Runners = Arc<Atom<HashMap<Box<str>, RemoteRunner>>>;
 
 pub struct RunnerHost {
     endpoint: Box<str>,
@@ -986,25 +1020,27 @@ impl RunnerHost {
                 "bearer credential must not be empty".into(),
             ));
         }
-        let mut runners = self.runners.lock().unwrap_or_else(PoisonError::into_inner);
-        if runners
-            .values()
-            .any(|existing| existing.namespace() == runner.namespace())
-        {
-            return Err(AttachmentError::Catalog(
-                format!(
-                    "runner namespace `{}` is already registered",
-                    runner.namespace()
-                )
-                .into(),
-            ));
-        }
-        if runners.contains_key(bearer.as_str()) {
-            return Err(AttachmentError::Authentication(
-                "bearer credential is already assigned to another runner".into(),
-            ));
-        }
-        runners.insert(bearer.into(), runner.clone());
+        self.runners.modify(|runners| {
+            if runners
+                .values()
+                .any(|existing| existing.namespace() == runner.namespace())
+            {
+                return Err(AttachmentError::Catalog(
+                    format!(
+                        "runner namespace `{}` is already registered",
+                        runner.namespace()
+                    )
+                    .into(),
+                ));
+            }
+            if runners.contains_key(bearer.as_str()) {
+                return Err(AttachmentError::Authentication(
+                    "bearer credential is already assigned to another runner".into(),
+                ));
+            }
+            runners.insert(bearer.as_str().into(), runner.clone());
+            Ok(())
+        })?;
         Ok(runner)
     }
 }
@@ -1037,13 +1073,7 @@ async fn serve_socket(stream: TcpStream, runners: Runners) {
             .get(http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .and_then(|bearer| {
-                runners
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(bearer)
-                    .cloned()
-            });
+            .and_then(|bearer| runners.read(|runners| runners.get(bearer).cloned()));
         if let Some(found) = found {
             runner = Some(found);
             Ok(response)
