@@ -16,7 +16,9 @@ case $1 in
       kill -0 "${builder:-0}" 2>/dev/null || rm -rf "$helper.lock"
     fi
     if mkdir "$helper.lock" 2>/dev/null; then
+      echo $$ > "$helper.lock/pid"
       (
+        sh -c 'echo $PPID' > "$helper.lock/pid"
         if env -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS "$1" --edition 2024 -C opt-level=2 -o "$helper.$$" "$source"; then
           mv -f "$helper.$$" "$helper"
         else
@@ -25,7 +27,6 @@ case $1 in
         rm -f "$helper.$$"
         rm -rf "$helper.lock"
       ) < /dev/null > /dev/null 2>&1 &
-      echo $! > "$helper.lock/pid"
     fi
     ;;
 esac
