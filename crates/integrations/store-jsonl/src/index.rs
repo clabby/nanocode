@@ -29,6 +29,7 @@ pub(super) struct Index {
     anchor: [u8; 32],
     deferred: HashMap<String, RecordBlock>,
     file: Option<File>,
+    saved: Option<String>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -94,6 +95,7 @@ impl Index {
             anchor: Sha256::digest([]).into(),
             deferred: HashMap::new(),
             file: None,
+            saved: None,
         }
     }
 
@@ -205,7 +207,9 @@ impl Journal {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let length = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        let file_identity = identity(&metadata).map_err(io::Error::other)?;
+        let length = metadata.len();
         let trailer = Sha256::output_size() + size_of::<u64>();
         let mut magic = vec![0; MAGIC.len()];
         file.read_exact(&mut magic)?;
@@ -244,7 +248,7 @@ impl Journal {
             index.created = saved.created;
             index.last = saved.last;
             index.anchor = saved.anchor;
-            return self.checked_index(index);
+            return self.checked_index(index, file_identity);
         }
         let format = match &*magic {
             MAGIC => None,
@@ -304,15 +308,16 @@ impl Journal {
             );
         }
         index.file = Some(file);
-        self.checked_index(index)
+        self.checked_index(index, file_identity)
     }
 
-    fn checked_index(&mut self, index: Index) -> io::Result<Option<Index>> {
+    fn checked_index(&mut self, mut index: Index, saved: String) -> io::Result<Option<Index>> {
         if !index.valid(&self.index.source, self.file.metadata()?.len())
             || digest_anchor(&mut self.reads, index.last)? != index.anchor
         {
             return Err(invalid());
         }
+        index.saved = Some(saved);
         Ok(Some(index))
     }
 
@@ -343,6 +348,7 @@ impl Journal {
         {
             tracing::debug!("retaining a current JSONL index saved by another store");
             self.persisted_offset = Some(index.offset);
+            self.index.saved = index.saved;
             return;
         }
         match self.write_index() {
@@ -355,14 +361,11 @@ impl Journal {
     }
 
     fn index_file_unchanged(&self) -> bool {
-        let Some(file) = &self.index.file else {
-            return false;
-        };
-        let (Ok(saved), Ok(current)) = (file.metadata(), std::fs::metadata(self.index_path()))
-        else {
-            return false;
-        };
-        matches!((identity(&saved), identity(&current)), (Ok(saved), Ok(current)) if saved == current)
+        self.index.saved.is_some()
+            && std::fs::metadata(self.index_path())
+                .ok()
+                .and_then(|metadata| identity(&metadata).ok())
+                == self.index.saved
     }
 
     fn write_index(&mut self) -> io::Result<()> {
@@ -429,7 +432,8 @@ impl Journal {
         temporary.write_all(&payload)?;
         temporary.write_all(&Sha256::digest(&payload))?;
         temporary.write_all(&(payload.len() as u64).to_le_bytes())?;
-        temporary.persist(path).map_err(|error| error.error)?;
+        let file = temporary.persist(path).map_err(|error| error.error)?;
+        self.index.saved = Some(identity(&file.metadata()?).map_err(io::Error::other)?);
         Ok(())
     }
 }
@@ -553,6 +557,38 @@ impl Journal {
             self.refresh()
         } else {
             result
+        }
+    }
+
+    pub(super) fn adopt_saved_index(&mut self) {
+        if !self.ready || self.index_file_unchanged() {
+            return;
+        }
+        let (Ok(journal), Ok(saved)) =
+            (self.reads.metadata(), std::fs::metadata(self.index_path()))
+        else {
+            return;
+        };
+        let unindexed = journal.len().saturating_sub(self.index.offset);
+        if unindexed <= saved.len() {
+            return;
+        }
+        let _span = tracing::info_span!(
+            "durability.jsonl.index.adopt",
+            log.unindexed_bytes = unindexed
+        )
+        .entered();
+        match self.read_index() {
+            Ok(Some(index)) if index.offset > self.index.offset => {
+                self.persisted_offset = index.file.as_ref().map(|_| index.offset);
+                self.index = index;
+                self.cached = None;
+                self.sealed = None;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "replaying the journal past an invalid JSONL index")
+            }
         }
     }
 }

@@ -776,6 +776,7 @@ impl Journal {
             }
             self.reopen_compacted()?;
         }
+        self.adopt_saved_index();
         self.refresh_index()
     }
 
