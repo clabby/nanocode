@@ -157,6 +157,11 @@ pub enum ClaudeNestedToolUpdate {
     },
 
     Completed(Value),
+
+    Notification {
+        call_id: String,
+        text: String,
+    },
 }
 
 #[derive(Clone)]
@@ -2866,6 +2871,13 @@ impl LiveNestedCalls<'_> {
                 );
                 self.open.retain(|(open, _, _)| open != call_id);
                 self.completed.insert(call_id.to_owned());
+            }
+            ClaudeNestedToolUpdate::Notification { call_id, text } => {
+                self.state.emit(
+                    self.events,
+                    AgentEventKind::ToolNotification,
+                    json!({"call_id": call_id, "text": text}),
+                );
             }
         }
     }

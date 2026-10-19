@@ -212,6 +212,12 @@ pub(super) struct ToolResultEvent<'a> {
     pub(super) cell: Option<&'a nanocode_code_mode::code_mode::CodeModeCell>,
 }
 
+#[derive(Serialize)]
+pub(super) struct ToolNotificationEvent<'a> {
+    pub(super) call_id: &'a str,
+    pub(super) text: &'a str,
+}
+
 #[allow(clippy::struct_field_names)]
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(super) struct UsageTotals {

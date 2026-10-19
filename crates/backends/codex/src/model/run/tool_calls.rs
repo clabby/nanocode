@@ -290,6 +290,13 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                     },
                 )
             }
+            CodeModeUpdate::Notification(notification) => self.events.emit(
+                AgentEventKind::ToolNotification,
+                ToolNotificationEvent {
+                    call_id: &notification.call_id,
+                    text: &notification.text,
+                },
+            ),
         };
         if let Err(error) = result {
             self.error = Some(error.into());

@@ -158,6 +158,8 @@ pub enum CodeModeUpdate<'a> {
     },
 
     NestedCallCompleted(&'a NestedToolCall),
+
+    Notification(&'a CodeModeNotification),
 }
 
 pub trait CodeModeObserver: Send {

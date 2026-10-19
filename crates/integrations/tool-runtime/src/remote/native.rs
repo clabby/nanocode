@@ -867,6 +867,9 @@ impl CodeModeObserver for Observer {
                 input,
             } => json!({"call_id":call_id,"name":name,"input":input}),
             CodeModeUpdate::NestedCallCompleted(call) => json!({"completed":nested(call)}),
+            CodeModeUpdate::Notification(notification) => {
+                json!({"notification":{"call_id":notification.call_id,"text":notification.text}})
+            }
         };
         let _ = self.outgoing.send(Frame::Update {
             id: self.id,
@@ -890,6 +893,9 @@ impl CodeModeObserver for DetachedObserver {
                 input,
             } => json!({"call_id":call_id,"name":name,"input":input}),
             CodeModeUpdate::NestedCallCompleted(call) => json!({"completed":nested(call)}),
+            CodeModeUpdate::Notification(notification) => {
+                json!({"notification":{"call_id":notification.call_id,"text":notification.text}})
+            }
         };
         let _ = self.outgoing.send(Frame::DetachedUpdate {
             session_id: self.session_id.clone(),

@@ -6,6 +6,6 @@ mod telemetry;
 use telemetry::{
     CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
     ModelCallStarted, ModelCallTiming, RunError, RunStarted, RunStats, RunSteered,
-    ToolCallArguments, ToolCallEvent, ToolResultEvent, WarmupCompleted, WarmupFailed,
-    WarmupStarted, display_endpoint, elapsed_ns, terminal_payload,
+    ToolCallArguments, ToolCallEvent, ToolNotificationEvent, ToolResultEvent, WarmupCompleted,
+    WarmupFailed, WarmupStarted, display_endpoint, elapsed_ns, terminal_payload,
 };

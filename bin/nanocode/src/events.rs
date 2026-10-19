@@ -317,6 +317,7 @@ impl EventMapper {
                 self.tool_result(transcript, &payload);
                 true
             }
+            AgentEventKind::ToolNotification => self.tool_notification(transcript, &payload),
             AgentEventKind::RunError => {
                 let message = payload["message"]
                     .as_str()
@@ -638,6 +639,25 @@ impl EventMapper {
                 });
             }
         }
+    }
+
+    fn tool_notification(&self, transcript: &mut Transcript, payload: &Value) -> bool {
+        let call_id = payload["call_id"].as_str().unwrap_or_default();
+        let text = payload["text"].as_str().unwrap_or_default();
+        let Some(target) = self.target(call_id) else {
+            return false;
+        };
+        let Some(index) = self.index(transcript, &target) else {
+            return false;
+        };
+        transcript.update(index, |cell| {
+            if let CellKind::Tool(top) = cell
+                && let Some(tool) = top.find_mut(&target)
+                && tool.status == ToolStatus::Running
+            {
+                text.clone_into(&mut tool.output);
+            }
+        })
     }
 
     fn learn_agents(&mut self, name: &str, payload: &Value) {

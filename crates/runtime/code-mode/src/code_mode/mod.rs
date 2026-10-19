@@ -183,7 +183,10 @@ enum CellUpdate {
         delivered: bool,
     },
     NestedCall(ObservedNestedCall),
-    Notification(CodeModeNotification),
+    Notification {
+        notification: CodeModeNotification,
+        delivered: bool,
+    },
     Content(ToolOutputContent),
     Yielded,
     Completed,
@@ -1081,6 +1084,13 @@ async fn relay_cell_updates(
                 sink.update(CodeModeUpdate::NestedCallCompleted(&call.call));
                 call.delivered = true;
             }
+            CellUpdate::Notification {
+                notification,
+                delivered,
+            } => {
+                sink.update(CodeModeUpdate::Notification(notification));
+                *delivered = true;
+            }
             _ => {}
         }
         observation.replay.push_back(update);
@@ -1193,7 +1203,13 @@ async fn observe_cell(
                 }
                 observation.buffered.nested_calls.push(call);
             }
-            Some(CellUpdate::Notification(notification)) => {
+            Some(CellUpdate::Notification {
+                notification,
+                delivered,
+            }) => {
+                if !delivered {
+                    observer.update(CodeModeUpdate::Notification(&notification));
+                }
                 observation.buffered.notifications.push(notification);
             }
             Some(CellUpdate::Content(item)) => observation.buffered.content.push(item),
@@ -1436,9 +1452,10 @@ impl EmbeddedHost {
                             pending_calls.push(nested_call.boxed());
                         }
                         RuntimeEvent::Notify { text, .. } => {
-                            let _ = updates.send(CellUpdate::Notification(
-                                CodeModeNotification::new(parent_call_id, text),
-                            ));
+                            let _ = updates.send(CellUpdate::Notification {
+                                notification: CodeModeNotification::new(parent_call_id, text),
+                                delivered: false,
+                            });
                         }
                         RuntimeEvent::Content { content, .. } => {
                             let _ = updates.send(CellUpdate::Content(content));

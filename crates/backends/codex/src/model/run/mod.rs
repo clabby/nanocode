@@ -49,8 +49,8 @@ use tracing::{Instrument, info, info_span};
 use super::{
     CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
     ModelCallStarted, ModelCallTiming, RunError, RunStarted, RunStats, RunSteered,
-    ToolCallArguments, ToolCallEvent, ToolResultEvent, WarmupCompleted, WarmupFailed,
-    WarmupStarted,
+    ToolCallArguments, ToolCallEvent, ToolNotificationEvent, ToolResultEvent, WarmupCompleted,
+    WarmupFailed, WarmupStarted,
     context::{ContextBaseline, ContextSnapshot, ContextState},
     display_endpoint, elapsed_ns,
     input::{

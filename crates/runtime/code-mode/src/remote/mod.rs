@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 pub use executors::{CodeModeExecutors, ExecutorSelection, HandRoute, HandsTool, Placement};
 
-use crate::embedded::{CodeModeUpdate, NestedToolCall};
+use crate::embedded::{CodeModeNotification, CodeModeUpdate, NestedToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -447,6 +447,10 @@ pub fn deliver_update(
         let call: NestedToolCall = serde_json::from_value(call.clone())
             .map_err(|error| CodeModeHostError::new(error.to_string()))?;
         observer.update(CodeModeUpdate::NestedCallCompleted(&call));
+    } else if let Some(notification) = value.get("notification") {
+        let notification: CodeModeNotification = serde_json::from_value(notification.clone())
+            .map_err(|error| CodeModeHostError::new(error.to_string()))?;
+        observer.update(CodeModeUpdate::Notification(&notification));
     } else {
         let call_id = value["call_id"]
             .as_str()

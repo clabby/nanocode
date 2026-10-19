@@ -1,4 +1,9 @@
-use std::{borrow::Cow, ops::Range, rc::Rc, time::Duration};
+use std::{
+    borrow::Cow,
+    ops::Range,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use ratatui::{
     buffer::{Buffer, CellWidth},
@@ -19,6 +24,7 @@ use crate::{
         strip_terminal_controls,
     },
     highlight, markdown,
+    spinner::elapsed_label,
     theme::Theme,
 };
 
@@ -84,6 +90,7 @@ pub struct ToolCell {
     pub output_body: ToolBody,
     pub status: ToolStatus,
     pub duration: Option<Duration>,
+    pub started_at: Instant,
     pub depth: usize,
     pub raw_output: String,
     pub language: String,
@@ -105,6 +112,7 @@ impl ToolCell {
             output_body: ToolBody::Text,
             status: ToolStatus::Running,
             duration: None,
+            started_at: Instant::now(),
             depth: 0,
             raw_output: String::new(),
             language: String::new(),
@@ -262,6 +270,13 @@ impl Rows {
         let mut line = self.line(row).clone();
         for (_, span) in self.spinners.iter().filter(|(slot, _)| *slot == row) {
             line.spans[*span].content = Cow::Owned(spinner.to_owned());
+        }
+        let (part, row) = self.part(row);
+        for &(_, span, started_at) in part.clocks.iter().filter(|(slot, ..)| *slot == row) {
+            line.spans[span].content = Cow::Owned(format!(
+                " · {}",
+                elapsed_label(Instant::now().saturating_duration_since(started_at))
+            ));
         }
         line
     }
@@ -1070,6 +1085,7 @@ const fn whole(part: Part) -> Option<Source> {
 struct Output {
     lines: Vec<Line<'static>>,
     sources: Vec<Option<Source>>,
+    clocks: Vec<(usize, usize, Instant)>,
 }
 
 impl Output {
@@ -1516,6 +1532,10 @@ impl RenderContext<'_> {
                 ),
                 muted,
             ));
+        } else if tool.status == ToolStatus::Running {
+            out.clocks
+                .push((out.lines.len(), header.len(), tool.started_at));
+            header.push(Span::styled("", muted));
         }
         if let Some(code) = tool.exit_code.filter(|code| *code != 0) {
             header.push(Span::styled(

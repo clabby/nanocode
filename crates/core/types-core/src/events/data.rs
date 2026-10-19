@@ -279,6 +279,8 @@ pub enum ToolEvent {
     Call(ToolCall),
 
     Result(ToolResultEvent),
+
+    Notification(ToolNotification),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -326,6 +328,13 @@ pub struct ToolResultEvent {
     pub structured_result: Value,
 
     pub metadata: Option<Box<RawValue>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ToolNotification {
+    pub call_id: String,
+
+    pub text: String,
 }
 
 #[derive(Clone, Debug)]

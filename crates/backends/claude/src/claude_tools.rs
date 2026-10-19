@@ -276,6 +276,10 @@ impl CodeModeObserver for Progress<'_> {
             CodeModeUpdate::NestedCallCompleted(call) => {
                 ClaudeNestedToolUpdate::Completed(nested_call(call))
             }
+            CodeModeUpdate::Notification(notification) => ClaudeNestedToolUpdate::Notification {
+                call_id: notification.call_id.clone(),
+                text: notification.text.clone(),
+            },
         });
     }
 }
