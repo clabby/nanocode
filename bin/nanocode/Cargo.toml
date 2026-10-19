@@ -24,12 +24,6 @@ path = "src/bin/nanocode-grep.rs"
 test = false
 bench = false
 
-[lib]
-path = "src/lib.rs"
-test = false
-doctest = false
-bench = false
-
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 clap.workspace = true
 futures-util.workspace = true
