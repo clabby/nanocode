@@ -504,8 +504,6 @@ struct Driver {
     releases: mpsc::UnboundedReceiver<ReleaseSignal>,
 }
 
-const COMMITTED_RECORD_LIMIT: usize = 65_536;
-
 const OWNER_ACTIVE: u8 = 0;
 const OWNER_RELEASING: u8 = 1;
 const OWNER_RELEASED: u8 = 2;
@@ -1837,8 +1835,8 @@ impl Driver {
         if let Some(record) = next.session_mut() {
             record.record_events(&events);
         }
-        let mut records = next.stage_records();
-        records.retain(|record| !self.committed_records.contains(&record.key));
+        let committed = &self.committed_records;
+        let records = next.stage_records_unless(&|key| committed.contains(key));
         if let Some(session) = next.session_mut() {
             session.touch();
         }
@@ -1903,9 +1901,6 @@ impl Driver {
                 "store acknowledged an event sequence range that does not match the committed events".to_owned(),
             ));
         };
-        if self.committed_records.len() + records.len() > COMMITTED_RECORD_LIMIT {
-            self.committed_records.clear();
-        }
         self.committed_records
             .extend(records.into_iter().map(|record| record.key));
         self.staged.clear();

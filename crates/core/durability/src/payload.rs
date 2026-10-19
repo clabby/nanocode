@@ -139,15 +139,25 @@ impl EncodedPayload {
     }
 
     pub fn stage(&mut self, records: &mut Vec<crate::StoreRecord>) {
-        records.append(&mut self.pending);
+        self.stage_unless(records, &|_| false);
+    }
+
+    pub fn stage_unless(
+        &mut self,
+        records: &mut Vec<crate::StoreRecord>,
+        known: &dyn Fn(&str) -> bool,
+    ) {
+        records.extend(self.pending.drain(..).filter(|record| !known(&record.key)));
         let Some(content) = self.content.take() else {
             return;
         };
         if content.len() < INLINE_BYTES {
-            records.push(crate::StoreRecord {
-                key: self.key.to_string(),
-                value: format!("={content}"),
-            });
+            if !known(&self.key) {
+                records.push(crate::StoreRecord {
+                    key: self.key.to_string(),
+                    value: format!("={content}"),
+                });
+            }
             return;
         }
 
@@ -158,17 +168,22 @@ impl EncodedPayload {
             let end = offset + chunk_end(&content[offset..]);
             let chunk = &content[offset..end];
             let hash = record_key(chunk);
-            records.push(crate::StoreRecord {
-                key: chunk_key(&hash),
-                value: chunk.to_owned(),
-            });
+            let key = chunk_key(&hash);
+            if !known(&key) {
+                records.push(crate::StoreRecord {
+                    key,
+                    value: chunk.to_owned(),
+                });
+            }
             manifest.push_str(&hash);
             offset = end;
         }
-        records.push(crate::StoreRecord {
-            key: self.key.to_string(),
-            value: manifest,
-        });
+        if !known(&self.key) {
+            records.push(crate::StoreRecord {
+                key: self.key.to_string(),
+                value: manifest,
+            });
+        }
     }
 
     pub async fn load(&self, store: &mut dyn crate::StateStore, state_id: &str) -> Result<Self> {

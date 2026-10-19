@@ -272,35 +272,44 @@ struct RetainedCheckpointRef<'a, R> {
 
 impl JournalState {
     pub fn stage_records(&mut self) -> Vec<crate::StoreRecord> {
+        self.stage_records_unless(&|_| false)
+    }
+
+    pub fn stage_records_unless(
+        &mut self,
+        known: &dyn Fn(&str) -> bool,
+    ) -> Vec<crate::StoreRecord> {
         let mut records = Vec::new();
         for operation in self.operations.values_mut() {
-            operation.input.stage(&mut records);
+            operation.input.stage_unless(&mut records, known);
             if let Some(value) = &mut operation.continuation {
-                value.stage(&mut records);
+                value.stage_unless(&mut records, known);
             }
             match &mut operation.status {
                 OperationStatus::Completed { checkpoint, output } => {
-                    checkpoint.stage(&mut records);
-                    output.stage(&mut records);
+                    checkpoint.stage_unless(&mut records, known);
+                    output.stage_unless(&mut records, known);
                 }
-                OperationStatus::Failed { checkpoint, .. } => checkpoint.stage(&mut records),
+                OperationStatus::Failed { checkpoint, .. } => {
+                    checkpoint.stage_unless(&mut records, known);
+                }
                 OperationStatus::Cancelled {
                     checkpoint: Some(value),
-                } => value.stage(&mut records),
+                } => value.stage_unless(&mut records, known),
                 _ => {}
             }
             for step in operation.steps.values_mut() {
-                step.input.stage(&mut records);
+                step.input.stage_unless(&mut records, known);
                 if let StepStatus::Completed(output) = &mut step.status {
-                    output.stage(&mut records);
+                    output.stage_unless(&mut records, known);
                 }
             }
             for steer in &mut operation.steers {
-                steer.input.stage(&mut records);
+                steer.input.stage_unless(&mut records, known);
             }
         }
         if let Some((_, value)) = &mut self.latest_checkpoint {
-            value.stage(&mut records);
+            value.stage_unless(&mut records, known);
         }
         records.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         records.dedup_by(|a, b| a.key == b.key);

@@ -148,14 +148,15 @@ impl ChildJournalStore for SharedJournal {
     fn save(&self, payload: String, records: Vec<Arc<str>>) -> BackendFuture<std::io::Result<()>> {
         let inner = Arc::clone(&self.0);
         Box::pin(async move {
+            let mut fenced = inner.fenced.lock().await;
             let mut staged = Vec::new();
             for json in records {
-                EncodedPayload::from_json(json).stage(&mut staged);
+                let committed = &fenced.committed;
+                EncodedPayload::from_json(json)
+                    .stage_unless(&mut staged, &|key| committed.contains(key));
             }
             staged.sort_unstable_by(|a, b| a.key.cmp(&b.key));
             staged.dedup_by(|a, b| a.key == b.key);
-            let mut fenced = inner.fenced.lock().await;
-            staged.retain(|record| !fenced.committed.contains(&record.key));
             if fenced.owner.is_none() {
                 inner.acquire(&mut fenced).await?;
             }
