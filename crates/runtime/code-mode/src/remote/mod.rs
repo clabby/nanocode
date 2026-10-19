@@ -24,7 +24,7 @@ pub struct RemoteContext {
     pub call_id: String,
     pub turn_id: Option<String>,
     #[serde(skip)]
-    pub history: Arc<Vec<nanocode_types_core::responses::ResponseItem>>,
+    pub history: Arc<nanocode_tool_contracts::SharedHistory>,
     #[serde(
         serialize_with = "serialize_output_budget",
         deserialize_with = "deserialize_output_budget"
@@ -63,9 +63,7 @@ impl RemoteContext {
             session_id: context.session_id().into(),
             call_id: context.call_id().into(),
             turn_id: context.turn_id().map(Into::into),
-            history: context
-                .shared_history()
-                .map_or_else(|| Arc::new(context.history().to_vec()), Arc::clone),
+            history: crate::embedded::shared_history(context),
             output_token_budget: context.output_token_budget(),
             instruction_revision: context.instruction_revision(),
             host_context: context.host_context().map(Into::into),
@@ -77,9 +75,10 @@ impl RemoteContext {
             &self.model,
             &self.session_id,
             &self.call_id,
-            Arc::clone(&self.history),
+            Arc::default(),
             self.output_token_budget,
         )
+        .with_history(Arc::clone(&self.history))
         .with_turn_id(self.turn_id.as_deref().map(Arc::from))
         .with_instruction_revision(self.instruction_revision)
         .with_host_context(self.host_context.as_deref().map(Arc::from))

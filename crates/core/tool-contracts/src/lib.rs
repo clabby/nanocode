@@ -2,7 +2,55 @@ use nanocode_types_core::responses::ResponseItem;
 pub use nanocode_types_core::tools::*;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
+
+pub trait HistorySource: Send + Sync {
+    fn items(&self) -> Vec<ResponseItem>;
+}
+
+#[derive(Default)]
+pub struct SharedHistory {
+    items: OnceLock<Arc<Vec<ResponseItem>>>,
+    source: Option<Box<dyn HistorySource>>,
+}
+
+impl SharedHistory {
+    #[must_use]
+    pub fn new(items: Arc<Vec<ResponseItem>>) -> Self {
+        Self {
+            items: OnceLock::from(items),
+            source: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_source(source: impl HistorySource + 'static) -> Self {
+        Self {
+            items: OnceLock::new(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    pub fn items(&self) -> &Arc<Vec<ResponseItem>> {
+        self.items.get_or_init(|| {
+            Arc::new(
+                self.source
+                    .as_ref()
+                    .map_or_else(Vec::new, |source| source.items()),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum History<'a> {
+    Borrowed(&'a [ResponseItem]),
+    Shared(&'a Arc<SharedHistory>),
+}
 
 #[derive(Clone, Copy)]
 pub struct ToolContext<'a> {
@@ -10,8 +58,7 @@ pub struct ToolContext<'a> {
     session_id: &'a str,
     call_id: &'a str,
     turn_id: Option<&'a str>,
-    history: &'a [ResponseItem],
-    shared_history: Option<&'a Arc<Vec<ResponseItem>>>,
+    history: History<'a>,
     output_token_budget: usize,
     host_context: Option<&'a str>,
     instruction_revision: Option<u64>,
@@ -31,26 +78,25 @@ impl<'a> ToolContext<'a> {
             session_id,
             call_id,
             turn_id: None,
-            history,
-            shared_history: None,
+            history: History::Borrowed(history),
             output_token_budget,
             host_context: None,
             instruction_revision: None,
         }
     }
 
-    #[doc(hidden)]
     #[must_use]
-    pub fn with_shared_history(mut self, history: &'a Arc<Vec<ResponseItem>>) -> Self {
-        self.history = history.as_slice();
-        self.shared_history = Some(history);
+    pub const fn with_shared_history(mut self, history: &'a Arc<SharedHistory>) -> Self {
+        self.history = History::Shared(history);
         self
     }
 
-    #[doc(hidden)]
     #[must_use]
-    pub const fn shared_history(self) -> Option<&'a Arc<Vec<ResponseItem>>> {
-        self.shared_history
+    pub const fn shared_history(self) -> Option<&'a Arc<SharedHistory>> {
+        match self.history {
+            History::Shared(history) => Some(history),
+            History::Borrowed(_) => None,
+        }
     }
 
     #[must_use]
@@ -104,8 +150,11 @@ impl<'a> ToolContext<'a> {
     }
 
     #[must_use]
-    pub const fn history(self) -> &'a [ResponseItem] {
-        self.history
+    pub fn history(self) -> &'a [ResponseItem] {
+        match self.history {
+            History::Borrowed(history) => history,
+            History::Shared(history) => history.items(),
+        }
     }
 
     #[must_use]

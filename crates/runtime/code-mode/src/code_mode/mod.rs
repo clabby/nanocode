@@ -1638,7 +1638,7 @@ async fn execute_nested_call(
         context.model(),
         context.session_id(),
         &call_id,
-        context.history(),
+        &[],
         context.output_token_budget(),
     )
     .with_shared_history(&owned.history)

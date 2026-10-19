@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use nanocode_tool_contracts::{ToolContext, ToolOutputBody};
+use nanocode_tool_contracts::{SharedHistory, ToolContext, ToolOutputBody};
 use nanocode_types_core::responses::ResponseItem;
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
@@ -11,9 +11,16 @@ pub struct OwnedToolContext {
     pub session_id: String,
     pub call_id: String,
     pub turn_id: Option<Arc<str>>,
-    pub history: Arc<Vec<ResponseItem>>,
+    pub history: Arc<SharedHistory>,
     pub output_token_budget: usize,
     pub host_context: Option<Arc<str>>,
+}
+
+pub(crate) fn shared_history(context: ToolContext<'_>) -> Arc<SharedHistory> {
+    context.shared_history().map_or_else(
+        || Arc::new(SharedHistory::new(Arc::new(context.history().to_vec()))),
+        Arc::clone,
+    )
 }
 
 impl OwnedToolContext {
@@ -31,23 +38,29 @@ impl OwnedToolContext {
             session_id: session_id.into(),
             call_id: call_id.into(),
             turn_id: None,
-            history,
+            history: Arc::new(SharedHistory::new(history)),
             output_token_budget,
             host_context: None,
         }
     }
 
     #[must_use]
+    pub fn with_history(mut self, history: Arc<SharedHistory>) -> Self {
+        self.history = history;
+        self
+    }
+
+    #[must_use]
     pub fn from_context(context: ToolContext<'_>) -> Self {
+        let history = shared_history(context);
         Self::new(
             context.model(),
             context.session_id(),
             context.call_id(),
-            context
-                .shared_history()
-                .map_or_else(|| Arc::new(context.history().to_vec()), Arc::clone),
+            Arc::default(),
             context.output_token_budget(),
         )
+        .with_history(history)
         .with_instruction_revision(context.instruction_revision())
         .with_host_context(context.host_context().map(Arc::from))
         .with_turn_id(context.turn_id().map(Arc::from))
@@ -59,7 +72,7 @@ impl OwnedToolContext {
             &self.model,
             &self.session_id,
             &self.call_id,
-            self.history.as_slice(),
+            &[],
             self.output_token_budget,
         )
         .with_shared_history(&self.history)

@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::{ToolContext, ToolDefinition, ToolInput, ToolOutput};
 
 pub use input::{prepare_output_images, prepare_user_input};
+pub(crate) use types::shared_history;
 pub use types::{
     CodeModeCell, CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate,
     NestedToolCall, OwnedToolContext,
