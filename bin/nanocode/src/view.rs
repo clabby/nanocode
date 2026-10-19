@@ -206,6 +206,11 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
     } else {
         u16::try_from(tree_lines.len() + 1).unwrap_or(u16::MAX)
     };
+    let queue_height = u16::try_from(queue_lines.len()).unwrap_or(u16::MAX);
+    let fixed = [tree_height, queue_height, 1, composer_height, 1]
+        .into_iter()
+        .try_fold(0_u16, u16::checked_add)
+        .filter(|fixed| *fixed < area.height);
     let [
         transcript_area,
         tree_area,
@@ -213,15 +218,28 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
         status_area,
         composer_area,
         footer_area,
-    ] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(tree_height),
-        Constraint::Length(u16::try_from(queue_lines.len()).unwrap_or(u16::MAX)),
-        Constraint::Length(1),
-        Constraint::Length(composer_height),
-        Constraint::Length(1),
-    ])
-    .areas(area);
+    ] = match fixed {
+        Some(fixed) => stack(
+            area,
+            [
+                area.height - fixed,
+                tree_height,
+                queue_height,
+                1,
+                composer_height,
+                1,
+            ],
+        ),
+        None => Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(tree_height),
+            Constraint::Length(queue_height),
+            Constraint::Length(1),
+            Constraint::Length(composer_height),
+            Constraint::Length(1),
+        ])
+        .areas(area),
+    };
     drop(layout);
     let buffer = frame.buffer_mut();
     transcripts(app, transcript_area, buffer, &theme, spinner);
@@ -276,6 +294,15 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
     }
 }
 
+fn stack<const N: usize>(area: Rect, heights: [u16; N]) -> [Rect; N] {
+    let mut y = area.y;
+    heights.map(|height| {
+        let row = Rect { y, height, ..area };
+        y += height;
+        row
+    })
+}
+
 fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, spinner: &str) {
     let _span = tracing::info_span!(target: "nanocode", "nc.panes.render", side = app.panes.side.is_some(), active_side = app.panes.active, zoomed = app.panes.zoomed).entered();
     app.panes.main_area = Rect::default();
@@ -288,7 +315,8 @@ fn transcripts(app: &mut App, area: Rect, buffer: &mut Buffer, theme: &Theme, sp
             .render(area, buffer, theme, spinner);
         return;
     }
-    let [tabs, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let tabs = area.height.min(1);
+    let [tabs, body] = stack(area, [tabs, area.height - tabs]);
     tab_line(app, theme, spinner).render(tabs, buffer);
     if app.panes.zoomed {
         let _pane = tracing::info_span!(target: "nanocode", "nc.pane.render", pane = if app.panes.active { "side" } else { "main" }).entered();
