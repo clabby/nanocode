@@ -36,6 +36,17 @@ impl CheckpointFormat for CodexCheckpointFormat {
         })
     }
 
+    fn hydrate_continuation<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        continuation: Value,
+    ) -> FormatFuture<'a, Result<Option<Value>>> {
+        Box::pin(async move {
+            let history = context::continuation_history(reader, continuation).await?;
+            Ok(Some(serde_json::json!({ "history": history })))
+        })
+    }
+
     fn encode(&self, checkpoint: Value) -> Result<EncodedPayload> {
         let snapshot: SessionSnapshot =
             serde_json::from_value(checkpoint).map_err(Error::InvalidPayload)?;

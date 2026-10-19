@@ -483,6 +483,7 @@ impl App {
             id: uuid::Uuid::now_v7().to_string(),
             text: question,
             prompt: sent.into(),
+            shown: false,
         });
     }
 
@@ -497,6 +498,9 @@ impl App {
         side.current = Some(turn.clone());
         side.busy = true;
         side.since = Some(Instant::now());
+        if turn.shown {
+            side.mapper.replayed_prompt(turn.id.clone());
+        }
         side.mapper.begin_turn();
         side.mapper.mark_turn_start(side.transcript.len());
         side.transcript.scroll_to_bottom();

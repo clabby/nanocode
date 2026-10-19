@@ -222,7 +222,10 @@ pub use store::*;
 mod store {
     use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-    use nanocode_agent_core::{HarnessFamily, Lineage, ModelSelection, Origin};
+    use nanocode_agent_core::{
+        HarnessFamily, Lineage, ModelSelection, Origin,
+        input::{Prompt, PromptInput, UserInput},
+    };
     use serde::Serialize;
     use serde_json::Value;
 
@@ -397,6 +400,8 @@ mod store {
         pub transcript: Vec<TranscriptItem>,
 
         pub turns: Vec<StoredTurn>,
+
+        pub in_progress: Option<String>,
 
         pub checkpoint: Option<Value>,
 
@@ -591,9 +596,17 @@ mod store {
             };
             let turns = self.state_turns(id, &state).await?;
             let admitted = admitted_turns(&turns, &state);
-            let transcript = match &checkpoint {
-                Some(checkpoint) => self.transcript(checkpoint, record.family(), &admitted)?,
-                None => Vec::new(),
+            let progress = self.progress(id, &state, record.family()).await?;
+            let transcript = match (&progress, &checkpoint) {
+                (Some((_, view, steers)), _) => {
+                    let mut transcript = self.transcript(view, record.family(), &admitted)?;
+                    transcript.extend(steers.iter().cloned().map(TranscriptItem::User));
+                    transcript
+                }
+                (None, Some(checkpoint)) => {
+                    self.transcript(checkpoint, record.family(), &admitted)?
+                }
+                (None, None) => Vec::new(),
             };
             let preview = turns
                 .iter()
@@ -608,6 +621,7 @@ mod store {
                 summary: SessionSummary { record, preview },
                 transcript,
                 turns,
+                in_progress: progress.map(|(operation, _, _)| operation),
                 checkpoint,
                 formats: self.formats.clone(),
                 loaded: Loaded {
@@ -1107,6 +1121,41 @@ mod store {
             Ok(self.formats.family(family)?.transcript(checkpoint, turns))
         }
 
+        async fn progress(
+            &self,
+            id: &str,
+            state: &DurableState,
+            family: HarnessFamily,
+        ) -> Result<Option<(String, Value, Vec<String>)>> {
+            let Some((operation_id, operation)) = state.first_pending_operation() else {
+                return Ok(None);
+            };
+            let Some(continuation) = &operation.continuation else {
+                return Ok(None);
+            };
+            let continuation: Value = self.load_payload(id, continuation).await?.decode()?;
+            let Some(view) = self
+                .formats
+                .family(family)?
+                .hydrate_continuation(PayloadReader::store(&self.store, id), continuation)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let unbound: Vec<_> = operation
+                .steers
+                .iter()
+                .filter(|steer| steer.model_call_index.is_none())
+                .map(|steer| steer.input.clone())
+                .collect();
+            let mut steers = Vec::new();
+            for input in EncodedPayload::load_many(&unbound, &mut self.store.clone(), id).await? {
+                let prompt: Prompt = input.decode()?;
+                steers.extend(instruction_text(&prompt.instruction));
+            }
+            Ok(Some((operation_id.to_owned(), view, steers)))
+        }
+
         async fn native_checkpoint(&self, id: &str, state: &DurableState) -> Result<Option<Value>> {
             match state.latest_checkpoint() {
                 Some(payload) => self
@@ -1282,13 +1331,33 @@ mod store {
         find(input, 0).and_then(super::preview_text)
     }
 
+    fn instruction_text(instruction: &PromptInput) -> Option<String> {
+        let text = match instruction {
+            PromptInput::Text(text) => text.clone(),
+            PromptInput::Content(items) => items
+                .iter()
+                .filter_map(|item| match item {
+                    UserInput::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        (!text.trim().is_empty()).then_some(text)
+    }
+
     fn admitted_turns<'a>(turns: &'a [StoredTurn], state: &DurableState) -> Vec<AdmittedTurn<'a>> {
         turns
             .iter()
             .map(|turn| AdmittedTurn {
                 input: &turn.input,
                 steers: state.operation(&turn.id).map_or(0, |operation| {
-                    operation.retired_steers as usize + operation.steers.len()
+                    operation.retired_steers as usize
+                        + operation
+                            .steers
+                            .iter()
+                            .filter(|steer| steer.model_call_index.is_some())
+                            .count()
                 }),
             })
             .collect()

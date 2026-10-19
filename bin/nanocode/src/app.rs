@@ -192,6 +192,8 @@ pub struct PendingTurn {
     pub id: String,
     pub text: String,
     pub prompt: nanocode::agent::input::Prompt,
+    #[serde(default)]
+    pub shown: bool,
 }
 
 pub enum TurnState {
@@ -1244,6 +1246,9 @@ impl App {
             self.queue.push(item);
         }
         self.resumes.remove(&first.id);
+        if first.shown {
+            self.mapper.replayed_prompt(first.id.clone());
+        }
         self.notice(NoticeLevel::Info, "continuing the interrupted turn…");
         self.launch_turn(agent, first.id, first.text, first.prompt, true);
     }
@@ -1269,7 +1274,7 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = match store.turns(&session_id).await {
-                Ok(turns) => pending_turns(&turns).map_err(|error| error.to_string()),
+                Ok(turns) => pending_turns(&turns, None).map_err(|error| error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
             drop(tx.send(AppEvent::Recovered {
@@ -1527,6 +1532,7 @@ impl App {
                                 id,
                                 text,
                                 prompt: sent,
+                                shown: false,
                             },
                         }));
                     }
@@ -2818,7 +2824,7 @@ pub async fn open_session(
     model
         .capabilities(nanocode::ModelTransport::Native)
         .check_thinking(thinking)?;
-    let pending = pending_turns(&stored.turns)?;
+    let pending = pending_turns(&stored.turns, stored.in_progress.as_deref())?;
     let prompts = stored
         .turns
         .iter()
@@ -2898,7 +2904,10 @@ fn operation_active(error: &nanocode::NanocodeError) -> bool {
     )
 }
 
-fn pending_turns(turns: &[nanocode::durability::StoredTurn]) -> Result<Vec<PendingTurn>> {
+fn pending_turns(
+    turns: &[nanocode::durability::StoredTurn],
+    in_progress: Option<&str>,
+) -> Result<Vec<PendingTurn>> {
     turns
         .iter()
         .filter(|turn| turn.status == nanocode::durability::TurnStatus::Pending)
@@ -2911,6 +2920,7 @@ fn pending_turns(turns: &[nanocode::durability::StoredTurn]) -> Result<Vec<Pendi
                 id: turn.id.clone(),
                 text: turn.preview.clone().unwrap_or_default(),
                 prompt,
+                shown: in_progress == Some(turn.id.as_str()),
             })
         })
         .collect()

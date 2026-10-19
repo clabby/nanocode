@@ -48,6 +48,20 @@ pub(crate) async fn load_continuation(
     Ok((continuation, keys))
 }
 
+#[derive(Deserialize)]
+struct ContinuationHistory {
+    history: Sequence,
+}
+
+pub(crate) async fn continuation_history(
+    reader: PayloadReader<'_>,
+    continuation: serde_json::Value,
+) -> Result<Vec<serde_json::Value>> {
+    let value: ContinuationHistory =
+        serde_json::from_value(continuation).map_err(nanocode_durability::Error::InvalidPayload)?;
+    load_sequence(reader, value.history, &mut HashSet::new()).await
+}
+
 #[derive(Deserialize, Serialize)]
 pub(crate) struct Snapshot {
     head: SessionSnapshotHead,

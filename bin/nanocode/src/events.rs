@@ -43,6 +43,7 @@ pub struct EventMapper {
     turn_start: usize,
     reported: bool,
     subagent: bool,
+    replayed: Option<String>,
 }
 
 pub fn subagent_prompt_display(text: &str) -> String {
@@ -185,6 +186,10 @@ impl EventMapper {
         self.turn_start = index;
     }
 
+    pub fn replayed_prompt(&mut self, request_id: String) {
+        self.replayed = Some(request_id);
+    }
+
     pub fn apply(&mut self, transcript: &mut Transcript, event: &AgentEvent) -> Mapped {
         let _span = tracing::info_span!(target: "nanocode", "nc.transcript.apply", event.kind = ?event.kind, event.bytes = event.payload.get().len(), cells = transcript.len()).entered();
         let mut mapped = Mapped { accepted: None };
@@ -204,15 +209,22 @@ impl EventMapper {
                     text
                 };
                 let shown = text.as_str();
-                match completion_agent(shown) {
-                    Some(agent) => transcript.push(CellKind::Notice(
-                        NoticeLevel::Info,
-                        format!("subagent #{agent} completed · continuing"),
-                    )),
-                    None => transcript.push(CellKind::User(
-                        crate::side::prompt_display(shown).to_owned(),
-                    )),
-                };
+                let replayed = payload["kind"] != "steer"
+                    && self
+                        .replayed
+                        .take_if(|id| payload["request_id"].as_str() == Some(id.as_str()))
+                        .is_some();
+                if !replayed {
+                    match completion_agent(shown) {
+                        Some(agent) => transcript.push(CellKind::Notice(
+                            NoticeLevel::Info,
+                            format!("subagent #{agent} completed · continuing"),
+                        )),
+                        None => transcript.push(CellKind::User(
+                            crate::side::prompt_display(shown).to_owned(),
+                        )),
+                    };
+                }
                 self.reasoning.clear();
                 mapped.accepted = Some(match payload["kind"].as_str() {
                     Some("steer") => Accepted::Steer {

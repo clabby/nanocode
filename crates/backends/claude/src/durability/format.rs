@@ -2,7 +2,9 @@ use nanocode_agent_core::{
     HarnessFamily, SessionCheckpoint,
     session::{ToolOutcome, TranscriptItem},
 };
-use nanocode_durability::{AdmittedTurn, CheckpointFormat, Error, Result, SessionRecord};
+use nanocode_durability::{
+    AdmittedTurn, CheckpointFormat, Error, FormatFuture, PayloadReader, Result, SessionRecord,
+};
 use serde_json::Value;
 
 pub struct ClaudeCheckpointFormat;
@@ -14,6 +16,35 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
 
     fn owns(&self, checkpoint: &Value) -> bool {
         checkpoint.get("provider").and_then(Value::as_str) == Some("claude")
+    }
+
+    fn hydrate_continuation<'a>(
+        &'a self,
+        _reader: PayloadReader<'a>,
+        mut continuation: Value,
+    ) -> FormatFuture<'a, Result<Option<Value>>> {
+        Box::pin(async move {
+            let Some(mut snapshot) = continuation
+                .get_mut("snapshot")
+                .map(Value::take)
+                .filter(|snapshot| self.owns(snapshot))
+            else {
+                return Ok(None);
+            };
+            if let (Some(pending), Some(conversation)) = (
+                continuation
+                    .get_mut("pending")
+                    .and_then(Value::as_array_mut)
+                    .filter(|pending| !pending.is_empty()),
+                snapshot
+                    .get_mut("conversation")
+                    .and_then(Value::as_object_mut),
+            ) {
+                conversation.insert("messages".into(), Value::Array(std::mem::take(pending)));
+                conversation.insert("summary".into(), Value::String(String::new()));
+            }
+            Ok(Some(snapshot))
+        })
     }
 
     fn session_checkpoint(

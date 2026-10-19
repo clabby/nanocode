@@ -33,6 +33,14 @@ pub trait CheckpointFormat: Send + Sync {
         Box::pin(async move { Ok(stored) })
     }
 
+    fn hydrate_continuation<'a>(
+        &'a self,
+        _reader: PayloadReader<'a>,
+        _continuation: Value,
+    ) -> FormatFuture<'a, Result<Option<Value>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn encode(&self, checkpoint: Value) -> Result<EncodedPayload> {
         EncodedPayload::encode(&checkpoint)
     }
