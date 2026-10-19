@@ -1,7 +1,9 @@
+mod kv;
 mod payload;
 mod state;
 mod store;
 
+pub use kv::{KeyValue, KeyValueStore, Versioned};
 pub use payload::EncodedPayload;
 pub use state::{
     DurableCheckpoint, IdentifiedSteerReceipt, JournalState, OperationState, OperationStatus,

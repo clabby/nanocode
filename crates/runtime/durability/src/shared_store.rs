@@ -111,7 +111,7 @@ impl SharedStore {
         WeakSharedStore(self.commands.downgrade())
     }
 
-    pub(crate) fn new<S>(mut store: S) -> crate::Result<Self>
+    pub(crate) fn new<S>(store: S) -> crate::Result<Self>
     where
         S: StateStore + 'static,
     {
@@ -121,62 +121,114 @@ impl SharedStore {
         let batches_companion_acquisition = false;
         let supports_events = store.supports_events();
         let supports_summaries = store.supports_summaries();
-        let (commands, mut receiver) = mpsc::channel(COMMAND_CAPACITY);
-        spawn_driver(async move {
-            let mut next = None;
-            loop {
-                let request = match next.take() {
-                    Some(request) => request,
-                    None => match receiver.recv().await {
-                        Some(request) => request,
-                        None => break,
-                    },
-                };
-                let first = match Grouped::from_request(request) {
-                    Ok(grouped) => grouped,
-                    Err(request) => {
-                        run(&mut store, request).await;
-                        continue;
-                    }
-                };
-                let mut group = vec![first];
-                while let Ok(request) = receiver.try_recv() {
-                    match Grouped::from_request(request) {
-                        Ok(grouped)
-                            if group
-                                .iter()
-                                .all(|other| other.commit.state_id != grouped.commit.state_id) =>
-                        {
-                            group.push(grouped);
-                        }
-                        Ok(grouped) => {
-                            next = Some(grouped.into_request());
-                            break;
-                        }
-                        Err(request) => {
-                            next = Some(request);
-                            break;
-                        }
-                    }
-                }
-                match group.pop() {
-                    Some(single) if group.is_empty() => {
-                        run(&mut store, single.into_request()).await;
-                    }
-                    Some(last) => {
-                        group.push(last);
-                        run_group(&mut store, group).await;
-                    }
-                    None => {}
-                }
-            }
-        })?;
+        let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        if store.concurrent_handle().is_some() {
+            spawn_driver(drive_concurrently(store, receiver))?;
+        } else {
+            spawn_driver(drive_grouped(store, receiver))?;
+        }
         Ok(Self {
             commands,
             batches_companion_acquisition,
             supports_events,
             supports_summaries,
         })
+    }
+}
+
+async fn drive_grouped<S: StateStore>(mut store: S, mut receiver: mpsc::Receiver<StoreRequest>) {
+    let mut next = None;
+    loop {
+        let request = match next.take() {
+            Some(request) => request,
+            None => match receiver.recv().await {
+                Some(request) => request,
+                None => break,
+            },
+        };
+        let first = match Grouped::from_request(request) {
+            Ok(grouped) => grouped,
+            Err(request) => {
+                run(&mut store, request).await;
+                continue;
+            }
+        };
+        let mut group = vec![first];
+        while let Ok(request) = receiver.try_recv() {
+            match Grouped::from_request(request) {
+                Ok(grouped)
+                    if group
+                        .iter()
+                        .all(|other| other.commit.state_id != grouped.commit.state_id) =>
+                {
+                    group.push(grouped);
+                }
+                Ok(grouped) => {
+                    next = Some(grouped.into_request());
+                    break;
+                }
+                Err(request) => {
+                    next = Some(request);
+                    break;
+                }
+            }
+        }
+        match group.pop() {
+            Some(single) if group.is_empty() => {
+                run(&mut store, single.into_request()).await;
+            }
+            Some(last) => {
+                group.push(last);
+                run_group(&mut store, group).await;
+            }
+            None => {}
+        }
+    }
+}
+
+struct Completion(mpsc::UnboundedSender<()>);
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+async fn drive_concurrently<S: StateStore>(
+    mut store: S,
+    mut receiver: mpsc::Receiver<StoreRequest>,
+) {
+    let (finished, mut completions) = mpsc::unbounded_channel();
+    let mut in_flight = 0_usize;
+    loop {
+        let request = tokio::select! {
+            biased;
+            Some(()) = completions.recv(), if in_flight > 0 => {
+                in_flight -= 1;
+                continue;
+            }
+            request = receiver.recv() => match request {
+                Some(request) => request,
+                None => break,
+            },
+        };
+        let handle = match &request.command {
+            Command::Flush { .. } => None,
+            _ => store.concurrent_handle(),
+        };
+        let Some(mut handle) = handle else {
+            while in_flight > 0 && completions.recv().await.is_some() {
+                in_flight -= 1;
+            }
+            run(&mut store, request).await;
+            continue;
+        };
+        in_flight += 1;
+        let completion = Completion(finished.clone());
+        spawn_operation(async move {
+            run(&mut *handle, request).await;
+            drop(completion);
+        });
     }
 }
 
@@ -303,7 +355,7 @@ impl Grouped {
     }
 }
 
-async fn run_group<S: StateStore>(store: &mut S, group: Vec<Grouped>) {
+async fn run_group<S: StateStore + ?Sized>(store: &mut S, group: Vec<Grouped>) {
     let count = group.len();
     let mut commits = Vec::with_capacity(count);
     let mut replies = Vec::with_capacity(count);
@@ -337,7 +389,7 @@ async fn run_group<S: StateStore>(store: &mut S, group: Vec<Grouped>) {
     }
 }
 
-async fn run<S: StateStore>(store: &mut S, request: StoreRequest) {
+async fn run<S: StateStore + ?Sized>(store: &mut S, request: StoreRequest) {
     let StoreRequest {
         command,
         span,
@@ -932,4 +984,14 @@ fn spawn_driver(driver: impl Future<Output = ()> + Send + 'static) -> crate::Res
 fn spawn_driver(driver: impl Future<Output = ()> + 'static) -> crate::Result<()> {
     nanocode_platform::spawn_local(driver);
     Ok(())
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn spawn_operation(operation: impl Future<Output = ()> + Send + 'static) {
+    drop(tokio::spawn(operation));
+}
+
+#[cfg(target_family = "wasm")]
+fn spawn_operation(operation: impl Future<Output = ()> + 'static) {
+    nanocode_platform::spawn_local(operation);
 }

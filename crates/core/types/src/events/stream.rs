@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use arc_swap::ArcSwap;
 use futures_util::Stream;
 use nanocode_platform::Instant;
 use nanocode_types_core::responses::MessagePhase;
@@ -118,11 +119,54 @@ fn write_jsonl_event(output: &mut impl Write, event: &AgentEvent) -> Result<(), 
         .map_err(EventError::Write)
 }
 
+struct Subscribers(ArcSwap<Vec<mpsc::UnboundedSender<TimedAgentEvent>>>);
+
+impl Subscribers {
+    fn channel() -> (Arc<Self>, mpsc::UnboundedReceiver<TimedAgentEvent>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self(ArcSwap::from_pointee(vec![sender]))),
+            receiver,
+        )
+    }
+
+    fn subscribe(&self) -> mpsc::UnboundedReceiver<TimedAgentEvent> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.0.rcu(|senders| {
+            let mut senders = Vec::clone(senders);
+            senders.retain(|sender| !sender.is_closed());
+            senders.push(sender.clone());
+            senders
+        });
+        receiver
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.load().iter().all(mpsc::UnboundedSender::is_closed)
+    }
+
+    fn send(&self, event: &TimedAgentEvent) {
+        let mut closed = false;
+        for sender in self.0.load().iter() {
+            closed |= sender.send(event.clone()).is_err();
+        }
+        if closed {
+            self.0.rcu(|senders| {
+                senders
+                    .iter()
+                    .filter(|sender| !sender.is_closed())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 struct EventChannel {
     request_id: Arc<str>,
     next_seq: Arc<AtomicU64>,
-    session: mpsc::UnboundedSender<TimedAgentEvent>,
+    session: Arc<Subscribers>,
     turn: Option<mpsc::UnboundedSender<TimedAgentEvent>>,
     turn_admission: Option<Arc<AtomicU64>>,
     pending: Arc<Mutex<PendingDelta>>,
@@ -220,7 +264,7 @@ impl Drop for TerminalClaim<'_> {
 
 impl EventChannel {
     fn channel(request_id: Arc<str>) -> (Self, AgentEvents) {
-        let (session, receiver) = mpsc::unbounded_channel();
+        let (session, receiver) = Subscribers::channel();
         (
             Self {
                 request_id: Arc::clone(&request_id),
@@ -243,7 +287,7 @@ impl EventChannel {
             Self {
                 request_id: Arc::clone(&self.request_id),
                 next_seq: Arc::clone(&self.next_seq),
-                session: self.session.clone(),
+                session: Arc::clone(&self.session),
                 turn: Some(turn),
                 turn_admission: Some(Arc::new(AtomicU64::new(0))),
                 pending: Arc::default(),
@@ -394,7 +438,7 @@ impl EventChannel {
     }
 
     fn publish(&self, event: TimedAgentEvent) {
-        drop(self.session.send(event.clone()));
+        self.session.send(&event);
         if let Some(turn) = &self.turn {
             drop(turn.send(event));
         }
@@ -555,6 +599,31 @@ impl AgentEventPublisher {
         !self.channel.receivers_are_closed()
     }
 
+    #[must_use]
+    pub fn subscribe(&self) -> AgentEvents {
+        AgentEvents {
+            request_id: Arc::clone(&self.channel.request_id),
+            receiver: self.channel.session.subscribe(),
+        }
+    }
+
+    #[must_use]
+    pub fn downgrade(&self) -> WeakAgentEventPublisher {
+        WeakAgentEventPublisher {
+            request_id: Arc::clone(&self.channel.request_id),
+            next_seq: Arc::clone(&self.channel.next_seq),
+            session: Arc::downgrade(&self.channel.session),
+            turn: self
+                .channel
+                .turn
+                .as_ref()
+                .map(mpsc::UnboundedSender::downgrade),
+            turn_admission: self.channel.turn_admission.clone(),
+            pending: Arc::clone(&self.channel.pending),
+            turn_id: self.turn_id.clone(),
+        }
+    }
+
     pub fn publish(&self, event: AgentEvent) -> Result<(), EventError> {
         self.publish_timed(TimedAgentEvent {
             event,
@@ -634,6 +703,43 @@ impl AgentEventPublisher {
             });
         }
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct WeakAgentEventPublisher {
+    request_id: Arc<str>,
+    next_seq: Arc<AtomicU64>,
+    session: std::sync::Weak<Subscribers>,
+    turn: Option<mpsc::WeakUnboundedSender<TimedAgentEvent>>,
+    turn_admission: Option<Arc<AtomicU64>>,
+    pending: Arc<Mutex<PendingDelta>>,
+    turn_id: Option<Arc<str>>,
+}
+
+impl WeakAgentEventPublisher {
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    #[must_use]
+    pub fn upgrade(&self) -> Option<AgentEventPublisher> {
+        let turn = match &self.turn {
+            Some(turn) => Some(turn.upgrade()?),
+            None => None,
+        };
+        Some(AgentEventPublisher {
+            channel: EventChannel {
+                request_id: Arc::clone(&self.request_id),
+                next_seq: Arc::clone(&self.next_seq),
+                session: self.session.upgrade()?,
+                turn,
+                turn_admission: self.turn_admission.clone(),
+                pending: Arc::clone(&self.pending),
+            },
+            turn_id: self.turn_id.clone(),
+        })
     }
 }
 

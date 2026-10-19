@@ -2,6 +2,8 @@ use super::backend::{
     BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey, LifecycleBackend,
 };
 use super::*;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use std::sync::atomic::AtomicBool;
 
 pub struct Agent {
     pub(super) backend: Arc<dyn LifecycleBackend>,
@@ -12,31 +14,57 @@ pub struct Agent {
 
     pub(super) driver_turn_ids: bool,
 
-    pub(super) seed: Arc<std::sync::Mutex<SeedState>>,
+    pub(super) seed: Arc<ArcSwap<SeedState>>,
+
+    pub(super) interrupted: Arc<Interrupted>,
 }
 
 #[derive(Default)]
+pub(super) struct Interrupted(ArcSwapOption<Resumption>);
+
+type InterruptedTurn = (String, serde_json::Value);
+
+struct Resumption {
+    turns: Vec<InterruptedTurn>,
+    claimed: AtomicBool,
+    finish: ArcSwapOption<tokio::sync::oneshot::Sender<()>>,
+    finished: futures_util::future::Shared<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Resumption {
+    fn new(turns: Vec<InterruptedTurn>) -> Arc<Self> {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        Arc::new(Self {
+            turns,
+            claimed: AtomicBool::new(false),
+            finish: ArcSwapOption::from_pointee(finish),
+            finished: futures_util::FutureExt::shared(finished),
+        })
+    }
+}
+
+#[derive(Clone, Default)]
 pub(super) struct SeedState {
-    transcript: Option<Vec<nanocode_types::PromptMessage>>,
+    transcript: Option<Arc<Vec<nanocode_types::PromptMessage>>>,
     in_flight: bool,
 }
 
 struct SeedClaim {
-    seed: Arc<std::sync::Mutex<SeedState>>,
+    seed: Arc<ArcSwap<SeedState>>,
     completed: bool,
 }
 
 impl Drop for SeedClaim {
     fn drop(&mut self) {
-        release_seed(&self.seed, self.completed);
-    }
-}
-
-fn release_seed(seed: &std::sync::Mutex<SeedState>, completed: bool) {
-    let mut state = seed.lock().expect("transcript seed lock poisoned");
-    state.in_flight = false;
-    if completed {
-        state.transcript = None;
+        let completed = self.completed;
+        self.seed.rcu(|state| SeedState {
+            transcript: if completed {
+                None
+            } else {
+                state.transcript.clone()
+            },
+            in_flight: false,
+        });
     }
 }
 
@@ -50,6 +78,7 @@ impl Clone for Agent {
             session: Arc::clone(&self.session),
             driver_turn_ids: self.driver_turn_ids,
             seed: Arc::clone(&self.seed),
+            interrupted: Arc::clone(&self.interrupted),
         }
     }
 }
@@ -57,12 +86,42 @@ impl Clone for Agent {
 #[derive(Clone)]
 pub struct WeakAgent {
     backend: std::sync::Weak<dyn LifecycleBackend>,
+    events: nanocode_types::events::WeakAgentEventPublisher,
+    next_turn: Arc<AtomicU64>,
+    agent_id: Arc<str>,
+    session: Arc<SessionInfo>,
+    driver_turn_ids: bool,
+    seed: Arc<ArcSwap<SeedState>>,
+    interrupted: Arc<Interrupted>,
 }
 
 impl WeakAgent {
     #[must_use]
     pub fn is_live(&self) -> bool {
         self.backend.strong_count() > 0
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session.session_id
+    }
+
+    #[must_use]
+    pub fn upgrade(&self) -> Option<Agent> {
+        let backend = self.backend.upgrade()?;
+        let events = self.events.upgrade().unwrap_or_else(|| {
+            nanocode_types::events::AgentEventPublisher::channel(self.events.request_id()).0
+        });
+        Some(Agent {
+            backend,
+            events,
+            next_turn: Arc::clone(&self.next_turn),
+            agent_id: Arc::clone(&self.agent_id),
+            session: Arc::clone(&self.session),
+            driver_turn_ids: self.driver_turn_ids,
+            seed: Arc::clone(&self.seed),
+            interrupted: Arc::clone(&self.interrupted),
+        })
     }
 
     pub async fn append_developer_message(
@@ -379,7 +438,95 @@ impl Agent {
     pub fn downgrade(&self) -> WeakAgent {
         WeakAgent {
             backend: Arc::downgrade(&self.backend),
+            events: self.events.downgrade(),
+            next_turn: Arc::clone(&self.next_turn),
+            agent_id: Arc::clone(&self.agent_id),
+            session: Arc::clone(&self.session),
+            driver_turn_ids: self.driver_turn_ids,
+            seed: Arc::clone(&self.seed),
+            interrupted: Arc::clone(&self.interrupted),
         }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_interrupted_turns(self, turns: Vec<(String, serde_json::Value)>) -> Self {
+        if !turns.is_empty() {
+            self.interrupted.0.store(Some(Resumption::new(turns)));
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn subscribe(&self) -> AgentEvents {
+        self.events.subscribe()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.backend.is_stopped()
+    }
+
+    async fn resume_interrupted(&self, request_id: Option<&str>) -> Result<()> {
+        loop {
+            let Some(resumption) = self.interrupted.0.load_full() else {
+                return Ok(());
+            };
+            if resumption.claimed.swap(true, Ordering::AcqRel) {
+                let _ = resumption.finished.clone().await;
+                continue;
+            }
+            let (result, remaining) = self.resume_turns(&resumption.turns, request_id).await;
+            self.interrupted
+                .0
+                .store((!remaining.is_empty()).then(|| Resumption::new(remaining)));
+            drop(resumption.finish.swap(None));
+            return result;
+        }
+    }
+
+    async fn resume_turns(
+        &self,
+        turns: &[InterruptedTurn],
+        request_id: Option<&str>,
+    ) -> (Result<()>, Vec<InterruptedTurn>) {
+        let (resumed, mut kept) =
+            match request_id.and_then(|id| turns.iter().position(|(turn, _)| turn == id)) {
+                Some(position) => (&turns[..position], turns[position + 1..].to_vec()),
+                None => (turns, Vec::new()),
+            };
+        for (index, (id, input)) in resumed.iter().enumerate() {
+            match self.resume_turn(id.clone(), input.clone()).await {
+                Ok(()) => {}
+                Err(error)
+                    if error.execution_policy_disposition()
+                        == Some(crate::ExecutionPolicyDisposition::Retry) => {}
+                Err(error) => {
+                    let mut remaining = resumed[index..].to_vec();
+                    remaining.append(&mut kept);
+                    return (Err(error), remaining);
+                }
+            }
+        }
+        (Ok(()), kept)
+    }
+
+    async fn resume_turn(&self, id: String, input: serde_json::Value) -> Result<()> {
+        let prompt = self.backend.decode_durable_prompt(input)?;
+        let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
+        let (events, _turn_events) = self.events.mirrored_channel();
+        let events = events.with_turn_id(id.clone());
+        self.backend
+            .submit(BackendPrompt {
+                key,
+                prompt,
+                request_id: Some(id),
+                cancel_on_admission: false,
+                events,
+            })
+            .await
+            .map(drop)
     }
 
     #[must_use]
@@ -449,6 +596,7 @@ impl Agent {
                 "request ID must not be empty".to_owned(),
             ));
         }
+        self.resume_interrupted(request_id.as_deref()).await?;
         let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (events, event_stream) = self.events.mirrored_channel();
         let turn_id = nanocode_platform::uuid_v7().to_string();
@@ -519,6 +667,7 @@ impl Agent {
                 "request ID must not be empty".to_owned(),
             ));
         }
+        self.resume_interrupted(request_id.as_deref()).await?;
         let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (events, event_stream) = self.events.mirrored_channel();
         let turn_id = nanocode_platform::uuid_v7().to_string();
@@ -610,24 +759,20 @@ impl Agent {
             .with_transcript(transcript.clone())
             .validate()
             .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
-        *self.seed.lock().expect("transcript seed lock poisoned") = SeedState {
-            transcript: (!transcript.is_empty()).then_some(transcript),
+        self.seed.store(Arc::new(SeedState {
+            transcript: (!transcript.is_empty()).then(|| Arc::new(transcript)),
             in_flight: false,
-        };
+        }));
         Ok(self)
     }
 
     fn pending_seed(&self) -> Option<Vec<nanocode_types::PromptMessage>> {
-        self.seed
-            .lock()
-            .expect("transcript seed lock poisoned")
-            .transcript
-            .clone()
+        self.seed.load().transcript.as_deref().cloned()
     }
 
     async fn claim_seed(&self, prompt: Prompt) -> Result<(Prompt, Option<SeedClaim>)> {
         let pending = {
-            let state = self.seed.lock().expect("transcript seed lock poisoned");
+            let state = self.seed.load();
             if state.in_flight {
                 None
             } else {
@@ -642,18 +787,24 @@ impl Agent {
             Err(NanocodeError::UnsupportedCapability { .. }) => false,
             Err(error) => return Err(error),
         };
-        let mut state = self.seed.lock().expect("transcript seed lock poisoned");
-        if committed {
-            state.transcript = None;
+        let mut claimed = false;
+        self.seed.rcu(|state| {
+            claimed = !committed && !state.in_flight && state.transcript.is_some();
+            SeedState {
+                transcript: if committed {
+                    None
+                } else {
+                    state.transcript.clone()
+                },
+                in_flight: state.in_flight || claimed,
+            }
+        });
+        if !claimed {
             return Ok((prompt, None));
         }
-        if state.in_flight || state.transcript.is_none() {
-            return Ok((prompt, None));
-        }
-        state.in_flight = true;
-        drop(state);
         let transcript = seed
-            .into_iter()
+            .iter()
+            .cloned()
             .chain(prompt.transcript().iter().cloned())
             .collect::<Vec<_>>();
         Ok((

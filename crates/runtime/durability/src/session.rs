@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use arc_swap::ArcSwapOption;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
@@ -2095,8 +2096,8 @@ pub struct DurableSession {
     caller_id: OwnerId,
     active_claims: AtomicUsize,
     described: Option<crate::SessionRecord>,
-    preload: Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>,
-    adopted: Arc<std::sync::Mutex<Option<crate::JournalClaim>>>,
+    preload: Arc<ArcSwapOption<(String, serde_json::Value)>>,
+    adopted: Arc<ArcSwapOption<crate::JournalClaim>>,
 }
 
 impl Clone for DurableSession {
@@ -2240,25 +2241,23 @@ impl DurableSession {
             caller_id: OwnerId::new(),
             active_claims: AtomicUsize::new(0),
             described,
-            preload: Arc::new(std::sync::Mutex::new(None)),
-            adopted: Arc::new(std::sync::Mutex::new(None)),
+            preload: Arc::default(),
+            adopted: Arc::default(),
         })
     }
 
     pub(crate) fn preload_checkpoint(&self, key: String, checkpoint: serde_json::Value) {
-        *self
-            .preload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((key, checkpoint));
+        self.preload.store(Some(Arc::new((key, checkpoint))));
     }
 
     pub fn take_checkpoint_preload(&self, key: &str) -> Option<serde_json::Value> {
         self.preload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .filter(|(preloaded, _)| preloaded == key)
-            .map(|(_, checkpoint)| checkpoint)
+            .swap(None)
+            .filter(|preloaded| preloaded.0 == key)
+            .map(|preloaded| {
+                Arc::try_unwrap(preloaded)
+                    .map_or_else(|shared| shared.1.clone(), |(_, checkpoint)| checkpoint)
+            })
     }
 
     pub async fn describe(
@@ -2312,19 +2311,12 @@ impl DurableSession {
                 "the journal seed does not belong to this session".to_owned(),
             ));
         }
-        *self
-            .adopted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seed.claim());
+        self.adopted.store(Some(Arc::new(seed.claim())));
         Ok(())
     }
 
     fn adopted_seed(&self) -> Option<crate::child_journal::Seed> {
-        self.adopted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()?
-            .take()
+        self.adopted.swap(None)?.take()
     }
 
     #[must_use]

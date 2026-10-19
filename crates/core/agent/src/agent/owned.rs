@@ -2,6 +2,7 @@ use super::backend::{
     BackendFuture, BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey, LifecycleBackend,
 };
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 #[doc(hidden)]
 pub trait AgentOwner: Send + Sync + 'static {
@@ -21,6 +22,7 @@ pub async fn adopt(agent: Agent, owner: &Arc<dyn AgentOwner>) -> Result<Agent> {
         inner: Arc::clone(&agent.backend),
         owner: Arc::downgrade(owner),
         key,
+        stopped: Arc::default(),
     });
     let owned = Agent {
         backend,
@@ -30,6 +32,7 @@ pub async fn adopt(agent: Agent, owner: &Arc<dyn AgentOwner>) -> Result<Agent> {
         session: Arc::clone(&agent.session),
         driver_turn_ids: agent.driver_turn_ids,
         seed: Arc::clone(&agent.seed),
+        interrupted: Arc::clone(&agent.interrupted),
     };
     if owner.adopt(key, owned.clone()) {
         return Ok(owned);
@@ -66,6 +69,34 @@ struct Owned {
     inner: Arc<dyn LifecycleBackend>,
     owner: std::sync::Weak<dyn AgentOwner>,
     key: usize,
+    stopped: Arc<AtomicBool>,
+}
+
+fn requires_reopen(error: &NanocodeError) -> bool {
+    matches!(
+        error,
+        NanocodeError::AgentStopped
+            | NanocodeError::TurnStopped
+            | NanocodeError::ExecutionPolicyOwnerStopped
+    ) || error.execution_policy_disposition() == Some(crate::ExecutionPolicyDisposition::Reopen)
+}
+
+fn observe<T>(stopped: &AtomicBool, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result
+        && requires_reopen(error)
+    {
+        stopped.store(true, Ordering::Release);
+    }
+    result
+}
+
+fn observed_turn(stopped: &Arc<AtomicBool>, turn: BackendTurn) -> BackendTurn {
+    let stopped = Arc::clone(stopped);
+    let result = turn.result;
+    BackendTurn {
+        request_id: turn.request_id,
+        result: Box::pin(async move { observe(&stopped, result.await) }),
+    }
 }
 
 impl LifecycleBackend for Owned {
@@ -82,10 +113,26 @@ impl LifecycleBackend for Owned {
         self.inner.persistence()
     }
     fn submit(&self, prompt: BackendPrompt) -> BackendFuture<Result<BackendTurn>> {
-        self.inner.submit(prompt)
+        let submitted = self.inner.submit(prompt);
+        let stopped = Arc::clone(&self.stopped);
+        Box::pin(async move {
+            observe(&stopped, submitted.await).map(|turn| observed_turn(&stopped, turn))
+        })
     }
     fn route(&self, prompt: BackendPrompt) -> BackendFuture<Result<BackendPromptRoute>> {
-        self.inner.route(prompt)
+        let routed = self.inner.route(prompt);
+        let stopped = Arc::clone(&self.stopped);
+        Box::pin(async move {
+            observe(&stopped, routed.await).map(|route| match route {
+                BackendPromptRoute::Started(turn) => {
+                    BackendPromptRoute::Started(observed_turn(&stopped, turn))
+                }
+                BackendPromptRoute::Steered => BackendPromptRoute::Steered,
+            })
+        })
+    }
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire) || self.inner.is_stopped()
     }
     fn steer(&self, key: BackendTurnKey, prompt: Prompt) -> BackendFuture<Result<()>> {
         self.inner.steer(key, prompt)

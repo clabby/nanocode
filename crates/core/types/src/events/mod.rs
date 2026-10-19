@@ -4,5 +4,5 @@ pub mod stream;
 
 pub use stream::{
     AgentEventPublisher, AgentEventTiming, AgentEvents, EventError, TimedAgentEvent,
-    monotonic_now_ns,
+    WeakAgentEventPublisher, monotonic_now_ns,
 };

@@ -8,12 +8,18 @@ use nanocode_agent_core::{
     backend::{AgentFactory, AgentOwner, BackendFuture, adopt},
 };
 use std::{
+    collections::HashMap,
     future::Future,
     marker::PhantomData,
     path::{Path, PathBuf},
     pin::pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
+
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 type Result<T> = nanocode_agent_core::Result<T>;
 
@@ -24,7 +30,12 @@ type Recipe = Arc<dyn Fn(AgentSpec) -> BackendFuture<AgentResult> + Send + Sync>
 
 pub type SubagentUpdates =
     tokio::sync::mpsc::UnboundedReceiver<nanocode_subagents::ScopedAgentUpdate>;
-type UpdateSlot = Arc<Mutex<Option<SubagentUpdates>>>;
+type UpdateSlot = Arc<ArcSwapOption<SubagentUpdates>>;
+
+fn take_updates(slot: &UpdateSlot) -> Option<SubagentUpdates> {
+    slot.swap(None)
+        .and_then(|updates| Arc::try_unwrap(updates).ok())
+}
 
 macro_rules! settings_methods {
     () => {
@@ -324,10 +335,7 @@ fn assemble(
     let workspace: Arc<Path> = resolve_workspace(data.workspace)?.into();
 
     let ownership = Arc::new(Ownership::default());
-    *ownership
-        .services
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(&services));
+    let _ = ownership.services.set(Arc::downgrade(&services));
     let backend_defaults: Vec<_> = data
         .backends
         .iter()
@@ -370,7 +378,8 @@ fn assemble(
         }
         (Some(registry), Some(control), Some(updates))
     };
-    let subagent_updates: UpdateSlot = Arc::new(Mutex::new(subagent_updates));
+    let subagent_updates: UpdateSlot =
+        Arc::new(ArcSwapOption::from(subagent_updates.map(Arc::new)));
     let mut recipes: Vec<(HarnessFamily, Recipe)> = Vec::new();
 
     for backend in data.backends {
@@ -605,12 +614,7 @@ fn unclaimed_updates_recipe(recipe: Recipe, updates: UpdateSlot) -> Recipe {
         let recipe = recipe.clone();
         let updates = updates.clone();
         Box::pin(async move {
-            drop(
-                updates
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take(),
-            );
+            drop(take_updates(&updates));
             recipe(spec).await
         })
     })
@@ -626,11 +630,18 @@ fn persistent_recipe(
         let store = store.clone();
         let workspace = workspace.clone();
         Box::pin(async move {
+            let mut interrupted = Vec::new();
             if spec.durable_state.is_none()
                 && let Some(checkpoint) = &spec.checkpoint
             {
                 match store.load(checkpoint.session_id()).await {
                     Ok(stored) => {
+                        interrupted = stored
+                            .turns
+                            .iter()
+                            .filter(|turn| turn.status == crate::durability::TurnStatus::Pending)
+                            .map(|turn| (turn.id.clone(), turn.input.clone()))
+                            .collect();
                         let record = &stored.summary.record;
                         let automatic_restore = spec.parent.is_some();
                         if record.family() != checkpoint.family()
@@ -690,7 +701,8 @@ fn persistent_recipe(
                 spec.durable_state =
                     Some(store.prepare_session(record).await.map_err(catalog_error)?);
             }
-            recipe(spec).await
+            let (agent, events) = recipe(spec).await?;
+            Ok((agent.with_interrupted_turns(interrupted), events))
         })
     })
 }
@@ -760,15 +772,23 @@ impl AgentRuntime {
 
     #[must_use]
     pub fn take_subagent_updates(&self) -> Option<SubagentUpdates> {
-        self.inner
-            .subagent_updates
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        take_updates(&self.inner.subagent_updates)
     }
 
     pub async fn resume(&self, checkpoint: SessionCheckpoint) -> AgentResult {
         checkpoint.validate()?;
+        let _opening = match &self.inner.durability {
+            Some(_) => match self
+                .inner
+                .ownership
+                .open_session(checkpoint.session_id())
+                .await
+            {
+                Opened::Live(agent) => return Ok(attached(agent)),
+                Opened::Vacant(opening, _) => Some(opening),
+            },
+            None => None,
+        };
         let model = checkpoint.model();
         let thinking = checkpoint.thinking();
         self.construct(AgentSpec {
@@ -801,8 +821,12 @@ impl AgentRuntime {
         session_id: &str,
     ) -> AgentResult {
         let configured = self.configured_store(store)?;
+        let opening = match self.inner.ownership.open_session(session_id).await {
+            Opened::Live(agent) => return Ok(attached(agent)),
+            Opened::Vacant(opening, _) => opening,
+        };
         let stored = configured.load(session_id).await.map_err(catalog_error)?;
-        self.open_loaded(store, &stored).await
+        self.open_stored(configured, &stored, opening).await
     }
 
     pub async fn open_loaded(
@@ -811,6 +835,24 @@ impl AgentRuntime {
         stored: &crate::durability::StoredSession,
     ) -> AgentResult {
         let configured = self.configured_store(store)?;
+        let session_id = &stored.summary.record.session_id;
+        let (opening, replaced) = match self.inner.ownership.open_session(session_id).await {
+            Opened::Live(agent) => return Ok(attached(agent)),
+            Opened::Vacant(opening, replaced) => (opening, replaced),
+        };
+        if replaced {
+            let reloaded = configured.load(session_id).await.map_err(catalog_error)?;
+            return self.open_stored(configured, &reloaded, opening).await;
+        }
+        self.open_stored(configured, stored, opening).await
+    }
+
+    async fn open_stored(
+        &self,
+        configured: &crate::durability::SessionStore,
+        stored: &crate::durability::StoredSession,
+        _opening: SessionOpening,
+    ) -> AgentResult {
         let model = stored.summary.record.model.clone();
         let thinking = stored
             .session_checkpoint()
@@ -857,6 +899,14 @@ impl AgentRuntime {
                 durable_state: Some(durable_state),
             })
             .await?;
+        let agent = agent.with_interrupted_turns(
+            stored
+                .turns
+                .iter()
+                .filter(|turn| turn.status == crate::durability::TurnStatus::Pending)
+                .map(|turn| (turn.id.clone(), turn.input.clone()))
+                .collect(),
+        );
         match inherited {
             Some(transcript) => Ok((agent.with_transcript(transcript)?, events)),
             None => Ok((agent, events)),
@@ -1192,6 +1242,11 @@ fn not_configured(family: HarnessFamily) -> NanocodeError {
     ))
 }
 
+fn attached(agent: Agent) -> (Agent, AgentEvents) {
+    let events = agent.subscribe();
+    (agent, events)
+}
+
 pub(crate) fn catalog_error(error: crate::durability::Error) -> NanocodeError {
     match error {
         crate::durability::Error::SessionNotFound { .. } => {
@@ -1204,22 +1259,60 @@ pub(crate) fn catalog_error(error: crate::durability::Error) -> NanocodeError {
     }
 }
 
+const CLOSED: usize = 1 << (usize::BITS - 1);
+
 #[derive(Default)]
 pub(crate) struct Ownership {
-    state: Mutex<OwnershipState>,
-    services: Mutex<Option<std::sync::Weak<dyn HostServices>>>,
+    admissions: AtomicUsize,
+    drained: AtomicBool,
+    owned: ArcSwap<Vec<(usize, WeakAgent)>>,
+    children: ArcSwap<Vec<WeakAgent>>,
+    opening: ArcSwap<HashMap<String, Arc<Opening>>>,
+    services: OnceLock<std::sync::Weak<dyn HostServices>>,
     idle: tokio::sync::Notify,
     stopped: tokio::sync::OnceCell<Option<Arc<ShutdownError>>>,
 }
 
-#[derive(Default)]
-struct OwnershipState {
-    closed: bool,
-    drained: bool,
-    in_flight: usize,
-    owned: Vec<(usize, Agent)>,
-    children: Vec<WeakAgent>,
-    failures: Vec<String>,
+struct Opening {
+    finish: ArcSwapOption<tokio::sync::oneshot::Sender<()>>,
+    finished: futures_util::future::Shared<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Opening {
+    fn new() -> Arc<Self> {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        Arc::new(Self {
+            finish: ArcSwapOption::from_pointee(finish),
+            finished: futures_util::FutureExt::shared(finished),
+        })
+    }
+}
+
+struct SessionOpening {
+    ownership: Arc<Ownership>,
+    session_id: String,
+    opening: Arc<Opening>,
+}
+
+impl Drop for SessionOpening {
+    fn drop(&mut self) {
+        self.ownership.opening.rcu(|opening| {
+            let mut opening = HashMap::clone(opening);
+            if opening
+                .get(&self.session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.opening))
+            {
+                opening.remove(&self.session_id);
+            }
+            opening
+        });
+        drop(self.opening.finish.swap(None));
+    }
+}
+
+enum Opened {
+    Live(Agent),
+    Vacant(SessionOpening, bool),
 }
 
 struct Admission<'a>(&'a Ownership);
@@ -1231,16 +1324,51 @@ impl Drop for Admission<'_> {
 }
 
 impl Ownership {
-    fn lock(&self) -> MutexGuard<'_, OwnershipState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn services(&self) -> Option<Arc<dyn HostServices>> {
+        self.services.get().and_then(std::sync::Weak::upgrade)
     }
 
     fn agent(&self, session_id: &str) -> Option<Agent> {
-        self.lock()
-            .owned
+        self.owned
+            .load()
             .iter()
-            .find(|(_, agent)| agent.session_id() == session_id)
-            .map(|(_, agent)| agent.clone())
+            .filter(|(_, agent)| agent.session_id() == session_id)
+            .find_map(|(_, agent)| agent.upgrade())
+    }
+
+    async fn open_session(self: &Arc<Self>, session_id: &str) -> Opened {
+        loop {
+            let opening = Opening::new();
+            let previous = self.opening.rcu(|current| {
+                let mut next = HashMap::clone(current);
+                next.entry(session_id.to_owned())
+                    .or_insert_with(|| Arc::clone(&opening));
+                next
+            });
+            if let Some(concurrent) = previous.get(session_id) {
+                let _ = concurrent.finished.clone().await;
+                continue;
+            }
+            let opening = SessionOpening {
+                ownership: Arc::clone(self),
+                session_id: session_id.to_owned(),
+                opening,
+            };
+            return match self.agent(session_id) {
+                Some(live) if !live.is_stopped() => Opened::Live(live),
+                Some(stopped) => {
+                    if let Err(error) = stopped.shutdown().await {
+                        tracing::warn!(
+                            session.id = session_id,
+                            %error,
+                            "the session's stopped agent failed to shut down before reopening"
+                        );
+                    }
+                    Opened::Vacant(opening, true)
+                }
+                None => Opened::Vacant(opening, false),
+            };
+        }
     }
 
     fn admission(&self) -> Result<Admission<'_>> {
@@ -1267,24 +1395,18 @@ impl Ownership {
     {
         let admission = self.admission()?;
         let created = construct.await?;
-        {
-            let mut state = self.lock();
-            state.children.retain(WeakAgent::is_live);
-            state
-                .children
-                .extend(created.iter().map(|(agent, _)| agent.downgrade()));
-        }
-        {
-            let runners = self
-                .services
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            if let Some(runners) = runners {
-                for (agent, _) in &created {
-                    runners.register(agent, false).await?;
-                }
+        let weak: Vec<_> = created.iter().map(|(agent, _)| agent.downgrade()).collect();
+        self.children.rcu(|children| {
+            children
+                .iter()
+                .filter(|child| child.is_live())
+                .chain(&weak)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        if let Some(runners) = self.services() {
+            for (agent, _) in &created {
+                runners.register(agent, false).await?;
             }
         }
         drop(admission);
@@ -1295,38 +1417,37 @@ impl Ownership {
         let outcome = self
             .stopped
             .get_or_init(|| async {
-                self.lock().closed = true;
+                self.admissions.fetch_or(CLOSED, Ordering::AcqRel);
                 loop {
                     let mut idle = pin!(self.idle.notified());
                     idle.as_mut().enable();
-                    if self.lock().in_flight == 0 {
+                    if self.admissions.load(Ordering::Acquire) & !CLOSED == 0 {
                         break;
                     }
                     idle.await;
                 }
-                self.lock().drained = true;
-
+                self.drained.store(true, Ordering::Release);
+                let mut failures = Vec::new();
                 loop {
-                    let next = self.lock().owned.last().cloned();
+                    let next = self.owned.load().last().cloned();
                     let Some((key, agent)) = next else { break };
-                    let result = agent.shutdown().await;
-                    let mut state = self.lock();
-                    state.owned.retain(|(owned, _)| *owned != key);
-                    if let Err(error) = result {
-                        state.failures.push(error.to_string());
+                    if let Some(Err(error)) = agent.shutdown().await {
+                        failures.push(error.to_string());
                     }
+                    self.forget(key);
                 }
                 loop {
-                    let next = self.lock().children.last().cloned();
+                    let next = self.children.load().last().cloned();
                     let Some(child) = next else { break };
-                    let result = child.shutdown().await;
-                    let mut state = self.lock();
-                    state.children.pop();
-                    if let Some(Err(error)) = result {
-                        state.failures.push(error.to_string());
+                    if let Some(Err(error)) = child.shutdown().await {
+                        failures.push(error.to_string());
                     }
+                    self.children.rcu(|children| {
+                        let mut children = Vec::clone(children);
+                        children.pop();
+                        children
+                    });
                 }
-                let failures = std::mem::take(&mut self.lock().failures);
                 (!failures.is_empty()).then(|| Arc::new(ShutdownError(failures)))
             })
             .await;
@@ -1338,40 +1459,61 @@ impl Ownership {
             }),
         }
     }
+
+    fn forget(&self, key: usize) -> Option<String> {
+        let previous = self.owned.rcu(|owned| {
+            owned
+                .iter()
+                .filter(|(owned, agent)| *owned != key && agent.is_live())
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        previous
+            .iter()
+            .find(|(owned, _)| *owned == key)
+            .map(|(_, agent)| agent.session_id().to_owned())
+    }
 }
 
 impl AgentOwner for Ownership {
     fn admit(&self) -> Result<()> {
-        let mut state = self.lock();
-        if state.closed {
-            return Err(NanocodeError::AgentStopped);
+        let mut current = self.admissions.load(Ordering::Acquire);
+        loop {
+            if current & CLOSED != 0 {
+                return Err(NanocodeError::AgentStopped);
+            }
+            match self.admissions.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
         }
-        state.in_flight += 1;
-        Ok(())
     }
 
     fn finish(&self) {
-        let mut state = self.lock();
-        state.in_flight -= 1;
-        if state.in_flight == 0 {
+        if self.admissions.fetch_sub(1, Ordering::AcqRel) & !CLOSED == 1 {
             self.idle.notify_waiters();
         }
     }
 
     fn adopt(&self, key: usize, agent: Agent) -> bool {
-        let mut state = self.lock();
-        if state.drained {
+        if self.drained.load(Ordering::Acquire) {
             return false;
         }
-        state.owned.push((key, agent.clone()));
-        drop(state);
-        if let Some(services) = self
-            .services
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade)
-        {
+        let weak = agent.downgrade();
+        self.owned.rcu(|owned| {
+            owned
+                .iter()
+                .filter(|(_, agent)| agent.is_live())
+                .cloned()
+                .chain(std::iter::once((key, weak.clone())))
+                .collect::<Vec<_>>()
+        });
+        if let Some(services) = self.services() {
             #[cfg(not(target_family = "wasm"))]
             tokio::spawn(async move {
                 let _ = services.register(&agent, false).await;
@@ -1385,31 +1527,13 @@ impl AgentOwner for Ownership {
     }
 
     fn release(&self, key: usize) {
-        let session_id;
-        {
-            let mut state = self.lock();
-            {
-                session_id = state
-                    .owned
-                    .iter()
-                    .find(|(owned, _)| *owned == key)
-                    .map(|(_, agent)| agent.session_id().to_owned());
-            }
-            state.owned.retain(|(owned, _)| *owned != key);
-        }
-        if let Some(session_id) = session_id
-            && let Some(runners) = self
-                .services
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
+        if let Some(session_id) = self.forget(key)
+            && let Some(runners) = self.services()
         {
             runners.unregister(&session_id);
         }
     }
 }
-
 #[derive(Debug)]
 struct ShutdownError(Vec<String>);
 

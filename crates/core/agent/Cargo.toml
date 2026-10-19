@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 description = "Backend-independent agent lifecycle, handles and session contracts"
 [dependencies]
+arc-swap.workspace = true
 nanocode-agent-types.workspace = true
 nanocode-platform.workspace = true
 nanocode-home.workspace = true
@@ -18,6 +19,7 @@ futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 [lints]
 workspace = true
 

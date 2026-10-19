@@ -11,6 +11,8 @@ autotests = false
 autobenches = false
 
 [dependencies]
+arc-swap.workspace = true
+futures-util.workspace = true
 tracing.workspace = true
 nanocode-agent-config.workspace = true
 nanocode-agent-core.workspace = true

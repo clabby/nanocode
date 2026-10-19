@@ -383,10 +383,8 @@ pub trait StateStore: Send {
 
     fn peek<'a>(
         &'a mut self,
-        _state_id: &'a str,
-    ) -> StoreFuture<'a, Result<StoredState, StoreError>> {
-        Box::pin(async { Err(read_only_unsupported()) })
-    }
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<StoredState, StoreError>>;
 
     fn list_states<'a>(
         &'a mut self,
@@ -474,6 +472,10 @@ pub trait StateStore: Send {
 
     fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn concurrent_handle(&self) -> Option<Box<dyn StateStore>> {
+        None
     }
 }
 
@@ -501,10 +503,8 @@ pub trait StateStore {
 
     fn peek<'a>(
         &'a mut self,
-        _state_id: &'a str,
-    ) -> StoreFuture<'a, Result<StoredState, StoreError>> {
-        Box::pin(async { Err(read_only_unsupported()) })
-    }
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<StoredState, StoreError>>;
 
     fn list_states<'a>(
         &'a mut self,
@@ -592,6 +592,10 @@ pub trait StateStore {
 
     fn flush(&mut self) -> StoreFuture<'_, Result<(), StoreError>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn concurrent_handle(&self) -> Option<Box<dyn StateStore>> {
+        None
     }
 }
 

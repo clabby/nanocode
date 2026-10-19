@@ -1,9 +1,6 @@
-use std::{
-    fmt,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, RwLock, RwLockReadGuard},
-};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
+
+use arc_swap::ArcSwap;
 
 use nanocode_agent_core::{HarnessFamily, SessionCheckpoint, session::TranscriptItem};
 use serde_json::Value;
@@ -55,27 +52,25 @@ pub trait CheckpointFormat: Send + Sync {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Formats(Arc<RwLock<Vec<Arc<dyn CheckpointFormat>>>>);
+pub(crate) struct Formats(Arc<ArcSwap<Vec<Arc<dyn CheckpointFormat>>>>);
 
 impl Formats {
-    fn read(&self) -> Result<RwLockReadGuard<'_, Vec<Arc<dyn CheckpointFormat>>>> {
-        self.0
-            .read()
-            .map_err(|_| Error::InvalidState("checkpoint format registry poisoned".into()))
-    }
-
     pub(crate) fn register(&self, format: Arc<dyn CheckpointFormat>) -> Result<()> {
-        let mut formats = self
-            .0
-            .write()
-            .map_err(|_| Error::InvalidState("checkpoint format registry poisoned".into()))?;
-        formats.retain(|known| known.family() != format.family());
-        formats.push(format);
+        let family = format.family();
+        self.0.rcu(|formats| {
+            formats
+                .iter()
+                .filter(|known| known.family() != family)
+                .cloned()
+                .chain(std::iter::once(Arc::clone(&format)))
+                .collect::<Vec<_>>()
+        });
         Ok(())
     }
 
     pub(crate) fn family(&self, family: HarnessFamily) -> Result<Arc<dyn CheckpointFormat>> {
-        self.read()?
+        self.0
+            .load()
             .iter()
             .find(|format| format.family() == family)
             .cloned()
@@ -83,7 +78,8 @@ impl Formats {
     }
 
     pub(crate) fn owner(&self, checkpoint: &Value) -> Result<Arc<dyn CheckpointFormat>> {
-        self.read()?
+        self.0
+            .load()
             .iter()
             .find(|format| format.owns(checkpoint))
             .cloned()
@@ -95,11 +91,7 @@ impl Formats {
 
 impl fmt::Debug for Formats {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let families: Vec<_> = self
-            .0
-            .read()
-            .map(|formats| formats.iter().map(|format| format.family()).collect())
-            .unwrap_or_default();
+        let families: Vec<_> = self.0.load().iter().map(|format| format.family()).collect();
         formatter.debug_list().entries(families).finish()
     }
 }

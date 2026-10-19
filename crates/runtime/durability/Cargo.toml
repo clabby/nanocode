@@ -18,6 +18,7 @@ description = "Portable durable execution state and stores for Nanocode"
 rustdoc-args = ["-D", "warnings"]
 
 [dependencies]
+arc-swap.workspace = true
 nanocode-durability-core.workspace = true
 nanocode-platform.workspace = true
 nanocode-agent-core.workspace = true

@@ -384,6 +384,10 @@ pub trait LifecycleBackend: Send + Sync + 'static {
     }
 
     fn shutdown(&self) -> BackendFuture<Result<()>>;
+
+    fn is_stopped(&self) -> bool {
+        false
+    }
 }
 
 #[doc(hidden)]
@@ -458,6 +462,7 @@ impl BackendRuntime {
             session: Arc::new(session),
             driver_turn_ids: self.driver_turn_ids,
             seed: Arc::default(),
+            interrupted: Arc::default(),
         }
     }
 }
