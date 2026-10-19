@@ -975,12 +975,12 @@ impl Tool for CallbackTool {
 
 struct HandCallbacks {
     bus: Arc<CallbackBus>,
-    name: Option<String>,
+    name: Mutex<Option<String>>,
 }
 
 impl HandCalls for HandCallbacks {
     fn here(&self, hand: &str) -> bool {
-        self.name.as_deref() == Some(hand)
+        self.name.lock().unwrap().as_deref() == Some(hand)
     }
 
     fn call<'a>(
@@ -1293,10 +1293,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         next: AtomicU64::new(0),
         timeout: options.callback_timeout,
     });
-    let hands: Arc<dyn HandCalls> = Arc::new(HandCallbacks {
+    let callbacks = Arc::new(HandCallbacks {
         bus: Arc::clone(&bus),
-        name: options.name,
+        name: Mutex::new(options.name),
     });
+    let hands: Arc<dyn HandCalls> = callbacks.clone();
     let mut runtimes = Sessions(HashMap::new());
     let mut tasks = tokio::task::JoinSet::new();
     let result = async {
@@ -1322,6 +1323,9 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                         continue;
                                     }
                                 }
+                            }
+                            if let RemoteOperation::Execute { hand: Some(hand), .. } = &operation {
+                                *callbacks.name.lock().unwrap() = Some(hand.clone());
                             }
                             if let RemoteOperation::Execute { local_tools, context, .. } = &operation
                                 && let Some((_, catalog)) = runtimes.get(&session_id)

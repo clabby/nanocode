@@ -189,7 +189,7 @@ impl CodeModeExecutors {
         host: Arc<dyn CodeModeHost>,
     ) -> Option<Arc<dyn CodeModeHost>> {
         let name = name.into();
-        host.route_hands(self.calls());
+        host.route_hands(&name, self.calls());
         let mut state = self.state();
         let previous = state.executors.insert(Arc::clone(&name), host);
         if previous.is_some() {

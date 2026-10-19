@@ -1,6 +1,6 @@
 mod executors;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub use executors::{CodeModeExecutors, ExecutorSelection, HandRoute, HandsTool, Placement};
 
@@ -90,6 +90,8 @@ pub enum RemoteOperation {
         source: String,
         context: RemoteContext,
         local_tools: Vec<ToolDefinition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hand: Option<String>,
     },
     Wait {
         input: String,
@@ -140,6 +142,7 @@ pub trait RemoteTransport: Send + Sync + 'static {
 pub struct RemoteCodeModeHost {
     transport: Arc<dyn RemoteTransport>,
     definitions: Vec<ToolDefinition>,
+    hand: Mutex<Option<String>>,
 }
 
 impl RemoteCodeModeHost {
@@ -147,6 +150,7 @@ impl RemoteCodeModeHost {
         Self {
             transport: Arc::new(transport),
             definitions,
+            hand: Mutex::new(None),
         }
     }
 
@@ -199,6 +203,11 @@ impl CodeModeHost for RemoteCodeModeHost {
             source: source.into(),
             context: RemoteContext::from_context(context),
             local_tools: tools.iter().map(|tool| tool.definition()).collect(),
+            hand: self
+                .hand
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         };
         Box::pin(async move { self.run(operation, tools, observer).await })
     }
@@ -238,7 +247,8 @@ impl CodeModeHost for RemoteCodeModeHost {
             ToolOutput::from_wire(wire).map_err(|error| CodeModeHostError::new(error.to_string()))
         })
     }
-    fn route_hands(&self, hands: Arc<dyn HandCalls>) {
+    fn route_hands(&self, name: &str, hands: Arc<dyn HandCalls>) {
+        *self.hand.lock().unwrap_or_else(PoisonError::into_inner) = Some(name.into());
         self.transport.route_hands(hands);
     }
     fn begin_turn(&self, session_id: &str) {
