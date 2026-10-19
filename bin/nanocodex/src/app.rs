@@ -185,6 +185,7 @@ pub struct Ready {
     pub prompts: Vec<String>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingTurn {
     pub id: String,
     pub text: String,
@@ -235,6 +236,7 @@ pub struct Launch {
     pub thinking_override: Option<Thinking>,
     pub tier_override: Option<ServiceTier>,
     pub reload: Option<reload::State>,
+    pub reload_path: Option<PathBuf>,
 }
 
 pub struct App {
@@ -278,10 +280,11 @@ pub struct App {
     computer_use_notice: Option<String>,
     pub(crate) session_started: bool,
     pub(crate) tx: UnboundedSender<AppEvent>,
-    quit: bool,
+    pub(crate) quit: bool,
     reload: bool,
     reload_all: bool,
-    submissions: tokio::task::JoinSet<()>,
+    pub(crate) submissions: tokio::task::JoinSet<()>,
+    reload_side: Option<crate::side::SavedSide>,
     quit_armed: Option<Instant>,
     esc_armed: Option<Instant>,
     stashed_draft: Option<String>,
@@ -350,6 +353,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         reload: false,
         reload_all: false,
         submissions: tokio::task::JoinSet::new(),
+        reload_side: None,
         quit_armed: None,
         esc_armed: None,
         stashed_draft: None,
@@ -386,7 +390,12 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
     } else {
         let connection = app.connection(launch.resume.clone());
         match connection.await {
-            Ok(ready) => app.ready(ready),
+            Ok(ready) => {
+                app.ready(ready);
+                if let Some(path) = launch.reload_path {
+                    tokio::fs::remove_file(path).await?;
+                }
+            }
             Err(error) => {
                 app.starting = false;
                 app.notice(NoticeLevel::Error, error.to_string());
@@ -424,7 +433,9 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
                 AppEvent::Agent { generation, event } if generation == app.generation => {
                     app.agent_event(&event);
                 }
-                AppEvent::SteerSent { .. } => { app.handle_app(event); }
+                AppEvent::SteerSent { .. } => {
+                    app.handle_app(event);
+                }
                 _ => {}
             }
         }
@@ -508,7 +519,10 @@ fn reload_args(session: Option<&str>, state: PathBuf) -> Vec<std::ffi::OsString>
                 (required || present).then(|| original.next()).flatten()
             })
             .flatten();
-        if matches!(definition.get_id().as_str(), "resume" | "continue_last" | "reload_state") {
+        if matches!(
+            definition.get_id().as_str(),
+            "resume" | "continue_last" | "reload_state"
+        ) {
             continue;
         }
         args.push(arg);
@@ -533,7 +547,11 @@ fn reload(session: Option<String>, state: PathBuf) -> String {
     let error = std::process::Command::new(&program)
         .args(reload_args(session.as_deref(), state.clone()))
         .exec();
-    format!("reload failed to start {}: {error}; saved window state: {}", program.display(), state.display())
+    format!(
+        "reload failed to start {}: {error}; saved window state: {}",
+        program.display(),
+        state.display()
+    )
 }
 
 #[cfg(not(unix))]
@@ -629,6 +647,11 @@ impl App {
         let mut scheduler = RenderScheduler::new(DISPLAY_FRAME, Instant::now());
         let mut metrics = crate::telemetry::FrameMetrics::new();
         while !self.quit {
+            while let Some(result) = self.submissions.try_join_next() {
+                if let Err(error) = result {
+                    self.notice(NoticeLevel::Error, format!("prompt task failed: {error}"));
+                }
+            }
             metrics.wakeup();
             let now = Instant::now();
             if scheduler.is_due(now) {
@@ -687,7 +710,7 @@ impl App {
                 event = rx.recv() => {
                     let Some(event) = event else { break };
                     let immediate = self.handle_app(event);
-                    while let Ok(event) = rx.try_recv() {
+                    while !self.quit && let Ok(event) = rx.try_recv() {
                         self.handle_app(event);
                     }
                     metrics.stream();
@@ -1136,6 +1159,9 @@ impl App {
             }
         });
         self.agent = Some(ready.agent);
+        if let Some(side) = self.reload_side.take() {
+            self.restore_side(side);
+        }
         self.refresh_agents();
         self.notice(NoticeLevel::Info, ready.notice);
         let unavailable = self.host.runtime.computer_use_unavailable();
@@ -1297,7 +1323,13 @@ impl App {
                         .map(|item| item.id.clone());
                     if let Some(found) = found {
                         self.queue.remove(&found);
+                        self.resumes.remove(&found);
+                        self.attachments_by_id.remove(&found);
                     }
+                }
+                if let Some(item) = removed {
+                    self.resumes.remove(&item.id);
+                    self.attachments_by_id.remove(&item.id);
                 }
             }
             Some(Accepted::Prompt { request_id }) => {
@@ -1314,14 +1346,19 @@ impl App {
                             .map(|item| item.id.clone())?;
                         self.queue.remove(&sent)
                     });
-                drop(found);
+                if let Some(item) = found {
+                    self.resumes.remove(&item.id);
+                    self.attachments_by_id.remove(&item.id);
+                }
             }
             None => {}
         }
     }
 
     fn settle_turn(&mut self) {
-        if self.quit { return; }
+        if self.quit {
+            return;
+        }
         self.awaiting_terminal = false;
         let unaccepted = self
             .queue
@@ -1483,7 +1520,9 @@ impl App {
 
     fn flush_pending_steers(&mut self) {
         let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "flush_pending_steers", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
-        if self.quit { return; }
+        if self.quit {
+            return;
+        }
         if matches!(self.turn, TurnState::External(_)) {
             self.route_pending_steers();
             return;
@@ -1501,10 +1540,16 @@ impl App {
         let control = control.clone();
         for (id, text) in pending {
             self.queue.set_state(&id, QueueState::Sent);
-            let prompt = self.resumes.get(&id).map(|(prompt, _)| prompt.clone()).unwrap_or_else(|| crate::extras::prompt_for(
-                &text,
-                self.attachments_by_id.get(&id).map_or(&[], Vec::as_slice),
-            ));
+            let prompt = self
+                .resumes
+                .get(&id)
+                .map(|(prompt, _)| prompt.clone())
+                .unwrap_or_else(|| {
+                    crate::extras::prompt_for(
+                        &text,
+                        self.attachments_by_id.get(&id).map_or(&[], Vec::as_slice),
+                    )
+                });
             let control = control.clone();
             let tx = self.tx.clone();
             let generation = self.generation;
@@ -1536,10 +1581,16 @@ impl App {
         let generation = self.generation;
         for (id, text) in pending {
             self.queue.set_state(&id, QueueState::Sent);
-            let prompt = self.resumes.get(&id).map(|(prompt, _)| prompt.clone()).unwrap_or_else(|| crate::extras::prompt_for(
-                &text,
-                self.attachments_by_id.get(&id).map_or(&[], Vec::as_slice),
-            ));
+            let prompt = self
+                .resumes
+                .get(&id)
+                .map(|(prompt, _)| prompt.clone())
+                .unwrap_or_else(|| {
+                    crate::extras::prompt_for(
+                        &text,
+                        self.attachments_by_id.get(&id).map_or(&[], Vec::as_slice),
+                    )
+                });
             let agent = agent.clone();
             let tx = self.tx.clone();
             self.submissions.spawn(async move {

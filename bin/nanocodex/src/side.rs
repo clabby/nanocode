@@ -3,7 +3,7 @@ use std::{collections::HashSet, time::Instant};
 use tokio::task::AbortHandle;
 
 use nanocode::{
-    ForkRequest, TurnControl,
+    ForkRequest, PromptRequest, TurnControl,
     agent::{
         Agent,
         events::{AgentEvent, AgentEventKind},
@@ -16,7 +16,10 @@ use nanocode_tui::{
 };
 
 use crate::{
-    app::{App, AppEvent, BtwUpdate, DIFF_PREVIEW_LINES, QUIT_CONFIRMATION, TOOL_PREVIEW_LINES},
+    app::{
+        App, AppEvent, BtwUpdate, DIFF_PREVIEW_LINES, PendingTurn, QUIT_CONFIRMATION,
+        TOOL_PREVIEW_LINES,
+    },
     events::EventMapper,
 };
 
@@ -34,9 +37,9 @@ const COLLAPSE_INSTRUCTION: &str = "The user finished a /btw side conversation f
 
 const EARLIER: &str = "Earlier questions and answers in this side conversation, for context:";
 
-const SIDE_COMMANDS: [&str; 13] = [
+const SIDE_COMMANDS: [&str; 15] = [
     "btw", "collapse", "split", "close", "zoom", "copy", "id", "expand", "mouse", "help", "keys",
-    "quit", "exit",
+    "quit", "exit", "reload", "restart",
 ];
 
 pub fn prompt_display(text: &str) -> &str {
@@ -55,6 +58,11 @@ pub fn prompt_display(text: &str) -> &str {
 
 pub enum SideUpdate {
     Forked(Agent),
+    Restored {
+        agent: Agent,
+        pending: Vec<PendingTurn>,
+        history: Vec<nanocode::durability::TranscriptItem>,
+    },
     ForkFailed(String),
     Event(AgentEvent),
     Started(TurnControl),
@@ -84,6 +92,22 @@ pub struct SidePane {
     asks: HashSet<u64>,
     asking: Option<(u64, AbortHandle)>,
     since: Option<Instant>,
+    current: Option<PendingTurn>,
+    resumes: Vec<PendingTurn>,
+    session_hint: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct SavedSide {
+    session: Option<String>,
+    owner: Option<AgentId>,
+    exchanges: Vec<(bool, String)>,
+    waiting: Vec<String>,
+    current: Option<PendingTurn>,
+    first: bool,
+    completed: bool,
+    active: bool,
+    zoomed: bool,
 }
 
 impl SidePane {
@@ -124,6 +148,31 @@ pub struct Panes {
 }
 
 impl Panes {
+    pub(crate) fn saved(&self) -> Option<SavedSide> {
+        let side = self.side.as_ref()?;
+        let mut exchanges = side.exchanges.clone();
+        let mut waiting = side.waiting.clone();
+        if side.busy
+            && matches!(side.mode, Mode::Questions)
+            && let Some((true, question)) = exchanges.pop()
+        {
+            waiting.insert(0, question);
+        }
+        Some(SavedSide {
+            session: match &side.mode {
+                Mode::Fork(agent) => Some(agent.session_id().to_owned()),
+                _ => side.session_hint.clone(),
+            },
+            owner: side.owner,
+            exchanges,
+            waiting,
+            current: side.current.clone(),
+            first: side.first,
+            completed: side.completed,
+            active: self.active,
+            zoomed: self.zoomed,
+        })
+    }
     pub const fn side_active(&self) -> bool {
         self.active && self.side.is_some()
     }
@@ -219,6 +268,30 @@ impl App {
     }
 
     fn open_side(&mut self) -> bool {
+        self.open_side_session(None)
+    }
+
+    pub(crate) fn restore_side(&mut self, saved: SavedSide) {
+        let focused = self.focus;
+        self.focus = saved.owner;
+        let restore = saved.session.map(|session| (session, saved.current));
+        let opened = self.open_side_session(restore);
+        self.focus = focused;
+        if !opened {
+            return;
+        }
+        if let Some(side) = self.panes.side.as_mut() {
+            side.exchanges = saved.exchanges;
+            side.waiting = saved.waiting;
+            side.first = saved.first;
+            side.completed = saved.completed;
+        }
+        self.panes.active = saved.active;
+        self.panes.zoomed = saved.zoomed;
+        self.side_next();
+    }
+
+    fn open_side_session(&mut self, restore: Option<(String, Option<PendingTurn>)>) -> bool {
         let _span = tracing::info_span!(target: "nanocodex", "nc.action", action.name = "open_side", session.id = self.agent.as_ref().map(|agent| agent.session_id())).entered();
         let Some(agent) = self.agent.clone() else {
             self.flash("the agent is still starting");
@@ -255,7 +328,7 @@ impl App {
             label,
             transcript,
             mapper: EventMapper::default(),
-            mode: if owner.is_some() {
+            mode: if owner.is_some() && restore.is_none() {
                 Mode::Questions
             } else {
                 Mode::Forking
@@ -269,12 +342,63 @@ impl App {
             asks: HashSet::new(),
             asking: None,
             since: None,
+            current: None,
+            resumes: Vec::new(),
+            session_hint: restore.as_ref().map(|(session, _)| session.clone()),
         });
         self.panes.zoomed = false;
-        if owner.is_none() {
+        if owner.is_none() || restore.is_some() {
             let tx = self.tx.clone();
+            let host = self.host.clone();
             tokio::spawn(async move {
                 let send = |update| tx.send(AppEvent::Side { pane: id, update }).is_ok();
+                if let Some((session, current)) = restore {
+                    let restored = async {
+                        let ready = crate::app::open_session(&host, &session, None, None).await?;
+                        let mut pending = ready.pending;
+                        if let Some(current) = current
+                            && !pending.iter().any(|turn| turn.id == current.id)
+                            && host
+                                .config
+                                .store
+                                .as_ref()
+                                .ok_or("side resume requires durability")?
+                                .turn(&session, &current.id)
+                                .await?
+                                .is_none()
+                        {
+                            pending.push(current);
+                        }
+                        Ok::<_, crate::host::Error>((
+                            ready.agent,
+                            ready.events,
+                            pending,
+                            ready.history.unwrap_or_default(),
+                        ))
+                    }
+                    .await;
+                    match restored {
+                        Ok((agent, mut events, pending, history)) => {
+                            if !send(SideUpdate::Restored {
+                                agent: agent.clone(),
+                                pending,
+                                history,
+                            }) {
+                                drop(agent.shutdown().await);
+                                return;
+                            }
+                            while let Some(event) = events.recv().await {
+                                if !send(SideUpdate::Event(event)) {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            send(SideUpdate::ForkFailed(error.to_string()));
+                        }
+                    }
+                    return;
+                }
                 match agent.fork(ForkRequest::latest().side_conversation()).await {
                     Ok((side, mut events)) => {
                         if !send(SideUpdate::Forked(side.clone())) {
@@ -314,10 +438,21 @@ impl App {
     }
 
     fn side_next(&mut self) {
+        if self.quit {
+            return;
+        }
         let Some(side) = self.panes.side.as_mut() else {
             return;
         };
-        if side.busy || side.waiting.is_empty() {
+        if side.busy || matches!(side.mode, Mode::Forking) {
+            return;
+        }
+        if !side.resumes.is_empty() {
+            let next = side.resumes.remove(0);
+            self.side_launch(next);
+            return;
+        }
+        if side.waiting.is_empty() {
             return;
         }
         let next = side.waiting.remove(0);
@@ -329,16 +464,31 @@ impl App {
         let Some(side) = self.panes.side.as_mut() else {
             return;
         };
-        let Mode::Fork(agent) = &side.mode else {
+        if !matches!(side.mode, Mode::Fork(_)) {
             return;
-        };
-        let agent = agent.clone();
+        }
         let sent = if std::mem::take(&mut side.first) {
             format!("{BTW_BOUNDARY}{question}")
         } else {
             question.clone()
         };
-        side.exchanges.push((true, question));
+        side.exchanges.push((true, question.clone()));
+        self.side_launch(PendingTurn {
+            id: uuid::Uuid::now_v7().to_string(),
+            text: question,
+            prompt: sent.into(),
+        });
+    }
+
+    fn side_launch(&mut self, turn: PendingTurn) {
+        let Some(side) = self.panes.side.as_mut() else {
+            return;
+        };
+        let Mode::Fork(agent) = &side.mode else {
+            return;
+        };
+        let agent = agent.clone();
+        side.current = Some(turn.clone());
         side.busy = true;
         side.since = Some(Instant::now());
         side.mapper.begin_turn();
@@ -346,9 +496,12 @@ impl App {
         side.transcript.scroll_to_bottom();
         let id = side.id;
         let tx = self.tx.clone();
-        tokio::spawn(async move {
+        self.submissions.spawn(async move {
             let send = |update| drop(tx.send(AppEvent::Side { pane: id, update }));
-            match agent.prompt(sent.as_str()).await {
+            match agent
+                .prompt(PromptRequest::new(turn.prompt).request_id(turn.id))
+                .await
+            {
                 Ok(turn) => {
                     send(SideUpdate::Started(turn.control()));
                     let result = turn
@@ -466,6 +619,17 @@ impl App {
             return;
         };
         match update {
+            SideUpdate::Restored {
+                agent,
+                pending,
+                history,
+            } => {
+                side.transcript.clear();
+                crate::sessions::replay(&mut side.transcript, history);
+                side.mode = Mode::Fork(agent);
+                side.resumes = pending;
+                self.side_next();
+            }
             SideUpdate::Forked(agent) => {
                 side.transcript.push(CellKind::Notice(
                     NoticeLevel::Info,
@@ -507,6 +671,7 @@ impl App {
             }
             SideUpdate::Started(control) => side.control = Some(control),
             SideUpdate::Finished(result) => {
+                side.current = None;
                 side.busy = false;
                 side.since = None;
                 side.control = None;
@@ -524,6 +689,7 @@ impl App {
                 self.side_next();
             }
             SideUpdate::PromptFailed(error) => {
+                side.current = None;
                 side.busy = false;
                 side.since = None;
                 side.exchanges.pop();

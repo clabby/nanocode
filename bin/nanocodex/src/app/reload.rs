@@ -17,6 +17,7 @@ pub(crate) struct State {
     pub model: ModelSelection,
     pub thinking: Thinking,
     pub tier: ServiceTier,
+    pub moved: bool,
     draft: String,
     attachments: Vec<PathBuf>,
     prompts: Vec<SavedPrompt>,
@@ -25,6 +26,7 @@ pub(crate) struct State {
     stashed_draft: Option<String>,
     pending_switch: Option<(ModelSelection, Thinking, ServiceTier)>,
     theme: Theme,
+    side: Option<crate::side::SavedSide>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -43,7 +45,10 @@ pub(crate) async fn read(path: &std::path::Path) -> Result<State> {
 impl App {
     pub(super) fn request_reload(&mut self, broadcast: bool) {
         if !cfg!(unix) {
-            self.notice(NoticeLevel::Error, "reload is not supported on this platform");
+            self.notice(
+                NoticeLevel::Error,
+                "reload is not supported on this platform",
+            );
             return;
         }
         if self.host.config.store.is_none() {
@@ -64,6 +69,7 @@ impl App {
             model: self.model.clone(),
             thinking: self.thinking,
             tier: self.tier,
+            moved: self.moved,
             draft: self.composer.text().to_owned(),
             attachments: self.attachments.clone(),
             prompts: self
@@ -72,17 +78,18 @@ impl App {
                 .iter()
                 .filter(|item| !(item.kind == QueueKind::Steer && item.state == QueueState::Sent))
                 .map(|item| {
-                    let (prompt, durable) = self.resumes.get(&item.id).cloned().unwrap_or_else(|| {
-                        (
-                            crate::extras::prompt_for(
-                                &item.text,
-                                self.attachments_by_id
-                                    .get(&item.id)
-                                    .map_or(&[], Vec::as_slice),
-                            ),
-                            false,
-                        )
-                    });
+                    let (prompt, durable) =
+                        self.resumes.get(&item.id).cloned().unwrap_or_else(|| {
+                            (
+                                crate::extras::prompt_for(
+                                    &item.text,
+                                    self.attachments_by_id
+                                        .get(&item.id)
+                                        .map_or(&[], Vec::as_slice),
+                                ),
+                                false,
+                            )
+                        });
                     SavedPrompt {
                         id: item.id.clone(),
                         text: item.text.clone(),
@@ -97,6 +104,7 @@ impl App {
             stashed_draft: self.stashed_draft.clone(),
             pending_switch: self.pending_switch.clone(),
             theme: self.theme.clone(),
+            side: self.panes.saved(),
         }
     }
 
@@ -108,13 +116,19 @@ impl App {
         self.stashed_draft = state.stashed_draft;
         self.pending_switch = state.pending_switch;
         self.theme = state.theme;
+        self.reload_side = state.side;
         self.resumes = HashMap::new();
         for item in state.prompts {
-            self.resumes.insert(item.id.clone(), (item.prompt, item.durable));
+            self.resumes
+                .insert(item.id.clone(), (item.prompt, item.durable));
             self.queue.push(QueuedPrompt {
                 id: item.id,
                 text: item.text,
-                kind: if item.steer { QueueKind::Steer } else { QueueKind::FollowUp },
+                kind: if item.steer {
+                    QueueKind::Steer
+                } else {
+                    QueueKind::FollowUp
+                },
                 state: QueueState::Pending,
             });
         }
@@ -144,8 +158,8 @@ impl Instance {
         }
         let path = directory.join(format!("{}.sock", std::process::id()));
         match tokio::fs::remove_file(&path).await {
-            Ok(()) => {},
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         let socket = std::sync::Arc::new(tokio::net::UnixDatagram::bind(&path)?);
@@ -155,21 +169,32 @@ impl Instance {
             loop {
                 match receiver.recv(&mut message).await {
                     Ok(length) if &message[..length] == REQUEST => {
-                        if tx.send(AppEvent::Reload).is_err() { break; }
-                    },
-                    Ok(_) => {},
+                        if tx.send(AppEvent::Reload).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
                     Err(error) => {
-                        drop(tx.send(AppEvent::Notice(NoticeLevel::Error, format!("reload listener: {error}"))));
+                        drop(tx.send(AppEvent::Notice(
+                            NoticeLevel::Error,
+                            format!("reload listener: {error}"),
+                        )));
                         break;
-                    },
+                    }
                 }
             }
         });
-        Ok(Self { socket, path, listener })
+        Ok(Self {
+            socket,
+            path,
+            listener,
+        })
     }
 
     pub(super) async fn broadcast(&self) -> Result<()> {
-        let mut entries = tokio::fs::read_dir(self.path.parent().ok_or("reload socket has no directory")?).await?;
+        let mut entries =
+            tokio::fs::read_dir(self.path.parent().ok_or("reload socket has no directory")?)
+                .await?;
         let mut failures = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
@@ -177,17 +202,25 @@ impl Instance {
                 continue;
             }
             match self.socket.send_to(REQUEST, &path).await {
-                Ok(_) => {},
-                Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound) => {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                    ) =>
+                {
                     if let Err(error) = tokio::fs::remove_file(&path).await
-                        && error.kind() != io::ErrorKind::NotFound {
+                        && error.kind() != io::ErrorKind::NotFound
+                    {
                         failures.push(format!("{}: {error}", path.display()));
                     }
-                },
+                }
                 Err(error) => failures.push(format!("{}: {error}", path.display())),
             }
         }
-        if !failures.is_empty() { return Err(failures.join("\n").into()); }
+        if !failures.is_empty() {
+            return Err(failures.join("\n").into());
+        }
         Ok(())
     }
 
@@ -195,7 +228,13 @@ impl Instance {
         use tokio::io::AsyncWriteExt;
         let path = self.path.with_extension("json");
         let bytes = serde_json::to_vec(state)?;
-        let mut file = tokio::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path).await?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .await?;
         file.write_all(&bytes).await?;
         file.sync_all().await?;
         Ok(path)
@@ -218,8 +257,16 @@ pub(super) struct Instance;
 
 #[cfg(not(unix))]
 impl Instance {
-    pub(super) async fn start(_: tokio::sync::mpsc::UnboundedSender<AppEvent>) -> Result<Self> { Ok(Self) }
-    pub(super) async fn broadcast(&self) -> Result<()> { Err("reload is not supported on this platform".into()) }
-    pub(super) async fn save(&self, _: &State) -> Result<PathBuf> { Err("reload is not supported on this platform".into()) }
-    pub(super) async fn close(self) -> Result<()> { Ok(()) }
+    pub(super) async fn start(_: tokio::sync::mpsc::UnboundedSender<AppEvent>) -> Result<Self> {
+        Ok(Self)
+    }
+    pub(super) async fn broadcast(&self) -> Result<()> {
+        Err("reload is not supported on this platform".into())
+    }
+    pub(super) async fn save(&self, _: &State) -> Result<PathBuf> {
+        Err("reload is not supported on this platform".into())
+    }
+    pub(super) async fn close(self) -> Result<()> {
+        Ok(())
+    }
 }

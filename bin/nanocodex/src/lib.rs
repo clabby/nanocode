@@ -243,7 +243,11 @@ async fn interactive(mut args: SessionArgs) -> Result<()> {
         None => None,
     };
     if let Some(state) = &reload {
-        args.resume.clone_from(&state.session);
+        args.resume = if state.moved {
+            Some(String::new())
+        } else {
+            state.session.clone()
+        };
         args.prompt = None;
         args.continue_last = false;
         args.model = Some(state.model.to_string());
@@ -305,6 +309,7 @@ async fn interactive(mut args: SessionArgs) -> Result<()> {
                 .transpose()?,
             tier_override: args.tier.as_deref().map(host::parse_tier).transpose()?,
             reload,
+            reload_path: args.reload_state,
         },
         terminal,
     )
