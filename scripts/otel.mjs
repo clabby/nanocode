@@ -52,6 +52,9 @@ Commands:
                          the same time (a machine-wide stall rather than this code path)
   trace <id>             Ancestors and descendant tree of a span (row id, span id or tool call id) with self time
   sessions               Sessions (threads) with turn, model and tool totals
+  breakdown              Turn wall time split exclusively into model calls, tool work (exec cells, waits, Codex
+                         tool calls and the terminal's tool calls), durable store writes and other (the agent
+                         loop itself), per session (--by model or --by none to aggregate)
   builds                 Executables that produced telemetry (path and build time), with processes, sessions and spans
   report                 Write an HTML report with tail (CCDF) plots, latency-over-time scatter plots and outliers
 
@@ -198,6 +201,7 @@ function openDb(file) {
   const sourceColumns = new Set(db.prepare("SELECT name FROM pragma_table_info('sources')").all().map((row) => row.name));
   if (!sourceColumns.has('executable')) db.exec('ALTER TABLE sources ADD COLUMN executable TEXT');
   if (!sourceColumns.has('built_us')) db.exec('ALTER TABLE sources ADD COLUMN built_us INTEGER');
+  if (db.prepare('SELECT 1 FROM spans LIMIT 1').get()) ensureIndexes(db);
   return db;
 }
 
@@ -873,6 +877,56 @@ function trace(db, options) {
   if (tree.length > limit + 1) console.log(`  … ${tree.length - limit - 1} more (raise --limit)`);
 }
 
+function breakdown(db, options) {
+  const since = sinceMicros(options.since);
+  const turns = db.prepare(`SELECT id, session_id, model, start_us, end_us FROM spans
+    WHERE ui = 0 AND name = 'agent.turn' AND session_id IS NOT NULL AND (? IS NULL OR start_us >= ?)
+      AND (? IS NULL OR session_id LIKE ? || '%') ORDER BY start_us`).all(since, since, options.session ?? null, options.session ?? null);
+  const parts = db.prepare(`SELECT name, start_us, end_us FROM spans INDEXED BY spans_agent_session
+    WHERE session_id = ? AND ui = 0 AND name IN ('model.call', 'model.compaction', 'model.warmup', 'code_mode.cell',
+      'code_mode.wait', 'tool.call', 'nc.tool_call', 'durability.store')
+      AND start_us < ? AND end_us > ?`);
+  const rank = { 'model.call': 0, 'model.compaction': 0, 'model.warmup': 0, 'code_mode.cell': 1, 'code_mode.wait': 1,
+    'tool.call': 1, 'nc.tool_call': 1, 'durability.store': 2 };
+  const labels = ['model calls', 'tools', 'durability', 'other'];
+  const key = options.by ?? 'session';
+  const totals = new Map();
+  for (const turn of turns) {
+    const edges = [];
+    for (const part of parts.all(turn.session_id, turn.end_us, turn.start_us)) {
+      edges.push([Math.max(part.start_us, turn.start_us), rank[part.name], 1]);
+      edges.push([Math.min(part.end_us, turn.end_us), rank[part.name], -1]);
+    }
+    edges.sort((a, b) => a[0] - b[0]);
+    const open = [0, 0, 0];
+    const spent = [0, 0, 0, 0];
+    let cursor = turn.start_us;
+    for (const [at, category, delta] of edges) {
+      const active = open.findIndex((count) => count > 0);
+      spent[active === -1 ? 3 : active] += at - cursor;
+      open[category] += delta;
+      cursor = at;
+    }
+    spent[3] += turn.end_us - cursor;
+    const group = key === 'model' ? turn.model : key === 'none' ? 'all' : turn.session_id;
+    let entry = totals.get(group);
+    if (!entry) totals.set(group, (entry = { turns: 0, wall: 0, spent: [0, 0, 0, 0] }));
+    entry.turns++;
+    entry.wall += turn.end_us - turn.start_us;
+    spent.forEach((value, index) => { entry.spent[index] += value; });
+  }
+  const rows = [...totals.entries()].sort((a, b) => b[1].wall - a[1].wall).slice(0, Number(options.limit ?? 25));
+  printTable(rows.map(([group, entry]) => {
+    const row = { [key === 'model' ? 'model' : key === 'none' ? 'scope' : 'session']: group, turns: entry.turns,
+      wall: fmtMs(entry.wall / 1000) };
+    labels.forEach((label, index) => {
+      row[label] = fmtMs(entry.spent[index] / 1000) + ' ' + (100 * entry.spent[index] / Math.max(entry.wall, 1)).toFixed(1) + '%';
+    });
+    row['other per turn'] = fmtMs(entry.spent[3] / 1000 / entry.turns);
+    return row;
+  }), options);
+}
+
 function builds(db, options) {
   const since = sinceMicros(options.since);
   const rows = db.prepare(`SELECT coalesce(src.executable, '-') AS executable, src.built_us,
@@ -1162,7 +1216,7 @@ if (!command || options.help || command === 'help') {
   console.log(HELP);
   process.exit(command ? 0 : 1);
 }
-const commands = { ingest: null, schema, sql, tails, outliers, trace, sessions, builds, report };
+const commands = { ingest: null, schema, sql, tails, outliers, trace, sessions, builds, breakdown, report };
 if (!(command in commands)) fail('unknown command ' + command + '\n\n' + HELP);
 const db = openDb(path.resolve(options.db ?? path.join(REPO, 'output', 'telemetry', 'telemetry.sqlite')));
 if (command === 'ingest' || !options['no-ingest']) {
