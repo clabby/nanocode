@@ -47,7 +47,9 @@ Commands:
   sql <query>            Run SQL against the cache. Tables: spans, events, links, metrics, sessions, callsites,
                          sources. Views: tools, cells, models, turns, frames
   tails                  Latency percentiles and log-scale histograms per group
-  outliers               Spans slower than their group's percentile threshold, with session, thread and arguments
+  outliers               Spans slower than their group's percentile threshold, with session, thread, process,
+                         arguments and how many other processes had a span of that name over the threshold at
+                         the same time (a machine-wide stall rather than this code path)
   trace <id>             Ancestors and descendant tree of a span (row id, span id or tool call id) with self time
   sessions               Sessions (threads) with turn, model and tool totals
   builds                 Executables that produced telemetry (path and build time), with processes, sessions and spans
@@ -734,8 +736,8 @@ function findOutliers(db, options) {
   const keys = groupKeys(options, filter.span ?? '');
   const above = Number(options.above ?? 99) / 100;
   const minimum = Number(options.min ?? 20);
-  const rows = db.prepare(`SELECT s.id, ${groupSql(keys)} AS grp, s.name, s.dur_ms, s.error, s.start_us, s.session_id,
-      s.thread_name, s.thread_id, s.call_id, s.status, s.attrs, c.file, c.line
+  const rows = db.prepare(`SELECT s.id, ${groupSql(keys)} AS grp, s.name, s.dur_ms, s.error, s.start_us, s.end_us,
+      s.pid, s.session_id, s.thread_name, s.thread_id, s.call_id, s.status, s.attrs, c.file, c.line
     FROM spans s LEFT JOIN callsites c ON c.id = s.callsite WHERE ${filter.where}`).all(...filter.params);
   const groups = new Map(groupStats(rows).map((group) => [group.name, group]));
   const skipped = [...groups.values()].filter((group) => group.n < minimum);
@@ -751,6 +753,9 @@ function findOutliers(db, options) {
 }
 
 function outlierRow(db, { row, group, threshold }, options) {
+  const elsewhere = db.prepare(`SELECT count(DISTINCT pid) AS n FROM spans
+    WHERE name = ? AND pid != ? AND start_us > ? AND start_us < ? AND end_us > ? AND dur_ms > ?`)
+    .get(row.name, row.pid, row.start_us - Math.ceil(group.max * 1000), row.end_us, row.start_us, threshold).n;
   return {
     id: row.id,
     at: fmtTime(row.start_us),
@@ -762,6 +767,8 @@ function outlierRow(db, { row, group, threshold }, options) {
     status: row.status ?? '-',
     session: options.json ? row.session_id : shortSession(row.session_id),
     thread: (row.thread_name ?? '-') + ':' + (row.thread_id ?? '-'),
+    pid: row.pid,
+    'slow elsewhere': elsewhere,
     call: row.call_id ?? '-',
     detail: detailFor(db, row),
     code: row.file ? row.file + ':' + row.line : '-',
