@@ -1,6 +1,9 @@
 #![cfg(not(target_family = "wasm"))]
 
-use std::{error::Error, io};
+use std::{
+    error::Error,
+    io::{self, Write},
+};
 
 use futures_util::{Stream, StreamExt, stream};
 use nanocode_zstd::{BlockHeader, BlockType, FrameHeader, StreamingDecoder, parse_frame_header};
@@ -165,6 +168,12 @@ fn decode_error(error: nanocode_zstd::Error) -> io::Error {
         io::ErrorKind::InvalidData
     };
     io::Error::new(kind, error)
+}
+
+pub fn gzip(bytes: &[u8], level: u32) -> io::Result<Vec<u8>> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+    encoder.write_all(bytes)?;
+    encoder.finish()
 }
 
 pub fn decode_response(mut response: reqwest::Response) -> reqwest::Response {

@@ -1912,6 +1912,7 @@ name = "nanocode-http"
 version = "0.6.7"
 dependencies = [
  "brotli-decompressor",
+ "flate2",
  "futures-util",
  "http",
  "nanocode-zstd",

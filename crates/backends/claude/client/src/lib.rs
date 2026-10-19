@@ -33,6 +33,12 @@ pub const ANTHROPIC_SUBSCRIPTION_MESSAGES_URL: &str =
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+const FIRST_PARTY_HOST: &str = "api.anthropic.com";
+const GZIP_MIN_BODY_BYTES: usize = 4096;
+const INVALID_JSON_MESSAGES: [&str; 2] = [
+    "The request body is not valid JSON",
+    "Failed to parse request: could not parse request body as JSON",
+];
 
 #[derive(Debug, Error)]
 pub enum ClaudeError {
@@ -100,6 +106,34 @@ fn retry_after(headers: &http::header::HeaderMap) -> Option<Duration> {
         .duration_since(nanocode_platform::UNIX_EPOCH)
         .ok()?;
     Some(deadline.saturating_sub(now))
+}
+
+fn rejects_gzip(status: u16, from_anthropic: bool, body: &str) -> bool {
+    matches!(status, 400 | 403 | 415) && (!from_anthropic || (status == 400 && invalid_json(body)))
+}
+
+fn invalid_json(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return bad_json(body.trim_end());
+    };
+    if value["type"] == "error"
+        && let Some(message) = value["error"]["message"].as_str()
+    {
+        return INVALID_JSON_MESSAGES
+            .iter()
+            .any(|prefix| message.starts_with(prefix));
+    }
+    value["reason"] == "bad_json" && value["error"].as_str().is_some_and(bad_json)
+}
+
+fn bad_json(text: &str) -> bool {
+    text.strip_prefix("bad json: ").is_some_and(|detail| {
+        detail.starts_with("invalid character ")
+            || matches!(
+                detail,
+                "unexpected EOF" | "unexpected end of JSON input" | "EOF"
+            )
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1106,6 +1140,7 @@ pub struct ClaudeClient {
     subscription_session: String,
 
     subscription_cache_tail: bool,
+    gzip_rejected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ClaudeClient {
@@ -1118,6 +1153,7 @@ impl ClaudeClient {
             subscription_identity: SubscriptionIdentity::default(),
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
+            gzip_rejected: Arc::default(),
         }
     }
 
@@ -1134,6 +1170,7 @@ impl ClaudeClient {
             subscription_identity: SubscriptionIdentity::default(),
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
+            gzip_rejected: Arc::default(),
         }
     }
 
@@ -1150,6 +1187,7 @@ impl ClaudeClient {
             subscription_identity: SubscriptionIdentity::default(),
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
+            gzip_rejected: Arc::default(),
         }
     }
 
@@ -1496,9 +1534,11 @@ impl ClaudeClient {
                     }
                 }
             }
+            let gzip = self.gzip_request_body(wire.body.len());
             let response = match &self.http {
                 HttpConnection::Client(client) => {
-                    transport::post(client, &self.endpoint, headers, wire.body.clone()).await?
+                    transport::post(client, &self.endpoint, headers, wire.body.clone(), gzip)
+                        .await?
                 }
                 HttpConnection::Transport(transport) => {
                     transport::post_with(
@@ -1523,7 +1563,24 @@ impl ClaudeClient {
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let retry_after = retry_after(response.headers());
+                let from_anthropic = response
+                    .headers()
+                    .get("request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|id| id.starts_with("req_"))
+                    || response.headers().contains_key("cf-ray");
                 let mut body = response.text().await?;
+                if gzip && rejects_gzip(status, from_anthropic, &body) {
+                    self.gzip_rejected
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "nanocode_claude",
+                        status,
+                        from_anthropic,
+                        "Claude Messages rejected a gzip request body; resending it and later requests uncompressed"
+                    );
+                    continue;
+                }
                 credentials.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
                 for credential in &credentials {
                     body = body.replace(credential, "[redacted]");
@@ -1537,6 +1594,17 @@ impl ClaudeClient {
             credentials.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
             return Ok((response, credentials));
         }
+    }
+
+    fn gzip_request_body(&self, bytes: usize) -> bool {
+        cfg!(not(target_family = "wasm"))
+            && matches!(self.http, HttpConnection::Client(_))
+            && bytes >= GZIP_MIN_BODY_BYTES
+            && !self
+                .gzip_rejected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && url::Url::parse(&self.endpoint)
+                .is_ok_and(|endpoint| endpoint.host_str() == Some(FIRST_PARTY_HOST))
     }
 
     pub async fn create(&self, request: &MessagesRequest) -> Result<MessageResponse, ClaudeError> {
