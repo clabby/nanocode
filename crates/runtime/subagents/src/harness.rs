@@ -234,6 +234,11 @@ pub(super) fn spawn(
         side_questions: Arc::new(AtomicUsize::new(0)),
     };
     let capacity_revision = capacity.subscribe();
+    let span = tracing::info_span!(
+        "subagent.harness",
+        session.root_id = root_session_id.as_str(),
+        session.id = agent.session_id()
+    );
     let task = platform::spawn(
         Harness {
             root_session_id,
@@ -254,7 +259,7 @@ pub(super) fn spawn(
             registry,
         }
         .run()
-        .instrument(tracing::Span::current()),
+        .instrument(span),
     );
     (handle, task)
 }
