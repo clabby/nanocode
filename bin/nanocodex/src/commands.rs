@@ -30,7 +30,7 @@ pub const COMMANDS: [(&str, &str); 30] = [
     ("/id", "show the session id and copy it to the clipboard"),
     (
         "/runner",
-        "list, connect, listen, select or disconnect runners and Code Mode executors",
+        "list, connect, listen, select or disconnect hands",
     ),
     ("/expand", "expand or collapse tools and reasoning"),
     ("/mouse", "toggle mouse capture for native text selection"),
@@ -91,10 +91,10 @@ pub enum RunnerAction {
         token: Option<String>,
     },
     #[command(
-        about = "Run this session's exec cells on a connected Code Mode executor, or on this machine without a name"
+        about = "Run this session's exec cells on one hand, on several at once, on every hand with *, or on this machine without names"
     )]
     Select {
-        name: Option<String>,
+        names: Vec<String>,
     },
     Disconnect {
         name: String,

@@ -39,6 +39,9 @@ tokio-tungstenite.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["hostname"] }
+
 [lints]
 workspace = true
 

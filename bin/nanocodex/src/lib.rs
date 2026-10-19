@@ -25,13 +25,10 @@ use std::{
 
 use clap::Parser;
 use futures_util::StreamExt;
-use nanocode::{
-    ModelSelection, ServiceTier, Thinking,
-    tools::attachment::{RunnerConfig, RunnerEndpoint, run_runner_with_tools},
-};
+use nanocode::{ModelSelection, ServiceTier, Thinking};
 
 use crate::{
-    cli::{Cli, Command, HarnessArg, RunnerArgs, SessionArgs, SessionsArgs},
+    cli::{Cli, Command, HandArgs, HarnessArg, SessionArgs, SessionsArgs},
     host::{Host, HostConfig, Result},
 };
 
@@ -48,7 +45,7 @@ fn install_telemetry(cli: &Cli) -> Result<Option<nanocode_observability::Observa
     let home = host::home_dir(explicit_home)?;
     let interactive = !matches!(
         cli.command,
-        Some(Command::Exec(_) | Command::Runner(_) | Command::Sessions(_) | Command::Models)
+        Some(Command::Exec(_) | Command::Hand(_) | Command::Sessions(_) | Command::Models)
     );
     let output = match (args.log_filter().is_some(), interactive) {
         (false, _) => nanocode_observability::LogOutput::Disabled,
@@ -105,7 +102,7 @@ pub fn main() -> ExitCode {
     drop(startup);
     let outcome = runtime.block_on(async move {
         match cli.command {
-            Some(Command::Runner(args)) => runner(args).await,
+            Some(Command::Hand(args)) => hand(args).await,
             Some(Command::Sessions(mut args)) => {
                 args.home = args.home.or(cli.session.home);
                 list_sessions(args).await
@@ -426,51 +423,44 @@ fn print_models() {
     }
 }
 
-async fn runner(args: RunnerArgs) -> Result<()> {
-    let workspace = match &args.workspace {
+async fn hand(args: HandArgs) -> Result<()> {
+    use nanocode::hand::{Hand, HandEvent};
+    let directory = match &args.directory {
         Some(path) => std::fs::canonicalize(path)?,
         None => std::env::current_dir()?,
     };
-    let endpoint = match (args.listen, args.connect) {
-        (Some(address), _) => RunnerEndpoint::Listen(address),
-        (None, Some(url)) => RunnerEndpoint::Connect(url),
-        (None, None) => return Err("pass --listen <ADDR> or --connect <WS_URL>".into()),
-    };
-    let config = RunnerConfig {
-        endpoint,
-        token: args.token,
-        workspace: workspace.clone(),
-        name: args.name.clone(),
-    };
-    let mut tools = nanocode::claude::runner_tools(workspace.clone())?.into_builder();
-    if args.code_mode {
-        tools = tools.add(nanocode::tools::WorkspaceTools::new(workspace.clone()));
-    }
+    let mut tools = nanocode::hand::tools(directory.clone())?.into_builder();
     if args.cua {
         let computer =
             nanocode::ComputerTools::connect(nanocode::ComputerConfig::installed()?).await?;
         tools = tools.tool(computer.js()).tool(computer.reset());
-        eprintln!(
-            "nanocodex runner {} serving {} with computer use",
-            args.name,
-            workspace.display()
-        );
-    } else {
-        eprintln!(
-            "nanocodex runner {} serving {}",
-            args.name,
-            workspace.display()
-        );
     }
-    if args.code_mode {
-        nanocode::tools::remote::run_code_mode_runner(
-            config,
-            tools.build()?,
-            nanocode::tools::remote::SocketPolicy::runner(),
-        )
-        .await?;
-        return Ok(());
+    let tools = tools.build()?;
+    let name = match args.name {
+        Some(name) => name,
+        None => Hand::machine_name()?,
+    };
+    let hand = match (args.url, args.listen) {
+        (Some(url), _) => Hand::connect(url, args.token, tools),
+        (None, Some(address)) => Hand::listen(address, args.token, tools),
+        (None, None) => return Err("pass the brain URL or --listen <ADDR>".into()),
     }
-    run_runner_with_tools(config, tools.build()?).await?;
+    .name(&name)
+    .directory(directory.clone());
+    eprintln!("nanocodex hand {name} in {}", directory.display());
+    let run = hand.run(|event| match event {
+        HandEvent::Connecting { endpoint } => eprintln!("hand: connecting {endpoint}"),
+        HandEvent::Connected { endpoint } => eprintln!("hand: connected to {endpoint}"),
+        HandEvent::Listening { endpoint } => eprintln!("hand: listening {endpoint}"),
+        HandEvent::BrainConnected { peer } => eprintln!("hand: brain connected from {peer}"),
+        HandEvent::Disconnected { reason } => eprintln!("hand: disconnected ({reason})"),
+        HandEvent::Retrying { delay } => eprintln!("hand: retrying in {}ms", delay.as_millis()),
+        HandEvent::Revoked => eprintln!("hand: the brain disconnected this hand; stopping"),
+        other => eprintln!("hand: {other:?}"),
+    });
+    tokio::select! {
+        result = run => result?,
+        signal = tokio::signal::ctrl_c() => signal?,
+    }
     Ok(())
 }

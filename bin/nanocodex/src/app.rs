@@ -491,7 +491,7 @@ fn runner_info(info: &RunnerInfo) -> String {
         .unwrap_or_else(|| "pending workspace".into());
     let kind = match info.protocol {
         RunnerProtocol::Tools => "tool runner",
-        RunnerProtocol::CodeMode => "Code Mode executor",
+        RunnerProtocol::CodeMode => "hand",
     };
     format!(
         "{} {} ({kind}, {}, {:?}, {} tools, {workspace})",
@@ -505,9 +505,7 @@ fn runner_info(info: &RunnerInfo) -> String {
 
 fn listener_notice(server: &RunnerServer) -> String {
     format!(
-        "listening {} · token {}\nStart a runner: nc runner --connect {} --token {}\nStart a Code Mode executor: nc runner --code-mode --connect {} --token {}",
-        server.endpoint(),
-        server.token(),
+        "listening {} · token {}\nStart a hand: nc hand {} --token {}",
         server.endpoint(),
         server.token(),
         server.endpoint(),
@@ -1960,7 +1958,9 @@ impl App {
                 .code_mode_executors()
                 .selection(agent.session_id())
             {
-                ExecutorSelection::Executor(name) => Some(name),
+                ExecutorSelection::Executor(name) => Some(name.to_string()),
+                ExecutorSelection::Executors(names) => Some(names.join(", ")),
+                ExecutorSelection::All => Some("every hand".to_owned()),
                 ExecutorSelection::Local => None,
             }
         });
@@ -2091,7 +2091,7 @@ impl App {
                 });
                 self.flash("opening runner listener…");
             }
-            crate::commands::RunnerAction::Select { name } => {
+            crate::commands::RunnerAction::Select { names } => {
                 let Some(session) = self
                     .agent
                     .as_ref()
@@ -2101,18 +2101,32 @@ impl App {
                     return;
                 };
                 let executors = runtime.runner_pool().code_mode_executors();
-                let (selection, message) = match name {
-                    Some(name) => {
-                        if let Err(error) = executors.connected(&name) {
-                            self.notice(NoticeLevel::Error, error.to_string());
-                            return;
-                        }
-                        let message = format!("exec cells run on {name}");
-                        (ExecutorSelection::Executor(name.into()), message)
-                    }
-                    None => (
+                if let Some(error) = names
+                    .iter()
+                    .filter(|name| name.as_str() != "*")
+                    .find_map(|name| executors.connected(name).err())
+                {
+                    self.notice(NoticeLevel::Error, error.to_string());
+                    return;
+                }
+                let (selection, message) = match names.as_slice() {
+                    [] => (
                         ExecutorSelection::Local,
                         "exec cells run on this machine".to_owned(),
+                    ),
+                    [all] if all == "*" => (
+                        ExecutorSelection::All,
+                        "exec cells run on every connected hand".to_owned(),
+                    ),
+                    [name] => (
+                        ExecutorSelection::Executor(name.as_str().into()),
+                        format!("exec cells run on {name}"),
+                    ),
+                    names => (
+                        ExecutorSelection::Executors(
+                            names.iter().map(|name| name.as_str().into()).collect(),
+                        ),
+                        format!("exec cells run on {}", names.join(", ")),
                     ),
                 };
                 executors.select(&session, Some(selection));

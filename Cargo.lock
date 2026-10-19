@@ -2203,6 +2203,7 @@ dependencies = [
  "nanocode-tool-provider",
  "nanocode-tools",
  "nanocode-types",
+ "nix 0.31.3",
  "reqwest",
  "serde",
  "serde_json",

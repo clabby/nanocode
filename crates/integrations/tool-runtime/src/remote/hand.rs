@@ -1,0 +1,238 @@
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+use tokio::net::TcpListener;
+
+use super::native::{
+    Dial, ExecutorOptions, SocketPolicy, dial, error, serve, serve_stream, validate_policy,
+};
+use crate::embedded::CodeModeHostError;
+
+#[derive(Clone, Debug)]
+pub enum HandEndpoint {
+    Connect(String),
+    Listen(SocketAddr),
+}
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum HandEvent {
+    Connecting { endpoint: String },
+    Connected { endpoint: String },
+    Listening { endpoint: String },
+    BrainConnected { peer: SocketAddr },
+    Disconnected { reason: String },
+    Retrying { delay: Duration },
+    Revoked,
+}
+
+pub struct Hand {
+    endpoint: HandEndpoint,
+    token: String,
+    name: Option<String>,
+    directory: Option<PathBuf>,
+    tools: crate::Tools,
+    policy: SocketPolicy,
+}
+
+impl Hand {
+    pub fn connect(url: impl Into<String>, token: impl Into<String>, tools: crate::Tools) -> Self {
+        Self::new(HandEndpoint::Connect(url.into()), token.into(), tools)
+    }
+
+    pub fn listen(address: SocketAddr, token: impl Into<String>, tools: crate::Tools) -> Self {
+        Self::new(HandEndpoint::Listen(address), token.into(), tools)
+    }
+
+    fn new(endpoint: HandEndpoint, token: String, tools: crate::Tools) -> Self {
+        Self {
+            endpoint,
+            token,
+            name: None,
+            directory: None,
+            tools,
+            policy: SocketPolicy::runner(),
+        }
+    }
+
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.directory = Some(directory.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn policy(mut self, policy: SocketPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn machine_name() -> Result<String, CodeModeHostError> {
+        let host = host_name()?;
+        let mut name = String::new();
+        for character in host.trim().chars().flat_map(char::to_lowercase) {
+            let next = if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            };
+            if !(next == '-' && name.ends_with('-')) {
+                name.push(next);
+            }
+        }
+        let name = name.trim_matches('-');
+        let name = if name.starts_with(|character: char| character.is_ascii_alphabetic()) {
+            name.to_owned()
+        } else {
+            format!("hand-{name}")
+        };
+        let name = name
+            .get(..MAX_NAME_BYTES)
+            .unwrap_or(&name)
+            .trim_end_matches('-')
+            .to_owned();
+        crate::attachment::RemoteRunner::new(&name).map_err(error)?;
+        Ok(name)
+    }
+
+    pub fn run<F>(
+        self,
+        mut events: F,
+    ) -> futures_util::future::BoxFuture<'static, Result<(), CodeModeHostError>>
+    where
+        F: FnMut(HandEvent) + Send + 'static,
+    {
+        Box::pin(async move {
+            validate_policy(self.policy)?;
+            let directory = match self.directory {
+                Some(directory) => directory,
+                None => std::env::current_dir().map_err(error)?,
+            };
+            let directory = tokio::fs::canonicalize(&directory).await.map_err(error)?;
+            let name = match self.name {
+                Some(name) => name,
+                None => Self::machine_name()?,
+            };
+            crate::attachment::RemoteRunner::new(&name).map_err(error)?;
+            let options = ExecutorOptions {
+                name: Some(name),
+                runtime_id: Some(uuid::Uuid::new_v4().to_string()),
+                callback_timeout: None,
+            };
+            let policy = self.policy;
+            match self.endpoint {
+                HandEndpoint::Connect(endpoint) => {
+                    let target = crate::attachment::AttachmentTarget::new(endpoint, self.token)
+                        .map_err(error)?;
+                    let mut backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
+                    loop {
+                        let endpoint = target.endpoint().to_string();
+                        events(HandEvent::Connecting {
+                            endpoint: endpoint.clone(),
+                        });
+                        match dial(&target, policy).await {
+                            Ok(socket) => {
+                                events(HandEvent::Connected { endpoint });
+                                let started = Instant::now();
+                                match serve(
+                                    socket,
+                                    directory.clone(),
+                                    self.tools.clone(),
+                                    policy,
+                                    options.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => events(HandEvent::Disconnected {
+                                        reason: "the brain closed the connection".into(),
+                                    }),
+                                    Err(issue)
+                                        if issue.message()
+                                            == nanocode_tool_host::attachment::ATTACHMENT_REVOKED_REASON =>
+                                    {
+                                        events(HandEvent::Revoked);
+                                        return Ok(());
+                                    }
+                                    Err(issue) => events(HandEvent::Disconnected {
+                                        reason: issue.to_string(),
+                                    }),
+                                }
+                                if started.elapsed() >= crate::attachment::STABLE_CONNECTION {
+                                    backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
+                                }
+                            }
+                            Err(Dial::Rejected(issue)) => return Err(issue),
+                            Err(Dial::Failed(issue)) => events(HandEvent::Disconnected {
+                                reason: issue.to_string(),
+                            }),
+                        }
+                        let delay = crate::attachment::reconnect_delay(&mut backoff);
+                        events(HandEvent::Retrying { delay });
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                HandEndpoint::Listen(address) => {
+                    if !address.ip().is_loopback() {
+                        return Err(error(
+                            "plaintext hand listeners require a loopback address; use a TLS proxy for remote access",
+                        ));
+                    }
+                    let listener = TcpListener::bind(address).await.map_err(error)?;
+                    events(HandEvent::Listening {
+                        endpoint: format!("ws://{}/", listener.local_addr().map_err(error)?),
+                    });
+                    let mut connections = tokio::task::JoinSet::new();
+                    loop {
+                        tokio::select! {
+                            accepted = listener.accept() => match accepted {
+                                Ok((stream, peer)) => {
+                                    events(HandEvent::BrainConnected { peer });
+                                    let token = self.token.clone();
+                                    let directory = directory.clone();
+                                    let tools = self.tools.clone();
+                                    let options = options.clone();
+                                    connections.spawn(async move {
+                                        serve_stream(stream, &token, &directory, tools, policy, options).await
+                                    });
+                                }
+                                Err(issue) => events(HandEvent::Disconnected { reason: issue.to_string() }),
+                            },
+                            Some(finished) = connections.join_next(), if !connections.is_empty() => {
+                                let reason = match finished {
+                                    Ok(Ok(())) => "the brain closed the connection".into(),
+                                    Ok(Err(issue)) => issue.to_string(),
+                                    Err(issue) => issue.to_string(),
+                                };
+                                events(HandEvent::Disconnected { reason });
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+const MAX_NAME_BYTES: usize = 48;
+
+#[cfg(unix)]
+fn host_name() -> Result<String, CodeModeHostError> {
+    nix::unistd::gethostname()
+        .map_err(error)?
+        .into_string()
+        .map_err(|_| error("the host name is not valid UTF-8"))
+}
+
+#[cfg(windows)]
+fn host_name() -> Result<String, CodeModeHostError> {
+    std::env::var("COMPUTERNAME").map_err(error)
+}

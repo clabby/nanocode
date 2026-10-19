@@ -2,7 +2,7 @@ mod executors;
 
 use std::sync::Arc;
 
-pub use executors::{CodeModeExecutors, ExecutorRoute, ExecutorSelection};
+pub use executors::{CodeModeExecutors, ExecutorSelection, HandRoute, Placement};
 
 use crate::embedded::{CodeModeUpdate, NestedToolCall};
 use serde::{Deserialize, Serialize};

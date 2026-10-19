@@ -41,7 +41,7 @@ mod code_mode_policy;
 mod defaults;
 #[cfg(not(target_family = "wasm"))]
 pub use defaults::{
-    install_default_tools, install_default_tools_with_executor,
+    hand_tools, install_default_tools, install_default_tools_with_executor,
     install_default_tools_with_process_routes, install_default_tools_with_runner_pool,
     runner_tools, runner_tools_with_executor,
 };

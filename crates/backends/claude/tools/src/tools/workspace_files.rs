@@ -17,6 +17,8 @@ static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 pub struct ClaudeWorkspaceFiles {
     root: PathBuf,
     root_alias: PathBuf,
+    base: PathBuf,
+    confined: bool,
     media: MediaReadOptions,
     read_token_budget: usize,
 }
@@ -36,11 +38,41 @@ impl ClaudeWorkspaceFiles {
             return Err("workspace root is not a directory".into());
         }
         Ok(Self {
+            base: root.clone(),
+            confined: true,
             root,
             root_alias,
             media: MediaReadOptions::default(),
             read_token_budget: 200_000,
         })
+    }
+
+    pub fn machine(directory: impl AsRef<Path>) -> Result<Self, String> {
+        let base = fs::canonicalize(directory.as_ref()).map_err(|e| format!("directory: {e}"))?;
+        if !base.is_dir() {
+            return Err("directory is not a directory".into());
+        }
+        let root = base
+            .ancestors()
+            .last()
+            .ok_or("directory has no filesystem root")?
+            .to_path_buf();
+        Ok(Self {
+            root_alias: root.clone(),
+            root,
+            base,
+            confined: false,
+            media: MediaReadOptions::default(),
+            read_token_budget: 200_000,
+        })
+    }
+
+    fn shown(&self, relative: &Path) -> String {
+        if self.confined {
+            relative.display().to_string()
+        } else {
+            self.root.join(relative).display().to_string()
+        }
     }
 
     #[must_use]
@@ -195,7 +227,13 @@ impl ClaudeWorkspaceFiles {
         if text.len() > 4096 {
             return Err("path exceeds 4096-byte limit".into());
         }
-        let path = Path::new(text);
+        let joined;
+        let path = if Path::new(text).is_absolute() || self.confined {
+            Path::new(text)
+        } else {
+            joined = self.base.join(text);
+            joined.as_path()
+        };
         let relative = if path.is_absolute() {
             path.strip_prefix(&self.root)
                 .or_else(|_| path.strip_prefix(&self.root_alias))
@@ -311,6 +349,16 @@ impl ClaudeWorkspaceFiles {
     fn write_target(&self, text: &str) -> Result<(PathBuf, PathBuf), String> {
         let rel = self.relative(text, false)?;
         let path = self.root.join(&rel);
+        if !self.confined {
+            let parent = path.parent().ok_or("file has no parent")?;
+            fs::create_dir_all(parent).map_err(|e| format!("create directory: {e}"))?;
+            let path = match fs::canonicalize(&path) {
+                Ok(real) => real,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => path,
+                Err(e) => return Err(format!("check target: {e}")),
+            };
+            return Ok((rel, path));
+        }
         let parent = path.parent().ok_or("file has no parent")?;
         let mut current = self.root.clone();
         for component in rel.parent().into_iter().flat_map(Path::components) {
@@ -341,7 +389,7 @@ impl ClaudeWorkspaceFiles {
         }
         let (rel, path) = self.write_target(Self::field(input, "file_path")?)?;
         atomic_write(&path, content)?;
-        Ok(format!("Wrote {}", rel.display()))
+        Ok(format!("Wrote {}", self.shown(&rel)))
     }
 
     fn edit(&self, input: &Value) -> Result<String, String> {
@@ -385,7 +433,10 @@ impl ClaudeWorkspaceFiles {
             return Err("file changed during edit".into());
         }
         atomic_write(&path, &updated)?;
-        Ok(format!("Edited {} ({count} replacement(s))", rel.display()))
+        Ok(format!(
+            "Edited {} ({count} replacement(s))",
+            self.shown(&rel)
+        ))
     }
 
     fn search_root(&self, input: &Value) -> Result<(PathBuf, PathBuf), String> {
@@ -441,7 +492,12 @@ impl ClaudeWorkspaceFiles {
             .take_while(|part| !part.contains(['*', '?', '[', '{', '\\']))
             .collect::<Vec<_>>()
             .join("/");
-        let (_, root) = self.search_root(input)?;
+        let anchored = Path::new(raw_pattern).is_absolute() && !self.confined;
+        let (_, root) = if anchored {
+            (PathBuf::new(), self.root.clone())
+        } else {
+            self.search_root(input)?
+        };
         if !literal_prefix.is_empty() {
             let candidate = root.join(&literal_prefix);
             if candidate.exists()
@@ -453,7 +509,15 @@ impl ClaudeWorkspaceFiles {
             }
         }
         let mut out = String::new();
-        let mut files = self.walk(&root)?;
+        let start = if anchored {
+            root.join(&literal_prefix)
+        } else {
+            root.clone()
+        };
+        if anchored && !start.exists() {
+            return Ok(out);
+        }
+        let mut files = self.walk(&start)?;
         files.sort_by_cached_key(|path| {
             (
                 std::cmp::Reverse(fs::metadata(path).and_then(|m| m.modified()).ok()),
@@ -466,10 +530,10 @@ impl ClaudeWorkspaceFiles {
                 .map_err(|_| "search path changed")?
                 .to_string_lossy();
             if matcher.is_match(rel.as_ref()) {
-                let shown = file
-                    .strip_prefix(&self.root)
-                    .map_err(|_| "search escaped workspace")?
-                    .display();
+                let shown = self.shown(
+                    file.strip_prefix(&self.root)
+                        .map_err(|_| "search escaped workspace")?,
+                );
                 if !push_bounded(&mut out, &format!("{shown}\n")) {
                     break;
                 }
@@ -580,10 +644,10 @@ impl ClaudeWorkspaceFiles {
         let mut skipped = 0u64;
         let mut yielded = 0u64;
         for file in self.walk(&root)? {
-            let shown = file
-                .strip_prefix(&self.root)
-                .map_err(|_| "search escaped workspace")?
-                .to_string_lossy();
+            let shown = self.shown(
+                file.strip_prefix(&self.root)
+                    .map_err(|_| "search escaped workspace")?,
+            );
             if let (Some(glob), Some(matcher)) = (glob, &glob_matcher) {
                 let relative = file
                     .strip_prefix(&root)

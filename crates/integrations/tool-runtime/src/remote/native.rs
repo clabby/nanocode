@@ -102,11 +102,11 @@ pub struct SocketTransport {
     _shutdown: DropGuard,
 }
 
-fn error(value: impl std::fmt::Display) -> CodeModeHostError {
+pub(super) fn error(value: impl std::fmt::Display) -> CodeModeHostError {
     CodeModeHostError::new(value.to_string())
 }
 
-fn validate_policy(policy: SocketPolicy) -> Result<(), CodeModeHostError> {
+pub(super) fn validate_policy(policy: SocketPolicy) -> Result<(), CodeModeHostError> {
     if policy.max_frame_bytes == 0 || policy.request_timeout.is_zero() {
         return Err(error(
             "max_frame_bytes and request_timeout must be positive",
@@ -194,7 +194,7 @@ fn config(policy: SocketPolicy) -> tungstenite::protocol::WebSocketConfig {
 
 type DialedSocket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
-enum Dial {
+pub(super) enum Dial {
     Rejected(CodeModeHostError),
     Failed(CodeModeHostError),
 }
@@ -210,7 +210,7 @@ async fn connect(
         })
 }
 
-async fn dial(
+pub(super) async fn dial(
     target: &crate::attachment::AttachmentTarget,
     policy: SocketPolicy,
 ) -> Result<DialedSocket, Dial> {
@@ -1130,111 +1130,6 @@ pub async fn serve_stream(
     .await
 }
 
-pub fn run_code_mode_runner(
-    config: crate::attachment::RunnerConfig,
-    tools: crate::Tools,
-    policy: SocketPolicy,
-) -> futures_util::future::BoxFuture<'static, Result<(), CodeModeHostError>> {
-    Box::pin(async move {
-        validate_policy(policy)?;
-        let workspace = tokio::fs::canonicalize(&config.workspace)
-            .await
-            .map_err(error)?;
-        let options = ExecutorOptions {
-            name: Some(config.name),
-            runtime_id: Some(uuid::Uuid::new_v4().to_string()),
-            callback_timeout: None,
-        };
-        match config.endpoint {
-            crate::attachment::RunnerEndpoint::Connect(endpoint) => {
-                let target = crate::attachment::AttachmentTarget::new(endpoint, config.token)
-                    .map_err(error)?;
-                let mut backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
-                loop {
-                    eprintln!("executor: connecting {}", target.endpoint());
-                    let dialed = tokio::select! {
-                        dialed = dial(&target, policy) => dialed,
-                        signal = tokio::signal::ctrl_c() => return signal.map_err(error),
-                    };
-                    match dialed {
-                        Ok(socket) => {
-                            eprintln!("executor: connected");
-                            let started = std::time::Instant::now();
-                            let served = tokio::select! {
-                                served = serve(socket, workspace.clone(), tools.clone(), policy, options.clone()) => served,
-                                signal = tokio::signal::ctrl_c() => return signal.map_err(error),
-                            };
-                            match served {
-                                Ok(()) => eprintln!("executor: brain closed the connection"),
-                                Err(issue)
-                                    if issue.message()
-                                        == nanocode_tool_host::attachment::ATTACHMENT_REVOKED_REASON =>
-                                {
-                                    eprintln!("executor: the brain disconnected this executor; stopping");
-                                    return Ok(());
-                                }
-                                Err(issue) => eprintln!("executor: disconnected ({issue})"),
-                            }
-                            if started.elapsed() >= crate::attachment::STABLE_CONNECTION {
-                                backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
-                            }
-                        }
-                        Err(Dial::Rejected(issue)) => return Err(issue),
-                        Err(Dial::Failed(issue)) => {
-                            eprintln!("executor: connection failed ({issue})");
-                        }
-                    }
-                    let delay = crate::attachment::reconnect_delay(&mut backoff);
-                    eprintln!("executor: retrying in {}ms", delay.as_millis());
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {}
-                        signal = tokio::signal::ctrl_c() => return signal.map_err(error),
-                    }
-                }
-            }
-            crate::attachment::RunnerEndpoint::Listen(address) => {
-                if !address.ip().is_loopback() {
-                    return Err(error(
-                        "plaintext runner listeners require a loopback address; use a TLS proxy for remote access",
-                    ));
-                }
-                let listener = TcpListener::bind(address).await.map_err(error)?;
-                eprintln!(
-                    "executor: listening ws://{}",
-                    listener.local_addr().map_err(error)?
-                );
-                let mut connections = tokio::task::JoinSet::new();
-                loop {
-                    tokio::select! {
-                        accepted = listener.accept() => match accepted {
-                            Ok((stream, peer)) => {
-                                eprintln!("executor: brain connected from {peer}");
-                                let token = config.token.clone();
-                                let workspace = workspace.clone();
-                                let tools = tools.clone();
-                                let options = options.clone();
-                                connections.spawn(async move {
-                                    serve_stream(stream, &token, &workspace, tools, policy, options).await
-                                });
-                            }
-                            Err(issue) => eprintln!("executor: accept failed ({issue})"),
-                        },
-                        Some(finished) = connections.join_next(), if !connections.is_empty() => match finished {
-                            Ok(Ok(())) => eprintln!("executor: brain closed a connection"),
-                            Ok(Err(issue)) => eprintln!("executor: connection ended ({issue})"),
-                            Err(issue) => eprintln!("executor: connection task failed ({issue})"),
-                        },
-                        signal = tokio::signal::ctrl_c() => {
-                            connections.shutdown().await;
-                            return signal.map_err(error);
-                        }
-                    }
-                }
-            }
-        }
-    })
-}
-
 struct Sessions(HashMap<String, (Arc<ToolRuntime>, CallbackCatalog)>);
 impl std::ops::Deref for Sessions {
     type Target = HashMap<String, (Arc<ToolRuntime>, CallbackCatalog)>;
@@ -1257,7 +1152,7 @@ impl Drop for Sessions {
     }
 }
 
-async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut socket: WebSocketStream<S>,
     workspace: PathBuf,
     tools: crate::Tools,

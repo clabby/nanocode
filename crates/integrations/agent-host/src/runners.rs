@@ -150,7 +150,7 @@ impl RunnerAgents {
         let executors = ready(RunnerProtocol::CodeMode)
             .map(|runner| {
                 format!(
-                    "{} (mode: {:?}, workspace: {}, tools: {})",
+                    "{} (mode: {:?}, directory: {}, tools: {})",
                     runner.name,
                     runner.mode,
                     runner
@@ -168,7 +168,7 @@ impl RunnerAgents {
         };
         if !executors.is_empty() {
             summary.push_str(&format!(
-                " Code Mode executors connected: {}. The runners tool with action=select runs a session's exec cells on one.",
+                " Hands connected: {}. The runners tool with action=select runs a session's exec cells on one hand, several, or every hand at once.",
                 executors.join("; ")
             ));
         }
@@ -187,7 +187,7 @@ impl RunnerAgents {
                             self.summary()
                         ),
                         RunnerProtocol::CodeMode => format!(
-                            "Code Mode executor {} status: {:?}. {}",
+                            "Hand {} status: {:?}. {}",
                             info.name,
                             info.status,
                             self.summary()

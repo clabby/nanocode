@@ -23,9 +23,10 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     #[command(
-        about = "Serve this machine to a remote nanocodex agent, as workspace tools or as a Code Mode executor"
+        visible_alias = "runner",
+        about = "Make this machine a hand that runs a nanocodex agent's exec cells: dial the brain's URL, or listen for the brain"
     )]
-    Runner(RunnerArgs),
+    Hand(HandArgs),
     #[command(about = "List saved sessions (current workspace unless --all)")]
     Sessions(SessionsArgs),
     #[command(
@@ -293,53 +294,42 @@ pub struct RemoteArgs {
 }
 
 #[derive(Clone, Debug, Args)]
-pub struct RunnerArgs {
+pub struct HandArgs {
+    #[arg(
+        value_name = "URL",
+        required_unless_present = "listen",
+        conflicts_with = "listen",
+        help = "Brain endpoint to dial, such as wss://<worker>/sessions/<name>/hands; the hand reconnects until the brain disconnects it"
+    )]
+    pub url: Option<String>,
+
     #[arg(
         long,
         value_name = "ADDR",
-        conflicts_with = "connect",
-        required_unless_present = "connect",
-        help = "Accept an agent connection on this address (agent uses --runner-connect)"
+        help = "Listen on this loopback address for a brain to dial instead"
     )]
     pub listen: Option<SocketAddr>,
 
     #[arg(
         long,
-        value_name = "WS_URL",
-        help = "Connect out to an agent listening with --runner-host"
-    )]
-    pub connect: Option<String>,
-
-    #[arg(
-        long,
         env = "NANOCODEX_RUNNER_TOKEN",
         hide_env_values = true,
-        help = "Shared secret the agent must present"
+        help = "Shared secret presented to or required from the brain"
     )]
     pub token: String,
+
+    #[arg(long, help = "Hand name (defaults to this machine's host name)")]
+    pub name: Option<String>,
 
     #[arg(
         short = 'C',
         long = "cd",
-        help = "Workspace to serve (defaults to the current directory)"
+        help = "Starting directory (defaults to the current directory)"
     )]
-    pub workspace: Option<PathBuf>,
-
-    #[arg(
-        long,
-        default_value = "runner",
-        help = "Runner name advertised to the agent"
-    )]
-    pub name: String,
+    pub directory: Option<PathBuf>,
 
     #[arg(long, help = "Also serve computer use from the installed provider")]
     pub cua: bool,
-
-    #[arg(
-        long,
-        help = "Run the agent's exec cells on this machine as a remote Code Mode executor; with --connect, reconnect until stopped"
-    )]
-    pub code_mode: bool,
 }
 
 #[derive(Clone, Debug, Args)]

@@ -45,6 +45,40 @@ pub use nanocode_tool_runtime::Tools;
 
 pub use nanocode_durability::DurableAgentExt;
 
+#[cfg(not(target_family = "wasm"))]
+pub mod hand {
+    use std::{net::SocketAddr, path::PathBuf};
+
+    pub use nanocode_tool_runtime::remote::{Hand, HandEndpoint, HandEvent, SocketPolicy};
+
+    pub fn tools(directory: impl Into<PathBuf>) -> Result<crate::Tools, crate::NanocodexError> {
+        let directory = directory.into();
+        crate::claude::hand_tools(directory.clone())?
+            .into_builder()
+            .add(crate::tools::WorkspaceTools::new(directory))
+            .build()
+            .map_err(|error| crate::NanocodexError::InvalidRequest(error.to_string()))
+    }
+
+    pub fn connect(
+        url: impl Into<String>,
+        token: impl Into<String>,
+        directory: impl Into<PathBuf>,
+    ) -> Result<Hand, crate::NanocodexError> {
+        let directory = directory.into();
+        Ok(Hand::connect(url, token, tools(directory.clone())?).directory(directory))
+    }
+
+    pub fn listen(
+        address: SocketAddr,
+        token: impl Into<String>,
+        directory: impl Into<PathBuf>,
+    ) -> Result<Hand, crate::NanocodexError> {
+        let directory = directory.into();
+        Ok(Hand::listen(address, token, tools(directory.clone())?).directory(directory))
+    }
+}
+
 pub fn session_store<S: durability::StateStore + 'static>(
     store: S,
 ) -> durability::Result<durability::SessionStore> {

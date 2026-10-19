@@ -1,6 +1,6 @@
 use super::*;
 use crate::embedded::{CodeModeHost, CodeModeHostError};
-use nanocode_code_mode::remote::{CodeModeExecutors, ExecutorRoute};
+use nanocode_code_mode::remote::{CodeModeExecutors, Placement};
 use std::sync::{Mutex, PoisonError};
 
 pub struct ToolRuntime {
@@ -470,12 +470,12 @@ impl NativeToolRuntime {
         }
     }
 
-    fn route(&self, session_id: &str) -> Result<ExecutorRoute, CodeModeHostError> {
+    fn placement(&self, session_id: &str) -> Placement {
         let Some(executors) = &self.executors else {
-            return Ok(None);
+            return Placement::Local;
         };
         self.track(session_id);
-        executors.route(session_id)
+        executors.placement(session_id)
     }
 
     fn record(&self, session_id: &str, executor: Option<&Arc<str>>, execution: &CodeModeExecution) {
@@ -484,37 +484,21 @@ impl NativeToolRuntime {
         }
     }
 
-    async fn execute_remote(
+    fn callbacks(
         &self,
-        name: &Arc<str>,
-        host: &Arc<dyn CodeModeHost>,
-        source: &str,
-        context: ToolContext<'_>,
-        observer: Option<&mut dyn CodeModeObserver>,
-    ) -> Result<CodeModeExecution, CodeModeHostError> {
-        let remote = match host.tool_definitions(context.session_id()) {
-            Ok(definitions) => definitions
-                .iter()
-                .map(|definition| definition.name().to_owned())
-                .collect::<HashSet<_>>(),
-            Err(error) => return Ok(CodeModeExecutors::failed(&error)),
+        host: Option<&Arc<dyn CodeModeHost>>,
+        session_id: &str,
+    ) -> Vec<Arc<dyn Tool>> {
+        let Some(host) = host else {
+            return Vec::new();
         };
-        let observer = observer.map(|observer| &mut *observer as &mut dyn CodeModeObserver);
-        match host
-            .execute_with_local_tools(
-                source,
-                context,
-                self.registry.callback_tools(&remote),
-                observer,
-            )
-            .await
-        {
-            Ok(execution) => {
-                self.record(context.session_id(), Some(name), &execution);
-                Ok(execution)
-            }
-            Err(error) => Ok(CodeModeExecutors::failed(&error)),
-        }
+        let remote = host
+            .tool_definitions(session_id)
+            .unwrap_or_default()
+            .iter()
+            .map(|definition| definition.name().to_owned())
+            .collect::<HashSet<_>>();
+        self.registry.callback_tools(&remote)
     }
 
     async fn execute_routed(
@@ -523,14 +507,19 @@ impl NativeToolRuntime {
         context: OwnedToolContext,
         observer: Option<&mut dyn CodeModeObserver>,
     ) -> Result<CodeModeExecution, CodeModeHostError> {
-        match self.route(&context.session_id) {
-            Ok(Some((name, host))) => {
-                return self
-                    .execute_remote(&name, &host, source, context.as_context(), observer)
-                    .await;
-            }
-            Ok(None) => {}
-            Err(error) => return Ok(CodeModeExecutors::failed(&error)),
+        if let (Some(executors), Placement::Hands { hands, broadcast }) =
+            (&self.executors, self.placement(&context.session_id))
+        {
+            let hands = hands
+                .into_iter()
+                .map(|hand| {
+                    let tools = self.callbacks(hand.host.as_ref(), &context.session_id);
+                    (hand, tools)
+                })
+                .collect();
+            return Ok(executors
+                .execute_on(hands, broadcast, source, context.as_context(), observer)
+                .await);
         }
         let session_id = self.executors.is_some().then(|| context.session_id.clone());
         let execution = match observer {
@@ -719,7 +708,13 @@ impl NativeToolRuntime {
                 return Ok(self.code_mode.wait_with_updates(input, observer).await);
             };
             let session_id = context.session_id();
-            self.track(session_id);
+            if let Placement::Hands {
+                hands,
+                broadcast: true,
+            } = self.placement(session_id)
+            {
+                return Ok(executors.wait_on(hands, input, context, observer).await);
+            }
             let places = executors.wait_route(session_id);
             let remaining = places.len();
             let mut failure = None;
@@ -779,16 +774,17 @@ impl NativeToolRuntime {
         Result<ToolOutput, crate::embedded::CodeModeHostError>,
     > {
         Box::pin(async move {
-            if self.registry.workspace_tool(name) {
-                match self.route(context.session_id()) {
-                    Ok(Some((executor, _))) => {
-                        return Ok(ToolOutput::error(format!(
-                            "Code Mode for this session runs on executor `{executor}`; call `tools.{name}` inside exec to run it there. No direct handler was invoked."
-                        )));
-                    }
-                    Ok(None) => {}
-                    Err(error) => return Ok(ToolOutput::error(error.to_string())),
-                }
+            if self.registry.workspace_tool(name)
+                && let Placement::Hands { hands, .. } = self.placement(context.session_id())
+            {
+                let names = hands
+                    .iter()
+                    .map(|hand| hand.name.as_ref())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(ToolOutput::error(format!(
+                    "Code Mode for this session runs on hands {names}; call `tools.{name}` inside exec to run it there. No direct handler was invoked."
+                )));
             }
             Ok(self.registry.execute_direct(name, input, context).await)
         })

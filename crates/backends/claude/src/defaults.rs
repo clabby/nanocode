@@ -53,6 +53,23 @@ pub fn runner_tools_with_executor(
     .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))
 }
 
+pub fn hand_tools(directory: PathBuf) -> Result<Tools> {
+    let files = crate::tools::ClaudeWorkspaceFiles::machine(&directory).map_err(|error| {
+        NanocodexError::InvalidRequest(format!(
+            "Claude file tools require the hand directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    crate::claude_files::selection(
+        &Arc::new(files),
+        directory,
+        None,
+        Arc::new(crate::claude_bash::Jobs::default()),
+        Arc::new(nanocode_process::NativeForeground),
+    )
+    .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))
+}
+
 pub fn install_default_tools_with_runner_pool(
     workspace: PathBuf,
     handle: &AgentHandle,
