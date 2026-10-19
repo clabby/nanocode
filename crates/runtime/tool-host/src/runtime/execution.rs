@@ -1,7 +1,7 @@
 use super::*;
 use crate::embedded::{CodeModeHost, CodeModeHostError};
 use nanocode_code_mode::remote::{CodeModeExecutors, Placement};
-use std::sync::{Mutex, PoisonError};
+use nanocode_sync::Atom;
 
 pub struct ToolRuntime {
     inner: Runtime,
@@ -369,7 +369,7 @@ struct NativeToolRuntime {
     default_shell_name: Arc<str>,
     working_directory: Arc<str>,
     executors: Option<CodeModeExecutors>,
-    sessions: Arc<Mutex<HashSet<Arc<str>>>>,
+    sessions: Arc<Atom<HashSet<Arc<str>>>>,
 }
 
 #[doc(hidden)]
@@ -379,7 +379,7 @@ struct NativeToolRuntimeControl {
     workspace: Option<Arc<dyn crate::workspace_runtime::WorkspaceExecutor>>,
     current_turn: Arc<AtomicU64>,
     executors: Option<CodeModeExecutors>,
-    sessions: Arc<Mutex<HashSet<Arc<str>>>>,
+    sessions: Arc<Atom<HashSet<Arc<str>>>>,
 }
 
 struct IgnoreUpdates;
@@ -487,9 +487,12 @@ impl NativeToolRuntime {
     }
 
     fn track(&self, session_id: &str) {
-        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        if !sessions.contains(session_id) {
-            sessions.insert(Arc::from(session_id));
+        if !self.sessions.read(|sessions| sessions.contains(session_id)) {
+            self.sessions.update(|sessions| {
+                if !sessions.contains(session_id) {
+                    sessions.insert(Arc::from(session_id));
+                }
+            });
         }
     }
 
@@ -854,11 +857,7 @@ fn group_direct_code_mode_definitions(
 impl NativeToolRuntimeControl {
     fn sessions(&self) -> Vec<Arc<str>> {
         self.sessions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .cloned()
-            .collect()
+            .read(|sessions| sessions.iter().cloned().collect())
     }
 
     fn remote(&self) -> Vec<(Arc<str>, Arc<dyn CodeModeHost>)> {

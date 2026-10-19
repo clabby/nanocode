@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use futures_util::future::{FutureExt, Shared};
 use tokio::sync::{mpsc, oneshot};
 
@@ -36,6 +36,67 @@ impl Signal {
 
     pub async fn wait(&self) {
         let _ = self.finished.clone().await;
+    }
+}
+
+pub struct Atom<T>(ArcSwap<T>);
+
+impl<T: Default> Default for Atom<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Atom<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("Atom").field(&self.0.load()).finish()
+    }
+}
+
+impl<T> Atom<T> {
+    pub fn new(value: T) -> Self {
+        Self(ArcSwap::from_pointee(value))
+    }
+
+    #[must_use]
+    pub fn get(&self) -> Arc<T> {
+        self.0.load_full()
+    }
+
+    pub fn read<R>(&self, read: impl FnOnce(&T) -> R) -> R {
+        read(&self.0.load())
+    }
+
+    pub fn set(&self, value: T) -> Arc<T> {
+        self.0.swap(Arc::new(value))
+    }
+}
+
+impl<T: Clone> Atom<T> {
+    pub fn update<R>(&self, mut change: impl FnMut(&mut T) -> R) -> R {
+        let mut current = self.0.load_full();
+        loop {
+            let mut next = T::clone(&current);
+            let output = change(&mut next);
+            let previous = self.0.compare_and_swap(&current, Arc::new(next));
+            if Arc::ptr_eq(&previous, &current) {
+                return output;
+            }
+            current = arc_swap::Guard::into_inner(previous);
+        }
+    }
+
+    pub fn try_update<R>(&self, mut change: impl FnMut(&mut T) -> Option<R>) -> Option<R> {
+        let mut current = self.0.load_full();
+        loop {
+            let mut next = T::clone(&current);
+            let output = change(&mut next)?;
+            let previous = self.0.compare_and_swap(&current, Arc::new(next));
+            if Arc::ptr_eq(&previous, &current) {
+                return Some(output);
+            }
+            current = arc_swap::Guard::into_inner(previous);
+        }
     }
 }
 

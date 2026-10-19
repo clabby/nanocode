@@ -20,6 +20,7 @@ nanocode-tool-provider.workspace = true
 nanocode-process.workspace = true
 nanocode-mcp.workspace = true
 nanocode-mcp-http.workspace = true
+nanocode-sync.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 http.workspace = true

@@ -18,6 +18,7 @@ nanocode-tools.workspace = true
 nanocode-types.workspace = true
 nanocode-home.workspace = true
 nanocode-media.workspace = true
+nanocode-sync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

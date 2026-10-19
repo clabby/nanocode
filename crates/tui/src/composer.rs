@@ -1,3 +1,4 @@
+use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
@@ -6,7 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -30,7 +31,7 @@ pub struct Composer {
     history: History,
     placeholder: String,
     preferred_column: Option<usize>,
-    layout: Mutex<Option<(usize, Arc<[Row]>)>>,
+    layout: ArcSwapOption<(usize, Arc<[Row]>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,12 +48,7 @@ impl Clone for Composer {
             history: self.history.clone(),
             placeholder: self.placeholder.clone(),
             preferred_column: self.preferred_column,
-            layout: Mutex::new(
-                self.layout
-                    .lock()
-                    .expect("composer layout cache is available")
-                    .clone(),
-            ),
+            layout: ArcSwapOption::new(self.layout.load_full()),
         }
     }
 }
@@ -96,20 +92,14 @@ impl Composer {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
-        self.layout
-            .get_mut()
-            .expect("composer layout cache is available")
-            .take();
+        self.layout.store(None);
         self.text = text.into();
         self.cursor = self.text.len();
         self.preferred_column = None;
     }
 
     pub fn take(&mut self) -> String {
-        self.layout
-            .get_mut()
-            .expect("composer layout cache is available")
-            .take();
+        self.layout.store(None);
         self.cursor = 0;
         self.preferred_column = None;
         self.history.reset();
@@ -118,10 +108,7 @@ impl Composer {
 
     pub fn insert_str(&mut self, text: &str) {
         let text = normalize_line_endings(text);
-        self.layout
-            .get_mut()
-            .expect("composer layout cache is available")
-            .take();
+        self.layout.store(None);
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
         self.preferred_column = None;
@@ -139,10 +126,7 @@ impl Composer {
 
     pub fn replace_before_cursor(&mut self, start: usize, replacement: &str) {
         if start <= self.cursor && self.text.is_char_boundary(start) {
-            self.layout
-                .get_mut()
-                .expect("composer layout cache is available")
-                .take();
+            self.layout.store(None);
             self.text.replace_range(start..self.cursor, replacement);
             self.cursor = start + replacement.len();
             self.preferred_column = None;
@@ -306,10 +290,7 @@ impl Composer {
         };
         match entry {
             Some(entry) => {
-                self.layout
-                    .get_mut()
-                    .expect("composer layout cache is available")
-                    .take();
+                self.layout.store(None);
                 self.text = entry;
                 self.cursor = self.text.len();
                 self.preferred_column = None;
@@ -321,10 +302,7 @@ impl Composer {
 
     fn delete_range(&mut self, start: usize, end: usize) {
         if start < end {
-            self.layout
-                .get_mut()
-                .expect("composer layout cache is available")
-                .take();
+            self.layout.store(None);
             self.text.replace_range(start..end, "");
             self.cursor = start;
         }
@@ -409,14 +387,10 @@ impl Composer {
     }
 
     fn rows(&self, width: usize) -> Arc<[Row]> {
-        if let Some((cached_width, rows)) = self
-            .layout
-            .lock()
-            .expect("composer layout cache is available")
-            .as_ref()
-            && *cached_width == width
+        if let Some(cached) = self.layout.load_full()
+            && cached.0 == width
         {
-            return Arc::clone(rows);
+            return Arc::clone(&cached.1);
         }
         let content = width.saturating_sub(PROMPT.width()).max(1);
         let mut rows = Vec::new();
@@ -459,10 +433,8 @@ impl Composer {
             line_start += line.len() + 1;
         }
         let rows: Arc<[Row]> = rows.into();
-        *self
-            .layout
-            .lock()
-            .expect("composer layout cache is available") = Some((width, Arc::clone(&rows)));
+        self.layout
+            .store(Some(Arc::new((width, Arc::clone(&rows)))));
         rows
     }
 

@@ -11,11 +11,13 @@ autobenches = false
 description = "Portable tool selection and host execution contracts"
 
 [dependencies]
+arc-swap.workspace = true
 nanocode-code-mode.workspace = true
 nanocode-home.workspace = true
 nanocode-media.workspace = true
 nanocode-tool-contracts.workspace = true
 nanocode-tool-provider.workspace = true
+nanocode-sync.workspace = true
 nanocode-tools.workspace = true
 nanocode-types.workspace = true
 serde_json.workspace = true

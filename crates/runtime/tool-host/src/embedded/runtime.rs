@@ -1,8 +1,6 @@
-use std::{
-    collections::HashSet,
-    path::PathBuf,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
+
+use arc_swap::ArcSwap;
 
 use nanocode_tools::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput};
 use nanocode_types::responses::CustomToolFormat;
@@ -28,7 +26,7 @@ pub struct EmbeddedToolRuntime {
     host: Option<Arc<dyn CodeModeHost>>,
     session_id: Option<Arc<str>>,
     local: Vec<LocalTool>,
-    callable_tool_names: RwLock<HashSet<String>>,
+    callable_tool_names: ArcSwap<HashSet<String>>,
     policies: Vec<Arc<dyn crate::CodeModeToolPolicy>>,
 }
 
@@ -59,7 +57,7 @@ impl EmbeddedToolRuntime {
                     model_visible: true,
                 })
                 .collect(),
-            callable_tool_names: RwLock::new(HashSet::new()),
+            callable_tool_names: ArcSwap::default(),
             policies: Vec::new(),
         }
     }
@@ -138,19 +136,12 @@ impl EmbeddedToolRuntime {
                 .any(|tool| tool.name.as_ref() == definition.name())
         });
         crate::code_mode_order::sort_definitions(&mut definitions);
-        if let Ok(mut names) = self.callable_tool_names.write() {
-            names.clear();
-            names.extend(
-                definitions
-                    .iter()
-                    .map(|definition| definition.name().to_owned()),
-            );
-        } else {
-            tracing::warn!(
-                target: "nanocode_code_mode",
-                "embedded callable-tool registry lock was poisoned"
-            );
-        }
+        self.callable_tool_names.store(Arc::new(
+            definitions
+                .iter()
+                .map(|definition| definition.name().to_owned())
+                .collect(),
+        ));
         if mode == EmbeddedToolMode::Direct {
             definitions.extend(
                 self.local
@@ -326,11 +317,7 @@ impl EmbeddedToolRuntime {
         if self.local.iter().any(|tool| tool.name.as_ref() == name) {
             return true;
         }
-        if self
-            .callable_tool_names
-            .read()
-            .is_ok_and(|names| names.contains(name))
-        {
+        if self.callable_tool_names.load().contains(name) {
             return true;
         }
         if let (Some(host), Some(session_id)) = (&self.host, &self.session_id)
@@ -339,14 +326,12 @@ impl EmbeddedToolRuntime {
             let found = definitions
                 .iter()
                 .any(|definition| definition.name() == name);
-            if let Ok(mut names) = self.callable_tool_names.write() {
-                names.clear();
-                names.extend(
-                    definitions
-                        .into_iter()
-                        .map(|definition| definition.name().to_owned()),
-                );
-            }
+            self.callable_tool_names.store(Arc::new(
+                definitions
+                    .into_iter()
+                    .map(|definition| definition.name().to_owned())
+                    .collect(),
+            ));
             return found;
         }
         false

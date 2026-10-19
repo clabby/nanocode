@@ -3,29 +3,30 @@ pub use nanocode_tool_runtime::attachment::{
     RunnerStatus,
 };
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, PoisonError},
-};
+use nanocode_sync::{Atom, Signal, Slot};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
+
+type Startup = tokio::sync::watch::Receiver<Option<Result<(), AttachmentError>>>;
 
 pub(crate) struct RunnerAgents {
     pool: RunnerPool,
-    state: Mutex<RunnerAgentState>,
+    pending: Slot<Pending>,
+    startup: Atom<Vec<Startup>>,
+    activated: Signal,
+    code_mode_hosts: Atom<HashMap<String, bool>>,
+    agents: Atom<Vec<(String, crate::WeakAgent, mpsc::UnboundedSender<Notice>)>>,
+    folded: Atom<Vec<(String, crate::WeakAgent, String)>>,
     initialized: tokio::sync::OnceCell<Result<(), AttachmentError>>,
 }
 
 const NOTICE_PREFIX: &str = "Runner ";
 const NO_RUNNERS: &str = "Runner mounts and hands: none connected.";
 
-struct RunnerAgentState {
-    code_mode_hosts: HashMap<String, bool>,
-    events: Option<mpsc::UnboundedReceiver<RunnerEvent>>,
-    agents: Vec<(String, crate::WeakAgent, mpsc::UnboundedSender<Notice>)>,
-    folded: Vec<(String, crate::WeakAgent, String)>,
+struct Pending {
+    events: mpsc::UnboundedReceiver<RunnerEvent>,
     runners: Vec<Runner>,
     servers: Vec<RunnerServerConfig>,
-    startup: Vec<tokio::sync::watch::Receiver<Option<Result<(), AttachmentError>>>>,
 }
 
 struct Notice {
@@ -44,15 +45,16 @@ impl RunnerAgents {
         Arc::new(Self {
             pool,
             initialized: tokio::sync::OnceCell::new(),
-            state: Mutex::new(RunnerAgentState {
-                code_mode_hosts: HashMap::new(),
-                events: Some(events),
-                agents: Vec::new(),
-                folded: Vec::new(),
+            pending: Slot::new(Some(Pending {
+                events,
                 runners,
                 servers,
-                startup: Vec::new(),
-            }),
+            })),
+            startup: Atom::default(),
+            activated: Signal::new(),
+            code_mode_hosts: Atom::default(),
+            agents: Atom::default(),
+            folded: Atom::default(),
         })
     }
 
@@ -60,26 +62,25 @@ impl RunnerAgents {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let (events, runners, servers) = (
-            state.events.take(),
-            std::mem::take(&mut state.runners),
-            std::mem::take(&mut state.servers),
-        );
-        if let Some(mut events) = events {
-            let weak = Arc::downgrade(self);
-            runtime.spawn(async move {
-                while let Some(event) = events.recv().await {
-                    let Some(agents) = weak.upgrade() else { break };
-                    agents.notify(event);
-                }
-            });
-        }
+        let Some(Pending {
+            mut events,
+            runners,
+            servers,
+        }) = self.pending.take()
+        else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        runtime.spawn(async move {
+            while let Some(event) = events.recv().await {
+                let Some(agents) = weak.upgrade() else { break };
+                agents.notify(event);
+            }
+        });
+        let mut startup = Vec::new();
         for runner in runners {
             if let Err(error) = self.pool.keep_connected(runner) {
-                state
-                    .startup
-                    .push(tokio::sync::watch::channel(Some(Err(error))).1);
+                startup.push(tokio::sync::watch::channel(Some(Err(error))).1);
             }
         }
         for server in servers {
@@ -95,24 +96,21 @@ impl RunnerAgents {
                 };
                 receipt.send_replace(Some(outcome));
             });
-            state.startup.push(result);
+            startup.push(result);
         }
+        self.startup.set(startup);
+        self.activated.fire();
     }
 
     pub(crate) async fn initialize(self: &Arc<Self>) -> Result<(), AttachmentError> {
         tokio::runtime::Handle::try_current()
             .map_err(|error| AttachmentError::Transport(error.to_string().into()))?;
         self.activate();
+        self.activated.wait().await;
         self.initialized
             .get_or_init(|| async {
-                let startup = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .startup
-                    .clone();
                 let mut result = Ok(());
-                for mut receipt in startup {
+                for mut receipt in self.startup.get().iter().cloned() {
                     let outcome = loop {
                         if let Some(outcome) = receipt.borrow().clone() {
                             break outcome;
@@ -207,25 +205,33 @@ impl RunnerAgents {
                 format!("Runner /{name} failed: {error}. {}", self.status_summary())
             }
         };
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.agents.retain(|(_, agent, notices)| {
-            agent.is_live()
-                && notices
+        let mut stale = false;
+        for (_, agent, notices) in self.agents.get().iter() {
+            stale |= !agent.is_live()
+                || notices
                     .send(Notice {
                         text: notice.clone(),
                         prefix: Some(NOTICE_PREFIX.to_owned()),
                         completed: None,
                     })
-                    .is_ok()
-        });
+                    .is_err();
+        }
+        if stale {
+            self.agents.update(|agents| {
+                agents.retain(|(_, agent, notices)| agent.is_live() && !notices.is_closed());
+            });
+        }
     }
 
     pub(crate) fn unregister(&self, session_id: &str) {
         self.pool.code_mode_executors().forget(session_id);
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.agents.retain(|(id, _, _)| id != session_id);
-        state.folded.retain(|(id, _, _)| id != session_id);
-        state.code_mode_hosts.remove(session_id);
+        self.agents
+            .update(|agents| agents.retain(|(id, _, _)| id != session_id));
+        self.folded
+            .update(|folded| folded.retain(|(id, _, _)| id != session_id));
+        self.code_mode_hosts.update(|hosts| {
+            hosts.remove(session_id);
+        });
     }
 
     pub(crate) fn initial_notice(
@@ -234,15 +240,13 @@ impl RunnerAgents {
         parent_session_id: Option<&str>,
     ) -> Option<String> {
         self.activate();
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let configured = state
-            .code_mode_hosts
-            .get(session_id)
-            .copied()
-            .or_else(|| {
-                parent_session_id.and_then(|parent| state.code_mode_hosts.get(parent).copied())
-            })
-            .unwrap_or(false);
+        let configured = self.code_mode_hosts.read(|hosts| {
+            hosts
+                .get(session_id)
+                .copied()
+                .or_else(|| parent_session_id.and_then(|parent| hosts.get(parent).copied()))
+                .unwrap_or(false)
+        });
         if configured { None } else { self.summary() }
     }
 
@@ -251,19 +255,17 @@ impl RunnerAgents {
     }
 
     pub(crate) fn initial_notice_committed(&self, agent: &crate::Agent, text: String) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.folded.retain(|(_, agent, _)| agent.is_live());
-        state
-            .folded
-            .push((agent.session_id().to_owned(), agent.downgrade(), text));
+        let weak = agent.downgrade();
+        self.folded.update(|folded| {
+            folded.retain(|(_, agent, _)| agent.is_live());
+            folded.push((agent.session_id().to_owned(), weak.clone(), text.clone()));
+        });
     }
 
     pub(crate) fn code_mode_host(&self, session_id: &str, configured: bool) {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .code_mode_hosts
-            .insert(session_id.to_owned(), configured);
+        self.code_mode_hosts.update(|hosts| {
+            hosts.insert(session_id.to_owned(), configured);
+        });
     }
 
     pub(crate) async fn register(
@@ -271,27 +273,23 @@ impl RunnerAgents {
         agent: &crate::Agent,
         await_initial: bool,
     ) -> nanocode_agent_core::Result<()> {
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let configured = state
-                .code_mode_hosts
+        let parent = agent.session().lineage.parent_session_id.clone();
+        let configured = self.code_mode_hosts.try_update(|hosts| {
+            hosts
                 .get(agent.session_id())
                 .copied()
                 .or_else(|| {
-                    agent
-                        .session()
-                        .lineage
-                        .parent_session_id
+                    parent
                         .as_ref()
-                        .and_then(|parent| state.code_mode_hosts.get(parent).copied())
+                        .and_then(|parent| hosts.get(parent).copied())
                 })
-                .unwrap_or(false);
-            if configured {
-                state
-                    .code_mode_hosts
-                    .insert(agent.session_id().to_owned(), true);
-                return Ok(());
-            }
+                .unwrap_or(false)
+                .then(|| {
+                    hosts.insert(agent.session_id().to_owned(), true);
+                })
+        });
+        if configured.is_some() {
+            return Ok(());
         }
         self.activate();
         if !agent.capabilities().developer_messages {
@@ -301,44 +299,39 @@ impl RunnerAgents {
         let worker = weak.clone();
         let (notices, mut receiver) = mpsc::unbounded_channel::<Notice>();
         let (completed, result) = oneshot::channel();
-        let awaited;
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state
-                .agents
-                .retain(|(_, agent, notices)| agent.is_live() && !notices.is_closed());
-            state.folded.retain(|(_, agent, _)| agent.is_live());
-            if state
-                .agents
-                .iter()
-                .any(|(id, _, _)| id == agent.session_id())
-            {
-                return Ok(());
+        let claimed = self.agents.try_update(|agents| {
+            agents.retain(|(_, agent, notices)| agent.is_live() && !notices.is_closed());
+            if agents.iter().any(|(id, _, _)| id == agent.session_id()) {
+                return None;
             }
-            let folded = state
-                .folded
+            agents.push((agent.session_id().to_owned(), weak.clone(), notices.clone()));
+            Some(())
+        });
+        if claimed.is_none() {
+            return Ok(());
+        }
+        let folded = self.folded.update(|folded| {
+            folded.retain(|(_, agent, _)| agent.is_live());
+            folded
                 .iter()
                 .position(|(id, _, _)| id == agent.session_id())
-                .map(|index| state.folded.swap_remove(index).2);
-            let folded_initial = folded.is_some();
-            let text = match (folded, self.summary()) {
-                (Some(folded), Some(summary)) if folded == summary => None,
-                (Some(_), None) => Some(NO_RUNNERS.to_owned()),
-                (None, summary) | (Some(_), summary) => summary,
-            };
-            awaited = await_initial && !folded_initial && text.is_some();
-            if let Some(text) = text {
-                notices
-                    .send(Notice {
-                        text,
-                        prefix: Some(NOTICE_PREFIX.to_owned()),
-                        completed: awaited.then_some(completed),
-                    })
-                    .map_err(|_| crate::NanocodeError::AgentStopped)?;
-            }
-            state
-                .agents
-                .push((agent.session_id().to_owned(), weak, notices));
+                .map(|index| folded.swap_remove(index).2)
+        });
+        let folded_initial = folded.is_some();
+        let text = match (folded, self.summary()) {
+            (Some(folded), Some(summary)) if folded == summary => None,
+            (Some(_), None) => Some(NO_RUNNERS.to_owned()),
+            (None, summary) | (Some(_), summary) => summary,
+        };
+        let awaited = await_initial && !folded_initial && text.is_some();
+        if let Some(text) = text {
+            notices
+                .send(Notice {
+                    text,
+                    prefix: Some(NOTICE_PREFIX.to_owned()),
+                    completed: awaited.then_some(completed),
+                })
+                .map_err(|_| crate::NanocodeError::AgentStopped)?;
         }
         tokio::spawn(async move {
             while let Some(mut notice) = receiver.recv().await {

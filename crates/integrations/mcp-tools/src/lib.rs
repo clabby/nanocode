@@ -15,7 +15,7 @@ mod stdio;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -48,7 +48,7 @@ pub struct Mcp {
     session: Arc<OnceLock<SessionEnvironment>>,
     started: AtomicBool,
 
-    startup_tasks: Mutex<tokio::task::JoinSet<()>>,
+    startup_tasks: OnceLock<tokio::task::JoinSet<()>>,
 }
 
 pub struct PreparedMcpTool {
@@ -260,7 +260,7 @@ impl McpBuilder {
             oauth_metadata: Arc::new(nanocode_mcp_http::oauth::OAuthMetadataCache::default()),
             session: Arc::new(OnceLock::new()),
             started: AtomicBool::new(false),
-            startup_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            startup_tasks: OnceLock::new(),
         })
     }
 }
@@ -472,10 +472,7 @@ impl DynamicToolProvider for Mcp {
         if self.started.swap(true, Ordering::AcqRel) {
             return;
         }
-        let mut startup_tasks = self
-            .startup_tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut startup_tasks = tokio::task::JoinSet::new();
         for server in &*self.servers {
             let name = server.name.clone();
             let model_namespace = server.model_namespace.clone();
@@ -535,6 +532,7 @@ impl DynamicToolProvider for Mcp {
                 state.complete_server(&name, 0, result);
             });
         }
+        let _ = self.startup_tasks.set(startup_tasks);
     }
 
     fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {

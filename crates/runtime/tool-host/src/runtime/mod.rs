@@ -1,3 +1,4 @@
+mod admission;
 mod execution;
 mod registry;
 mod schema;

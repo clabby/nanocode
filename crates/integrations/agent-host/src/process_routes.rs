@@ -1,31 +1,29 @@
 use nanocode_durability::{OwnedState, OwnerId, SharedStore, StateStore};
+use nanocode_sync::Atom;
 use nanocode_tool_host::{attachment::ProcessRouteStore, contract::ToolError};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
 
-struct Routes {
+pub(crate) struct DurableProcessRoutes {
     store: SharedStore,
-    owners: HashMap<String, OwnedState>,
+    owners: Atom<HashMap<String, OwnedState>>,
 }
-
-pub(crate) struct DurableProcessRoutes(Mutex<Routes>);
 
 impl DurableProcessRoutes {
     pub(crate) fn new(store: SharedStore) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(Routes {
+        Arc::new(Self {
             store,
-            owners: HashMap::new(),
-        })))
+            owners: Atom::default(),
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl ProcessRouteStore for DurableProcessRoutes {
     async fn load(&self, session_id: &str) -> Result<Option<serde_json::Value>, ToolError> {
-        let mut routes = self.0.lock().await;
         let state_id = format!("{session_id}:process-routes");
-        let owned = routes
+        let owned = self
             .store
+            .clone()
             .acquire(&state_id, OwnerId::new())
             .await
             .map_err(|error| -> ToolError { Box::new(error) })?;
@@ -35,34 +33,40 @@ impl ProcessRouteStore for DurableProcessRoutes {
             .as_deref()
             .map(serde_json::from_str)
             .transpose()?;
-        routes.owners.insert(state_id, owned);
+        self.owners.update(|owners| {
+            owners.insert(state_id.clone(), owned.clone());
+        });
         Ok(value)
     }
 
     async fn save(&self, session_id: &str, value: serde_json::Value) -> Result<(), ToolError> {
         let payload = serde_json::to_string(&value)?;
-        let mut routes = self.0.lock().await;
         let state_id = format!("{session_id}:process-routes");
-        let owned = routes
+        let owned = self
             .owners
-            .get(&state_id)
-            .cloned()
+            .read(|owners| owners.get(&state_id).cloned())
             .ok_or("process routes were not loaded before saving")?;
-        let revision = routes
+        let revision = self
             .store
+            .clone()
             .replace(&state_id, &owned.owner, owned.state.revision, &payload, &[])
             .await
             .map_err(|error| -> ToolError { Box::new(error) })?;
-        routes.owners.insert(
-            state_id,
-            OwnedState {
-                owner: owned.owner,
-                state: nanocode_durability::StoredState {
-                    revision,
-                    payload: Some(payload),
-                },
+        let saved = OwnedState {
+            owner: owned.owner.clone(),
+            state: nanocode_durability::StoredState {
+                revision,
+                payload: Some(payload),
             },
-        );
+        };
+        self.owners.update(|owners| {
+            if owners
+                .get(&state_id)
+                .is_some_and(|current| current.owner == owned.owner)
+            {
+                owners.insert(state_id.clone(), saved.clone());
+            }
+        });
         Ok(())
     }
 }

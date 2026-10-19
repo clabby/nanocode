@@ -3,9 +3,9 @@ use std::{
     io::{self, BufWriter, Write},
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{self, RecvTimeoutError, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -66,7 +66,13 @@ impl Exporters {
 
 #[derive(Debug)]
 struct Jsonl {
-    file: Mutex<Option<File>>,
+    sender: Sender<JsonlMessage>,
+}
+
+#[derive(Debug)]
+enum JsonlMessage {
+    Write(Vec<u8>, SyncSender<io::Result<()>>),
+    Shutdown(SyncSender<()>),
 }
 
 fn max_queue_size() -> io::Result<usize> {
@@ -101,34 +107,55 @@ fn write_failed(error: impl std::fmt::Display) -> OTelSdkError {
 
 impl Jsonl {
     fn create(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            file: Mutex::new(Some(create_file(path)?)),
-        })
+        let file = create_file(path)?;
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("nanocode-otlp-metrics".to_owned())
+            .spawn(move || Self::run(file, &receiver))?;
+        Ok(Self { sender })
+    }
+
+    fn run(file: File, receiver: &Receiver<JsonlMessage>) {
+        let mut file = Some(file);
+        while let Ok(message) = receiver.recv() {
+            match message {
+                JsonlMessage::Write(encoded, reply) => {
+                    let result = file.as_mut().map_or_else(
+                        || Err(io::Error::other("OTLP file exporter is shut down")),
+                        |file| file.write_all(&encoded),
+                    );
+                    drop(reply.send(result));
+                }
+                JsonlMessage::Shutdown(reply) => {
+                    drop(file.take());
+                    let _ = reply.send(());
+                }
+            }
+        }
     }
 
     fn write(&self, value: &impl Serialize) -> OTelSdkResult {
         let result = (|| {
             let mut encoded = serde_json::to_vec(value).map_err(io::Error::other)?;
             encoded.push(b'\n');
-            let mut file = self
-                .file
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let file = file
-                .as_mut()
-                .ok_or_else(|| io::Error::other("OTLP file exporter is shut down"))?;
-            file.write_all(&encoded)
+            let (reply, response) = mpsc::sync_channel(1);
+            self.sender
+                .send(JsonlMessage::Write(encoded, reply))
+                .map_err(|_| io::Error::other("OTLP file exporter stopped"))?;
+            response
+                .recv()
+                .map_err(|_| io::Error::other("OTLP file exporter stopped"))?
         })();
         result.map_err(write_failed)
     }
 
     fn shutdown(&self) -> OTelSdkResult {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|error| OTelSdkError::InternalFailure(error.to_string()))?;
-        drop(file.take());
-        Ok(())
+        let stopped = || OTelSdkError::InternalFailure("OTLP file exporter stopped".to_owned());
+        let (reply, response) = mpsc::sync_channel(1);
+        self.sender
+            .send(JsonlMessage::Shutdown(reply))
+            .map_err(|_| stopped())?;
+        response.recv().map_err(|_| stopped())
     }
 }
 

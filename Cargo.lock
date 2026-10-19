@@ -1632,6 +1632,7 @@ dependencies = [
  "nanocode-process",
  "nanocode-process-contracts",
  "nanocode-store-jsonl",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-tool-host",
  "nanocode-tool-runtime",
@@ -2013,6 +2014,7 @@ dependencies = [
  "nanocode-mcp",
  "nanocode-mcp-http",
  "nanocode-process",
+ "nanocode-sync",
  "nanocode-tls",
  "nanocode-tool-provider",
  "nanocode-tools",
@@ -2192,11 +2194,13 @@ dependencies = [
 name = "nanocode-tool-host"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "futures-util",
  "nanocode-code-mode",
  "nanocode-home",
  "nanocode-media",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-tool-provider",
  "nanocode-tools",
@@ -2232,6 +2236,7 @@ dependencies = [
  "nanocode-mcp-tools",
  "nanocode-media",
  "nanocode-process",
+ "nanocode-sync",
  "nanocode-tls",
  "nanocode-tool-host",
  "nanocode-tool-provider",
@@ -2276,6 +2281,7 @@ dependencies = [
 name = "nanocode-tui"
 version = "0.6.7"
 dependencies = [
+ "arc-swap",
  "crossterm",
  "memchr",
  "pulldown-cmark",
