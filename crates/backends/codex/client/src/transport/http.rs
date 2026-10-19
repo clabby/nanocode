@@ -1,4 +1,7 @@
-use crate::client::{OpenAiAuthSnapshot, monotonic_now_ns};
+use crate::client::{
+    OpenAiAuthSnapshot, monotonic_now_ns,
+    transport::host::{HostConnectRequest, HostError, HostHttpBody, HostTransport},
+};
 use http::header;
 
 #[cfg(not(target_family = "wasm"))]
@@ -17,8 +20,7 @@ pub(crate) struct ResponsesHttp {
 
     #[cfg(not(target_family = "wasm"))]
     chat_gateway: Option<(std::sync::Arc<super::chat::ChatGateway>, reqwest::Client)>,
-    #[cfg(target_family = "wasm")]
-    host: Option<std::sync::Arc<dyn crate::client::transport::host::HostTransport>>,
+    host: Option<std::sync::Arc<dyn HostTransport>>,
     gateway: Option<std::sync::Arc<super::ResponsesGateway>>,
 }
 
@@ -28,8 +30,10 @@ pub(crate) struct ResponsesHttpStream {
 
     #[cfg(not(target_family = "wasm"))]
     chat: Option<Box<super::chat::ChatStream>>,
+    #[cfg(not(target_family = "wasm"))]
+    host: Option<Box<dyn HostHttpBody>>,
     #[cfg(target_family = "wasm")]
-    response: Box<dyn crate::client::transport::host::HostHttpBody>,
+    response: Box<dyn HostHttpBody>,
     decoder: SseDecoder,
     ended: bool,
 }
@@ -43,6 +47,7 @@ pub(crate) struct HttpMetadata {
 impl ResponsesHttp {
     pub(crate) fn new(
         client: reqwest::Client,
+        host: Option<std::sync::Arc<dyn HostTransport>>,
         chat_gateway: Option<std::sync::Arc<super::chat::ChatGateway>>,
         gateway: Option<std::sync::Arc<super::ResponsesGateway>>,
     ) -> Self {
@@ -50,6 +55,7 @@ impl ResponsesHttp {
             client,
             chat_gateway: chat_gateway
                 .map(|gateway| (gateway, super::chat::ChatGateway::http_client())),
+            host,
             gateway,
         }
     }
@@ -63,6 +69,18 @@ impl ResponsesHttp {
         turn_state: Option<&str>,
         request: &EncodedRequest,
     ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
+        if self.host.is_some() {
+            return self
+                .send_host(
+                    api_base_url,
+                    auth,
+                    session_id,
+                    thread_id,
+                    turn_state,
+                    request,
+                )
+                .await;
+        }
         if let Some((gateway, client)) = &self.chat_gateway {
             return gateway
                 .send(client, api_base_url, auth, request.raw().get())
@@ -134,6 +152,7 @@ impl ResponsesHttp {
             ResponsesHttpStream {
                 response: Some(response),
                 chat: None,
+                host: None,
                 decoder: SseDecoder::default(),
                 ended: false,
             },
@@ -148,8 +167,26 @@ impl ResponsesHttpStream {
         Self {
             response: None,
             chat: Some(Box::new(stream)),
+            host: None,
             decoder: SseDecoder::default(),
             ended: true,
+        }
+    }
+
+    fn host(body: Box<dyn HostHttpBody>) -> Self {
+        #[cfg(not(target_family = "wasm"))]
+        return Self {
+            response: None,
+            chat: None,
+            host: Some(body),
+            decoder: SseDecoder::default(),
+            ended: false,
+        };
+        #[cfg(target_family = "wasm")]
+        Self {
+            response: body,
+            decoder: SseDecoder::default(),
+            ended: false,
         }
     }
 
@@ -166,15 +203,28 @@ impl ResponsesHttpStream {
                 return Err(ResponsesError::UnexpectedEnd);
             }
             #[cfg(not(target_family = "wasm"))]
-            let chunk = match self.response.as_mut() {
-                Some(response) => response.chunk().await.map_err(map_http_error)?,
-                None => None,
+            let pushed = if let Some(host) = self.host.as_mut() {
+                host.next()
+                    .await
+                    .map_err(map_host_error)?
+                    .map(|chunk| self.decoder.push(&chunk))
+            } else if let Some(response) = self.response.as_mut() {
+                response
+                    .chunk()
+                    .await
+                    .map_err(map_http_error)?
+                    .map(|chunk| self.decoder.push(&chunk))
+            } else {
+                None
             };
             #[cfg(target_family = "wasm")]
-            let chunk = self.response.next().await.map_err(map_host_error)?;
-            if let Some(chunk) = chunk {
-                self.decoder.push(&chunk);
-            } else {
+            let pushed = self
+                .response
+                .next()
+                .await
+                .map_err(map_host_error)?
+                .map(|chunk| self.decoder.push(&chunk));
+            if pushed.is_none() {
                 self.ended = true;
                 self.decoder.finish();
             }
@@ -313,7 +363,7 @@ fn map_http_error(error: reqwest::Error) -> ResponsesError {
 #[cfg(target_family = "wasm")]
 impl ResponsesHttp {
     pub(crate) fn new(
-        host: Option<std::sync::Arc<dyn crate::client::transport::host::HostTransport>>,
+        host: Option<std::sync::Arc<dyn HostTransport>>,
         gateway: Option<std::sync::Arc<super::ResponsesGateway>>,
     ) -> Self {
         Self { host, gateway }
@@ -328,7 +378,28 @@ impl ResponsesHttp {
         turn_state: Option<&str>,
         request: &EncodedRequest,
     ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
-        use crate::client::transport::host::HostConnectRequest;
+        self.send_host(
+            api_base_url,
+            auth,
+            session_id,
+            thread_id,
+            turn_state,
+            request,
+        )
+        .await
+    }
+}
+
+impl ResponsesHttp {
+    async fn send_host(
+        &self,
+        api_base_url: &str,
+        auth: &OpenAiAuthSnapshot,
+        session_id: &str,
+        thread_id: &str,
+        turn_state: Option<&str>,
+        request: &EncodedRequest,
+    ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
         let host = self
             .host
             .as_deref()
@@ -360,20 +431,11 @@ impl ResponsesHttp {
             reasoning_included: response.metadata.reasoning_included(),
             turn_state: response.metadata.turn_state().map(str::to_owned),
         };
-        Ok((
-            ResponsesHttpStream {
-                response: response.body,
-                decoder: SseDecoder::default(),
-                ended: false,
-            },
-            metadata,
-        ))
+        Ok((ResponsesHttpStream::host(response.body), metadata))
     }
 }
 
-#[cfg(target_family = "wasm")]
-fn map_host_error(error: crate::client::transport::host::HostError) -> ResponsesError {
-    use crate::client::transport::host::HostError;
+fn map_host_error(error: HostError) -> ResponsesError {
     match error {
         HostError::HandshakeRejected {
             status,

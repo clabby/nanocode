@@ -1,9 +1,15 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin};
 
 use futures_util::{Stream, TryStreamExt};
 use http::{HeaderMap, StatusCode};
 
+#[cfg(not(target_family = "wasm"))]
+pub type HttpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+#[cfg(target_family = "wasm")]
 pub type HttpFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+#[cfg(not(target_family = "wasm"))]
+pub type HttpBody = Pin<Box<dyn Stream<Item = Result<Vec<u8>, HttpError>> + Send>>;
+#[cfg(target_family = "wasm")]
 pub type HttpBody = Pin<Box<dyn Stream<Item = Result<Vec<u8>, HttpError>>>>;
 
 pub trait HttpTransport: Send + Sync + 'static {
@@ -16,12 +22,14 @@ pub struct HttpRequest {
     pub body: String,
 }
 
+#[cfg(target_family = "wasm")]
 #[derive(Clone)]
-pub struct HttpClient(pub(super) Arc<dyn HttpTransport>);
+pub struct HttpClient(pub(super) std::sync::Arc<dyn HttpTransport>);
 
+#[cfg(target_family = "wasm")]
 impl HttpClient {
     pub fn new(transport: impl HttpTransport) -> Self {
-        Self(Arc::new(transport))
+        Self(std::sync::Arc::new(transport))
     }
 }
 

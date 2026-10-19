@@ -232,7 +232,6 @@ impl<F> OpenAiBuilder<F> {
         self
     }
 
-    #[cfg(any(target_family = "wasm", docsrs))]
     #[must_use]
     pub fn host_transport(
         mut self,

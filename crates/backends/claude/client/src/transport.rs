@@ -1,23 +1,12 @@
+pub mod host;
+
+pub use host::{HttpBody, HttpError, HttpFuture, HttpRequest, HttpResponse, HttpTransport};
+
 #[cfg(not(target_family = "wasm"))]
 pub type HttpClient = reqwest::Client;
-#[cfg(not(target_family = "wasm"))]
-pub type HttpError = reqwest::Error;
-#[cfg(not(target_family = "wasm"))]
-pub type HttpResponse = reqwest::Response;
-
 #[cfg(target_family = "wasm")]
-mod host;
-#[cfg(target_family = "wasm")]
-pub use host::{
-    HttpBody, HttpClient, HttpError, HttpFuture, HttpRequest, HttpResponse, HttpTransport,
-};
+pub use host::HttpClient;
 
-#[cfg(not(target_family = "wasm"))]
-pub(crate) fn is_transient(error: &HttpError) -> bool {
-    error.is_timeout() || error.is_request() || error.is_body()
-}
-
-#[cfg(target_family = "wasm")]
 pub(crate) const fn is_transient(error: &HttpError) -> bool {
     matches!(
         error,
@@ -35,10 +24,12 @@ pub(crate) async fn post(
     mut headers: http::HeaderMap,
     body: String,
 ) -> Result<HttpResponse, HttpError> {
+    use futures_util::TryStreamExt;
+
     headers
         .entry(http::header::ACCEPT_ENCODING)
         .or_insert(http::HeaderValue::from_static("gzip, br, deflate, zstd"));
-    client
+    let mut response = client
         .post(endpoint)
         .header("anthropic-version", crate::ANTHROPIC_VERSION)
         .headers(headers)
@@ -47,11 +38,42 @@ pub(crate) async fn post(
         .send()
         .await
         .map(nanocode_http::decode_response)
+        .map_err(reqwest_error)?;
+    let status = response.status();
+    let headers = std::mem::take(response.headers_mut());
+    Ok(HttpResponse::new(
+        status,
+        headers,
+        Box::pin(
+            response
+                .bytes_stream()
+                .map_ok(Vec::from)
+                .map_err(reqwest_error),
+        ),
+    ))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn reqwest_error(error: reqwest::Error) -> HttpError {
+    HttpError::Transport {
+        retryable: error.is_request() || error.is_body(),
+        timeout: error.is_timeout(),
+        detail: error.to_string(),
+    }
 }
 
 #[cfg(target_family = "wasm")]
 pub(crate) async fn post(
     client: &HttpClient,
+    endpoint: &str,
+    headers: http::HeaderMap,
+    body: String,
+) -> Result<HttpResponse, HttpError> {
+    post_with(client.0.as_ref(), endpoint, headers, body).await
+}
+
+pub(crate) async fn post_with(
+    transport: &dyn HttpTransport,
     endpoint: &str,
     mut headers: http::HeaderMap,
     body: String,
@@ -63,8 +85,7 @@ pub(crate) async fn post(
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("application/json"),
     );
-    client
-        .0
+    transport
         .post(HttpRequest {
             endpoint: endpoint.to_owned(),
             headers,

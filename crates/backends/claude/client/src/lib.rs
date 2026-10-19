@@ -1083,8 +1083,14 @@ pub struct FrozenWireProfile {
 }
 
 #[derive(Clone)]
+enum HttpConnection {
+    Client(HttpClient),
+    Transport(Arc<dyn transport::HttpTransport>),
+}
+
+#[derive(Clone)]
 pub struct ClaudeClient {
-    http: HttpClient,
+    http: HttpConnection,
     endpoint: String,
     auth: ClientAuth,
     subscription_compatibility: bool,
@@ -1097,7 +1103,7 @@ pub struct ClaudeClient {
 impl ClaudeClient {
     pub fn new(http: HttpClient, endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            http,
+            http: HttpConnection::Client(http),
             endpoint: endpoint.into(),
             auth: ClientAuth::ApiKey(api_key.into()),
             subscription_compatibility: false,
@@ -1113,7 +1119,7 @@ impl ClaudeClient {
         headers: http::header::HeaderMap,
     ) -> Self {
         Self {
-            http,
+            http: HttpConnection::Client(http),
             endpoint: endpoint.into(),
             auth: ClientAuth::Headers(headers),
             subscription_compatibility: false,
@@ -1129,7 +1135,7 @@ impl ClaudeClient {
         provider: Arc<dyn ClaudeAuthProvider>,
     ) -> Self {
         Self {
-            http,
+            http: HttpConnection::Client(http),
             endpoint: endpoint.into(),
             auth: ClientAuth::Provider(provider),
             subscription_compatibility: false,
@@ -1137,6 +1143,12 @@ impl ClaudeClient {
             subscription_session: nanocode_platform::uuid_v4().to_string(),
             subscription_cache_tail: true,
         }
+    }
+
+    #[must_use]
+    pub fn with_transport(mut self, transport: impl transport::HttpTransport) -> Self {
+        self.http = HttpConnection::Transport(Arc::new(transport));
+        self
     }
 
     pub fn official(http: HttpClient, api_key: impl Into<String>) -> Self {
@@ -1476,8 +1488,20 @@ impl ClaudeClient {
                     }
                 }
             }
-            let response =
-                transport::post(&self.http, &self.endpoint, headers, wire.body.clone()).await?;
+            let response = match &self.http {
+                HttpConnection::Client(client) => {
+                    transport::post(client, &self.endpoint, headers, wire.body.clone()).await?
+                }
+                HttpConnection::Transport(transport) => {
+                    transport::post_with(
+                        transport.as_ref(),
+                        &self.endpoint,
+                        headers,
+                        wire.body.clone(),
+                    )
+                    .await?
+                }
+            };
 
             if response.status() == http::StatusCode::UNAUTHORIZED
                 && !retried
@@ -1536,7 +1560,6 @@ impl ClaudeClient {
                 "expected text/event-stream response".into(),
             ));
         }
-        #[cfg(target_family = "wasm")]
         let response = response.bytes_stream();
         let decode_subscription = self.subscription_compatibility;
         Ok(Box::pin(stream::unfold(
@@ -1593,11 +1616,7 @@ impl ClaudeClient {
                             }
                         }
                     }
-                    #[cfg(not(target_family = "wasm"))]
-                    let chunk = state.response.chunk().await.transpose();
-                    #[cfg(target_family = "wasm")]
-                    let chunk = state.response.next().await;
-                    match chunk {
+                    match state.response.next().await {
                         Some(Ok(chunk)) => {
                             state.push(&chunk);
                         }
@@ -1807,9 +1826,6 @@ impl<T: Future> ToolFuture for T {}
 
 const MAX_SSE_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
-#[cfg(not(target_family = "wasm"))]
-type ResponseBytes = HttpResponse;
-#[cfg(target_family = "wasm")]
 type ResponseBytes = transport::HttpBody;
 
 fn redact_error(error: ClaudeError, credentials: &[String]) -> ClaudeError {

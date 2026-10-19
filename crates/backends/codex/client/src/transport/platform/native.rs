@@ -25,6 +25,7 @@ impl ServicePlatform {
         Self {
             http: ResponsesHttp::new(
                 client,
+                config.host_transport.clone(),
                 config.chat_gateway.clone(),
                 config.responses_gateway.clone(),
             ),

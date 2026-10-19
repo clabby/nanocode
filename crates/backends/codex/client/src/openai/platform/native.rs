@@ -1,6 +1,8 @@
 use std::{num::NonZeroU32, sync::Arc};
 
-use crate::client::{DefaultResponsesService, ModelConfig, OpenAiError, ResponsesService};
+use crate::client::{
+    DefaultResponsesService, ModelConfig, OpenAiError, ResponsesService, ResponsesTransport,
+};
 
 #[derive(Clone, Default)]
 pub(crate) struct FactoryPlatform {
@@ -16,7 +18,20 @@ impl FactoryPlatform {
         self.http_client = Some(client);
     }
 
-    pub(crate) const fn validate_config(&self, _config: &ModelConfig) -> Result<(), OpenAiError> {
+    pub(crate) fn validate_config(&self, config: &ModelConfig) -> Result<(), OpenAiError> {
+        if config.host_transport.is_none() {
+            return Ok(());
+        }
+        if config.chat_gateway.is_some() {
+            return Err(OpenAiError::InvalidConfiguration {
+                detail: "choose either a Chat Completions gateway or a Responses host transport",
+            });
+        }
+        if !matches!(config.responses_transport, ResponsesTransport::Https) {
+            return Err(OpenAiError::InvalidConfiguration {
+                detail: "native Responses host transports serve HTTPS; select the HTTPS Responses transport",
+            });
+        }
         Ok(())
     }
 

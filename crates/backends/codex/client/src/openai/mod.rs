@@ -189,13 +189,14 @@ fn validate_responses_gateway(
 pub fn validate(config: &ModelConfig) -> Result<(), OpenAiError> {
     config.auth.validate()?;
     if config.auth.is_gateway_managed()
+        && config.host_transport.is_none()
         && !config
             .responses_gateway
             .as_deref()
             .is_some_and(ResponsesGateway::authenticates_requests)
     {
         return Err(OpenAiError::InvalidConfiguration {
-            detail: "gateway-managed authentication requires a Cloudflare provider-native gateway with a gateway token",
+            detail: "gateway-managed authentication requires a Responses host transport or a Cloudflare provider-native gateway with a gateway token",
         });
     }
     if !config.model.supports_thinking(config.thinking) {

@@ -45,7 +45,6 @@ pub struct ModelConfig {
 
     pub api_base_url: String,
 
-    #[cfg(any(target_family = "wasm", docsrs))]
     pub host_transport: Option<Arc<dyn crate::client::transport::host::HostTransport>>,
 
     #[cfg(not(target_family = "wasm"))]
@@ -170,7 +169,6 @@ impl ModelConfig {
             strict_json_schema: None,
             websocket_url: "wss://api.openai.com/v1/responses".to_owned(),
             api_base_url: "https://api.openai.com/v1".to_owned(),
-            #[cfg(any(target_family = "wasm", docsrs))]
             host_transport: None,
             #[cfg(not(target_family = "wasm"))]
             chat_gateway: None,

@@ -92,7 +92,6 @@ impl<'a> HostConnectRequest<'a> {
         }
     }
 
-    #[cfg(target_family = "wasm")]
     pub(crate) const fn with_headers(mut self, headers: &'a [super::GatewayHeader]) -> Self {
         self.headers = headers;
         self
