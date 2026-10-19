@@ -1,4 +1,6 @@
 use super::*;
+use crate::execution::{BeginRequest, JournalWrite};
+use serde_json::value::RawValue;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,36 +176,67 @@ impl Effect<'_> {
         }
     }
 
-    pub(super) async fn begin(&self, kind: &str, input: Value) -> Result<Step> {
-        self.policy
-            .begin_step(
-                self.operation.to_owned(),
-                self.step.clone(),
-                if kind == "model" && self.model_call {
-                    "model_call"
-                } else {
-                    kind
-                }
-                .to_owned(),
-                input,
-            )
-            .await
+    pub(super) async fn begin_model(
+        &self,
+        wire: &crate::PreparedWire,
+        writes: Vec<JournalWrite>,
+    ) -> Result<Step> {
+        let request = BeginRequest {
+            step_id: self.step.clone(),
+            kind: if self.model_call { "model_call" } else { "model" }.to_owned(),
+            input: wire.durable_input().map_err(provider_error)?,
+            wire: Some(wire),
+        };
+        self.admit(writes, request).await
     }
-    pub(super) async fn begin_model(&self, wire: &crate::PreparedWire) -> Result<Step> {
+    pub(super) async fn begin_tool(
+        &self,
+        input: Box<RawValue>,
+        writes: Vec<JournalWrite>,
+    ) -> Result<Step> {
+        let request = BeginRequest {
+            step_id: self.step.clone(),
+            kind: "tool".to_owned(),
+            input,
+            wire: None,
+        };
+        self.admit(writes, request).await
+    }
+    async fn admit(&self, writes: Vec<JournalWrite>, request: BeginRequest<'_>) -> Result<Step> {
         self.policy
-            .begin_model_step(
-                self.operation.to_owned(),
-                self.step.clone(),
-                if self.model_call { "model_call" } else { "model" }.to_owned(),
-                wire.durable_input().map_err(provider_error)?,
-                wire,
-            )
-            .await
+            .commit_writes(self.operation.to_owned(), writes, Some(request))
+            .await?
+            .ok_or_else(|| recovery_error("the Claude step admission returned no outcome"))
     }
     pub(super) async fn complete(&self, output: Value) -> Result<()> {
         self.policy
             .complete_step(self.operation.to_owned(), self.step.clone(), output)
             .await
+    }
+    pub(super) fn completion(&self, output: &impl Serialize) -> Result<JournalWrite> {
+        Ok(JournalWrite::Complete {
+            step_id: self.step.clone(),
+            output: serde_json::value::to_raw_value(output).map_err(provider_error)?,
+        })
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Journal {
+    operation: Option<String>,
+    writes: Vec<JournalWrite>,
+}
+impl Journal {
+    fn advance(&mut self, state: Box<RawValue>) {
+        self.writes
+            .retain(|write| !matches!(write, JournalWrite::Advance(_)));
+        self.writes.push(JournalWrite::Advance(state));
+    }
+    pub(super) fn complete(&mut self, write: JournalWrite) {
+        self.writes.push(write);
+    }
+    pub(super) fn take(&mut self) -> Vec<JournalWrite> {
+        std::mem::take(&mut self.writes)
     }
 }
 
@@ -333,6 +366,7 @@ impl State {
         speed: Option<crate::Speed>,
         prompt: Option<&Prompt>,
         mut developer_notice_ids: HashSet<String>,
+        journal: &mut Journal,
     ) -> Result<Cursor> {
         let update = self.persistence_update.lock().await;
         if let (Some(policy), Some(operation)) = (&self.policy, operation)
@@ -373,6 +407,7 @@ impl State {
                 &mut cursor.developer_notice_ids,
             )
             .await?;
+            journal.operation.clone_from(&cursor.operation);
             return Ok(cursor);
         }
         if let (Some(policy), Some(operation)) = (&self.policy, operation) {
@@ -437,7 +472,7 @@ impl State {
         if self.policy.is_some() && self.task_board.is_some() {
             cursor.parallel = false;
         }
-        self.advance_cursor(&mut cursor, conversation).await?;
+        self.defer_cursor(&mut cursor, conversation, journal).await?;
         Ok(cursor)
     }
 
@@ -450,18 +485,21 @@ impl State {
             cursor.pending = pending.to_vec();
         }
     }
-    pub(super) async fn advance_cursor(
+    pub(super) async fn defer_cursor(
         &self,
         cursor: &mut Cursor,
         conversation: &mut Conversation,
+        journal: &mut Journal,
     ) -> Result<()> {
         let _update = self.persistence_update.lock().await;
-        self.advance_cursor_locked(cursor, conversation).await
+        self.defer_cursor_locked(cursor, conversation, journal)
+            .await
     }
-    pub(super) async fn advance_cursor_locked(
+    pub(super) async fn defer_cursor_locked(
         &self,
         cursor: &mut Cursor,
         conversation: &mut Conversation,
+        journal: &mut Journal,
     ) -> Result<()> {
         if self.code_only && !is_code_only_catalog(&cursor.template.tools) {
             cursor.template.tools = self.code_only_tools();
@@ -469,12 +507,43 @@ impl State {
             cursor.tool_search = false;
         }
 
-        if let (Some(policy), Some(operation)) = (&self.policy, cursor.operation.clone()) {
+        if self.persists(cursor) {
             cursor.snapshot = self.snapshot(&Conversation::default()).await?;
             cursor.snapshot.conversation = std::mem::take(conversation);
             let encoded = encode_cursor(cursor);
             *conversation = std::mem::take(&mut cursor.snapshot).conversation;
-            policy.advance_encoded(operation, encoded?).await?;
+            journal.operation.clone_from(&cursor.operation);
+            journal.advance(encoded?);
+        }
+        Ok(())
+    }
+    pub(super) async fn flush_for_lifecycle(
+        &self,
+        event: &crate::ClaudeLifecycleEvent,
+        journal: &mut Journal,
+    ) -> Result<()> {
+        if self
+            .tool_hooks
+            .iter()
+            .any(|hook| hook.handles_lifecycle(event))
+        {
+            self.flush_journal(journal).await?;
+        }
+        Ok(())
+    }
+    pub(super) async fn flush_journal(&self, journal: &mut Journal) -> Result<()> {
+        let (Some(policy), Some(operation)) = (&self.policy, journal.operation.clone()) else {
+            return Ok(());
+        };
+        let writes = journal.take();
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let advanced = writes
+            .iter()
+            .any(|write| matches!(write, JournalWrite::Advance(_)));
+        policy.commit_writes(operation, writes, None).await?;
+        if advanced {
             self.persistence_ready.notify_waiters();
         }
         Ok(())
@@ -547,19 +616,36 @@ impl State {
     pub(super) async fn durable_tool(
         &self,
         control: (&Cursor, &Cancellation),
-        id: &str,
-        name: &str,
-        input: &Value,
+        call: (&str, &str, &Value),
         handler: Option<&Handler>,
         events: &AgentEventPublisher,
-    ) -> Result<ContentBlock> {
+        journal: (Vec<JournalWrite>, bool),
+    ) -> Result<(ContentBlock, Option<JournalWrite>)> {
+        #[derive(Serialize)]
+        struct Call<'a> {
+            id: &'a str,
+            input: &'a Value,
+            name: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Completed<'a> {
+            result: &'a ContentBlock,
+            tasks: Option<Value>,
+            discovered: &'a HashSet<String>,
+        }
         let (cursor, cancel) = control;
+        let (id, name, input) = call;
+        let (writes, defer) = journal;
         let index = cursor.index;
         let step = format!("tool-{index}-{id}");
         let effect = cursor.effect(self, &step);
         let admitted = if let Some(effect) = &effect {
             effect
-                .begin("tool", json!({"id":id,"name":name,"input":input}))
+                .begin_tool(
+                    serde_json::value::to_raw_value(&Call { id, input, name })
+                        .map_err(provider_error)?,
+                    writes,
+                )
                 .await?
         } else {
             Step::Execute
@@ -582,7 +668,7 @@ impl State {
             }
             self.restore_tasks(receipt.tasks).map_err(recovery_error)?;
             self.discovered.lock().await.extend(receipt.discovered);
-            return Ok(receipt.result);
+            return Ok((receipt.result, None));
         }
         let unknown = || {
             ContentBlock::tool_result_content(id, ToolResultContent::Text("Tool execution interrupted; outcome unknown. Do not assume it did not run or automatically repeat it.".into()), true)
@@ -645,8 +731,18 @@ impl State {
                 true,
             )
         };
+        let mut deferred = None;
         if let Some(effect) = &effect {
-            effect.complete(json!({"result":result,"tasks":self.task_snapshot()?,"discovered":self.discovered.lock().await.clone()})).await?;
+            let completion = effect.completion(&Completed {
+                result: &result,
+                tasks: self.task_snapshot()?,
+                discovered: &*self.discovered.lock().await,
+            })?;
+            if defer {
+                deferred = Some(completion);
+            } else {
+                self.policy_writes(effect, vec![completion]).await?;
+            }
         }
         if interrupted {
             self.emit(
@@ -663,7 +759,14 @@ impl State {
                 }),
             );
         }
-        Ok(result)
+        Ok((result, deferred))
+    }
+    async fn policy_writes(&self, effect: &Effect<'_>, writes: Vec<JournalWrite>) -> Result<()> {
+        effect
+            .policy
+            .commit_writes(effect.operation.to_owned(), writes, None)
+            .await
+            .map(drop)
     }
 }
 

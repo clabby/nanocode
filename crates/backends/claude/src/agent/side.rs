@@ -176,6 +176,7 @@ impl State {
                     template: Some(&template),
                     wire_profile: Some(&wire_profile),
                     effect: None,
+                    journal: None,
                 },
             )
             .await

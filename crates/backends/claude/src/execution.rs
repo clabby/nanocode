@@ -28,6 +28,27 @@ pub enum Step {
     Replay(Value),
 }
 
+#[doc(hidden)]
+pub enum JournalWrite {
+    Advance(Box<RawValue>),
+
+    Complete {
+        step_id: String,
+        output: Box<RawValue>,
+    },
+}
+
+#[doc(hidden)]
+pub struct BeginRequest<'a> {
+    pub step_id: String,
+
+    pub kind: String,
+
+    pub input: Box<RawValue>,
+
+    pub wire: Option<&'a crate::PreparedWire>,
+}
+
 pub struct ClaudeSteer {
     pub message_id: Option<String>,
 
@@ -132,19 +153,36 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         }
     }
     #[doc(hidden)]
-    #[allow(clippy::boxed_local)]
-    fn begin_model_step<'a>(
+    fn commit_writes<'a>(
         &'a self,
         id: String,
-        step_id: String,
-        kind: String,
-        _digest: Box<RawValue>,
-        wire: &'a crate::PreparedWire,
-    ) -> PolicyFuture<'a, Step> {
-        match wire.legacy_durable_input() {
-            Ok(input) => self.begin_step_encoded(id, step_id, kind, input),
-            Err(error) => Box::pin(async move { Err(crate::agent::provider_error(error)) }),
-        }
+        writes: Vec<JournalWrite>,
+        begin: Option<BeginRequest<'a>>,
+    ) -> PolicyFuture<'a, Option<Step>> {
+        Box::pin(async move {
+            for write in writes {
+                match write {
+                    JournalWrite::Advance(state) => self.advance_encoded(id.clone(), state).await?,
+                    JournalWrite::Complete { step_id, output } => {
+                        let output =
+                            serde_json::from_str(output.get()).map_err(crate::agent::provider_error)?;
+                        self.complete_step(id.clone(), step_id, output).await?;
+                    }
+                }
+            }
+            let Some(begin) = begin else {
+                return Ok(None);
+            };
+            let input = match begin.wire {
+                Some(wire) => wire
+                    .legacy_durable_input()
+                    .map_err(crate::agent::provider_error)?,
+                None => begin.input,
+            };
+            self.begin_step_encoded(id, begin.step_id, begin.kind, input)
+                .await
+                .map(Some)
+        })
     }
     fn complete_step(&self, id: String, step_id: String, output: Value) -> PolicyFuture<'_, ()>;
     fn complete(&self, id: String, checkpoint: Value, output: Value) -> PolicyFuture<'_, ()>;

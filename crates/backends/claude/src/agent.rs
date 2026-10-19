@@ -29,7 +29,7 @@ pub use durable::{
     ClaudeCheckpointView, decode_checkpoint, decode_session_checkpoint, rewind_checkpoint,
     session_checkpoint,
 };
-use durable::{Cursor, Effect, Snapshot};
+use durable::{Cursor, Effect, Journal, Snapshot};
 use history::HistoryMessage;
 use nanocode_platform::Instant;
 #[cfg(target_family = "wasm")]
@@ -3548,6 +3548,7 @@ struct ResponseContext<'a> {
     template: Option<&'a MessagesRequest>,
     wire_profile: Option<&'a crate::FrozenWireProfile>,
     effect: Option<Effect<'a>>,
+    journal: Option<&'a mut Journal>,
 }
 const DEVELOPER_NOTICE_OPEN: &str = "<system-reminder>\n";
 const DEVELOPER_NOTICE_CLOSE: &str = "\n</system-reminder>";
@@ -4153,8 +4154,19 @@ impl State {
         };
         let needs_upgrade = self.code_only && !durable::is_code_only_catalog(&request.tools);
 
+        let mut journal = context.journal;
         let admitted = match &context.effect {
-            Some(effect) => effect.begin_model(&wire).await?,
+            Some(effect) => {
+                let writes = journal.as_deref_mut().map(Journal::take).unwrap_or_default();
+                let advanced = writes
+                    .iter()
+                    .any(|write| matches!(write, crate::execution::JournalWrite::Advance(_)));
+                let admitted = effect.begin_model(&wire, writes).await?;
+                if advanced {
+                    self.persistence_ready.notify_waiters();
+                }
+                admitted
+            }
             None => Step::Execute,
         };
         let upgrade = match admitted {
@@ -4219,7 +4231,7 @@ impl State {
                 ..ServerRecovery::default()
             });
             if let Some(effect) = &replacement_effect
-                && let Step::Replay(value) = effect.begin_model(&wire).await?
+                && let Step::Replay(value) = effect.begin_model(&wire, Vec::new()).await?
             {
                 let response = serde_json::from_value(value).map_err(durable::recovery_error)?;
                 completed(
@@ -4414,9 +4426,16 @@ impl State {
                 Ok(response) => {
                     telemetry::complete_attempt(&attempt_span);
                     if let Some(effect) = active_effect {
-                        effect
-                            .complete(serde_json::to_value(&response).map_err(provider_error)?)
-                            .await?;
+                        match journal.as_deref_mut() {
+                            Some(journal) => journal.complete(effect.completion(&response)?),
+                            None => {
+                                effect
+                                    .complete(
+                                        serde_json::to_value(&response).map_err(provider_error)?,
+                                    )
+                                    .await?;
+                            }
+                        }
                     }
                     completed(
                         &response,
@@ -4825,6 +4844,7 @@ impl State {
                         template: Some(&template),
                         wire_profile: cursor.wire_profile.as_ref(),
                         effect: cursor.effect(self, step),
+                        journal: None,
                     },
                 )
                 .await
@@ -5302,6 +5322,23 @@ impl State {
         speed: Option<crate::Speed>,
         cancel: &Cancellation,
     ) -> Result<TurnResult> {
+        let mut journal = Journal::default();
+        let result = self
+            .run_rounds(conversation, request, speed, cancel, &mut journal)
+            .await;
+        let flushed = self.flush_journal(&mut journal).await;
+        let result = result?;
+        flushed.map(|()| result)
+    }
+
+    async fn run_rounds(
+        &self,
+        conversation: &mut Conversation,
+        request: &BackendPrompt,
+        speed: Option<crate::Speed>,
+        cancel: &Cancellation,
+        journal: &mut Journal,
+    ) -> Result<TurnResult> {
         if request.cancel_on_admission {
             cancel.cancel();
         }
@@ -5325,6 +5362,7 @@ impl State {
                 speed,
                 Some(&request.prompt),
                 developer_notice_ids,
+                journal,
             )
             .await?;
         if let (Some(policy), Some(operation)) = (&self.policy, &cursor.operation) {
@@ -5380,34 +5418,31 @@ impl State {
                 .collect::<Vec<_>>()
                 .join("\n");
             if self.lifecycle_opened.lock().await.is_none() {
-                let outcome = self
-                    .lifecycle(
-                        &cursor,
-                        cancel,
-                        "session-start",
-                        match self
-                            .subagent_type_resolver
-                            .as_ref()
-                            .and_then(|resolve| resolve(&self.session_id))
-                            .or_else(|| self.subagent_type.clone())
+                let event = match self
+                    .subagent_type_resolver
+                    .as_ref()
+                    .and_then(|resolve| resolve(&self.session_id))
+                    .or_else(|| self.subagent_type.clone())
+                {
+                    Some(agent_type) => crate::ClaudeLifecycleEvent::SubagentStart {
+                        agent_id: self.session_id.clone(),
+                        agent_type,
+                    },
+                    None => crate::ClaudeLifecycleEvent::SessionStart {
+                        source: if !conversation.lifecycle_started
+                            && conversation.messages.is_empty()
+                            && conversation.summary.is_empty()
                         {
-                            Some(agent_type) => crate::ClaudeLifecycleEvent::SubagentStart {
-                                agent_id: self.session_id.clone(),
-                                agent_type,
-                            },
-                            None => crate::ClaudeLifecycleEvent::SessionStart {
-                                source: if !conversation.lifecycle_started
-                                    && conversation.messages.is_empty()
-                                    && conversation.summary.is_empty()
-                                {
-                                    "startup"
-                                } else {
-                                    "resume"
-                                }
-                                .into(),
-                            },
-                        },
-                    )
+                            "startup"
+                        } else {
+                            "resume"
+                        }
+                        .into(),
+                    },
+                };
+                self.flush_for_lifecycle(&event, journal).await?;
+                let outcome = self
+                    .lifecycle(&cursor, cancel, "session-start", event)
                     .await?;
                 Self::hook_context(conversation, &outcome);
                 for context in outcome.additional_context {
@@ -5421,13 +5456,10 @@ impl State {
                         .unwrap_or_else(|| cursor.lifecycle_turn_id.clone()),
                 );
             }
+            let event = crate::ClaudeLifecycleEvent::UserPromptSubmit { prompt: submitted };
+            self.flush_for_lifecycle(&event, journal).await?;
             let outcome = self
-                .lifecycle(
-                    &cursor,
-                    cancel,
-                    "user-prompt-submit",
-                    crate::ClaudeLifecycleEvent::UserPromptSubmit { prompt: submitted },
-                )
+                .lifecycle(&cursor, cancel, "user-prompt-submit", event)
                 .await?;
             Self::hook_context(conversation, &outcome);
             match outcome.decision {
@@ -5461,6 +5493,7 @@ impl State {
                     >= cursor.threshold
             {
                 let compaction_started = Instant::now();
+                self.flush_journal(journal).await?;
                 add_usage(
                     &mut usage,
                     &self
@@ -5503,7 +5536,7 @@ impl State {
             cursor.prepared = true;
             self.retain_pending(&mut cursor, &pending);
             cursor.usage = usage.clone();
-            self.advance_cursor_locked(&mut cursor, conversation)
+            self.defer_cursor_locked(&mut cursor, conversation, journal)
                 .await?;
         }
         let mut previous_message_id = conversation.previous_message_id.clone();
@@ -5515,7 +5548,8 @@ impl State {
             {
                 self.retain_pending(&mut cursor, &pending);
                 if !replaying_boundary {
-                    self.advance_cursor(&mut cursor, conversation).await?;
+                    self.defer_cursor(&mut cursor, conversation, journal)
+                        .await?;
                 }
             }
             if cancel.flag.load(Ordering::SeqCst) && self.policy.is_none() {
@@ -5528,6 +5562,7 @@ impl State {
                 && conversation.active_context_tokens >= cursor.threshold
             {
                 let compaction_started = Instant::now();
+                self.flush_journal(journal).await?;
                 add_usage(
                     &mut usage,
                     &self
@@ -5545,7 +5580,8 @@ impl State {
                 previous_message_id = conversation.previous_message_id.clone();
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
-                self.advance_cursor(&mut cursor, conversation).await?;
+                self.defer_cursor(&mut cursor, conversation, journal)
+                    .await?;
             }
 
             let discovered = client_discovered_tools(&pending)
@@ -5575,6 +5611,7 @@ impl State {
                             self,
                             &format!("model-{}", index.saturating_add(cursor.model_step_offset)),
                         ),
+                        journal: Some(&mut *journal),
                     },
                 )
                 .await;
@@ -5796,6 +5833,9 @@ impl State {
                     return Err(error);
                 }
             };
+            if tool_calls.is_empty() {
+                self.flush_journal(journal).await?;
+            }
             if !text.is_empty() {
                 self.emit(&request.events,AgentEventKind::AssistantMessage,json!({"model_call_index":index,"item_id":response.id,"phase":null,"text":text,"citations":citations}));
             }
@@ -5821,28 +5861,35 @@ impl State {
                 &self.parallel_safe_tools,
             );
             if self.policy.is_some() {
-                for batch in batches {
+                let last = batches.len().saturating_sub(1);
+                for (number, batch) in batches.into_iter().enumerate() {
+                    let defer = number == last && batch.len() == 1;
+                    let mut writes = journal.take();
                     let mut calls = futures_util::stream::FuturesUnordered::new();
                     for position in batch {
                         let (id, name, input, handler) = &tool_calls[position];
                         let cursor = &cursor;
+                        let writes = std::mem::take(&mut writes);
                         calls.push(async move {
                             (
                                 position,
                                 self.durable_tool(
                                     (cursor, cancel),
-                                    id,
-                                    name,
-                                    input,
+                                    (id, name, input),
                                     *handler,
                                     &request.events,
+                                    (writes, defer),
                                 )
                                 .await,
                             )
                         });
                     }
                     while let Some((position, result)) = calls.next().await {
-                        results[position] = Some(result?);
+                        let (result, completion) = result?;
+                        if let Some(completion) = completion {
+                            journal.complete(completion);
+                        }
+                        results[position] = Some(result);
                     }
                 }
                 interrupted = cancel.flag.load(Ordering::SeqCst);
@@ -5864,13 +5911,13 @@ impl State {
                                 Some(
                                     self.durable_tool(
                                         (cursor, cancel),
-                                        id,
-                                        name,
-                                        input,
+                                        (id, name, input),
                                         *handler,
                                         &request.events,
+                                        (Vec::new(), false),
                                     )
-                                    .await,
+                                    .await
+                                    .map(|(result, _)| result),
                                 )
                             };
                             (position, result)
@@ -5962,7 +6009,7 @@ impl State {
                 self.refresh_dynamic_tools(&mut cursor);
                 if response.stop_reason == Some(StopReason::ToolUse) {
                     cursor.output_continuations = 0;
-                    self.advance_cursor(&mut cursor, conversation).await?;
+                    self.defer_cursor(&mut cursor, conversation, journal).await?;
                     continue;
                 }
             }
@@ -5983,7 +6030,7 @@ impl State {
                 cursor.usage = usage.clone();
 
                 cursor.output_continuations = 0;
-                self.advance_cursor(&mut cursor, conversation).await?;
+                self.defer_cursor(&mut cursor, conversation, journal).await?;
                 continue;
             }
             let exhausted = response.stop_reason == Some(StopReason::ModelContextWindowExceeded);
@@ -6032,7 +6079,7 @@ impl State {
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
                 self.refresh_dynamic_tools(&mut cursor);
-                self.advance_cursor(&mut cursor, conversation).await?;
+                self.defer_cursor(&mut cursor, conversation, journal).await?;
                 continue;
             }
             if exhausted {
@@ -6044,6 +6091,7 @@ impl State {
                 }
                 cursor.context_recovery_attempted = true;
                 let compaction_started = Instant::now();
+                self.flush_journal(journal).await?;
                 add_usage(
                     &mut usage,
                     &self
@@ -6070,7 +6118,7 @@ impl State {
                 cursor.index = index + 1;
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
-                self.advance_cursor(&mut cursor, conversation).await?;
+                self.defer_cursor(&mut cursor, conversation, journal).await?;
                 continue;
             }
             if has_tool_calls || response.stop_reason != Some(StopReason::EndTurn) {
@@ -6131,7 +6179,7 @@ impl State {
                 cursor.index = index + 1;
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
-                self.advance_cursor(&mut cursor, conversation).await?;
+                self.defer_cursor(&mut cursor, conversation, journal).await?;
                 continue;
             }
 
@@ -6161,7 +6209,7 @@ impl State {
                 cursor.index = index + 1;
                 self.retain_pending(&mut cursor, &pending);
                 cursor.usage = usage.clone();
-                self.advance_cursor(&mut cursor, conversation).await?;
+                self.defer_cursor(&mut cursor, conversation, journal).await?;
                 continue;
             }
             conversation.messages = pending;
@@ -6703,6 +6751,7 @@ impl LifecycleBackend for Driver {
                         }
                         operation = Some(id);
                     }
+                    let mut journal = Journal::default();
                     let cursor = state
                         .cursor(
                             &mut context,
@@ -6710,8 +6759,10 @@ impl LifecycleBackend for Driver {
                             state.speed(),
                             None,
                             HashSet::new(),
+                            &mut journal,
                         )
                         .await?;
+                    state.flush_journal(&mut journal).await?;
                     let result = state
                         .compact_locked(
                             &mut context,

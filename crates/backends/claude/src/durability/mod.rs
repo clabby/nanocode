@@ -9,14 +9,15 @@ use nanocode_agent_core::{
 use nanocode_durability::{
     Admission, BeginStep, Branches, CheckpointFormat, DurableAgentExt, DurableBackendRegistration,
     DurableOwner, DurableSession, EncodedPayload, InitialAcquisition, InitialSettings,
-    JournalClaim, JournalSeed, SessionRecord, SharedStore, agent_error,
+    JournalClaim, JournalSeed, OwnerWrite, SessionRecord, SharedStore, WriteOutcome, agent_error,
 };
 use serde_json::{Value, value::RawValue};
 
 use crate::{
     Claude, ClaudeBuilder,
     execution::{
-        Admission as ClaudeAdmission, ClaudeExecutionPolicy, ClaudeSteer, PolicyFuture, Step,
+        Admission as ClaudeAdmission, BeginRequest, ClaudeExecutionPolicy, ClaudeSteer,
+        JournalWrite, PolicyFuture, Step,
     },
 };
 
@@ -415,20 +416,13 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         Box::pin(async move { self.get().await?.begin_step(id, step_id, kind, input).await })
     }
 
-    fn begin_model_step<'a>(
+    fn commit_writes<'a>(
         &'a self,
         id: String,
-        step_id: String,
-        kind: String,
-        digest: Box<RawValue>,
-        wire: &'a crate::PreparedWire,
-    ) -> PolicyFuture<'a, Step> {
-        Box::pin(async move {
-            self.get()
-                .await?
-                .begin_model_step(id, step_id, kind, digest, wire)
-                .await
-        })
+        writes: Vec<JournalWrite>,
+        begin: Option<BeginRequest<'a>>,
+    ) -> PolicyFuture<'a, Option<Step>> {
+        Box::pin(async move { self.get().await?.commit_writes(id, writes, begin).await })
     }
 
     fn complete_step(&self, id: String, step_id: String, output: Value) -> PolicyFuture<'_, ()> {
@@ -700,21 +694,44 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         })
     }
 
-    fn begin_model_step<'a>(
+    fn commit_writes<'a>(
         &'a self,
         id: String,
-        step_id: String,
-        kind: String,
-        digest: Box<RawValue>,
-        wire: &'a crate::PreparedWire,
-    ) -> PolicyFuture<'a, Step> {
+        writes: Vec<JournalWrite>,
+        begin: Option<BeginRequest<'a>>,
+    ) -> PolicyFuture<'a, Option<Step>> {
         Box::pin(async move {
-            let begun = match self
-                .owner
-                .begin_step(id.clone(), step_id.clone(), kind.clone(), &*digest)
-                .await
-            {
-                Err(nanocode_durability::Error::InvalidState(message)) => {
+            let mut fused = writes.iter().map(owner_write).collect::<Vec<_>>();
+            let Some(begin) = begin else {
+                if !fused.is_empty() {
+                    self.owner
+                        .commit_writes(id, fused)
+                        .await
+                        .map_err(agent_error)?;
+                }
+                return Ok(None);
+            };
+            fused.push(OwnerWrite::BeginStep {
+                step_id: begin.step_id.clone(),
+                kind: begin.kind.clone(),
+                input: EncodedPayload::from_json(Arc::from(begin.input.get())),
+            });
+            let begun = match self.owner.commit_writes(id.clone(), fused).await {
+                Ok(mut outcomes) => match outcomes.pop() {
+                    Some(WriteOutcome::Began(begun)) => Ok(begun),
+                    _ => Err(nanocode_durability::Error::InvalidState(
+                        "a fused step admission returned no step outcome".to_owned(),
+                    )),
+                },
+                Err(nanocode_durability::Error::InvalidState(message))
+                    if let Some(wire) = begin.wire =>
+                {
+                    if !writes.is_empty() {
+                        self.owner
+                            .commit_writes(id.clone(), writes.iter().map(owner_write).collect())
+                            .await
+                            .map_err(agent_error)?;
+                    }
                     let legacy = wire
                         .legacy_durable_input()
                         .map_err(crate::agent::provider_error)?;
@@ -722,20 +739,22 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                     let state = self.session.state().await.map_err(agent_error)?;
                     if !state
                         .operation(&id)
-                        .and_then(|operation| operation.steps.get(&step_id))
-                        .is_some_and(|step| step.kind == kind && step.input.key() == key.key())
+                        .and_then(|operation| operation.steps.get(&begin.step_id))
+                        .is_some_and(|step| {
+                            step.kind == begin.kind && step.input.key() == key.key()
+                        })
                     {
                         return Err(agent_error(nanocode_durability::Error::InvalidState(
                             message,
                         )));
                     }
                     self.owner
-                        .begin_step(id, step_id, kind.clone(), &*legacy)
+                        .begin_step(id, begin.step_id, begin.kind.clone(), &*legacy)
                         .await
                 }
-                begun => begun,
+                Err(error) => Err(error),
             };
-            admitted_step(begun, &kind)
+            admitted_step(begun, &begin.kind).map(Some)
         })
     }
 
@@ -866,6 +885,18 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 .await
                 .map_err(agent_error)
         })
+    }
+}
+
+fn owner_write(write: &JournalWrite) -> OwnerWrite {
+    match write {
+        JournalWrite::Advance(state) => OwnerWrite::Advance {
+            continuation: EncodedPayload::from_json(Arc::from(state.get())),
+        },
+        JournalWrite::Complete { step_id, output } => OwnerWrite::CompleteStep {
+            step_id: step_id.clone(),
+            output: EncodedPayload::from_json(Arc::from(output.get())),
+        },
     }
 }
 
