@@ -92,7 +92,10 @@ pub type Defaults = nanocode_agent_host::Defaults<CodexHarness, ClaudeHarness>;
 pub type Nanocode = nanocode_agent::Runtime<Defaults>;
 pub type NanocodeBuilder<B = nanocode_agent::Unselected> =
     nanocode_agent::RuntimeBuilder<B, Defaults>;
-pub use nanocode_agent::{SpawnBuilder, SubagentUpdates, Unselected};
+pub use nanocode_agent::{
+    DurableOutcome, EventSink, SessionEvent, SessionEvents, SpawnBuilder, SubagentUpdates,
+    Unselected,
+};
 
 pub mod agent {
 

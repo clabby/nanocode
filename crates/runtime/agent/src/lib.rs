@@ -4,9 +4,12 @@ pub use nanocode_agent_core::*;
 pub use nanocode_durability as durability;
 mod router;
 mod runtime;
+mod session_events;
 pub use router::{
     CheckpointFormats, Harness, HarnessBuilder, HarnessRequest, NoFormats, session_store,
 };
 pub use runtime::{
-    AgentRuntime, Runtime, RuntimeBuilder, SpawnBuilder, SubagentUpdates, Unselected,
+    AgentRuntime, DurableOutcome, Runtime, RuntimeBuilder, SpawnBuilder, SubagentUpdates,
+    Unselected,
 };
+pub use session_events::{EventSink, SessionEvent, SessionEvents};

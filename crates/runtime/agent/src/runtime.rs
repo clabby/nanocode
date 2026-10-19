@@ -1,3 +1,7 @@
+mod turns;
+
+pub use turns::DurableOutcome;
+
 use crate::{
     Agent, AgentEvents, HarnessFamily, ModelSelection, NanocodeError, SessionCheckpoint, Thinking,
     router::{AgentResult, Harness, HarnessRequest},

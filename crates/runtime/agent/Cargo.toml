@@ -23,6 +23,7 @@ nanocode-tool-host.workspace = true
 nanocode-tool-contracts.workspace = true
 nanocode-home.workspace = true
 nanocode-process-contracts.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [lints]

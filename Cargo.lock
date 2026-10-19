@@ -1585,6 +1585,7 @@ dependencies = [
  "nanocode-subagents",
  "nanocode-tool-contracts",
  "nanocode-tool-host",
+ "serde_json",
  "tokio",
  "tracing",
 ]
