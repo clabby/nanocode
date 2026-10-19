@@ -2,17 +2,18 @@ mod executors;
 
 use std::sync::Arc;
 
-pub use executors::{CodeModeExecutors, ExecutorSelection, HandRoute, Placement};
+pub use executors::{CodeModeExecutors, ExecutorSelection, HandRoute, HandsTool, Placement};
 
 use crate::embedded::{CodeModeUpdate, NestedToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    Tool, ToolContext, ToolDefinition,
+    Tool, ToolContext, ToolDefinition, ToolOutput,
+    contract::ToolOutputWire,
     embedded::{
         CodeModeExecution, CodeModeHost, CodeModeHostError, CodeModeObserver, EmbeddedToolMode,
-        HostFuture, OwnedToolContext,
+        HandCalls, HostFuture, OwnedToolContext,
     },
 };
 
@@ -94,6 +95,11 @@ pub enum RemoteOperation {
         input: String,
         context: RemoteContext,
     },
+    Call {
+        name: String,
+        input: Value,
+        context: RemoteContext,
+    },
     DetachTurn {
         session_id: String,
     },
@@ -121,6 +127,8 @@ pub trait RemoteTransport: Send + Sync + 'static {
         local_tools: Vec<Arc<dyn Tool>>,
         observer: Option<&'a mut dyn CodeModeObserver>,
     ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>>;
+    fn call(&self, operation: RemoteOperation) -> HostFuture<'_, Result<Value, CodeModeHostError>>;
+    fn route_hands(&self, hands: Arc<dyn HandCalls>);
     fn notify(&self, operation: RemoteOperation) -> Result<(), CodeModeHostError>;
     fn detach_turn(
         &self,
@@ -211,6 +219,27 @@ impl CodeModeHost for RemoteCodeModeHost {
             )
             .await
         })
+    }
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
+        let operation = RemoteOperation::Call {
+            name: name.into(),
+            input,
+            context: RemoteContext::from_context(context),
+        };
+        Box::pin(async move {
+            let value = self.transport.call(operation).await?;
+            let wire = serde_json::from_value::<ToolOutputWire>(value)
+                .map_err(|error| CodeModeHostError::new(error.to_string()))?;
+            ToolOutput::from_wire(wire).map_err(|error| CodeModeHostError::new(error.to_string()))
+        })
+    }
+    fn route_hands(&self, hands: Arc<dyn HandCalls>) {
+        self.transport.route_hands(hands);
     }
     fn begin_turn(&self, session_id: &str) {
         if let Err(error) = self.transport.notify(RemoteOperation::BeginTurn {
@@ -351,6 +380,8 @@ pub enum RemoteFrame {
         input: Value,
         freeform: bool,
         context: RemoteContext,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hand: Option<String>,
     },
     CallbackCancel {
         id: u64,

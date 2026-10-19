@@ -60,6 +60,7 @@ pub(crate) struct ToolRegistry {
     by_name: HashMap<Box<str>, usize>,
     pub(super) providers: Vec<Arc<dyn DynamicToolProvider>>,
     pub(super) policies: Vec<Arc<dyn crate::CodeModeToolPolicy>>,
+    pub(super) hand_calls: Option<Arc<dyn crate::embedded::HandCalls>>,
     nested_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -203,6 +204,34 @@ impl ToolRegistry {
         if let Some(arguments_content) = &arguments_content {
             record_tool_content(&span, "tool.arguments", arguments_content);
         }
+        let (input, hand) = match take_hand(input) {
+            Ok(split) => split,
+            Err(output) => return output,
+        };
+        if let Some(hand) = hand.filter(|hand| {
+            self.hand_calls
+                .as_ref()
+                .is_none_or(|calls| !calls.here(hand))
+        }) {
+            span.record("tool.hand", hand.as_str());
+            let started_at = std::time::Instant::now();
+            let execution = match &self.hand_calls {
+                Some(calls) => {
+                    calls
+                        .call(&hand, name, input, context)
+                        .instrument(span.clone())
+                        .await
+                }
+                None => ToolOutput::error(format!(
+                    "hand `{hand}` is not reachable because this session has no hands; nothing was dispatched"
+                )),
+            };
+            let output_content = trace_content
+                .then(|| serde_json::to_string(&execution.output).ok())
+                .flatten();
+            finish_tool_execution_span(&span, started_at, &execution, output_content.as_deref());
+            return execution;
+        }
         let queued_at = std::time::Instant::now();
         let exclusive = self.policies.iter().any(|policy| policy.exclusive(name));
         let _admission = if exclusive {
@@ -284,11 +313,11 @@ impl ToolRegistry {
                     }
                 }
             }
-            ToolDefinition::Custom { .. } => match input.as_str() {
+            ToolDefinition::Custom { .. } => match freeform(&input) {
                 Some(input) => ToolInput::Freeform(input.to_owned()),
                 None => {
                     return ToolOutput::error(format!(
-                        "nested freeform tool {name} requires a string argument"
+                        "nested freeform tool {name} requires a string argument or {{ input }}"
                     ));
                 }
             },
@@ -353,6 +382,7 @@ impl ToolRegistry {
             by_name,
             providers: Vec::new(),
             policies: Vec::new(),
+            hand_calls: None,
             nested_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
@@ -534,6 +564,27 @@ fn nested_definition(definition: ToolDefinition) -> ToolDefinition {
             ..
         } => ToolDefinition::function("tool_search", description, parameters),
         other => other,
+    }
+}
+
+fn take_hand(input: Value) -> Result<(Value, Option<String>), ToolOutput> {
+    let Value::Object(mut fields) = input else {
+        return Ok((input, None));
+    };
+    match fields.remove("hand") {
+        None => Ok((Value::Object(fields), None)),
+        Some(Value::String(hand)) => Ok((Value::Object(fields), Some(hand))),
+        Some(_) => Err(ToolOutput::error(
+            "`hand` must be the name of an attached hand; nothing was dispatched",
+        )),
+    }
+}
+
+fn freeform(input: &Value) -> Option<&str> {
+    match input {
+        Value::String(input) => Some(input),
+        Value::Object(fields) if fields.len() == 1 => fields.get("input")?.as_str(),
+        _ => None,
     }
 }
 

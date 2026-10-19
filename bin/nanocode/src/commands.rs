@@ -95,10 +95,10 @@ pub enum RunnerAction {
         token: Option<String>,
     },
     #[command(
-        about = "Run this session's exec cells on one hand, on several at once, on every hand with *, or on this machine without names"
+        about = "Run this session's exec cells on hand NAME, or on this machine without a name; scripts reach other hands with a hand argument on each tool call"
     )]
     Select {
-        names: Vec<String>,
+        name: Option<String>,
     },
     Disconnect {
         name: String,

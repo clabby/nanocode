@@ -3,6 +3,8 @@ mod types;
 
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
+use serde_json::Value;
+
 use crate::{ToolContext, ToolDefinition, ToolInput, ToolOutput};
 
 pub use input::{prepare_output_images, prepare_user_input};
@@ -52,6 +54,18 @@ pub enum EmbeddedToolMode {
     CodeOnly,
 
     Direct,
+}
+
+pub trait HandCalls: Send + Sync + 'static {
+    fn here(&self, hand: &str) -> bool;
+
+    fn call<'a>(
+        &'a self,
+        hand: &'a str,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, ToolOutput>;
 }
 
 pub trait CodeModeHost: Send + Sync + 'static {
@@ -136,6 +150,21 @@ pub trait CodeModeHost: Send + Sync + 'static {
             )))
         })
     }
+
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        _input: Value,
+        _context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
+        Box::pin(async move {
+            Err(CodeModeHostError::new(format!(
+                "this host cannot run `{name}` for another hand"
+            )))
+        })
+    }
+
+    fn route_hands(&self, _hands: std::sync::Arc<dyn HandCalls>) {}
 
     fn link_session(&self, _session_id: &str, _root_session_id: &str) {}
 
@@ -234,6 +263,17 @@ impl<T: CodeModeHost + ?Sized> CodeModeHost for std::sync::Arc<T> {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
         (**self).execute_tool(name, input, context)
+    }
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
+        (**self).call(name, input, context)
+    }
+    fn route_hands(&self, hands: std::sync::Arc<dyn HandCalls>) {
+        (**self).route_hands(hands);
     }
     fn link_session(&self, session_id: &str, root_session_id: &str) {
         (**self).link_session(session_id, root_session_id);

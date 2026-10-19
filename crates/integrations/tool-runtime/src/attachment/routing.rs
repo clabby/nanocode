@@ -92,13 +92,17 @@ impl WorkspaceRouter for AttachmentRouter {
                 mode: route.mode,
             })
             .collect::<Vec<_>>();
-        if let Some(pool) = &pool
-            && pool.model_management_enabled()
-        {
+        if let Some(pool) = &pool {
             catalog.add(
-                Arc::new(RunnerManagement { pool: pool.clone() }),
+                Arc::new(pool.code_mode_executors().tool()),
                 ToolExposure::CodeModeOnly,
             );
+            if pool.model_management_enabled() {
+                catalog.add(
+                    Arc::new(RunnerManagement { pool: pool.clone() }),
+                    ToolExposure::CodeModeOnly,
+                );
+            }
         }
         let local_names = catalog.names();
         let providers = catalog.providers().to_vec();

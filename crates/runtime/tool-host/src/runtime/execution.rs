@@ -261,6 +261,23 @@ impl ToolRuntime {
             }
         })
     }
+
+    #[doc(hidden)]
+    pub fn execute_nested_tool<'call>(
+        &'call self,
+        name: &'call str,
+        input: Value,
+        context: ToolContext<'call>,
+    ) -> futures_util::future::BoxFuture<'call, ToolOutput> {
+        match &self.inner {
+            Runtime::Native(runtime) => runtime.execute_nested_tool(name, input, context),
+            Runtime::Host(_) => Box::pin(async move {
+                ToolOutput::error(format!(
+                    "`{name}` cannot run here for another hand because this runtime delegates Code Mode to its own host"
+                ))
+            }),
+        }
+    }
 }
 
 impl ToolRuntimeControl {
@@ -460,6 +477,12 @@ impl NativeToolRuntime {
             self.default_shell_name = Arc::clone(default_shell);
         }
         self.executors.clone_from(&tools.code_mode_executors);
+        registry.hand_calls = tools.hand_calls.clone().or_else(|| {
+            tools
+                .code_mode_executors
+                .as_ref()
+                .map(CodeModeExecutors::calls)
+        });
         self
     }
 
@@ -507,18 +530,12 @@ impl NativeToolRuntime {
         context: OwnedToolContext,
         observer: Option<&mut dyn CodeModeObserver>,
     ) -> Result<CodeModeExecution, CodeModeHostError> {
-        if let (Some(executors), Placement::Hands { hands, broadcast }) =
+        if let (Some(executors), Placement::Hand(hand)) =
             (&self.executors, self.placement(&context.session_id))
         {
-            let hands = hands
-                .into_iter()
-                .map(|hand| {
-                    let tools = self.callbacks(hand.host.as_ref(), &context.session_id);
-                    (hand, tools)
-                })
-                .collect();
+            let tools = self.callbacks(hand.host.as_ref(), &context.session_id);
             return Ok(executors
-                .execute_on(hands, broadcast, source, context.as_context(), observer)
+                .execute_on(hand, tools, source, context.as_context(), observer)
                 .await);
         }
         let session_id = self.executors.is_some().then(|| context.session_id.clone());
@@ -708,13 +725,7 @@ impl NativeToolRuntime {
                 return Ok(self.code_mode.wait_with_updates(input, observer).await);
             };
             let session_id = context.session_id();
-            if let Placement::Hands {
-                hands,
-                broadcast: true,
-            } = self.placement(session_id)
-            {
-                return Ok(executors.wait_on(hands, input, context, observer).await);
-            }
+            self.track(session_id);
             let places = executors.wait_route(session_id);
             let remaining = places.len();
             let mut failure = None;
@@ -775,19 +786,25 @@ impl NativeToolRuntime {
     > {
         Box::pin(async move {
             if self.registry.workspace_tool(name)
-                && let Placement::Hands { hands, .. } = self.placement(context.session_id())
+                && let Placement::Hand(hand) = self.placement(context.session_id())
             {
-                let names = hands
-                    .iter()
-                    .map(|hand| hand.name.as_ref())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 return Ok(ToolOutput::error(format!(
-                    "Code Mode for this session runs on hands {names}; call `tools.{name}` inside exec to run it there. No direct handler was invoked."
+                    "Code Mode for this session runs on hand {}; call `tools.{name}` inside exec to run it there. No direct handler was invoked.",
+                    hand.name
                 )));
             }
             Ok(self.registry.execute_direct(name, input, context).await)
         })
+    }
+
+    #[doc(hidden)]
+    pub fn execute_nested_tool<'call>(
+        &'call self,
+        name: &'call str,
+        input: Value,
+        context: ToolContext<'call>,
+    ) -> futures_util::future::BoxFuture<'call, ToolOutput> {
+        Box::pin(self.registry.execute_nested(name, input, context))
     }
 }
 
@@ -1036,6 +1053,7 @@ pub(super) fn tool_execution_span(
         tool.arguments.keys = argument_keys,
         tool.admission = tracing::field::Empty,
         tool.admission.wait_ns = tracing::field::Empty,
+        tool.hand = tracing::field::Empty,
         process.exit.code = tracing::field::Empty,
         process.running = tracing::field::Empty,
         process.wall_time_ms = tracing::field::Empty,

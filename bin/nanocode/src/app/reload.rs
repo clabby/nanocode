@@ -65,10 +65,6 @@ impl App {
                 .selection(agent.session_id())
         }) {
             Some(ExecutorSelection::Executor(name)) => SavedExecutor::Names(vec![name.to_string()]),
-            Some(ExecutorSelection::Executors(names)) => {
-                SavedExecutor::Names(names.iter().map(ToString::to_string).collect())
-            }
-            Some(ExecutorSelection::All) => SavedExecutor::All,
             _ => SavedExecutor::Local,
         }
     }
@@ -148,11 +144,13 @@ impl App {
     pub(super) fn restore_reload(&mut self, state: State) {
         if let Some(session) = &state.session {
             let selection = match state.executor {
-                SavedExecutor::Local => ExecutorSelection::Local,
-                SavedExecutor::Names(names) => ExecutorSelection::Executors(
-                    names.into_iter().map(Into::into).collect::<Vec<_>>().into(),
-                ),
-                SavedExecutor::All => ExecutorSelection::All,
+                SavedExecutor::Names(names) => names
+                    .into_iter()
+                    .next()
+                    .map_or(ExecutorSelection::Local, |name| {
+                        ExecutorSelection::Executor(name.into())
+                    }),
+                SavedExecutor::Local | SavedExecutor::All => ExecutorSelection::Local,
             };
             self.host
                 .runtime

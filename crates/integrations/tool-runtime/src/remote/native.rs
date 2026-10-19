@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     ToolInput, ToolOutput,
     contract::{ToolError, ToolOutputWire, ToolResult},
-    embedded::CodeModeUpdate,
+    embedded::{CodeModeUpdate, HandCalls},
     runtime::ToolRuntime,
 };
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -90,6 +90,7 @@ struct Client {
     operation_timeout: Option<Duration>,
     failure: Mutex<Option<String>>,
     closed: watch::Sender<Option<String>>,
+    hands: Mutex<Option<Arc<dyn HandCalls>>>,
 }
 
 pub struct SocketTransport {
@@ -493,6 +494,7 @@ impl SocketTransport {
             turns: Mutex::new(HashMap::new()),
             failure: Mutex::new(None),
             closed: watch::channel(None).0,
+            hands: Mutex::new(None),
         });
         let weak = Arc::downgrade(&client);
         let stopped = shutdown.token.clone();
@@ -535,7 +537,27 @@ impl SocketTransport {
                                     if let Some(state) = client.callbacks.lock().unwrap().get_mut(&(session_id, origin_call_id)) { if let Some(observer) = state.observer.as_deref_mut() { deliver_update(observer, update)?; } }
                                 },
                                 Frame::DetachedComplete { session_id, origin_call_id } => { client.callbacks.lock().unwrap().remove(&(session_id, origin_call_id)); },
-                                Frame::Callback { id, name, input, freeform, context } => {
+                                Frame::Callback { id, name, input, context, hand: Some(hand), .. } => {
+                                    let authoritative = client.callbacks.lock().unwrap().get(&(context.session_id.clone(), context.call_id.rsplit_once("/code-").map_or(context.call_id.as_str(), |(origin, _)| origin).to_owned())).map(|state| (state.context.clone(), state.generation));
+                                    let callback_generation = authoritative.as_ref().map_or(0, |(_, generation)| *generation);
+                                    let hands = client.hands.lock().unwrap().clone();
+                                    let outgoing = client.outgoing.clone();
+                                    let callback_session = context.session_id.clone();
+                                    let abort = callback_tasks.spawn(async move {
+                                        let result = async {
+                                            let (mut authoritative, _) = authoritative.ok_or_else(|| error(format!("brain callback origin for `{name}` on hand `{hand}` unavailable")))?;
+                                            let hands = hands.ok_or_else(|| error("this brain does not route calls between hands"))?;
+                                            authoritative.call_id = context.call_id;
+                                            let owned = authoritative.owned();
+                                            let output = hands.call(&hand, &name, input, owned.as_context()).await;
+                                            serde_json::to_value(output.into_wire().map_err(error)?).map_err(error)
+                                        }.await.map_err(|e: CodeModeHostError| e.to_string());
+                                        let _ = outgoing.send(Frame::CallbackResult { id, result });
+                                        id
+                                    });
+                                    callback_aborts.insert(id, (callback_session, callback_generation, abort));
+                                },
+                                Frame::Callback { id, name, input, freeform, context, hand: None } => {
                                     let local = client.callbacks.lock().unwrap().get(&(context.session_id.clone(), context.call_id.rsplit_once("/code-").map_or(context.call_id.as_str(), |(origin, _)| origin).to_owned())).and_then(|state| state.tools.iter().find(|t| t.definition().name() == name).map(|tool| (Arc::clone(tool), state.context.clone(), state.generation)));
                                     let outgoing = client.outgoing.clone();
                                     let callback_session = context.session_id.clone();
@@ -738,6 +760,56 @@ impl RemoteTransport for SocketTransport {
             result
         })
     }
+    fn call(&self, operation: RemoteOperation) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
+        Box::pin(async move {
+            if let Some(failure) = self.client.failure.lock().unwrap().clone() {
+                return Err(error(format!(
+                    "{failure}; the operation was not dispatched"
+                )));
+            }
+            let id = self.client.next.fetch_add(1, Ordering::Relaxed);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            self.client.pending.lock().unwrap().insert(id, tx);
+            let mut guard = Pending {
+                client: Arc::clone(&self.client),
+                id,
+                session_id: None,
+                origin: None,
+                complete: false,
+            };
+            self.client
+                .outgoing
+                .send(Frame::Request { id, operation })
+                .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
+            let reply = async {
+                while let Some(frame) = rx.recv().await {
+                    match frame {
+                        Frame::Reply { result, .. } => {
+                            return result
+                                .map_err(error)?
+                                .ok_or_else(|| error("hand omitted the tool result"));
+                        }
+                        Frame::Update { .. } => {}
+                        _ => return Err(error("unexpected operation reply")),
+                    }
+                }
+                Err(error(
+                    "remote reply channel closed; operation outcome unknown",
+                ))
+            };
+            let result = match self.client.operation_timeout {
+                Some(deadline) => tokio::time::timeout(deadline, reply).await.map_err(|_| {
+                    error("remote operation deadline elapsed; outcome unknown; no retry")
+                })?,
+                None => reply.await,
+            };
+            guard.complete = true;
+            result
+        })
+    }
+    fn route_hands(&self, hands: Arc<dyn HandCalls>) {
+        *self.client.hands.lock().unwrap() = Some(hands);
+    }
     fn notify(&self, operation: RemoteOperation) -> Result<(), CodeModeHostError> {
         if let RemoteOperation::BeginTurn { session_id } = &operation {
             *self
@@ -851,6 +923,29 @@ impl Drop for CallbackPending {
     }
 }
 
+async fn callback(bus: &Arc<CallbackBus>, frame: impl FnOnce(u64) -> Frame) -> ToolResult {
+    let id = bus.next.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = oneshot::channel();
+    bus.pending.lock().unwrap().insert(id, tx);
+    let _pending = CallbackPending {
+        bus: Arc::clone(bus),
+        id,
+    };
+    bus.outgoing
+        .send(frame(id))
+        .map_err(|e| -> ToolError { e.to_string().into() })?;
+    let result = match bus.timeout {
+        Some(deadline) => tokio::time::timeout(deadline, rx)
+            .await
+            .map_err(|_| -> ToolError {
+                "brain callback deadline elapsed; outcome unknown".into()
+            })?,
+        None => rx.await,
+    };
+    let value = result.map_err(|e| -> ToolError { e.to_string().into() })??;
+    ToolOutput::from_wire(serde_json::from_value::<ToolOutputWire>(value)?).map_err(Into::into)
+}
+
 struct CallbackTool {
     definition: ToolDefinition,
     bus: Arc<CallbackBus>,
@@ -865,35 +960,49 @@ impl Tool for CallbackTool {
             ToolInput::Function(input) => (serde_json::from_str(input.get())?, false),
             ToolInput::Freeform(input) => (Value::String(input), true),
         };
-        let id = self.bus.next.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.bus.pending.lock().unwrap().insert(id, tx);
-        let _pending = CallbackPending {
-            bus: Arc::clone(&self.bus),
+        let context = RemoteContext::from_context(context);
+        callback(&self.bus, |id| Frame::Callback {
             id,
-        };
-        self.bus
-            .outgoing
-            .send(Frame::Callback {
+            name: self.definition.name().into(),
+            input,
+            freeform,
+            context,
+            hand: None,
+        })
+        .await
+    }
+}
+
+struct HandCallbacks {
+    bus: Arc<CallbackBus>,
+    name: Option<String>,
+}
+
+impl HandCalls for HandCallbacks {
+    fn here(&self, hand: &str) -> bool {
+        self.name.as_deref() == Some(hand)
+    }
+
+    fn call<'a>(
+        &'a self,
+        hand: &'a str,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, ToolOutput> {
+        let context = RemoteContext::from_context(context);
+        Box::pin(async move {
+            callback(&self.bus, |id| Frame::Callback {
                 id,
-                name: self.definition.name().into(),
+                name: name.into(),
                 input,
-                freeform,
-                context: RemoteContext::from_context(context),
+                freeform: false,
+                context,
+                hand: Some(hand.into()),
             })
-            .map_err(|e| -> ToolError { e.to_string().into() })?;
-        let result = match self.bus.timeout {
-            Some(deadline) => {
-                tokio::time::timeout(deadline, rx)
-                    .await
-                    .map_err(|_| -> ToolError {
-                        "brain callback deadline elapsed; outcome unknown".into()
-                    })?
-            }
-            None => rx.await,
-        };
-        let value = result.map_err(|e| -> ToolError { e.to_string().into() })??;
-        ToolOutput::from_wire(serde_json::from_value::<ToolOutputWire>(value)?).map_err(Into::into)
+            .await
+            .unwrap_or_else(|error| ToolOutput::error(error.to_string()))
+        })
     }
 }
 
@@ -1166,7 +1275,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut socket,
         Frame::Catalog {
             definitions,
-            name: options.name,
+            name: options.name.clone(),
             workspace: Some(workspace.display().to_string()),
             runtime_id: options.runtime_id,
         },
@@ -1184,6 +1293,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         next: AtomicU64::new(0),
         timeout: options.callback_timeout,
     });
+    let hands: Arc<dyn HandCalls> = Arc::new(HandCallbacks {
+        bus: Arc::clone(&bus),
+        name: options.name,
+    });
     let mut runtimes = Sessions(HashMap::new());
     let mut tasks = tokio::task::JoinSet::new();
     let result = async {
@@ -1195,28 +1308,27 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     match frame {
                         Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.lock().unwrap().remove(&id) { let _ = tx.send(result); } },
                         Frame::Request { id, operation } => {
-                            let session_id = match &operation { RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } => &context.session_id, RemoteOperation::Cancel { session_id } | RemoteOperation::CancelTurn { session_id } | RemoteOperation::DetachTurn { session_id } | RemoteOperation::BeginTurn { session_id } | RemoteOperation::Preempt { session_id } | RemoteOperation::SettlePreempt { session_id } => session_id }.clone();
-                            if let RemoteOperation::Execute { local_tools, context, .. } = &operation {
-                                let catalog = runtimes.get(&session_id).map(|(_, catalog)| catalog.clone()).unwrap_or_else(|| CallbackCatalog {
+                            let session_id = match &operation { RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } | RemoteOperation::Call { context, .. } => &context.session_id, RemoteOperation::Cancel { session_id } | RemoteOperation::CancelTurn { session_id } | RemoteOperation::DetachTurn { session_id } | RemoteOperation::BeginTurn { session_id } | RemoteOperation::Preempt { session_id } | RemoteOperation::SettlePreempt { session_id } => session_id }.clone();
+                            if matches!(&operation, RemoteOperation::Execute { .. } | RemoteOperation::Call { .. }) && !runtimes.contains_key(&session_id) {
+                                let catalog = CallbackCatalog {
                                     session_id: Arc::from(session_id.as_str()),
                                     state: Arc::new(Mutex::new(CallbackCatalogState::default())),
                                     bus: Arc::clone(&bus),
-                                });
-                                if let Err(issue) = catalog.register(&context.call_id, local_tools.clone()) {
-                                    outgoing.send(Frame::Reply { id, result: Err(issue.to_string()) }).map_err(error)?;
-                                    continue;
-                                }
-                                let selected = match tools.clone().into_builder().provider(catalog.clone()).build() {
-                                    Ok(selected) => selected,
+                                };
+                                match tools.clone().into_builder().provider(catalog.clone()).hand_calls(Arc::clone(&hands)).build() {
+                                    Ok(selected) => { runtimes.insert(session_id.clone(), (Arc::new(ToolRuntime::new_with_tools(workspace.clone(), Vec::new(), &selected)), catalog)); },
                                     Err(issue) => {
-                                        catalog.finish(&context.call_id);
                                         outgoing.send(Frame::Reply { id, result: Err(issue.to_string()) }).map_err(error)?;
                                         continue;
                                     }
-                                };
-                                if !runtimes.contains_key(&session_id) {
-                                    runtimes.insert(session_id.clone(), (Arc::new(ToolRuntime::new_with_tools(workspace.clone(), Vec::new(), &selected)), catalog));
                                 }
+                            }
+                            if let RemoteOperation::Execute { local_tools, context, .. } = &operation
+                                && let Some((_, catalog)) = runtimes.get(&session_id)
+                                && let Err(issue) = catalog.register(&context.call_id, local_tools.clone())
+                            {
+                                outgoing.send(Frame::Reply { id, result: Err(issue.to_string()) }).map_err(error)?;
+                                continue;
                             }
                             let runtime = if matches!(&operation, RemoteOperation::Cancel { .. }) { runtimes.0.remove(&session_id) } else { runtimes.get(&session_id).map(|(runtime, catalog)| (Arc::clone(runtime), catalog.clone())) };
                             let runtime = runtime.map(|(runtime, catalog)| {
@@ -1236,7 +1348,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             tasks.spawn(async move {
                                 let result = async {
                                     let Some((runtime, catalog, turn)) = runtime else {
-                                        return match operation { RemoteOperation::Execute { .. } | RemoteOperation::Wait { .. } => Err(error("unknown runner session")), _ => Ok(None) };
+                                        return match operation { RemoteOperation::Execute { .. } | RemoteOperation::Wait { .. } | RemoteOperation::Call { .. } => Err(error("unknown runner session")), _ => Ok(None) };
                                     };
                                     let mut observer = Observer { id, outgoing:outgoing.clone() };
                                     match operation {
@@ -1253,6 +1365,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                                 else { catalog.finish(&cell.origin_call_id); }
                                             }
                                             Ok(Some(execution_to_wire(execution)))
+                                        },
+                                        RemoteOperation::Call { name, input, context } => {
+                                            let owned = context.owned();
+                                            let output = runtime.execute_nested_tool(&name, input, owned.as_context()).await;
+                                            serde_json::to_value(output.into_wire().map_err(error)?).map(Some).map_err(error)
                                         },
                                         RemoteOperation::Cancel { .. } => { runtime.control().cancel_with_updates(&mut observer).await; catalog.finish_turn(None); Ok(None) },
                                         RemoteOperation::CancelTurn { .. } => { runtime.control().cancel_turn_with_updates(&mut observer).await; catalog.finish_turn(Some(turn)); Ok(None) },

@@ -101,6 +101,8 @@ pub struct Tools {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) code_mode_executors: Option<nanocode_code_mode::remote::CodeModeExecutors>,
     #[cfg(not(target_family = "wasm"))]
+    pub(crate) hand_calls: Option<Arc<dyn crate::embedded::HandCalls>>,
+    #[cfg(not(target_family = "wasm"))]
     pub(super) deferred_tools_guidance_enabled: bool,
 
     pub(crate) embedded_host: Option<Arc<dyn crate::embedded::CodeModeHost>>,
@@ -145,6 +147,8 @@ impl Default for Tools {
             runner_pool: None,
             #[cfg(not(target_family = "wasm"))]
             code_mode_executors: None,
+            #[cfg(not(target_family = "wasm"))]
+            hand_calls: None,
             #[cfg(not(target_family = "wasm"))]
             deferred_tools_guidance_enabled: false,
 
@@ -489,6 +493,13 @@ impl ToolsBuilder {
     #[cfg(not(target_family = "wasm"))]
     pub fn process_route_store(mut self, store: Arc<dyn ProcessRouteStore>) -> Self {
         self.tools.process_route_store = Some(store);
+        self
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn hand_calls(mut self, calls: Arc<dyn crate::embedded::HandCalls>) -> Self {
+        self.tools.hand_calls = Some(calls);
         self
     }
 

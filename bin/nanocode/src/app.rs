@@ -2305,8 +2305,6 @@ impl App {
                 .selection(agent.session_id())
             {
                 ExecutorSelection::Executor(name) => Some(name.to_string()),
-                ExecutorSelection::Executors(names) => Some(names.join(", ")),
-                ExecutorSelection::All => Some("every hand".to_owned()),
                 ExecutorSelection::Local => None,
             }
         });
@@ -2437,7 +2435,7 @@ impl App {
                 });
                 self.flash("opening runner listener…");
             }
-            crate::commands::RunnerAction::Select { names } => {
+            crate::commands::RunnerAction::Select { name } => {
                 let Some(session) = self
                     .agent
                     .as_ref()
@@ -2447,32 +2445,21 @@ impl App {
                     return;
                 };
                 let executors = runtime.runner_pool().code_mode_executors();
-                if let Some(error) = names
-                    .iter()
-                    .filter(|name| name.as_str() != "*")
-                    .find_map(|name| executors.connected(name).err())
+                if let Some(error) = name
+                    .as_deref()
+                    .and_then(|name| executors.connected(name).err())
                 {
                     self.notice(NoticeLevel::Error, error.to_string());
                     return;
                 }
-                let (selection, message) = match names.as_slice() {
-                    [] => (
+                let (selection, message) = match name {
+                    None => (
                         ExecutorSelection::Local,
                         "exec cells run on this machine".to_owned(),
                     ),
-                    [all] if all == "*" => (
-                        ExecutorSelection::All,
-                        "exec cells run on every connected hand".to_owned(),
-                    ),
-                    [name] => (
+                    Some(name) => (
                         ExecutorSelection::Executor(name.as_str().into()),
                         format!("exec cells run on {name}"),
-                    ),
-                    names => (
-                        ExecutorSelection::Executors(
-                            names.iter().map(|name| name.as_str().into()).collect(),
-                        ),
-                        format!("exec cells run on {}", names.join(", ")),
                     ),
                 };
                 executors.select(&session, Some(selection));
