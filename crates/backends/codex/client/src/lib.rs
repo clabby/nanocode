@@ -107,7 +107,7 @@ pub mod __private {
                 RequestHistory,
             },
         },
-        tower::attempt::ResponsesAttemptFactory,
+        tower::attempt::{ResponsesAttemptFactory, TransportFallback},
     };
 
     pub mod compaction {

@@ -536,6 +536,9 @@ impl ResponsesServiceResponse {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct TransportFallback(Arc<SessionTransport>);
+
 #[must_use]
 pub struct ResponsesAttemptFactory {
     profile: Arc<RequestProfile>,
@@ -545,6 +548,11 @@ pub struct ResponsesAttemptFactory {
 }
 
 impl ResponsesAttemptFactory {
+    pub fn with_transport_fallback(mut self, fallback: &TransportFallback) -> Self {
+        self.session_transport = Arc::clone(&fallback.0);
+        self
+    }
+
     pub fn new(profile: RequestProfile, events: EventSink, stats: Arc<TransportStats>) -> Self {
         Self {
             profile: Arc::new(profile),

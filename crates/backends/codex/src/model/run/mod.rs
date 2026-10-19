@@ -23,8 +23,8 @@ use std::{
 use crate::client::{
     __private::{
         EventSink, ManagedSessionState, ModelConfig, RequestHistory, ResponsesAttemptFactory,
-        assign_missing_response_item_id, compaction, responses_lite_request_prefix,
-        with_code_mode_tool_names,
+        TransportFallback, assign_missing_response_item_id, compaction,
+        responses_lite_request_prefix, with_code_mode_tool_names,
     },
     Model, Prompt, Thinking,
     events::AgentEventKind,
@@ -83,6 +83,7 @@ pub(crate) struct ModelRun {
     service_tier: ServiceTier,
     client: ResponsesClientBox,
     transport_stats: Arc<TransportStats>,
+    transport_fallback: TransportFallback,
     started_at: Instant,
     operation_started_at: Option<Duration>,
     elapsed_before_attempt: Duration,
@@ -288,6 +289,7 @@ impl ModelRun {
             service_tier,
             client,
             transport_stats,
+            transport_fallback: TransportFallback::default(),
             started_at: Instant::now(),
             operation_started_at: None,
             elapsed_before_attempt: Duration::ZERO,
@@ -334,6 +336,7 @@ impl ModelRun {
         let provider_session_id = Arc::clone(&checkpoint.provider_session_id);
         let active_tools = runtime.control();
         let (_, code_mode_tool_names) = model_tool_contract(&runtime, events.request_id());
+        let transport_fallback = TransportFallback::default();
         let factory = ResponsesAttemptFactory::new(
             with_code_mode_tool_names(
                 RequestProfile::new(
@@ -346,7 +349,8 @@ impl ModelRun {
             ),
             events.clone(),
             Arc::clone(&transport_stats),
-        );
+        )
+        .with_transport_fallback(&transport_fallback);
         let model = config.model;
         let thinking = config.thinking;
         let service_tier = config.service_tier;
@@ -367,6 +371,7 @@ impl ModelRun {
             service_tier,
             client,
             transport_stats,
+            transport_fallback,
             started_at: Instant::now(),
             operation_started_at: None,
             elapsed_before_attempt: Duration::ZERO,
@@ -437,7 +442,8 @@ impl ModelRun {
             .with_thread_id(self.events.request_id()),
             self.events.clone(),
             Arc::clone(&self.transport_stats),
-        );
+        )
+        .with_transport_fallback(&self.transport_fallback);
         self.client
             .preconnect(factory.connect(self.model, self.thinking, self.service_tier))
     }
@@ -581,6 +587,7 @@ impl ModelRun {
             tools,
             &self.config.base_system_prompt(),
         )
+        .map(|factory| factory.with_transport_fallback(&self.transport_fallback))
     }
 
     fn responses_endpoint(&self) -> &str {

@@ -72,9 +72,6 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
         request: &mut ResponsesAttempt,
         result: &mut Result<ResponsesServiceResponse, ResponsesServiceError>,
     ) -> Option<Self::Future> {
-        if matches!(request.kind, ResponsesAttemptKind::Connect) {
-            return None;
-        }
         request.limit_attempts(self.max_attempts);
         let failure = result.as_ref().err()?;
         let checkpoint_missing =
@@ -94,8 +91,10 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
             failure.responses_error(),
             Some(ResponsesError::HandshakeRejected { status: 426, .. })
         );
-        let exhausted_websocket_budget = !matches!(request.kind, ResponsesAttemptKind::Warmup)
-            && advice.is_some()
+        let exhausted_websocket_budget = !matches!(
+            request.kind,
+            ResponsesAttemptKind::Warmup | ResponsesAttemptKind::Connect
+        ) && advice.is_some()
             && request.attempt >= request.max_attempts;
         let fallback_reason = if upgrade_required {
             Some("upgrade_required")
@@ -120,7 +119,10 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
                 attempt = failed_attempt,
                 "falling back from WebSocket to HTTPS Responses transport"
             );
-            if matches!(request.kind, ResponsesAttemptKind::Warmup) {
+            if matches!(
+                request.kind,
+                ResponsesAttemptKind::Warmup | ResponsesAttemptKind::Connect
+            ) {
                 return None;
             }
             if let Err(error) = request.observer.emit(
@@ -164,6 +166,9 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
                 server_deadline,
                 Duration::ZERO,
             ));
+        }
+        if matches!(request.kind, ResponsesAttemptKind::Connect) {
+            return None;
         }
         if !checkpoint_missing && advice.is_none() {
             return None;
