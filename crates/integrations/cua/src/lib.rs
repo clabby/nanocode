@@ -9,9 +9,13 @@ use nanocode_tool_contracts::{
 use nanocode_types::ImageDetail;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap, ffi::OsString, path::PathBuf, process::Stdio, sync::Arc, time::Duration,
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -20,6 +24,7 @@ use tokio::{
 };
 
 const PROVIDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const PINNED_CATALOG: &str = include_str!("catalog.json");
 const PROVIDER_ENVIRONMENT: &[&str] = &[
     "PATH",
     "HOME",
@@ -45,107 +50,7 @@ pub struct ComputerConfig {
     pub args: Vec<OsString>,
     pub environment: BTreeMap<OsString, OsString>,
     provider_catalog: Option<Vec<ProviderTool>>,
-    catalog_cache: Option<CatalogCache>,
-}
-
-#[derive(Clone, Debug)]
-struct CatalogCache {
-    path: PathBuf,
-    inputs: Vec<PathBuf>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct CachedCatalog {
-    fingerprint: Value,
-    catalog: Vec<ProviderTool>,
-}
-
-impl CatalogCache {
-    fn entry_path(&self, fingerprint: &Value) -> PathBuf {
-        self.path.with_extension("").join(format!(
-            "{}.json",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(Sha256::digest(fingerprint.to_string().as_bytes()))
-        ))
-    }
-
-    fn fingerprint(&self, config: &ComputerConfig) -> Value {
-        let lossy = |value: &std::ffi::OsStr| value.to_string_lossy().into_owned();
-        let inputs = self
-            .inputs
-            .iter()
-            .map(|path| {
-                let stamp = std::fs::metadata(path).ok().map(|metadata| {
-                    let modified = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|elapsed| elapsed.as_nanos().to_string());
-                    json!({"len": metadata.len(), "modified": modified})
-                });
-                json!({"path": lossy(path.as_os_str()), "stamp": stamp})
-            })
-            .collect::<Vec<_>>();
-        let inherited = PROVIDER_ENVIRONMENT
-            .iter()
-            .map(|name| json!([name, std::env::var_os(name).as_deref().map(lossy)]))
-            .collect::<Vec<_>>();
-        json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "executable": lossy(config.executable.as_os_str()),
-            "args": config.args.iter().map(|arg| lossy(arg)).collect::<Vec<_>>(),
-            "environment": config
-                .environment
-                .iter()
-                .map(|(name, value)| [lossy(name), lossy(value)])
-                .collect::<Vec<_>>(),
-            "inherited": inherited,
-            "inputs": inputs,
-        })
-    }
-
-    fn load(&self, fingerprint: &Value) -> Option<Vec<ProviderTool>> {
-        let entry = self.entry_path(fingerprint);
-        for path in [&entry, &self.path] {
-            let Some(cached) = std::fs::read(path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<CachedCatalog>(&bytes).ok())
-            else {
-                continue;
-            };
-            if cached.fingerprint == *fingerprint && validate_catalog(&cached.catalog).is_ok() {
-                if path == &self.path {
-                    drop(self.store(fingerprint.clone(), &cached.catalog));
-                }
-                return Some(cached.catalog);
-            }
-        }
-        None
-    }
-
-    fn store(&self, fingerprint: Value, catalog: &[ProviderTool]) -> std::io::Result<()> {
-        let path = self.entry_path(&fingerprint);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let staged = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(
-            &staged,
-            serde_json::to_vec(&json!({"fingerprint": fingerprint, "catalog": catalog}))?,
-        )?;
-        std::fs::rename(&staged, &path)
-    }
-
-    fn invalidate(&self, fingerprint: &Value) {
-        drop(std::fs::remove_file(self.entry_path(fingerprint)));
-        if std::fs::read(&self.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<CachedCatalog>(&bytes).ok())
-            .is_some_and(|cached| cached.fingerprint == *fingerprint)
-        {
-            drop(std::fs::remove_file(&self.path));
-        }
-    }
+    required: Vec<PathBuf>,
 }
 
 impl ComputerConfig {
@@ -160,16 +65,9 @@ impl ComputerConfig {
         let codex_home = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(&home).join(".codex"));
-        let nanocode_home = std::env::var_os("NANOCODE_HOME")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&home).join(".nanocode"));
         let base = PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/cua_node");
         let mut config = Self::new(base.join("bin/node_repl"));
         let service = codex_home.join("computer-use/Codex Computer Use.app");
-        if !config.executable.is_file() || !service.is_dir() {
-            return Err("Default Sky CUA installation missing: expected ChatGPT.app/Contents/Resources/cua_node/bin/node_repl and CODEX_HOME/computer-use/Codex Computer Use.app".into());
-        }
         config.environment = [
             (
                 "NODE_REPL_NODE_PATH",
@@ -193,17 +91,21 @@ impl ComputerConfig {
         .into_iter()
         .map(|(key, value)| (OsString::from(key), value))
         .collect();
-        config.catalog_cache = Some(CatalogCache {
-            path: nanocode_home.join("cua-catalog.json"),
-            inputs: vec![
-                config.executable.clone(),
-                base.join("bin/node"),
-                base.join("lib/node_modules/.package-map.json"),
-                service.join("Contents/Info.plist"),
-                codex_home.join("computer-use/config.json"),
-            ],
-        });
+        config.required = vec![config.executable.clone(), service];
+        config.provider_catalog = Some(serde_json::from_str(PINNED_CATALOG)?);
         Ok(config)
+    }
+
+    pub fn unavailable(&self) -> Option<String> {
+        self.required
+            .iter()
+            .find(|path| !path.exists())
+            .map(|path| {
+                format!(
+                    "Default Sky CUA installation missing: expected {}; install ChatGPT.app with Codex Computer Use",
+                    path.display()
+                )
+            })
     }
 
     pub fn new(executable: impl Into<PathBuf>) -> Self {
@@ -212,7 +114,7 @@ impl ComputerConfig {
             args: Vec::new(),
             environment: BTreeMap::new(),
             provider_catalog: None,
-            catalog_cache: None,
+            required: Vec::new(),
         }
     }
 
@@ -269,21 +171,9 @@ pub struct ComputerTools {
 }
 impl ComputerTools {
     pub async fn connect(mut config: ComputerConfig) -> Result<Self, ToolError> {
-        let cache = config
-            .catalog_cache
-            .clone()
-            .map(|cache| (cache.fingerprint(&config), cache));
-        if let Some((fingerprint, cache)) = &cache
-            && let Some(catalog) = cache.load(fingerprint)
-        {
-            config.provider_catalog = Some(catalog);
-            return Ok(Self::local(config));
+        if config.provider_catalog.is_none() {
+            config.provider_catalog = Some(Process::start(&config).await?.catalog);
         }
-        let process = Process::start(&config).await?;
-        if let Some((fingerprint, cache)) = cache {
-            drop(cache.store(fingerprint, &process.catalog));
-        }
-        config.provider_catalog = Some(process.catalog.clone());
         Ok(Self::local(config))
     }
     fn local(config: ComputerConfig) -> Self {
@@ -291,7 +181,7 @@ impl ComputerTools {
             config
                 .provider_catalog
                 .clone()
-                .expect("connect discovers the upstream catalog before registration"),
+                .expect("connect pins or discovers the provider catalog before registration"),
         );
         let (dispatch, requests) = mpsc::unbounded_channel();
         tokio::spawn(route_sessions(config, requests));
@@ -570,7 +460,9 @@ async fn run_session(
         let execution = async {
             let mut process = match previous {
                 Some(process) => process,
-                None => Process::start(&config).await?,
+                None => Process::start(&config)
+                    .await
+                    .map_err(|error| (false, error))?,
             };
             let value = process
                 .rpc(
@@ -578,9 +470,10 @@ async fn run_session(
                     json!({"name":name,"arguments":arguments,
                 "_meta": call_meta(&session, turn_id.as_deref(), &call_id, &model)}),
                 )
-                .await?;
-            let output = output(value)?;
-            Ok::<_, ToolError>((process, output))
+                .await
+                .map_err(|error| (true, error))?;
+            let output = output(value).map_err(|error| (true, error))?;
+            Ok::<_, (bool, ToolError)>((process, output))
         };
         let outcome = tokio::select! {
             biased;
@@ -603,9 +496,9 @@ async fn run_session(
                     interrupted = true;
                 }
             }
-            Err(error) => {
+            Err((dispatched, error)) => {
                 turns.clear();
-                interrupted = true;
+                interrupted |= dispatched;
                 let _ = response.send(Err(error));
             }
         }
@@ -627,6 +520,9 @@ impl Process {
     }
 
     async fn start_and_discover(config: &ComputerConfig) -> Result<Self, ToolError> {
+        if let Some(missing) = config.unavailable() {
+            return Err(missing.into());
+        }
         let mut command = Command::new(&config.executable);
         command.args(&config.args).env_clear();
 
@@ -661,17 +557,23 @@ impl Process {
             .send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await?;
         let catalog = process.discover().await?;
-        if config
-            .provider_catalog
-            .as_ref()
-            .is_some_and(|expected| expected != &catalog)
-        {
-            if let Some(cache) = &config.catalog_cache {
-                cache.invalidate(&cache.fingerprint(config));
+        if let Some(expected) = &config.provider_catalog {
+            let changed = expected
+                .iter()
+                .chain(&catalog)
+                .map(|tool| tool.name.as_str())
+                .filter(|name| {
+                    expected.iter().find(|tool| tool.name == *name)
+                        != catalog.iter().find(|tool| tool.name == *name)
+                })
+                .collect::<BTreeSet<_>>();
+            if !changed.is_empty() {
+                return Err(format!(
+                    "CUA provider tools differ from the definitions advertised to the model: {}. Nothing was dispatched; calls are refused until the advertised catalog matches this provider version",
+                    changed.into_iter().collect::<Vec<_>>().join(", ")
+                )
+                .into());
             }
-            return Err(
-                "CUA provider catalog changed; reconnect the attachment before invoking it".into(),
-            );
         }
         process.catalog = catalog;
         Ok(process)
@@ -679,7 +581,7 @@ impl Process {
     async fn discover(&mut self) -> Result<Vec<ProviderTool>, ToolError> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
-        let mut cursors = std::collections::BTreeSet::new();
+        let mut cursors = BTreeSet::new();
         loop {
             let page = self
                 .rpc(
@@ -761,7 +663,7 @@ impl Process {
 }
 
 fn validate_catalog(catalog: &[ProviderTool]) -> Result<(), ToolError> {
-    let mut names = std::collections::BTreeSet::new();
+    let mut names = BTreeSet::new();
     for tool in catalog {
         if tool.name.is_empty() || !names.insert(&tool.name) {
             return Err("CUA provider tool names must be non-empty and unique".into());

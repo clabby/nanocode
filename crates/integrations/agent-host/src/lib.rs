@@ -215,9 +215,7 @@ impl HostServices for Services {
             if remote {
                 return Ok(Vec::new());
             }
-            Ok(computer::shared(
-                computer::connect(computer).await?.as_ref(),
-            ))
+            Ok(computer::shared(computer::connect(computer).await.as_ref()))
         })
     }
 
@@ -293,9 +291,7 @@ impl HostServices for Services {
     fn unavailable(&self) -> Option<String> {
         computer::unavailable(&self.computer)
     }
-    fn close(&self) {
-        computer::close(&self.computer);
-    }
+    fn close(&self) {}
     fn shutdown(&self) -> BackendFuture<Result<()>> {
         #[cfg(not(target_family = "wasm"))]
         {
