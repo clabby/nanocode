@@ -62,6 +62,40 @@ pub(crate) struct ToolRegistry {
     pub(super) policies: Vec<Arc<dyn crate::CodeModeToolPolicy>>,
     pub(super) hand_calls: Option<Arc<dyn crate::embedded::HandCalls>>,
     nested_gate: Arc<tokio::sync::RwLock<()>>,
+    admissions: Arc<std::sync::Mutex<Admissions>>,
+}
+
+#[derive(Default)]
+struct Admissions {
+    yielded: HashSet<String>,
+    held: HashMap<String, (String, tokio::sync::OwnedRwLockReadGuard<()>)>,
+}
+
+enum SharedAdmission<'call> {
+    Held {
+        admissions: &'call std::sync::Mutex<Admissions>,
+        call_id: &'call str,
+    },
+    Local {
+        _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    },
+    Released,
+}
+
+impl Drop for SharedAdmission<'_> {
+    fn drop(&mut self) {
+        if let Self::Held {
+            admissions,
+            call_id,
+        } = self
+        {
+            admissions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .held
+                .remove(*call_id);
+        }
+    }
 }
 
 impl ToolRegistry {
@@ -234,16 +268,19 @@ impl ToolRegistry {
         }
         let queued_at = std::time::Instant::now();
         let exclusive = self.policies.iter().any(|policy| policy.exclusive(name));
-        let _admission = if exclusive {
-            (
-                None,
-                Some(self.nested_gate.write().instrument(span.clone()).await),
-            )
+        let _exclusive = if exclusive {
+            Some(self.nested_gate.write().instrument(span.clone()).await)
         } else {
-            (
-                Some(self.nested_gate.read().instrument(span.clone()).await),
-                None,
-            )
+            None
+        };
+        let _shared = if exclusive {
+            SharedAdmission::Released
+        } else {
+            let guard = Arc::clone(&self.nested_gate)
+                .read_owned()
+                .instrument(span.clone())
+                .await;
+            self.shared_admission(context.call_id(), guard)
         };
         span.record(
             "tool.admission",
@@ -266,6 +303,30 @@ impl ToolRegistry {
             .flatten();
         finish_tool_execution_span(&span, started_at, &execution, output_content.as_deref());
         execution
+    }
+
+    fn shared_admission<'call>(
+        &'call self,
+        call_id: &'call str,
+        guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> SharedAdmission<'call> {
+        let Some((origin, _)) = call_id.rsplit_once('/') else {
+            return SharedAdmission::Local { _guard: guard };
+        };
+        let mut admissions = self
+            .admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admissions.yielded.contains(origin) {
+            return SharedAdmission::Released;
+        }
+        admissions
+            .held
+            .insert(call_id.to_owned(), (origin.to_owned(), guard));
+        SharedAdmission::Held {
+            admissions: &self.admissions,
+            call_id,
+        }
     }
 
     async fn execute_nested_inner(
@@ -384,6 +445,7 @@ impl ToolRegistry {
             policies: Vec::new(),
             hand_calls: None,
             nested_gate: Arc::new(tokio::sync::RwLock::new(())),
+            admissions: Arc::default(),
         }
     }
 
@@ -600,6 +662,21 @@ impl nanocode_code_mode::CodeModeToolset for ToolRegistry {
         context: ToolContext<'a>,
     ) -> crate::embedded::HostFuture<'a, ToolOutput> {
         Box::pin(Self::execute_nested(self, name, input, context))
+    }
+
+    fn cell_observed(&self, origin_call_id: &str, observed: bool) {
+        let mut admissions = self
+            .admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if observed {
+            admissions.yielded.remove(origin_call_id);
+        } else {
+            admissions.yielded.insert(origin_call_id.to_owned());
+            admissions
+                .held
+                .retain(|_, (origin, _)| origin != origin_call_id);
+        }
     }
 
     fn append_observation_content(

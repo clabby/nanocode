@@ -18,6 +18,8 @@ pub trait CodeModeToolset: Send + Sync {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, ToolOutput>;
 
+    fn cell_observed(&self, _origin_call_id: &str, _observed: bool) {}
+
     fn append_observation_content(
         &self,
         _calls: &[CodeModeToolObservation<'_>],

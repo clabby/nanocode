@@ -417,6 +417,9 @@ impl CodeModeRuntime {
             observer,
         )
         .await;
+        if running {
+            cell.yielded();
+        }
         execution.cell = Some(CodeModeCell {
             origin_call_id: cell.origin_call_id.clone(),
             running,
@@ -521,6 +524,7 @@ impl CodeModeRuntime {
                 );
             }
         };
+        cell.tools.cell_observed(&cell.origin_call_id, true);
         let output_token_budget = arguments.max_tokens;
         if arguments.terminate {
             cell.request_terminate();
@@ -553,7 +557,9 @@ impl CodeModeRuntime {
             observer,
         )
         .await;
-        if !running {
+        if running {
+            cell.yielded();
+        } else {
             self.remove_and_join(&cell).await;
         }
         execution.cell = Some(CodeModeCell {
@@ -918,6 +924,13 @@ impl LiveCell {
             .map_err(|_| CellError::Busy)
     }
 
+    fn yielded(&self) {
+        self.tools.cell_observed(&self.origin_call_id, false);
+        if self.lifecycle.closed() {
+            self.tools.cell_observed(&self.origin_call_id, true);
+        }
+    }
+
     fn request_terminate(&self) {
         if self.lifecycle.request_termination() {
             let terminate = self
@@ -998,6 +1011,10 @@ impl CellLifecycle {
 
     fn close(&self) {
         self.phase.store(CELL_CLOSED, Ordering::Release);
+    }
+
+    fn closed(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == CELL_CLOSED
     }
 }
 
@@ -1599,6 +1616,7 @@ async fn run_cell_actor(
         record_elapsed("host.termination_ns", termination_started_at);
     }
     lifecycle.close();
+    tools.cell_observed(&context.call_id, true);
     record_elapsed("duration_ns", started_at);
 }
 
