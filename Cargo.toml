@@ -201,7 +201,7 @@ incremental = false
 
 [profile.release]
 opt-level = 3
-lto = false
+lto = "off"
 debug = "none"
 strip = "symbols"
 panic = "unwind"
