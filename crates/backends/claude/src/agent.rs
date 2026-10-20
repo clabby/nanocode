@@ -3219,6 +3219,9 @@ async fn defer_turn(
                         }
                         continue;
                     }
+                    if blocked && state.stopped.load(Ordering::SeqCst) {
+                        break Err((NanocodeError::AgentStopped, false));
+                    }
                     break Err((error, false));
                 }
             }
@@ -6495,6 +6498,9 @@ impl LifecycleBackend for Driver {
                                         retire_unstarted(policy.as_ref(), id).await;
                                     } else {
                                         let _ = policy.release(id).await;
+                                    }
+                                    if blocked && state.stopped.load(Ordering::SeqCst) {
+                                        return Err(NanocodeError::AgentStopped);
                                     }
                                     return Err(error);
                                 }
