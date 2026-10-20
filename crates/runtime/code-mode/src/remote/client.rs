@@ -177,7 +177,7 @@ impl RemoteClient {
             pending: Atom::default(),
             callbacks: Atom::default(),
             running: Atom::default(),
-            next: AtomicU64::new(0),
+            next: AtomicU64::new(nanocode_platform::uuid_v4().as_u64_pair().0 >> 12),
             turns: Atom::default(),
             operation_timeout,
             failure: Atom::default(),
