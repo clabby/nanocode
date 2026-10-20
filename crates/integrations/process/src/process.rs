@@ -4,6 +4,10 @@ use std::{
     io::{self, Read, Write},
     path::Path,
     process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -58,6 +62,7 @@ pub(super) struct ProcessChild {
     wait: Option<JoinHandle<io::Result<i32>>>,
     completed: Option<io::Result<i32>>,
     process_group: SharedProcessGroup,
+    exited: Arc<AtomicBool>,
 }
 
 impl ProcessChild {
@@ -71,6 +76,8 @@ impl ProcessChild {
         let (commands, mut received) = mpsc::unbounded_channel();
         let process_group = SharedProcessGroup(commands);
         let mut guard = ProcessGroupGuard::new(pid);
+        let exited = Arc::new(AtomicBool::new(false));
+        let reaped = Arc::clone(&exited);
         let wait = tokio::spawn(async move {
             let mut listening = true;
             #[cfg(unix)]
@@ -94,12 +101,14 @@ impl ProcessChild {
                     Ok(None) => {}
                     Ok(Some(status)) => {
                         guard.disarm();
+                        reaped.store(true, Ordering::SeqCst);
                         return Ok(status);
                     }
 
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
                         guard.disarm();
+                        reaped.store(true, Ordering::SeqCst);
                         return Err(error);
                     }
                 }
@@ -131,7 +140,12 @@ impl ProcessChild {
             wait: Some(wait),
             completed: None,
             process_group,
+            exited,
         }
+    }
+
+    pub(super) fn exited(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.exited)
     }
 
     pub(super) async fn wait(&mut self) -> io::Result<i32> {

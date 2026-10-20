@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -308,6 +308,7 @@ struct Session {
     owner: Actor<SessionState>,
     last_used: AtomicU64,
     busy: AtomicUsize,
+    exited: Arc<AtomicBool>,
 }
 
 struct Busy<'a>(&'a Session);
@@ -339,9 +340,15 @@ fn prune(sessions: &mut HashMap<i64, Arc<Session>>) -> Option<Arc<Session>> {
         .take(PROTECTED_SESSIONS)
         .map(|(_, id)| *id)
         .collect::<HashSet<_>>();
-    let victim = recent.iter().rev().find_map(|(_, id)| {
-        (!protected.contains(id) && sessions[id].busy.load(Ordering::SeqCst) == 0).then_some(*id)
-    })?;
+    let candidates = || {
+        recent.iter().rev().filter(|(_, id)| {
+            !protected.contains(id) && sessions[id].busy.load(Ordering::SeqCst) == 0
+        })
+    };
+    let victim = candidates()
+        .find(|(_, id)| sessions[id].exited.load(Ordering::SeqCst))
+        .or_else(|| candidates().next())
+        .map(|(_, id)| *id)?;
     sessions.remove(&victim)
 }
 
@@ -373,6 +380,7 @@ impl Session {
             process::ProcessOutput::Pty(reader) => vec![output::drain_blocking(reader, chunks)],
         };
         let process_group = spawned.process_group;
+        let exited = spawned.child.exited();
         let owner = Actor::spawn(SessionState {
             id,
             tty,
@@ -391,6 +399,7 @@ impl Session {
             owner,
             last_used: AtomicU64::new(0),
             busy: AtomicUsize::new(0),
+            exited,
         }))
     }
 
