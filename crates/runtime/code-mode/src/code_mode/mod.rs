@@ -929,10 +929,15 @@ impl LiveCell {
     }
 
     async fn begin_observation(&self) -> Result<Leased<CellObservationState>, CellError> {
-        self.finish_relay(true).await;
-        Arc::clone(&self.observation)
-            .try_acquire_owned()
-            .ok_or(CellError::Busy)
+        loop {
+            self.finish_relay(true).await;
+            if let Some(observation) = Arc::clone(&self.observation).try_acquire_owned() {
+                return Ok(observation);
+            }
+            if self.relay.is_empty() {
+                return Err(CellError::Busy);
+            }
+        }
     }
 
     fn yielded(&self) {
