@@ -432,20 +432,18 @@ impl SocketTransport {
         operation_timeout: Option<Duration>,
     ) -> Result<Self, CodeModeHostError> {
         let liveness = Liveness::new();
-        let catalog = match catalog {
-            Some(text) => Some(serde_json::from_str::<Frame>(&text).map_err(error)?),
-            None => tokio::time::timeout(policy.request_timeout, read(&mut socket, &liveness))
-                .await
-                .map_err(error)??,
-        };
-        let Some(Frame::Catalog {
+        let RemoteCatalog {
             definitions,
             name,
             workspace,
             runtime_id,
-        }) = catalog
-        else {
-            return Err(error("runner did not publish a code mode catalog"));
+        } = match catalog {
+            Some(text) => RemoteCatalog::decode(&text, policy.max_frame_bytes)?,
+            None => tokio::time::timeout(policy.request_timeout, read(&mut socket, &liveness))
+                .await
+                .map_err(error)??
+                .ok_or_else(|| error(NO_CATALOG))?
+                .try_into()?,
         };
         crate::host::validate_public_tool_catalog_names(
             definitions.iter().map(ToolDefinition::name),

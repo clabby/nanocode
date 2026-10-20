@@ -417,6 +417,18 @@ pub enum RemoteFrame {
 }
 
 impl RemoteFrame {
+    #[must_use]
+    pub const fn dispatches(&self) -> bool {
+        matches!(
+            self,
+            Self::Request {
+                operation: RemoteOperation::Execute { .. }
+                    | RemoteOperation::Wait { .. }
+                    | RemoteOperation::Call { .. },
+                ..
+            }
+        )
+    }
     pub fn encode(&self, max_frame_bytes: usize) -> Result<String, CodeModeHostError> {
         let text = serde_json::to_string(self)
             .map_err(|error| CodeModeHostError::new(error.to_string()))?;
@@ -434,6 +446,42 @@ impl RemoteFrame {
             ));
         }
         serde_json::from_str(text).map_err(|error| CodeModeHostError::new(error.to_string()))
+    }
+}
+
+pub const NO_CATALOG: &str = "runner did not publish a code mode catalog";
+
+pub struct RemoteCatalog {
+    pub definitions: Vec<ToolDefinition>,
+    pub name: Option<String>,
+    pub workspace: Option<String>,
+    pub runtime_id: Option<String>,
+}
+
+impl RemoteCatalog {
+    pub fn decode(text: &str, max_frame_bytes: usize) -> Result<Self, CodeModeHostError> {
+        Self::try_from(RemoteFrame::decode(text, max_frame_bytes)?)
+    }
+}
+
+impl TryFrom<RemoteFrame> for RemoteCatalog {
+    type Error = CodeModeHostError;
+
+    fn try_from(frame: RemoteFrame) -> Result<Self, Self::Error> {
+        match frame {
+            RemoteFrame::Catalog {
+                definitions,
+                name,
+                workspace,
+                runtime_id,
+            } => Ok(Self {
+                definitions,
+                name,
+                workspace,
+                runtime_id,
+            }),
+            _ => Err(CodeModeHostError::new(NO_CATALOG)),
+        }
     }
 }
 
