@@ -424,6 +424,22 @@ mod store {
     }
 
     impl StoredSession {
+        pub fn checkpoint_thinking(&self) -> Result<Option<nanocode_agent_core::Thinking>> {
+            let Some(checkpoint) = &self.checkpoint else {
+                return Ok(None);
+            };
+            if is_portable(checkpoint) {
+                return Ok(self
+                    .session_checkpoint()?
+                    .map(|checkpoint| checkpoint.thinking()));
+            }
+            let record = &self.summary.record;
+            self.formats
+                .family(record.family())?
+                .thinking(record, checkpoint)
+                .map(Some)
+        }
+
         pub fn session_checkpoint(&self) -> Result<Option<nanocode_agent_core::SessionCheckpoint>> {
             let Some(checkpoint) = &self.checkpoint else {
                 return Ok(None);
@@ -766,13 +782,16 @@ mod store {
                     "the stored session identity changed after loading".to_owned(),
                 ));
             }
-            let inferred = match (&stored.loaded.checkpoint_key, &stored.checkpoint) {
-                (Some(key), Some(checkpoint)) if stored.loaded.record_inferred => {
-                    Some((key.as_str(), checkpoint))
-                }
-                _ => None,
+            let state = if stored.loaded.record_inferred {
+                let inferred = match (&stored.loaded.checkpoint_key, &stored.checkpoint) {
+                    (Some(key), Some(checkpoint)) => Some((key.as_str(), checkpoint)),
+                    _ => None,
+                };
+                self.prepare_resume_with(id, inferred).await?
+            } else {
+                DurableSession::prepare_shared_described(self.store.clone(), id.clone(), None, None)
+                    .await?
             };
-            let state = self.prepare_resume_with(id, inferred).await?;
             if let (Some(key), Some(checkpoint)) =
                 (&stored.loaded.checkpoint_key, &stored.checkpoint)
             {
@@ -1055,7 +1074,8 @@ mod store {
             family: Option<HarnessFamily>,
         ) -> Result<Value> {
             let value: Value = self.load_payload(id, payload).await?.decode()?;
-            self.hydrate_value(id, value, family).await
+            self.hydrate_value(id, value, family, &mut HashSet::new())
+                .await
         }
 
         async fn hydrate_value(
@@ -1063,6 +1083,7 @@ mod store {
             id: &str,
             value: Value,
             family: Option<HarnessFamily>,
+            read: &mut HashSet<String>,
         ) -> Result<Value> {
             if is_portable(&value) {
                 return Ok(value);
@@ -1072,7 +1093,7 @@ mod store {
                 None => self.formats.owner(&value)?,
             };
             format
-                .hydrate(PayloadReader::store(&self.store, id), value)
+                .hydrate_noting(PayloadReader::store(&self.store, id), value, read)
                 .await
         }
 
@@ -1197,6 +1218,7 @@ mod store {
                     id,
                     loaded.decode()?,
                     state.session().map(SessionRecord::family),
+                    &mut records,
                 )
                 .await?;
             Ok(Some((value, loaded, records)))

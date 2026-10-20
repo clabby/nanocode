@@ -169,18 +169,15 @@ impl<D: CheckpointFormats> Harness<D> {
         let stored = store.load(session_id).await.map_err(catalog_error)?;
         let model = stored.summary.record.model.clone();
         let thinking = stored
-            .session_checkpoint()
+            .checkpoint_thinking()
             .map_err(catalog_error)?
-            .map_or_else(
-                || {
-                    stored
-                        .summary
-                        .record
-                        .initial
-                        .map_or_else(|| model.default_thinking(), |initial| initial.thinking)
-                },
-                |checkpoint| checkpoint.thinking(),
-            );
+            .unwrap_or_else(|| {
+                stored
+                    .summary
+                    .record
+                    .initial
+                    .map_or_else(|| model.default_thinking(), |initial| initial.thinking)
+            });
         let options = SpawnOptions::new()
             .harness(model.family())
             .harness_model(model)

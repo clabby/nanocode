@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 
 use nanocode_agent_core::{
-    HarnessFamily, SessionCheckpoint,
+    HarnessFamily, SessionCheckpoint, Thinking,
     session::{ToolOutcome, TranscriptItem},
 };
 use nanocode_durability::{
     AdmittedTurn, CheckpointFormat, EncodedPayload, Error, FormatFuture, PayloadReader, Result,
     SessionRecord,
 };
+use serde::Deserialize as _;
 use serde_json::Value;
 
 use crate::{CodexCheckpointExt as _, durability::context, session::SessionSnapshot};
@@ -28,12 +29,16 @@ impl CheckpointFormat for CodexCheckpointFormat {
         reader: PayloadReader<'a>,
         stored: Value,
     ) -> FormatFuture<'a, Result<Value>> {
-        Box::pin(async move {
-            let saved: context::Snapshot =
-                serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
-            let snapshot = context::restore_snapshot(reader, saved).await?;
-            serde_json::to_value(snapshot).map_err(Error::InvalidPayload)
-        })
+        Box::pin(async move { hydrate(reader, stored, &mut HashSet::new()).await })
+    }
+
+    fn hydrate_noting<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        stored: Value,
+        read: &'a mut HashSet<String>,
+    ) -> FormatFuture<'a, Result<Value>> {
+        Box::pin(hydrate(reader, stored, read))
     }
 
     fn hydrate_continuation<'a>(
@@ -67,6 +72,16 @@ impl CheckpointFormat for CodexCheckpointFormat {
             snapshot,
         )
         .map_err(|error| Error::InvalidState(error.to_string()))
+    }
+
+    fn thinking(&self, record: &SessionRecord, checkpoint: &Value) -> Result<Thinking> {
+        match checkpoint
+            .get("thinking")
+            .filter(|thinking| !thinking.is_null())
+        {
+            Some(thinking) => Thinking::deserialize(thinking).map_err(Error::InvalidPayload),
+            None => Ok(record.model.default_thinking()),
+        }
     }
 
     fn transcript(&self, checkpoint: &Value, _turns: &[AdmittedTurn<'_>]) -> Vec<TranscriptItem> {
@@ -131,6 +146,17 @@ impl CheckpointFormat for CodexCheckpointFormat {
         }
         items
     }
+}
+
+async fn hydrate(
+    reader: PayloadReader<'_>,
+    stored: Value,
+    read: &mut HashSet<String>,
+) -> Result<Value> {
+    let saved: context::Snapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let (snapshot, keys) = context::load_snapshot_with_keys(reader, saved).await?;
+    read.extend(keys);
+    serde_json::to_value(snapshot).map_err(Error::InvalidPayload)
 }
 
 fn is_injected_context(text: &str) -> bool {

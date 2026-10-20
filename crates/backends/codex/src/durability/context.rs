@@ -146,21 +146,31 @@ pub(crate) async fn restore_snapshot(
 }
 
 pub(crate) fn preloaded_snapshot(
-    checkpoint: &serde_json::Value,
+    checkpoint: serde_json::Value,
+    records: Option<Arc<HashSet<String>>>,
     key: &str,
 ) -> Option<(SessionSnapshot, HashSet<String>)> {
-    let prepared = prepare_snapshot(
-        SessionSnapshot::deserialize(checkpoint).ok()?,
-        &HashSet::new(),
-    )
-    .ok()?;
+    let snapshot = SessionSnapshot::deserialize(checkpoint).ok()?;
+    if let Some(records) = records {
+        return Some((snapshot, Arc::unwrap_or_clone(records)));
+    }
+    let (head, history, prefix) = snapshot.into_context_parts();
+    let known = HashSet::new();
+    let mut writer = PagedWriter::new(&known);
+    let saved = Snapshot {
+        history: writer.sequence(&history).ok()?,
+        prefix: prefix
+            .as_ref()
+            .map(|items| writer.sequence(items))
+            .transpose()
+            .ok()?,
+        head,
+    };
+    let prepared = writer.finish(&saved).ok()?;
     if !prepared.payload.matches_key(key) {
         return None;
     }
-    Some((
-        SessionSnapshot::deserialize(checkpoint).ok()?,
-        prepared.keys,
-    ))
+    Some((saved.head.with_context(history, prefix), prepared.keys))
 }
 
 pub(crate) async fn load_snapshot_with_keys(

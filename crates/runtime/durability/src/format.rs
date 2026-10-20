@@ -1,8 +1,8 @@
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashSet, fmt, future::Future, pin::Pin, sync::Arc};
 
 use arc_swap::ArcSwap;
 
-use nanocode_agent_core::{HarnessFamily, SessionCheckpoint, session::TranscriptItem};
+use nanocode_agent_core::{HarnessFamily, SessionCheckpoint, Thinking, session::TranscriptItem};
 use serde_json::Value;
 
 use crate::{EncodedPayload, Error, PayloadReader, Result, SessionRecord};
@@ -30,6 +30,15 @@ pub trait CheckpointFormat: Send + Sync {
         Box::pin(async move { Ok(stored) })
     }
 
+    fn hydrate_noting<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        stored: Value,
+        _read: &'a mut HashSet<String>,
+    ) -> FormatFuture<'a, Result<Value>> {
+        self.hydrate(reader, stored)
+    }
+
     fn hydrate_continuation<'a>(
         &'a self,
         _reader: PayloadReader<'a>,
@@ -47,6 +56,12 @@ pub trait CheckpointFormat: Send + Sync {
         record: &SessionRecord,
         checkpoint: Value,
     ) -> Result<SessionCheckpoint>;
+
+    fn thinking(&self, record: &SessionRecord, checkpoint: &Value) -> Result<Thinking> {
+        Ok(self
+            .session_checkpoint(record, checkpoint.clone())?
+            .thinking())
+    }
 
     fn transcript(&self, checkpoint: &Value, turns: &[AdmittedTurn<'_>]) -> Vec<TranscriptItem>;
 }

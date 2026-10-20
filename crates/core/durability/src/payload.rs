@@ -345,14 +345,16 @@ impl EncodedPayload {
         if records.len() != values.len() {
             return Err(Error::InvalidState("record batch length mismatch".into()));
         }
-        let mut result = Vec::with_capacity(values.len());
-        for (value, record) in values.iter().zip(records) {
-            let record = record.ok_or_else(|| {
-                Error::InvalidState(format!("missing payload record {}", value.key))
-            })?;
-            result.push(value.load_record(&mut source, state_id, record).await?);
-        }
-        Ok(result)
+        let records = values
+            .iter()
+            .zip(records)
+            .map(|(value, record)| {
+                record.ok_or_else(|| {
+                    Error::InvalidState(format!("missing payload record {}", value.key))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::load_records(values, &mut source, state_id, records).await
     }
 
     pub async fn manifests_by_content(
@@ -392,144 +394,222 @@ impl EncodedPayload {
         state_id: &str,
         record: String,
     ) -> Result<Self> {
-        let assembled;
-        let mut verified = false;
-        let content = if let Some(content) = record.strip_prefix('=') {
-            content
-        } else if record.starts_with(MANIFEST_PREFIX) || record.starts_with(TREE_PREFIX) {
-            if record_key(&record) != self.key.as_ref() {
-                return Err(Error::InvalidState(format!(
-                    "payload manifest checksum mismatch {}",
-                    self.key
-                )));
-            }
-            let hashes = self.leaf_hashes(store, state_id, record.clone()).await?;
-            assembled = self.assemble(store, state_id, &hashes, true).await?;
-            verified = true;
-            &assembled
-        } else if let Some(hashes) = record.strip_prefix(SHA256_MANIFEST_PREFIX) {
-            assembled = self.assemble(store, state_id, hashes, false).await?;
-            &assembled
-        } else {
-            let count: usize = record
-                .strip_prefix('+')
-                .ok_or_else(|| Error::InvalidState("invalid payload record".into()))?
-                .parse()
-                .map_err(|_| Error::InvalidState("invalid payload record count".into()))?;
-            let mut content = String::new();
-            for index in 0..count {
-                let chunk = store
-                    .records(state_id, &[format!("{}/{index}", self.key)])
-                    .await?
-                    .pop()
-                    .flatten()
-                    .ok_or_else(|| {
-                        Error::InvalidState(format!("missing payload chunk {}/{index}", self.key))
-                    })?;
-                content.push_str(&chunk);
-            }
-            assembled = content;
-            &assembled
-        };
-        if !verified && !key_matches(&self.key, content) {
-            return Err(Error::InvalidState(format!(
-                "payload record checksum mismatch {}",
-                self.key
-            )));
-        }
-        Ok(Self {
-            key: self.key.clone(),
-            content: Some(content.into()),
-            layout: None,
-            pending: Vec::new(),
-        })
+        Self::load_records(std::slice::from_ref(self), store, state_id, vec![record])
+            .await?
+            .pop()
+            .ok_or_else(|| Error::InvalidState("record batch length mismatch".into()))
     }
 
-    async fn leaf_hashes<S: RecordSource + ?Sized>(
+    async fn load_records<S: RecordSource + ?Sized>(
+        values: &[Self],
+        store: &mut S,
+        state_id: &str,
+        records: Vec<String>,
+    ) -> Result<Vec<Self>> {
+        let mut pending = Vec::with_capacity(values.len());
+        for (value, record) in values.iter().zip(&records) {
+            pending.push(if record.starts_with('=') {
+                Assembly::Inline
+            } else if record.starts_with(MANIFEST_PREFIX) || record.starts_with(TREE_PREFIX) {
+                if record_key(record) != value.key.as_ref() {
+                    return Err(Error::InvalidState(format!(
+                        "payload manifest checksum mismatch {}",
+                        value.key
+                    )));
+                }
+                Assembly::Tree(vec![record.clone()])
+            } else if let Some(hashes) = record.strip_prefix(SHA256_MANIFEST_PREFIX) {
+                Assembly::Leaves(hashes.to_owned(), false)
+            } else {
+                Assembly::Assembled(value.numbered_chunks(store, state_id, record).await?)
+            });
+        }
+        Self::resolve_trees(values, store, state_id, &mut pending).await?;
+        Self::assemble(values, store, state_id, &mut pending).await?;
+        let mut loaded = Vec::with_capacity(values.len());
+        for ((value, record), assembly) in values.iter().zip(&records).zip(pending) {
+            let (content, verified) = match &assembly {
+                Assembly::Inline => (&record[1..], false),
+                Assembly::Assembled(content) => (content.as_str(), false),
+                Assembly::Verified(content) => (content.as_str(), true),
+                Assembly::Tree(_) | Assembly::Leaves(..) => {
+                    return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+                }
+            };
+            if !verified && !key_matches(&value.key, content) {
+                return Err(Error::InvalidState(format!(
+                    "payload record checksum mismatch {}",
+                    value.key
+                )));
+            }
+            loaded.push(Self {
+                key: value.key.clone(),
+                content: Some(content.into()),
+                layout: None,
+                pending: Vec::new(),
+            });
+        }
+        Ok(loaded)
+    }
+
+    async fn numbered_chunks<S: RecordSource + ?Sized>(
         &self,
         store: &mut S,
         state_id: &str,
-        root: String,
+        record: &str,
     ) -> Result<String> {
-        let mut level = vec![root];
+        let count: usize = record
+            .strip_prefix('+')
+            .ok_or_else(|| Error::InvalidState("invalid payload record".into()))?
+            .parse()
+            .map_err(|_| Error::InvalidState("invalid payload record count".into()))?;
+        let mut content = String::new();
+        for index in 0..count {
+            let chunk = store
+                .records(state_id, &[format!("{}/{index}", self.key)])
+                .await?
+                .pop()
+                .flatten()
+                .ok_or_else(|| {
+                    Error::InvalidState(format!("missing payload chunk {}/{index}", self.key))
+                })?;
+            content.push_str(&chunk);
+        }
+        Ok(content)
+    }
+
+    async fn resolve_trees<S: RecordSource + ?Sized>(
+        values: &[Self],
+        store: &mut S,
+        state_id: &str,
+        pending: &mut [Assembly],
+    ) -> Result<()> {
         loop {
-            let leaves = level.iter().all(|text| text.starts_with(MANIFEST_PREFIX));
-            if !leaves && !level.iter().all(|text| text.starts_with(TREE_PREFIX)) {
-                return Err(Error::InvalidState(format!(
-                    "payload manifest tree mixes levels {}",
-                    self.key
-                )));
+            let mut keys = Vec::new();
+            let mut owners = Vec::new();
+            for (index, assembly) in pending.iter_mut().enumerate() {
+                let Assembly::Tree(level) = assembly else {
+                    continue;
+                };
+                let leaves = level.iter().all(|text| text.starts_with(MANIFEST_PREFIX));
+                if !leaves && !level.iter().all(|text| text.starts_with(TREE_PREFIX)) {
+                    return Err(Error::InvalidState(format!(
+                        "payload manifest tree mixes levels {}",
+                        values[index].key
+                    )));
+                }
+                let hashes: String = level.iter().map(|text| &text[1..]).collect();
+                check_hashes(&hashes)?;
+                if leaves {
+                    *assembly = Assembly::Leaves(hashes, true);
+                    continue;
+                }
+                level.clear();
+                for hash in hashes.as_bytes().chunks(HASH_HEX) {
+                    let hash = std::str::from_utf8(hash).unwrap_or_default();
+                    keys.push(chunk_key(hash));
+                    owners.push((index, hash.to_owned()));
+                }
             }
-            let hashes: String = level.iter().map(|text| &text[1..]).collect();
-            if hashes.is_empty()
-                || !hashes.len().is_multiple_of(HASH_HEX)
-                || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+            if keys.is_empty() {
+                return Ok(());
             }
-            if leaves {
-                return Ok(hashes);
-            }
-            let keys: Vec<String> = hashes
-                .as_bytes()
-                .chunks(HASH_HEX)
-                .map(|hash| chunk_key(std::str::from_utf8(hash).unwrap_or_default()))
-                .collect();
             let children = store.records(state_id, &keys).await?;
             if children.len() != keys.len() {
                 return Err(Error::InvalidState("record batch length mismatch".into()));
             }
-            level = Vec::with_capacity(keys.len());
-            for (index, (key, child)) in keys.iter().zip(children).enumerate() {
+            for ((key, child), (index, hash)) in keys.iter().zip(children).zip(owners) {
                 let child = child.ok_or_else(|| {
-                    Error::InvalidState(format!("missing payload manifest {key} of {}", self.key))
+                    Error::InvalidState(format!(
+                        "missing payload manifest {key} of {}",
+                        values[index].key
+                    ))
                 })?;
-                if content_hash(&child) != hashes[index * HASH_HEX..(index + 1) * HASH_HEX] {
+                if content_hash(&child) != hash {
                     return Err(Error::InvalidState(format!(
                         "payload manifest checksum mismatch {key} of {}",
-                        self.key
+                        values[index].key
                     )));
                 }
-                level.push(child);
+                if let Assembly::Tree(level) = &mut pending[index] {
+                    level.push(child);
+                }
             }
         }
     }
 
     async fn assemble<S: RecordSource + ?Sized>(
-        &self,
+        values: &[Self],
         store: &mut S,
         state_id: &str,
-        hashes: &str,
-        verify: bool,
-    ) -> Result<String> {
-        if hashes.is_empty()
-            || !hashes.len().is_multiple_of(64)
-            || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+        pending: &mut [Assembly],
+    ) -> Result<()> {
+        let mut keys = Vec::new();
+        let mut owners = Vec::new();
+        for (index, assembly) in pending.iter().enumerate() {
+            let Assembly::Leaves(hashes, _) = assembly else {
+                continue;
+            };
+            check_hashes(hashes)?;
+            for chunk in 0..hashes.len() / HASH_HEX {
+                keys.push(chunk_key(&hashes[chunk * HASH_HEX..(chunk + 1) * HASH_HEX]));
+                owners.push((index, chunk));
+            }
         }
-        let keys: Vec<String> = (0..hashes.len() / 64)
-            .map(|index| chunk_key(&hashes[index * 64..(index + 1) * 64]))
-            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
         let chunks = store.records(state_id, &keys).await?;
         if chunks.len() != keys.len() {
             return Err(Error::InvalidState("record batch length mismatch".into()));
         }
-        let mut content = String::new();
-        for (index, (key, chunk)) in keys.iter().zip(chunks).enumerate() {
+        let mut contents: Vec<String> = vec![String::new(); pending.len()];
+        for ((key, chunk), (index, position)) in keys.iter().zip(chunks).zip(owners) {
             let chunk = chunk.ok_or_else(|| {
-                Error::InvalidState(format!("missing payload chunk {key} of {}", self.key))
+                Error::InvalidState(format!(
+                    "missing payload chunk {key} of {}",
+                    values[index].key
+                ))
             })?;
-            if verify && content_hash(&chunk) != hashes[index * 64..(index + 1) * 64] {
+            if let Assembly::Leaves(hashes, true) = &pending[index]
+                && content_hash(&chunk) != hashes[position * HASH_HEX..(position + 1) * HASH_HEX]
+            {
                 return Err(Error::InvalidState(format!(
                     "payload chunk checksum mismatch {key} of {}",
-                    self.key
+                    values[index].key
                 )));
             }
-            content.push_str(&chunk);
+            contents[index].push_str(&chunk);
         }
-        Ok(content)
+        for (assembly, content) in pending.iter_mut().zip(contents) {
+            if let Assembly::Leaves(_, verified) = assembly {
+                *assembly = if *verified {
+                    Assembly::Verified(content)
+                } else {
+                    Assembly::Assembled(content)
+                };
+            }
+        }
+        Ok(())
     }
+}
+
+enum Assembly {
+    Inline,
+    Tree(Vec<String>),
+    Leaves(String, bool),
+    Assembled(String),
+    Verified(String),
+}
+
+fn check_hashes(hashes: &str) -> Result<()> {
+    if hashes.is_empty()
+        || !hashes.len().is_multiple_of(HASH_HEX)
+        || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::InvalidState("invalid payload chunk manifest".into()));
+    }
+    Ok(())
 }
 
 trait RecordSource {

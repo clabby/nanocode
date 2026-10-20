@@ -919,18 +919,15 @@ impl AgentRuntime {
     ) -> AgentResult {
         let model = stored.summary.record.model.clone();
         let thinking = stored
-            .session_checkpoint()
+            .checkpoint_thinking()
             .map_err(catalog_error)?
-            .map_or_else(
-                || {
-                    stored
-                        .summary
-                        .record
-                        .initial
-                        .map_or_else(|| model.default_thinking(), |initial| initial.thinking)
-                },
-                |checkpoint| checkpoint.thinking(),
-            );
+            .unwrap_or_else(|| {
+                stored
+                    .summary
+                    .record
+                    .initial
+                    .map_or_else(|| model.default_thinking(), |initial| initial.thinking)
+            });
         self.inner.recipe(model.family())?;
         let inherited = stored
             .turns

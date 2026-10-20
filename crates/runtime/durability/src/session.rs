@@ -2414,13 +2414,34 @@ impl DurableSession {
     }
 
     pub fn take_checkpoint_preload(&self, key: &str) -> Option<serde_json::Value> {
+        self.take_checkpoint_preload_with_records(key)
+            .map(|(checkpoint, _)| checkpoint)
+    }
+
+    pub fn take_checkpoint_preload_with_records(
+        &self,
+        key: &str,
+    ) -> Option<(serde_json::Value, Option<Arc<HashSet<String>>>)> {
         self.preload
             .swap(None)
             .filter(|preloaded| preloaded.key == key)
             .map(|preloaded| {
                 Arc::try_unwrap(preloaded).map_or_else(
-                    |shared| shared.checkpoint.clone(),
-                    |preloaded| preloaded.checkpoint,
+                    |shared| {
+                        (
+                            shared.checkpoint.clone(),
+                            shared
+                                .loaded
+                                .as_ref()
+                                .map(|(_, records)| Arc::clone(records)),
+                        )
+                    },
+                    |preloaded| {
+                        (
+                            preloaded.checkpoint,
+                            preloaded.loaded.map(|(_, records)| records),
+                        )
+                    },
                 )
             })
     }
