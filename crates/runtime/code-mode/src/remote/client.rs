@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     RemoteCodeModeHost, RemoteContext, RemoteFrame as Frame, RemoteOperation, RemoteTransport,
-    deliver_update,
+    deliver_update, oversized,
 };
 use crate::{
     Tool, ToolDefinition, ToolInput,
@@ -47,6 +47,9 @@ pub trait RemoteLink: Send + Sync + 'static {
     fn receive(&self) -> HostFuture<'_, Result<Vec<Frame>, CodeModeHostError>>;
     fn close<'a>(&'a self, reason: &'a str) -> HostFuture<'a, ()>;
     fn changed(&self) {}
+    fn max_frame_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -83,9 +86,17 @@ struct CallbackState {
 
 type Callbacks = HashMap<(String, String), CallbackState>;
 
+type Sending<'a> = (HostFuture<'a, Result<(), CodeModeHostError>>, Vec<u64>);
+
+#[derive(Clone)]
+struct Waiter {
+    replies: mpsc::UnboundedSender<Frame>,
+    written: Arc<AtomicBool>,
+}
+
 struct Client {
     outgoing: mpsc::UnboundedSender<(Frame, RemoteDelivery)>,
-    pending: Atom<HashMap<u64, mpsc::UnboundedSender<Frame>>>,
+    pending: Atom<HashMap<u64, Waiter>>,
     callbacks: Atom<Callbacks>,
     running: Atom<HashMap<u64, (String, AbortHandle)>>,
     next: AtomicU64,
@@ -93,6 +104,7 @@ struct Client {
     operation_timeout: Option<Duration>,
     failure: Atom<Option<String>>,
     hands: Atom<Option<Arc<dyn HandCalls>>>,
+    max_frame_bytes: Option<usize>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -112,6 +124,32 @@ fn origin(call_id: &str) -> &str {
     call_id
         .rsplit_once("/code-")
         .map_or(call_id, |(origin, _)| origin)
+}
+
+fn fits(frame: &Frame, max_frame_bytes: Option<usize>) -> Result<(), CodeModeHostError> {
+    let Some(limit) = max_frame_bytes else {
+        return Ok(());
+    };
+    let bytes = frame.encoded_len()?;
+    if bytes > limit {
+        return Err(oversized(bytes, limit));
+    }
+    Ok(())
+}
+
+fn requested_yield(operation: &RemoteOperation) -> Duration {
+    let requested = match operation {
+        RemoteOperation::Execute { source, .. } => source
+            .lines()
+            .next()
+            .and_then(|line| line.trim_start().strip_prefix("// @exec:"))
+            .and_then(|pragma| serde_json::from_str::<Value>(pragma).ok()),
+        RemoteOperation::Wait { input, .. } => serde_json::from_str::<Value>(input).ok(),
+        _ => None,
+    };
+    requested
+        .and_then(|value| value.get("yield_time_ms")?.as_u64())
+        .map_or(Duration::ZERO, Duration::from_millis)
 }
 
 impl RemoteActivity {
@@ -140,6 +178,7 @@ impl RemoteClient {
     ) -> (Self, HostFuture<'static, String>) {
         let (outgoing, frames) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel();
+        let max_frame_bytes = link.max_frame_bytes();
         let client = Arc::new(Client {
             outgoing,
             pending: Atom::default(),
@@ -150,6 +189,7 @@ impl RemoteClient {
             operation_timeout,
             failure: Atom::default(),
             hands: Atom::default(),
+            max_frame_bytes,
             _stop: stop,
         });
         let driver = Box::pin(drive(Arc::downgrade(&client), link, frames, stopped));
@@ -208,8 +248,8 @@ impl Client {
     ) -> Result<Option<HostFuture<'static, ()>>, CodeModeHostError> {
         match frame {
             Frame::Reply { id, .. } | Frame::Update { id, .. } => {
-                if let Some(channel) = self.pending.read(|pending| pending.get(&id).cloned()) {
-                    let _ = channel.send(frame);
+                if let Some(waiter) = self.pending.read(|pending| pending.get(&id).cloned()) {
+                    let _ = waiter.replies.send(frame);
                 }
             }
             Frame::CallbackCancel { id } => {
@@ -293,6 +333,7 @@ impl Client {
         });
         let outgoing = self.outgoing.clone();
         let client = Arc::downgrade(self);
+        let max_frame_bytes = self.max_frame_bytes;
         Box::pin(async move {
             let execution = Abortable::new(
                 async move {
@@ -335,13 +376,17 @@ impl Client {
                 registration,
             );
             if let Ok(result) = execution.await {
-                let _ = outgoing.send((
-                    Frame::CallbackResult {
+                let mut frame = Frame::CallbackResult {
+                    id,
+                    result: result.map_err(|issue: CodeModeHostError| issue.to_string()),
+                };
+                if let Err(issue) = fits(&frame, max_frame_bytes) {
+                    frame = Frame::CallbackResult {
                         id,
-                        result: result.map_err(|issue: CodeModeHostError| issue.to_string()),
-                    },
-                    delivery,
-                ));
+                        result: Err(format!("{issue}; the brain callback's result was not sent")),
+                    };
+                }
+                let _ = outgoing.send((frame, delivery));
             }
             if let Some(client) = client.upgrade() {
                 client.running.update(|running| {
@@ -359,13 +404,52 @@ impl Client {
         let uncertain = format!(
             "{message}; the dispatched operation has an unknown outcome and was not retried"
         );
+        let unsent = format!("{message}; the operation was not dispatched");
         self.failure.set(Some(message.to_owned()));
-        for (id, channel) in self.pending.update(std::mem::take) {
-            let _ = channel.send(Frame::Reply {
+        for (id, waiter) in self.pending.update(std::mem::take) {
+            let result = if waiter.written.load(Ordering::SeqCst) {
+                uncertain.clone()
+            } else {
+                unsent.clone()
+            };
+            let _ = waiter.replies.send(Frame::Reply {
                 id,
-                result: Err(uncertain.clone()),
+                result: Err(result),
             });
         }
+    }
+
+    fn written(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.pending.read(|pending| {
+            for id in ids {
+                if let Some(waiter) = pending.get(id) {
+                    waiter.written.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+    }
+
+    const fn request_frame(&self, id: u64, operation: RemoteOperation) -> Frame {
+        Frame::Request {
+            id,
+            operation,
+            max_frame_bytes: self.max_frame_bytes,
+        }
+    }
+
+    fn waiter(&self, id: u64) -> mpsc::UnboundedReceiver<Frame> {
+        let (replies, receiver) = mpsc::unbounded_channel();
+        let waiter = Waiter {
+            replies,
+            written: Arc::default(),
+        };
+        self.pending.update(|pending| {
+            pending.insert(id, waiter.clone());
+        });
+        receiver
     }
 
     fn not_dispatched(&self) -> Result<(), CodeModeHostError> {
@@ -380,12 +464,18 @@ impl Client {
     async fn deadline<T>(
         &self,
         reply: impl Future<Output = T>,
+        requested: Duration,
         elapsed: &str,
     ) -> Result<T, CodeModeHostError> {
         let Some(timeout) = self.operation_timeout else {
             return Ok(reply.await);
         };
-        match select(pin!(reply), pin!(nanocode_platform::sleep(timeout))).await {
+        match select(
+            pin!(reply),
+            pin!(nanocode_platform::sleep(timeout.saturating_add(requested))),
+        )
+        .await
+        {
             Either::Left((result, _)) => Ok(result),
             Either::Right(_) => Err(error(elapsed)),
         }
@@ -399,22 +489,34 @@ async fn drive(
     mut stopped: oneshot::Receiver<()>,
 ) -> String {
     let mut callbacks = FuturesUnordered::new();
+    let written = |ids: &[u64]| {
+        if let Some(client) = client.upgrade() {
+            client.written(ids);
+        }
+    };
     let result = {
         let mut receiving = link.receive();
-        let mut sending: Option<HostFuture<'_, Result<(), CodeModeHostError>>> = None;
-        poll_fn(|cx| {
+        let mut sending: Option<Sending<'_>> = None;
+        let result = poll_fn(|cx| {
             loop {
                 if stopped.poll_unpin(cx).is_ready() {
                     return Poll::Ready(Ok(()));
                 }
                 let mut progressed = false;
-                if let Some(send) = sending.as_mut() {
+                if let Some((send, ids)) = sending.as_mut() {
                     match send.as_mut().poll(cx) {
                         Poll::Ready(Ok(())) => {
+                            written(ids);
                             sending = None;
                             progressed = true;
                         }
-                        Poll::Ready(Err(issue)) => return Poll::Ready(Err(issue)),
+                        Poll::Ready(Err(issue)) => {
+                            if !issue.is_unsent() {
+                                written(ids);
+                            }
+                            sending = None;
+                            return Poll::Ready(Err(issue));
+                        }
                         Poll::Pending => {}
                     }
                 }
@@ -431,7 +533,14 @@ async fn drive(
                         batch.push(frame);
                     }
                     if !batch.is_empty() {
-                        sending = Some(link.send(batch, delivery));
+                        let ids = batch
+                            .iter()
+                            .filter_map(|frame| match frame {
+                                Frame::Request { id, .. } => Some(*id),
+                                _ => None,
+                            })
+                            .collect();
+                        sending = Some((link.send(batch, delivery), ids));
                         continue;
                     }
                 }
@@ -463,9 +572,14 @@ async fn drive(
                 }
             }
         })
-        .await
+        .await;
+        if let Some((_, ids)) = sending.take() {
+            written(&ids);
+        }
+        result
     };
     drop(callbacks);
+    frames.close();
     let message = result.map_or_else(|issue| issue.to_string(), |()| LOCAL_CLOSED.to_owned());
     if let Some(client) = client.upgrade() {
         client.terminate(&message);
@@ -496,10 +610,8 @@ impl Drop for Pending {
             if let Some(session_id) = self.session_id.take() {
                 let id = self.client.next.fetch_add(1, Ordering::Relaxed);
                 let _ = self.client.outgoing.send((
-                    Frame::Request {
-                        id,
-                        operation: RemoteOperation::CancelTurn { session_id },
-                    },
+                    self.client
+                        .request_frame(id, RemoteOperation::CancelTurn { session_id }),
                     RemoteDelivery::Durable,
                 ));
             }
@@ -517,40 +629,42 @@ impl RemoteTransport for RemoteClient {
         Box::pin(async move {
             let client = &self.client;
             client.not_dispatched()?;
-            let origin_call_id = match &operation {
-                RemoteOperation::Execute { context, .. } => Some(context.call_id.clone()),
+            let executed = match &operation {
+                RemoteOperation::Execute { context, .. } => Some(context.clone()),
                 _ => None,
             };
+            let origin_call_id = executed.as_ref().map(|context| context.call_id.clone());
             let session_id = match &operation {
-                RemoteOperation::Execute { context, .. } => {
-                    let generation = client
-                        .turns
-                        .read(|turns| turns.get(&context.session_id).copied())
-                        .unwrap_or(0);
-                    let key = (context.session_id.clone(), context.call_id.clone());
-                    let state = CallbackState {
-                        tools,
-                        context: context.clone(),
-                        generation,
-                        observer: Arc::default(),
-                    };
-                    client.callbacks.modify(|callbacks| {
-                        if callbacks.contains_key(&key) {
-                            return Err(error("callback origin is already active"));
-                        }
-                        callbacks.insert(key.clone(), state.clone());
-                        Ok(())
-                    })?;
-                    Some(context.session_id.clone())
-                }
-                RemoteOperation::Wait { context, .. } => Some(context.session_id.clone()),
+                RemoteOperation::Execute { context, .. }
+                | RemoteOperation::Wait { context, .. } => Some(context.session_id.clone()),
                 _ => None,
             };
+            let requested = requested_yield(&operation);
             let id = client.next.fetch_add(1, Ordering::Relaxed);
-            let (sender, mut replies) = mpsc::unbounded_channel();
-            client.pending.update(|pending| {
-                pending.insert(id, sender.clone());
-            });
+            let frame = client.request_frame(id, operation);
+            fits(&frame, client.max_frame_bytes)
+                .map_err(|issue| error(format!("{issue}; the operation was not dispatched")))?;
+            if let Some(context) = executed {
+                let generation = client
+                    .turns
+                    .read(|turns| turns.get(&context.session_id).copied())
+                    .unwrap_or(0);
+                let key = (context.session_id.clone(), context.call_id.clone());
+                let state = CallbackState {
+                    tools,
+                    context,
+                    generation,
+                    observer: Arc::default(),
+                };
+                client.callbacks.modify(|callbacks| {
+                    if callbacks.contains_key(&key) {
+                        return Err(error("callback origin is already active"));
+                    }
+                    callbacks.insert(key.clone(), state.clone());
+                    Ok(())
+                })?;
+            }
+            let mut replies = client.waiter(id);
             let mut guard = Pending {
                 client: Arc::clone(client),
                 id,
@@ -559,7 +673,7 @@ impl RemoteTransport for RemoteClient {
                 complete: false,
             };
             client
-                .dispatch(Frame::Request { id, operation }, RemoteDelivery::Durable)
+                .dispatch(frame, RemoteDelivery::Durable)
                 .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
             let reply = async {
                 while let Some(frame) = replies.recv().await {
@@ -588,6 +702,7 @@ impl RemoteTransport for RemoteClient {
             let result = client
                 .deadline(
                     reply,
+                    requested,
                     "remote operation deadline elapsed; outcome unknown; cancellation requested; no retry",
                 )
                 .await?;
@@ -632,10 +747,10 @@ impl RemoteTransport for RemoteClient {
             let client = &self.client;
             client.not_dispatched()?;
             let id = client.next.fetch_add(1, Ordering::Relaxed);
-            let (sender, mut replies) = mpsc::unbounded_channel();
-            client.pending.update(|pending| {
-                pending.insert(id, sender.clone());
-            });
+            let frame = client.request_frame(id, operation);
+            fits(&frame, client.max_frame_bytes)
+                .map_err(|issue| error(format!("{issue}; the operation was not dispatched")))?;
+            let mut replies = client.waiter(id);
             let mut guard = Pending {
                 client: Arc::clone(client),
                 id,
@@ -644,7 +759,7 @@ impl RemoteTransport for RemoteClient {
                 complete: false,
             };
             client
-                .dispatch(Frame::Request { id, operation }, RemoteDelivery::Immediate)
+                .dispatch(frame, RemoteDelivery::Immediate)
                 .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
             let reply = async {
                 while let Some(frame) = replies.recv().await {
@@ -665,6 +780,7 @@ impl RemoteTransport for RemoteClient {
             let result = client
                 .deadline(
                     reply,
+                    Duration::ZERO,
                     "remote operation deadline elapsed; outcome unknown; no retry",
                 )
                 .await?;
@@ -687,10 +803,8 @@ impl RemoteTransport for RemoteClient {
             return Err(error(failure));
         }
         self.client.dispatch(
-            Frame::Request {
-                id: self.client.next.fetch_add(1, Ordering::Relaxed),
-                operation,
-            },
+            self.client
+                .request_frame(self.client.next.fetch_add(1, Ordering::Relaxed), operation),
             RemoteDelivery::Durable,
         )
     }

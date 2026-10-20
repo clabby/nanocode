@@ -23,6 +23,7 @@ pub type HostFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 #[derive(Debug)]
 pub struct CodeModeHostError {
     message: Box<str>,
+    unsent: bool,
 }
 
 impl CodeModeHostError {
@@ -30,12 +31,26 @@ impl CodeModeHostError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into().into_boxed_str(),
+            unsent: false,
+        }
+    }
+
+    #[must_use]
+    pub fn unsent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into().into_boxed_str(),
+            unsent: true,
         }
     }
 
     #[must_use]
     pub const fn message(&self) -> &str {
         &self.message
+    }
+
+    #[must_use]
+    pub const fn is_unsent(&self) -> bool {
+        self.unsent
     }
 }
 

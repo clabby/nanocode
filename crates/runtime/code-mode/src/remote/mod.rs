@@ -376,10 +376,14 @@ pub enum RemoteFrame {
         workspace: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_frame_bytes: Option<usize>,
     },
     Request {
         id: u64,
         operation: RemoteOperation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_frame_bytes: Option<usize>,
     },
     Reply {
         id: u64,
@@ -433,11 +437,25 @@ impl RemoteFrame {
         let text = serde_json::to_string(self)
             .map_err(|error| CodeModeHostError::new(error.to_string()))?;
         if text.len() > max_frame_bytes {
-            return Err(CodeModeHostError::new(
-                "remote frame exceeds caller max_frame_bytes policy",
-            ));
+            return Err(oversized(text.len(), max_frame_bytes));
         }
         Ok(text)
+    }
+    pub fn encoded_len(&self) -> Result<usize, CodeModeHostError> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, self)
+            .map_err(|error| CodeModeHostError::new(error.to_string()))?;
+        Ok(count.0)
     }
     pub fn decode(text: &str, max_frame_bytes: usize) -> Result<Self, CodeModeHostError> {
         if text.len() > max_frame_bytes {
@@ -449,13 +467,23 @@ impl RemoteFrame {
     }
 }
 
+#[must_use]
+pub fn oversized(bytes: usize, max_frame_bytes: usize) -> CodeModeHostError {
+    CodeModeHostError::new(format!(
+        "remote frame of {bytes} bytes exceeds the connection's max_frame_bytes policy of {max_frame_bytes} bytes"
+    ))
+}
+
 pub const NO_CATALOG: &str = "runner did not publish a code mode catalog";
+
+pub const HAND_REPLACED: &str = "another hand attached under this name";
 
 pub struct RemoteCatalog {
     pub definitions: Vec<ToolDefinition>,
     pub name: Option<String>,
     pub workspace: Option<String>,
     pub runtime_id: Option<String>,
+    pub max_frame_bytes: Option<usize>,
 }
 
 impl RemoteCatalog {
@@ -474,11 +502,13 @@ impl TryFrom<RemoteFrame> for RemoteCatalog {
                 name,
                 workspace,
                 runtime_id,
+                max_frame_bytes,
             } => Ok(Self {
                 definitions,
                 name,
                 workspace,
                 runtime_id,
+                max_frame_bytes,
             }),
             _ => Err(CodeModeHostError::new(NO_CATALOG)),
         }

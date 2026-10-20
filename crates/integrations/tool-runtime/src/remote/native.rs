@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -304,15 +304,9 @@ async fn read<S: Stream<Item = Result<Message, tungstenite::Error>> + Unpin>(
 
 async fn write<S: Sink<Message, Error = tungstenite::Error> + Unpin>(
     socket: &mut S,
-    frame: Frame,
+    text: String,
     policy: SocketPolicy,
 ) -> Result<(), CodeModeHostError> {
-    let text = serde_json::to_string(&frame).map_err(error)?;
-    if text.len() > policy.max_frame_bytes {
-        return Err(error(
-            "remote code mode frame exceeds caller max_frame_bytes policy",
-        ));
-    }
     tokio::time::timeout(policy.request_timeout, socket.send(Message::text(text)))
         .await
         .map_err(|_| error("remote write deadline elapsed"))?
@@ -330,7 +324,7 @@ fn writer<S: Sink<Message, Error = tungstenite::Error> + Unpin + Send + 'static>
     policy: SocketPolicy,
     liveness: Arc<Liveness>,
     reason: Arc<Atom<Option<&'static str>>>,
-) -> (mpsc::UnboundedSender<Frame>, Writer) {
+) -> (mpsc::UnboundedSender<String>, Writer) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         let period = policy.request_timeout / 2;
@@ -437,6 +431,7 @@ impl SocketTransport {
             name,
             workspace,
             runtime_id,
+            max_frame_bytes,
         } = match catalog {
             Some(text) => RemoteCatalog::decode(&text, policy.max_frame_bytes)?,
             None => tokio::time::timeout(policy.request_timeout, read(&mut socket, &liveness))
@@ -474,6 +469,9 @@ impl SocketTransport {
                 liveness,
                 window: policy.request_timeout / 2,
                 stopped: shutdown.token.clone(),
+                max_frame_bytes: max_frame_bytes.map_or(policy.max_frame_bytes, |peer| {
+                    peer.min(policy.max_frame_bytes)
+                }),
             },
             operation_timeout,
         );
@@ -503,10 +501,11 @@ struct SocketReader<S> {
 
 struct SocketLink<S> {
     reader: Owned<SocketReader<S>>,
-    wire: Atom<Option<mpsc::UnboundedSender<Frame>>>,
+    wire: Atom<Option<mpsc::UnboundedSender<String>>>,
     liveness: Arc<Liveness>,
     window: Duration,
     stopped: CancellationToken,
+    max_frame_bytes: usize,
 }
 
 enum Received {
@@ -522,13 +521,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteLink for SocketLi
         frames: Vec<Frame>,
         _delivery: RemoteDelivery,
     ) -> HostFuture<'_, Result<(), CodeModeHostError>> {
-        let sent = match &*self.wire.get() {
-            Some(wire) => frames
-                .into_iter()
-                .try_for_each(|frame| wire.send(frame).map_err(error)),
-            None => Err(error(LOCAL_CLOSED)),
-        };
+        let sent = frames
+            .iter()
+            .map(|frame| frame.encode(self.max_frame_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|issue| CodeModeHostError::unsent(issue.message()))
+            .and_then(|texts| match &*self.wire.get() {
+                Some(wire) => texts.into_iter().enumerate().try_for_each(|(index, text)| {
+                    wire.send(text).map_err(|issue| {
+                        if index == 0 {
+                            CodeModeHostError::unsent(issue.to_string())
+                        } else {
+                            error(issue)
+                        }
+                    })
+                }),
+                None => Err(CodeModeHostError::unsent(LOCAL_CLOSED)),
+            });
         Box::pin(std::future::ready(sent))
+    }
+
+    fn max_frame_bytes(&self) -> Option<usize> {
+        Some(self.max_frame_bytes)
     }
 
     fn receive(&self) -> HostFuture<'_, Result<Vec<Frame>, CodeModeHostError>> {
@@ -604,54 +618,190 @@ impl RemoteTransport for SocketTransport {
     }
 }
 
+#[derive(Clone)]
+struct Outgoing {
+    wire: mpsc::UnboundedSender<String>,
+    limit: Arc<AtomicUsize>,
+}
+
+impl Outgoing {
+    fn encode(&self, frame: &Frame) -> Result<String, CodeModeHostError> {
+        frame.encode(self.limit.load(Ordering::Relaxed))
+    }
+    fn push(&self, text: String) -> Result<(), CodeModeHostError> {
+        self.wire.send(text).map_err(error)
+    }
+    fn send(&self, frame: &Frame) -> Result<(), CodeModeHostError> {
+        self.push(self.encode(frame)?)
+    }
+    fn send_or(
+        &self,
+        frame: &Frame,
+        fallback: impl FnOnce(&CodeModeHostError) -> Frame,
+    ) -> Result<(), CodeModeHostError> {
+        match self.encode(frame) {
+            Ok(text) => self.push(text),
+            Err(issue) => self.send(&fallback(&issue)),
+        }
+    }
+}
+
+fn update_wire(update: &CodeModeUpdate<'_>) -> Value {
+    match update {
+        CodeModeUpdate::NestedCallStarted {
+            call_id,
+            name,
+            input,
+        } => json!({"call_id":call_id,"name":name,"input":input}),
+        CodeModeUpdate::NestedCallCompleted(call) => json!({"completed":nested(call)}),
+        CodeModeUpdate::Notification(notification) => {
+            json!({"notification":{"call_id":notification.call_id,"text":notification.text}})
+        }
+    }
+}
+
+fn unsent_update(update: &CodeModeUpdate<'_>, issue: &CodeModeHostError) -> Value {
+    match update {
+        CodeModeUpdate::NestedCallStarted { call_id, name, .. } => {
+            json!({"call_id":call_id,"name":name,"input":Value::Null})
+        }
+        CodeModeUpdate::NestedCallCompleted(call) => json!({"completed":{
+            "call_id":call.call_id,
+            "name":call.name,
+            "input":Value::Null,
+            "output":format!("{issue}; the call's input and output were not sent"),
+            "structured_result":Value::Null,
+            "success":call.success,
+            "started_after_ns":call.started_after_ns,
+            "duration_ns":call.duration_ns,
+            "metadata":Value::Null,
+        }}),
+        CodeModeUpdate::Notification(notification) => {
+            json!({"notification":{"call_id":notification.call_id,"text":format!("{issue}; the notification was not sent")}})
+        }
+    }
+}
+
+fn status_line(execution: &CodeModeExecution) -> String {
+    let header = match &execution.output {
+        crate::contract::ToolOutputBody::Text(text) => Some(text.as_str()),
+        crate::contract::ToolOutputBody::Content(content) => {
+            content.first().and_then(|item| match item {
+                crate::contract::ToolOutputContent::InputText { text } => Some(text.as_str()),
+                _ => None,
+            })
+        }
+    };
+    header
+        .and_then(|header| header.lines().next())
+        .unwrap_or("Script failed")
+        .to_owned()
+}
+
+fn reply(
+    outgoing: &Outgoing,
+    id: u64,
+    result: Result<Option<Value>, String>,
+    status: Option<String>,
+) {
+    let mut frame = Frame::Reply { id, result };
+    let mut issue = match outgoing.encode(&frame) {
+        Ok(text) => {
+            let _ = outgoing.push(text);
+            return;
+        }
+        Err(issue) => issue,
+    };
+    let execution = match &mut frame {
+        Frame::Reply {
+            result: Ok(Some(Value::Object(execution))),
+            ..
+        } if status.is_some() => Some(execution),
+        _ => None,
+    };
+    let Some(execution) = execution else {
+        let _ = outgoing.send(&Frame::Reply {
+            id,
+            result: Err(format!("{issue}; the result was not sent")),
+        });
+        return;
+    };
+    if let Some(Value::Array(calls)) = execution.get_mut("nested_calls") {
+        for call in calls.iter_mut().filter_map(Value::as_object_mut) {
+            call.insert("input".into(), Value::Null);
+            call.insert(
+                "output".into(),
+                Value::String(format!(
+                    "{issue}; the call's input and output were not sent"
+                )),
+            );
+            call.insert("structured_result".into(), Value::Null);
+            call.insert("metadata".into(), Value::Null);
+        }
+    }
+    match outgoing.encode(&frame) {
+        Ok(text) => {
+            let _ = outgoing.push(text);
+            return;
+        }
+        Err(next) => issue = next,
+    }
+    if let Frame::Reply {
+        result: Ok(Some(Value::Object(execution))),
+        ..
+    } = &mut frame
+    {
+        let status = status.unwrap_or_default();
+        execution.insert(
+            "output".into(),
+            Value::String(format!(
+                "{status}\nOutput:\n{issue}; the script's output was not sent"
+            )),
+        );
+        execution.insert("success".into(), Value::Bool(false));
+        execution.insert("notifications".into(), json!([]));
+    }
+    let _ = outgoing.send(&frame);
+}
+
 struct Observer {
     id: u64,
-    outgoing: mpsc::UnboundedSender<Frame>,
+    outgoing: Outgoing,
 }
 impl CodeModeObserver for Observer {
     fn update(&mut self, update: CodeModeUpdate<'_>) {
-        let update = match update {
-            CodeModeUpdate::NestedCallStarted {
-                call_id,
-                name,
-                input,
-            } => json!({"call_id":call_id,"name":name,"input":input}),
-            CodeModeUpdate::NestedCallCompleted(call) => json!({"completed":nested(call)}),
-            CodeModeUpdate::Notification(notification) => {
-                json!({"notification":{"call_id":notification.call_id,"text":notification.text}})
-            }
-        };
-        let _ = self.outgoing.send(Frame::Update {
-            id: self.id,
-            update,
-        });
+        let id = self.id;
+        let _ = self.outgoing.send_or(
+            &Frame::Update {
+                id,
+                update: update_wire(&update),
+            },
+            |issue| Frame::Update {
+                id,
+                update: unsent_update(&update, issue),
+            },
+        );
     }
 }
 
 struct DetachedObserver {
     session_id: String,
     origin_call_id: String,
-    outgoing: mpsc::UnboundedSender<Frame>,
+    outgoing: Outgoing,
     catalog: CallbackCatalog,
 }
 impl CodeModeObserver for DetachedObserver {
     fn update(&mut self, update: CodeModeUpdate<'_>) {
-        let update = match update {
-            CodeModeUpdate::NestedCallStarted {
-                call_id,
-                name,
-                input,
-            } => json!({"call_id":call_id,"name":name,"input":input}),
-            CodeModeUpdate::NestedCallCompleted(call) => json!({"completed":nested(call)}),
-            CodeModeUpdate::Notification(notification) => {
-                json!({"notification":{"call_id":notification.call_id,"text":notification.text}})
-            }
-        };
-        let _ = self.outgoing.send(Frame::DetachedUpdate {
+        let frame = |update| Frame::DetachedUpdate {
             session_id: self.session_id.clone(),
             origin_call_id: self.origin_call_id.clone(),
             update,
-        });
+        };
+        let _ = self
+            .outgoing
+            .send_or(&frame(update_wire(&update)), |issue| {
+                frame(unsent_update(&update, issue))
+            });
     }
     fn completed(&mut self) {
         self.catalog.finish(&self.origin_call_id);
@@ -661,7 +811,7 @@ impl CodeModeObserver for DetachedObserver {
 type CallbackReply = Arc<Slot<oneshot::Sender<Result<Value, String>>>>;
 
 struct CallbackBus {
-    outgoing: mpsc::UnboundedSender<Frame>,
+    outgoing: Outgoing,
     pending: Atom<HashMap<u64, CallbackReply>>,
     next: AtomicU64,
     timeout: Option<Duration>,
@@ -681,13 +831,17 @@ impl Drop for CallbackPending {
             let _ = self
                 .bus
                 .outgoing
-                .send(Frame::CallbackCancel { id: self.id });
+                .send(&Frame::CallbackCancel { id: self.id });
         }
     }
 }
 
 async fn callback(bus: &Arc<CallbackBus>, frame: impl FnOnce(u64) -> Frame) -> ToolResult {
     let id = bus.next.fetch_add(1, Ordering::Relaxed);
+    let text = bus
+        .outgoing
+        .encode(&frame(id))
+        .map_err(|issue| -> ToolError { format!("{issue}; the call was not dispatched").into() })?;
     let (tx, rx) = oneshot::channel();
     let tx = Arc::new(Slot::new(Some(tx)));
     bus.pending.update(|pending| {
@@ -698,7 +852,7 @@ async fn callback(bus: &Arc<CallbackBus>, frame: impl FnOnce(u64) -> Frame) -> T
         id,
     };
     bus.outgoing
-        .send(frame(id))
+        .push(text)
         .map_err(|e| -> ToolError { e.to_string().into() })?;
     let result = match bus.timeout {
         Some(deadline) => tokio::time::timeout(deadline, rx)
@@ -835,7 +989,7 @@ impl CallbackCatalog {
             Some(())
         });
         if removed.is_some() {
-            let _ = self.bus.outgoing.send(Frame::DetachedComplete {
+            let _ = self.bus.outgoing.send(&Frame::DetachedComplete {
                 session_id: self.session_id.to_string(),
                 origin_call_id: origin.into(),
             });
@@ -1035,22 +1189,23 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let catalog_runtime = ToolRuntime::new_with_tools(workspace.clone(), Vec::new(), &tools);
     let definitions = catalog_runtime.registered_code_mode_definitions();
     catalog_runtime.control().cancel().await;
-    write(
-        &mut socket,
-        Frame::Catalog {
-            definitions,
-            name: options.name.clone(),
-            workspace: Some(workspace.display().to_string()),
-            runtime_id: options.runtime_id,
-        },
-        policy,
-    )
-    .await?;
+    let catalog = Frame::Catalog {
+        definitions,
+        name: options.name.clone(),
+        workspace: Some(workspace.display().to_string()),
+        runtime_id: options.runtime_id,
+        max_frame_bytes: Some(policy.max_frame_bytes),
+    };
+    write(&mut socket, catalog.encode(policy.max_frame_bytes)?, policy).await?;
     let (sink, mut socket) = socket.split();
     let liveness = Liveness::new();
     let watchdog = liveness.watch(policy.request_timeout / 2);
     tokio::pin!(watchdog);
-    let (outgoing, mut writer) = writer(sink, policy, Arc::clone(&liveness), Arc::default());
+    let (wire, mut writer) = writer(sink, policy, Arc::clone(&liveness), Arc::default());
+    let outgoing = Outgoing {
+        wire,
+        limit: Arc::new(AtomicUsize::new(policy.max_frame_bytes)),
+    };
     let bus = Arc::new(CallbackBus {
         outgoing: outgoing.clone(),
         pending: Atom::default(),
@@ -1072,7 +1227,8 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let Some(frame) = frame? else { return Ok(()); };
                     match frame {
                         Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.update(|pending| pending.remove(&id)).and_then(|tx| tx.take()) { let _ = tx.send(result); } },
-                        Frame::Request { id, operation } => {
+                        Frame::Request { id, operation, max_frame_bytes } => {
+                            if let Some(bytes) = max_frame_bytes { outgoing.limit.fetch_min(bytes, Ordering::Relaxed); }
                             let session_id = match &operation { RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } | RemoteOperation::Call { context, .. } => &context.session_id, RemoteOperation::Cancel { session_id } | RemoteOperation::CancelTurn { session_id } | RemoteOperation::DetachTurn { session_id } | RemoteOperation::BeginTurn { session_id } | RemoteOperation::Preempt { session_id } | RemoteOperation::SettlePreempt { session_id } => session_id }.clone();
                             if matches!(&operation, RemoteOperation::Execute { .. } | RemoteOperation::Call { .. }) && !runtimes.contains_key(&session_id) {
                                 let catalog = CallbackCatalog {
@@ -1083,7 +1239,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 match tools.clone().into_builder().provider(catalog.clone()).hand_calls(Arc::clone(&hands)).build() {
                                     Ok(selected) => { runtimes.insert(session_id.clone(), (Arc::new(ToolRuntime::new_with_tools(workspace.clone(), Vec::new(), &selected)), catalog)); },
                                     Err(issue) => {
-                                        outgoing.send(Frame::Reply { id, result: Err(issue.to_string()) }).map_err(error)?;
+                                        outgoing.send(&Frame::Reply { id, result: Err(issue.to_string()) })?;
                                         continue;
                                     }
                                 }
@@ -1095,7 +1251,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 && let Some((_, catalog)) = runtimes.get(&session_id)
                                 && let Err(issue) = catalog.register(&context.call_id, local_tools.clone())
                             {
-                                outgoing.send(Frame::Reply { id, result: Err(issue.to_string()) }).map_err(error)?;
+                                outgoing.send(&Frame::Reply { id, result: Err(issue.to_string()) })?;
                                 continue;
                             }
                             let runtime = if matches!(&operation, RemoteOperation::Cancel { .. }) { runtimes.0.remove(&session_id) } else { runtimes.get(&session_id).map(|(runtime, catalog)| (Arc::clone(runtime), catalog.clone())) };
@@ -1105,15 +1261,16 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             });
                             if let Some((runtime, catalog, turn)) = &runtime {
                                 match &operation {
-                                    RemoteOperation::CancelTurn { .. } => { runtime.control().cancel_turn_with_updates(&mut Observer { id, outgoing:outgoing.clone() }).await; catalog.finish_turn(Some(*turn)); outgoing.send(Frame::Reply { id, result:Ok(None) }).map_err(error)?; continue; },
-                                    RemoteOperation::BeginTurn { .. } => { runtime.control().begin_turn(); catalog.begin_turn(); outgoing.send(Frame::Reply { id, result:Ok(None) }).map_err(error)?; continue; },
-                                    RemoteOperation::SettlePreempt { .. } => { runtime.control().settle_preempt(); outgoing.send(Frame::Reply { id, result:Ok(None) }).map_err(error)?; continue; },
-                                    RemoteOperation::DetachTurn { session_id } => { runtime.control().detach_turn_with_updates(&mut |origin| Box::new(DetachedObserver { session_id:session_id.clone(), origin_call_id:origin.into(), outgoing:outgoing.clone(), catalog:catalog.clone() })).await; outgoing.send(Frame::Reply { id, result:Ok(None) }).map_err(error)?; continue; },
+                                    RemoteOperation::CancelTurn { .. } => { runtime.control().cancel_turn_with_updates(&mut Observer { id, outgoing:outgoing.clone() }).await; catalog.finish_turn(Some(*turn)); outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
+                                    RemoteOperation::BeginTurn { .. } => { runtime.control().begin_turn(); catalog.begin_turn(); outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
+                                    RemoteOperation::SettlePreempt { .. } => { runtime.control().settle_preempt(); outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
+                                    RemoteOperation::DetachTurn { session_id } => { runtime.control().detach_turn_with_updates(&mut |origin| Box::new(DetachedObserver { session_id:session_id.clone(), origin_call_id:origin.into(), outgoing:outgoing.clone(), catalog:catalog.clone() })).await; outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
                                     _ => {},
                                 }
                             }
                             let outgoing = outgoing.clone();
                             tasks.spawn(async move {
+                                let mut status = None;
                                 let result = async {
                                     let Some((runtime, catalog, turn)) = runtime else {
                                         return match operation { RemoteOperation::Execute { .. } | RemoteOperation::Wait { .. } | RemoteOperation::Call { .. } => Err(error("unknown runner session")), _ => Ok(None) };
@@ -1124,7 +1281,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                             let mut origin = CallbackOriginGuard { catalog:catalog.clone(), origin:context.call_id.clone(), retained:false };
                                             let result = runtime.execute_code_owned_with_updates(&source, context.owned(), &mut observer).await;
                                             origin.retained = result.as_ref().is_ok_and(|execution| execution.cell.as_ref().is_some_and(|cell| cell.running));
-                                            result.map(|value| Some(execution_to_wire(value)))
+                                            result.map(|value| { status = Some(status_line(&value)); Some(execution_to_wire(value)) })
                                         },
                                         RemoteOperation::Wait { input, context } => {
                                             let execution = runtime.wait_for_code_with_updates(&input, context.owned().as_context(), &mut observer).await?;
@@ -1132,6 +1289,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                                 if cell.running { catalog.adopt(&cell.origin_call_id, turn); }
                                                 else { catalog.finish(&cell.origin_call_id); }
                                             }
+                                            status = Some(status_line(&execution));
                                             Ok(Some(execution_to_wire(execution)))
                                         },
                                         RemoteOperation::Call { name, input, context } => {
@@ -1147,7 +1305,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                         RemoteOperation::SettlePreempt { .. } => { runtime.control().settle_preempt(); Ok(None) },
                                     }
                                 }.await.map_err(|e| e.to_string());
-                                let _ = outgoing.send(Frame::Reply { id, result });
+                                reply(&outgoing, id, result, status);
                             });
                         },
                         _ => return Err(error("unexpected brain frame")),

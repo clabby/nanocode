@@ -27,6 +27,7 @@ pub enum HandEvent {
     Disconnected { reason: String },
     Retrying { delay: Duration },
     Revoked,
+    Replaced,
 }
 
 pub struct Hand {
@@ -160,6 +161,10 @@ impl Hand {
                                             == nanocode_tool_host::attachment::ATTACHMENT_REVOKED_REASON =>
                                     {
                                         events(HandEvent::Revoked);
+                                        return Ok(());
+                                    }
+                                    Err(issue) if issue.message() == super::HAND_REPLACED => {
+                                        events(HandEvent::Replaced);
                                         return Ok(());
                                     }
                                     Err(issue) => events(HandEvent::Disconnected {
