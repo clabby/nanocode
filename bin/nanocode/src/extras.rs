@@ -51,6 +51,25 @@ pub fn image_path(text: &str, workspace: &Path) -> Option<PathBuf> {
     (IMAGE_EXTENSIONS.contains(&extension.as_str()) && path.is_file()).then_some(path)
 }
 
+pub fn open_url(url: &str) -> bool {
+    let mut command = if cfg!(target_os = "macos") {
+        tokio::process::Command::new("open")
+    } else if cfg!(windows) {
+        let mut command = tokio::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    } else {
+        tokio::process::Command::new("xdg-open")
+    };
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 fn workspace_files(workspace: &Path) -> Result<Vec<String>, String> {
     let output = std::process::Command::new("git")
         .args(["ls-files", "--cached", "--others", "--exclude-standard"])

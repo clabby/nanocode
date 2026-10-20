@@ -20,7 +20,7 @@ use crate::app::{App, Overlay, TurnState};
 
 pub const STATUS_VISIBLE: Duration = Duration::from_secs(4);
 
-pub const BINDINGS: [Binding; 34] = [
+pub const BINDINGS: [Binding; 35] = [
     Binding {
         keys: "enter",
         action: "send · steer into the running turn",
@@ -111,7 +111,11 @@ pub const BINDINGS: [Binding; 34] = [
     },
     Binding {
         keys: "drag",
-        action: "select transcript lines (scrolls at the edges) · release copies the raw markdown",
+        action: "select transcript rows (scrolls at the edges) · release copies them, as raw markdown where whole blocks are selected",
+    },
+    Binding {
+        keys: "click",
+        action: "open the link under the pointer",
     },
     Binding {
         keys: "ctrl+home / ctrl+end",

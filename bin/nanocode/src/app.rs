@@ -1941,14 +1941,26 @@ impl App {
             MouseEventKind::Up(_) => {
                 let side = self.dragging.take()?;
                 self.autoscroll_at = None;
-                if let Some(text) = self.pane_transcript(side).select_end() {
+                let transcript = self.pane_transcript(side);
+                let selected = transcript.select_end();
+                let link = selected
+                    .is_none()
+                    .then(|| transcript.link_at(mouse.column, mouse.row))
+                    .flatten();
+                if let Some(text) = selected {
                     match terminal.copy(&text) {
-                        Ok(()) => self.flash(format!(
-                            "copied {} raw transcript lines",
-                            text.lines().count()
-                        )),
+                        Ok(()) => {
+                            self.flash(format!("copied {} transcript lines", text.lines().count()))
+                        }
                         Err(error) => self.flash(format!("copy failed: {error}")),
                     }
+                }
+                if let Some(url) = link {
+                    self.flash(if crate::extras::open_url(&url) {
+                        format!("opened {url}")
+                    } else {
+                        format!("could not open {url}")
+                    });
                 }
                 Some(true)
             }

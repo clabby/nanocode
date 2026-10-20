@@ -220,16 +220,15 @@ struct Point {
 
 #[derive(Clone, Copy, Debug)]
 struct Selection {
-    anchor: (Point, Point),
-    head: Option<(Point, Point)>,
-    under: Option<Point>,
+    anchor: Point,
+    head: Option<Point>,
     pointer: Option<u16>,
 }
 
 impl Selection {
     fn bounds(&self) -> Option<(Point, Point)> {
         self.head
-            .map(|(start, end)| (start.min(self.anchor.0), end.max(self.anchor.1)))
+            .map(|head| (head.min(self.anchor), head.max(self.anchor)))
     }
 }
 
@@ -250,6 +249,14 @@ impl Rows {
         &part.lines[row]
     }
 
+    fn link(&self, row: usize, column: u16) -> Option<&str> {
+        let (part, row) = self.part(row);
+        part.links
+            .iter()
+            .find(|(slot, link)| *slot == row && (link.start..link.end).contains(&column))
+            .map(|(_, link)| link.destination.as_ref())
+    }
+
     fn source(&self, row: usize) -> Option<&Option<Source>> {
         if let Some((rows, source)) = &self.group
             && rows.contains(&row)
@@ -258,10 +265,6 @@ impl Rows {
         }
         let (part, row) = self.part(row);
         part.sources.get(row)
-    }
-
-    fn sources(&self) -> impl Iterator<Item = &Option<Source>> {
-        (0..self.len()).filter_map(|row| self.source(row))
     }
 
     fn clocks(&self, row: usize) -> impl Iterator<Item = Instant> + '_ {
@@ -569,14 +572,12 @@ impl Transcript {
         if !self.area.contains(Position::new(column, row)) {
             return false;
         }
-        let Some(point) = self.point_at(row) else {
+        let Some(anchor) = self.point_at(row) else {
             return false;
         };
-        let anchor = self.segment(point);
         self.selection = Some(Selection {
             anchor,
             head: None,
-            under: None,
             pointer: None,
         });
         true
@@ -591,16 +592,11 @@ impl Transcript {
     }
 
     fn point_to(&mut self, row: u16) {
-        let under = self.point_at(row);
-        let Some(mut selection) = self.selection else {
-            return;
-        };
-        selection.pointer = Some(row);
-        if selection.under != under {
-            selection.under = under;
-            selection.head = under.map(|point| self.segment(point));
+        let head = self.point_at(row);
+        if let Some(selection) = &mut self.selection {
+            selection.pointer = Some(row);
+            selection.head = head;
         }
-        self.selection = Some(selection);
     }
 
     pub fn autoscroll(&mut self) -> bool {
@@ -637,11 +633,10 @@ impl Transcript {
             } else {
                 rows.len().saturating_sub(1)
             };
-            let sources = (last < rows.len())
-                .then(|| rows.sources().take(last + 1).skip(first))
-                .into_iter()
-                .flatten();
-            let text = raw_rows(&self.cells[index].kind, self.mode, sources);
+            if last >= rows.len() {
+                continue;
+            }
+            let text = selected_text(&rows, first, last, &self.cells[index].kind, self.mode);
             if !text.is_empty() {
                 cells.push(text);
             }
@@ -652,6 +647,19 @@ impl Transcript {
 
     pub const fn select_cancel(&mut self) {
         self.selection = None;
+    }
+
+    pub fn link_at(&mut self, column: u16, row: u16) -> Option<String> {
+        if !self.area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let point = *self.screen.get(usize::from(row - self.area.top()))?;
+        let rows = self.cell_rows(point.cell)?;
+        let column = column - self.area.left();
+        rows.link(point.row, column)
+            .map(str::to_owned)
+            .or_else(|| url_at(&rows, point.row, column, self.last_width))
+            .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
     }
 
     fn point_at(&self, row: u16) -> Option<Point> {
@@ -667,42 +675,6 @@ impl Transcript {
         let rows = self.layout(index, self.last_width, &theme);
         self.theme = Some(theme);
         Some(rows)
-    }
-
-    fn segment(&mut self, point: Point) -> (Point, Point) {
-        let Some(rows) = self.cell_rows(point.cell) else {
-            return (point, point);
-        };
-        let Some(Some(source)) = rows.source(point.row) else {
-            return (point, point);
-        };
-        let same = |other: &Option<Source>| {
-            other.as_ref().is_some_and(|other| {
-                if source.extent == Extent::Whole {
-                    other.part == source.part
-                } else {
-                    other == source
-                }
-            })
-        };
-        let mut start = point.row;
-        while start > 0 && rows.source(start - 1).is_some_and(same) {
-            start -= 1;
-        }
-        let mut end = point.row;
-        while rows.source(end + 1).is_some_and(same) {
-            end += 1;
-        }
-        (
-            Point {
-                cell: point.cell,
-                row: start,
-            },
-            Point {
-                cell: point.cell,
-                row: end,
-            },
-        )
     }
 
     fn key(&self, index: usize, width: u16) -> CacheKey {
@@ -1020,6 +992,7 @@ impl Stable {
         let head = Rc::make_mut(&mut self.rows);
         head.lines.truncate(lines);
         head.sources.truncate(lines);
+        head.links.retain(|&(row, _)| row < lines);
         self.spinners.retain(|&(row, _)| row < lines);
         self.body = body;
         self.bytes = bytes;
@@ -1126,12 +1099,24 @@ struct Output {
     lines: Vec<Line<'static>>,
     sources: Vec<Option<Source>>,
     clocks: Vec<(usize, usize, Instant)>,
+    links: Vec<(usize, markdown::LinkSpan)>,
 }
 
 impl Output {
     fn push(&mut self, line: Line<'static>, source: Option<Source>) {
         self.lines.push(line);
         self.sources.push(source);
+    }
+
+    fn push_linked(
+        &mut self,
+        line: Line<'static>,
+        source: Option<Source>,
+        links: Vec<markdown::LinkSpan>,
+    ) {
+        let row = self.lines.len();
+        self.links.extend(links.into_iter().map(|link| (row, link)));
+        self.push(line, source);
     }
 
     fn prefixed(&mut self, body: Vec<Row>, first: Span<'static>, rest: Span<'static>) {
@@ -1262,6 +1247,7 @@ impl RenderContext<'_> {
         let commit = width > 0 && contained(&stable);
         let mut group = None;
         let mut block = None;
+        let mut links = Vec::new();
         let (body, boundary) = match plain {
             None => {
                 let render = |stable: &Stable, highlights: &mut markdown::Highlights| {
@@ -1282,6 +1268,7 @@ impl RenderContext<'_> {
                 }
                 group = rendered_text.group;
                 block = rendered_text.block;
+                links = std::mem::take(&mut rendered_text.layout.links);
                 (
                     rendered(rendered_text.layout, &Part::Text),
                     rendered_text.boundary.filter(|_| commit),
@@ -1328,21 +1315,28 @@ impl RenderContext<'_> {
             }
         };
         let opening = stable.body == 0;
+        let mut links = links.into_iter();
         let mut body = body.into_iter().enumerate().map(|(row, (line, source))| {
             let prefix = if opening && row == 0 {
                 first.clone()
             } else {
                 rest.clone()
             };
-            (prefixed(line, prefix), source)
+            let shift = u16::try_from(prefix.width()).unwrap_or(u16::MAX);
+            let mut links = links.next().unwrap_or_default();
+            for link in &mut links {
+                link.start = link.start.saturating_add(shift);
+                link.end = link.end.saturating_add(shift);
+            }
+            (prefixed(line, prefix), source, links)
         });
         let open = stable.open;
         let mut committed = 0;
         if let Some(boundary) = boundary {
             let head = Rc::make_mut(&mut stable.rows);
             let before = head.lines.len();
-            for (line, source) in body.by_ref().take(boundary.lines) {
-                head.push(line, source);
+            for (line, source, links) in body.by_ref().take(boundary.lines) {
+                head.push_linked(line, source, links);
             }
             if let (Some((row, start)), Some((rows, end))) = (stable.open, group)
                 && boundary.lines >= rows
@@ -1377,8 +1371,8 @@ impl RenderContext<'_> {
             }
         }
         let mut tail = Output::default();
-        for (line, source) in body {
-            tail.push(line, source);
+        for (line, source, links) in body {
+            tail.push_linked(line, source, links);
         }
         let offset = stable.rows.lines.len();
         let rows = Rows {
@@ -1901,6 +1895,165 @@ fn raw_rows<'a>(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn selected_text(
+    rows: &Rows,
+    first: usize,
+    last: usize,
+    kind: &CellKind,
+    mode: DisplayMode,
+) -> String {
+    let source = |row: usize| rows.source(row).and_then(Option::as_ref);
+    let top = source(first).filter(|&top| first.checked_sub(1).and_then(source) == Some(top));
+    let bottom = source(last).filter(|&bottom| source(last + 1) == Some(bottom));
+    let head = top.map_or(0, |top| {
+        (first..=last)
+            .take_while(|&row| source(row) == Some(top))
+            .count()
+    });
+    let tail = bottom.map_or(0, |bottom| {
+        (first + head..=last)
+            .rev()
+            .take_while(|&row| source(row) == Some(bottom))
+            .count()
+    });
+    let middle = first + head..last + 1 - tail;
+    let blank = |row: &usize| source(*row).is_none();
+    let leading = middle.clone().take_while(blank).count();
+    let trailing = middle.clone().skip(leading).rev().take_while(blank).count();
+    let raw = raw_rows(kind, mode, middle.filter_map(|row| rows.source(row)));
+    let mut lines = Vec::new();
+    if head > 0 {
+        lines.push(shown_rows(rows, first..first + head));
+    }
+    lines.extend(std::iter::repeat_n(String::new(), leading));
+    if !raw.is_empty() {
+        lines.push(raw);
+    }
+    lines.extend(std::iter::repeat_n(String::new(), trailing));
+    if tail > 0 {
+        lines.push(shown_rows(rows, last + 1 - tail..last + 1));
+    }
+    lines.join("\n").trim_matches('\n').to_owned()
+}
+
+fn shown_rows(rows: &Rows, range: Range<usize>) -> String {
+    range
+        .map(|row| {
+            let mut text = content(rows.line(row));
+            text.truncate(text.trim_end().len());
+            text
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn content(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .skip(1)
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn url_at(rows: &Rows, row: usize, column: u16, width: u16) -> Option<String> {
+    let line = rows.line(row);
+    let mut at = 0;
+    let cells = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.graphemes(true))
+        .map(|grapheme| {
+            let cell = (at, grapheme);
+            at += grapheme.cell_width();
+            cell
+        })
+        .collect::<Vec<(u16, &str)>>();
+    let url = |grapheme: &str| grapheme.bytes().all(url_byte);
+    let index = cells.iter().position(|&(start, grapheme)| {
+        url(grapheme) && (start..start + grapheme.cell_width()).contains(&column)
+    })?;
+    let start = cells[..index]
+        .iter()
+        .rposition(|&(_, grapheme)| !url(grapheme))
+        .map_or(0, |index| index + 1);
+    let end = cells[index..]
+        .iter()
+        .position(|&(_, grapheme)| !url(grapheme))
+        .map_or(cells.len(), |end| index + end);
+    let mut token = cells[start..end]
+        .iter()
+        .map(|&(_, grapheme)| grapheme)
+        .collect::<String>();
+    let mut offset = cells[start..index]
+        .iter()
+        .map(|&(_, grapheme)| grapheme.len())
+        .sum::<usize>();
+    let full = |row: usize| rows.line(row).width() >= usize::from(width);
+    let wrapped = |above: usize, below: usize| {
+        full(above)
+            && rows
+                .source(above)
+                .and_then(Option::as_ref)
+                .is_some_and(|source| rows.source(below).and_then(Option::as_ref) == Some(source))
+    };
+    let prefix = line.spans.first().map_or(0, Span::width);
+    let (mut above, mut open) = (row, usize::from(cells[start].0) == prefix);
+    while open && above > 0 && wrapped(above - 1, above) {
+        above -= 1;
+        let text = content(rows.line(above));
+        let length = text
+            .bytes()
+            .rev()
+            .position(|byte| !url_byte(byte))
+            .unwrap_or(text.len());
+        token.insert_str(0, &text[text.len() - length..]);
+        offset += length;
+        open = length == text.len();
+    }
+    let (mut below, mut open) = (row, end == cells.len());
+    while open && wrapped(below, below + 1) {
+        below += 1;
+        let text = content(rows.line(below));
+        let length = text
+            .bytes()
+            .position(|byte| !url_byte(byte))
+            .unwrap_or(text.len());
+        token.push_str(&text[..length]);
+        open = length == text.len();
+    }
+    let start = ["https://", "http://"]
+        .into_iter()
+        .filter_map(|scheme| token[..token.len().min(offset + scheme.len())].rfind(scheme))
+        .max()?;
+    let url = trim_url(&token[start..]);
+    let host = url.find("://")? + 3;
+    (host < url.len() && offset < start + url.len()).then(|| url.to_owned())
+}
+
+const fn url_byte(byte: u8) -> bool {
+    byte.is_ascii_graphic()
+        && !matches!(
+            byte,
+            b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'
+        )
+}
+
+fn trim_url(mut url: &str) -> &str {
+    loop {
+        let count = |byte| url.bytes().filter(|&other| other == byte).count();
+        let trailing = match url.as_bytes().last() {
+            Some(b'.' | b',' | b';' | b':' | b'!' | b'?' | b'\'' | b'*') => true,
+            Some(b')') => count(b'(') < count(b')'),
+            Some(b']') => count(b'[') < count(b']'),
+            _ => false,
+        };
+        if !trailing {
+            return url;
+        }
+        url = &url[..url.len() - 1];
+    }
 }
 
 fn part_text<'a>(kind: &'a CellKind, part: &Part, mode: DisplayMode) -> Option<Cow<'a, str>> {
