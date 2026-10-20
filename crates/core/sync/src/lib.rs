@@ -105,39 +105,51 @@ impl<T: Clone> Atom<T> {
     }
 }
 
-pub struct Slot<T>(ArcSwapOption<SyncWrapper<T>>);
+pub struct Slot<T> {
+    value: ArcSwapOption<SyncWrapper<T>>,
+    occupied: std::sync::atomic::AtomicIsize,
+}
 
 impl<T> Default for Slot<T> {
     fn default() -> Self {
-        Self(ArcSwapOption::empty())
+        Self::new(None)
     }
+}
+
+fn unshared<T>(value: Arc<SyncWrapper<T>>) -> T {
+    Arc::try_unwrap(value)
+        .expect("a slot never shares the value it holds")
+        .into_inner()
 }
 
 impl<T> Slot<T> {
     #[must_use]
     pub fn new(value: Option<T>) -> Self {
-        Self(ArcSwapOption::from(
-            value.map(|value| Arc::new(SyncWrapper::new(value))),
-        ))
+        Self {
+            occupied: std::sync::atomic::AtomicIsize::new(isize::from(value.is_some())),
+            value: ArcSwapOption::from(value.map(|value| Arc::new(SyncWrapper::new(value)))),
+        }
     }
 
     pub fn put(&self, value: T) -> Option<T> {
-        self.0
-            .swap(Some(Arc::new(SyncWrapper::new(value))))
-            .and_then(|previous| Arc::try_unwrap(previous).ok())
-            .map(SyncWrapper::into_inner)
+        let previous = self.value.swap(Some(Arc::new(SyncWrapper::new(value))));
+        if previous.is_none() {
+            self.occupied
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        previous.map(unshared)
     }
 
     pub fn take(&self) -> Option<T> {
-        self.0
-            .swap(None)
-            .and_then(|value| Arc::try_unwrap(value).ok())
-            .map(SyncWrapper::into_inner)
+        let value = self.value.swap(None)?;
+        self.occupied
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Some(unshared(value))
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.load().is_none()
+        self.occupied.load(std::sync::atomic::Ordering::SeqCst) <= 0
     }
 }
 
