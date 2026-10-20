@@ -532,7 +532,7 @@ async fn hand(args: HandArgs) -> Result<()> {
     .name(&name)
     .directory(directory.clone());
     eprintln!("nanocode hand {name} in {}", directory.display());
-    let run = hand.run(move |event| match event {
+    let run = hand.run(|event| match event {
         HandEvent::Connecting { endpoint } => eprintln!("hand: connecting {endpoint}"),
         HandEvent::Connected { endpoint } => eprintln!("hand: connected to {endpoint}"),
         HandEvent::Listening { endpoint } => eprintln!("hand: listening {endpoint}"),
@@ -540,9 +540,7 @@ async fn hand(args: HandArgs) -> Result<()> {
         HandEvent::Disconnected { reason } => eprintln!("hand: disconnected ({reason})"),
         HandEvent::Retrying { delay } => eprintln!("hand: retrying in {}ms", delay.as_millis()),
         HandEvent::Revoked => eprintln!("hand: the brain disconnected this hand; stopping"),
-        HandEvent::Replaced => {
-            eprintln!("hand: another hand attached under the name {name}; stopping")
-        }
+        HandEvent::Replaced => eprintln!("hand: another hand attached under this name; stopping"),
         other => eprintln!("hand: {other:?}"),
     });
     tokio::select! {
