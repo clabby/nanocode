@@ -42,6 +42,10 @@ pub trait ApprovedWebProvider: Send + Sync {
 pub struct ApprovedPage {
     pub final_url: String,
 
+    pub status: u16,
+
+    pub content_type: String,
+
     pub content: String,
 }
 

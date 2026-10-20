@@ -111,6 +111,7 @@ impl RuntimeBackend for ClaudeHarness {
         let client = self.client.clone();
         let settings = settings.or(&self.settings.clone().or(&defaults));
         let configure = self.configure.clone();
+        #[cfg(not(target_family = "wasm"))]
         let headless = self.headless;
         Box::pin(async move {
             let remote = settings
