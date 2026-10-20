@@ -96,6 +96,7 @@ impl AgentDriver {
             Vec::new();
         let mut developer_checkpoint_ready = true;
         let mut commands_open = true;
+        let mut detached = false;
         let mut shutdown_failures = Vec::new();
         let mut initial_notices = Ok(());
         for text in std::mem::take(&mut self.spawner.initial_developer_messages) {
@@ -978,10 +979,7 @@ impl AgentDriver {
                                     }
                                     None => {
                                         commands_open = false;
-                                        mark_all_queued_turns_cancelled(&mut queued_turns);
-                                        if let Some(cancel) = cancel_compaction.take() {
-                                            let _ = cancel.send(());
-                                        }
+                                        detached = true;
                                         break execution.as_mut().await;
                                     }
                                 }
@@ -1792,10 +1790,7 @@ impl AgentDriver {
                             }
                             None => {
                                 commands_open = false;
-                                mark_all_queued_turns_cancelled(&mut queued_turns);
-                                if let Some(cancel) = cancel.take() {
-                                    let _ = cancel.send(());
-                                }
+                                detached = true;
                             }
                         }
                     }
@@ -1850,7 +1845,7 @@ impl AgentDriver {
                         None,
                     )
                 }
-                Ok(ModelTurnOutcome::Cancelled(_)) if !commands_open => {
+                Ok(ModelTurnOutcome::Cancelled(_)) if !commands_open && !detached => {
                     if let Some(operation_id) = &execution_operation {
                         self.execution.release_claim(operation_id).await;
                     }
