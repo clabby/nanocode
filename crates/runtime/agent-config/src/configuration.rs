@@ -34,6 +34,8 @@ impl AgentTools {
 pub struct Settings {
     pub instructions: Option<Arc<str>>,
     pub tools: Option<AgentTools>,
+    #[cfg(not(target_family = "wasm"))]
+    pub providers: Vec<Arc<dyn nanocode_tool_host::runtime::DynamicToolProvider>>,
 }
 
 impl Settings {
@@ -41,6 +43,11 @@ impl Settings {
         Self {
             instructions: self.instructions.or_else(|| fallback.instructions.clone()),
             tools: self.tools.or_else(|| fallback.tools.clone()),
+            #[cfg(not(target_family = "wasm"))]
+            providers: match self.providers.is_empty() {
+                true => fallback.providers.clone(),
+                false => self.providers,
+            },
         }
     }
 }
@@ -141,6 +148,7 @@ pub trait NativeDefaults: RuntimeDefaults {
     type Runner;
     type RunnerServerConfig;
     fn computer(&mut self, computer: Option<Self::Computer>);
+    fn tool_environment(&mut self, environment: Vec<(std::ffi::OsString, std::ffi::OsString)>);
     fn runner_management(&mut self, enabled: bool);
     fn runner(&mut self, runner: Self::Runner);
     fn runner_server(&mut self, config: Self::RunnerServerConfig);

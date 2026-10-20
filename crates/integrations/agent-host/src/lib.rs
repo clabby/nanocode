@@ -38,6 +38,8 @@ pub struct Defaults<C, A> {
     runners: Vec<Runner>,
     #[cfg(not(target_family = "wasm"))]
     servers: Vec<RunnerServerConfig>,
+    #[cfg(not(target_family = "wasm"))]
+    tool_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
 impl<C, A> Default for Defaults<C, A> {
@@ -56,6 +58,8 @@ impl<C, A> Default for Defaults<C, A> {
             runners: Vec::new(),
             #[cfg(not(target_family = "wasm"))]
             servers: Vec::new(),
+            #[cfg(not(target_family = "wasm"))]
+            tool_environment: Vec::new(),
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct Services {
     pool: RunnerPool,
     #[cfg(not(target_family = "wasm"))]
     agents: Arc<runners::RunnerAgents>,
+    #[cfg(not(target_family = "wasm"))]
+    processes: nanocode_process::NativeProcessExecutors,
 }
 
 impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Defaults<C, A> {
@@ -151,6 +157,9 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
                 computer: (!self.computer_disabled).then(|| computer::cell(self.computer)),
                 pool,
                 agents,
+                processes: nanocode_process::NativeProcessExecutors::with_environment(
+                    self.tool_environment,
+                ),
             }))
         }
         #[cfg(target_family = "wasm")]
@@ -191,12 +200,15 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> NativeDefaults for Defa
     fn runner_server(&mut self, config: RunnerServerConfig) {
         self.servers.push(config);
     }
+    fn tool_environment(&mut self, environment: Vec<(std::ffi::OsString, std::ffi::OsString)>) {
+        self.tool_environment.extend(environment);
+    }
 }
 
 impl HostServices for Services {
     #[cfg(not(target_family = "wasm"))]
     fn process_executors(&self) -> Arc<dyn nanocode_process_contracts::ProcessExecutors> {
-        Arc::new(nanocode_process::NativeProcessExecutors)
+        Arc::new(self.processes.clone())
     }
 
     fn activate(&self) {

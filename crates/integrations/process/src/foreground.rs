@@ -1,5 +1,5 @@
 use super::{process, selection};
-use std::{path::Path, time::Duration};
+use std::{ffi::OsString, path::Path, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub use nanocode_process_contracts::ForegroundOutput;
@@ -14,10 +14,38 @@ pub fn run_bash<'call>(
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ForegroundOutput, String>> + Send + 'call>,
 > {
+    run_bash_with_environment(
+        workspace,
+        command,
+        timeout,
+        max_stdout,
+        max_stderr,
+        session,
+        &[],
+    )
+}
+
+pub(crate) fn run_bash_with_environment<'call>(
+    workspace: &'call Path,
+    command: &'call str,
+    timeout: Duration,
+    max_stdout: usize,
+    max_stderr: usize,
+    session: Option<&'call crate::SessionEnvironment>,
+    environment: &'call [(OsString, OsString)],
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ForegroundOutput, String>> + Send + 'call>,
+> {
     Box::pin(async move {
-        let overrides = session
-            .map(crate::SessionEnvironment::os_variables)
-            .unwrap_or_default();
+        let overrides: Vec<_> = environment
+            .iter()
+            .cloned()
+            .chain(
+                session
+                    .map(crate::SessionEnvironment::os_variables)
+                    .unwrap_or_default(),
+            )
+            .collect();
         let (environment, _) = process::sanitized_environment(&overrides);
         let shell = selection::bash_shell().ok_or("Bash executable not found")?;
         let mut spawned = process::spawn(command, workspace, &shell, false, false, &environment)

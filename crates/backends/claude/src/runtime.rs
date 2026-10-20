@@ -134,6 +134,8 @@ impl RuntimeBackend for ClaudeHarness {
                 builder = configure(builder)?.workspace(workspace.to_string_lossy().into_owned());
             }
             let tools = settings.tools;
+            #[cfg(not(target_family = "wasm"))]
+            let providers = settings.providers;
             let root = workspace.to_path_buf();
             let process_store = spec
                 .durable_state
@@ -165,7 +167,7 @@ impl RuntimeBackend for ClaudeHarness {
                 }
                 #[cfg(not(target_family = "wasm"))]
                 {
-                    crate::install_default_tools_with_executor(
+                    crate::defaults::install_default_tools_with_providers(
                         root.clone(),
                         &handle,
                         selected,
@@ -175,6 +177,7 @@ impl RuntimeBackend for ClaudeHarness {
                             .map(|store| services.process_routes(store)),
                         services.runner_routing(),
                         services.process_executors().foreground(),
+                        &providers,
                     )
                 }
                 #[cfg(target_family = "wasm")]

@@ -64,6 +64,9 @@ pub trait McpPaymentProvider: Send + Sync {
 #[async_trait]
 pub trait McpPendingPayment: Send {
     fn credential(&self) -> &Value;
+    fn receipt(&mut self, receipt: &Value) {
+        let _ = receipt;
+    }
 
     async fn commit(self: Box<Self>) -> Result<(), String>;
 

@@ -37,15 +37,55 @@ pub use nanocode_process_contracts::{
     ShellExecutor, WriteStdin,
 };
 
-pub struct NativeProcessExecutors;
+#[derive(Clone, Default)]
+pub struct NativeProcessExecutors {
+    environment: Arc<Vec<(OsString, OsString)>>,
+}
+
+impl NativeProcessExecutors {
+    #[must_use]
+    pub fn with_environment(environment: Vec<(OsString, OsString)>) -> Self {
+        Self {
+            environment: Arc::new(environment),
+        }
+    }
+}
 
 impl ProcessExecutors for NativeProcessExecutors {
     fn shell(&self, environment: Vec<(OsString, OsString)>) -> Arc<dyn ShellExecutor> {
+        let environment = self
+            .environment
+            .iter()
+            .cloned()
+            .chain(environment)
+            .collect();
         Arc::new(ShellSessions::with_environment(Arc::new(environment)))
     }
 
     fn foreground(&self) -> Arc<dyn ForegroundExecutor> {
-        Arc::new(NativeForeground)
+        match self.environment.is_empty() {
+            true => Arc::new(NativeForeground),
+            false => Arc::new(EnvironmentForeground(Arc::clone(&self.environment))),
+        }
+    }
+}
+
+struct EnvironmentForeground(Arc<Vec<(OsString, OsString)>>);
+
+impl ForegroundExecutor for EnvironmentForeground {
+    fn execute<'a>(
+        &'a self,
+        request: ForegroundCommand<'a>,
+    ) -> nanocode_process_contracts::ProcessFuture<'a, Result<ForegroundOutput, String>> {
+        foreground::run_bash_with_environment(
+            request.workspace,
+            request.command,
+            request.timeout,
+            request.max_stdout,
+            request.max_stderr,
+            request.session,
+            &self.0,
+        )
     }
 }
 

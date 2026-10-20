@@ -98,6 +98,29 @@ pub fn install_default_tools_with_executor(
     runner_pool: Option<nanocode_tool_host::attachment::RunnerRouting>,
     executor: Arc<dyn nanocode_process_contracts::ForegroundExecutor>,
 ) -> Result<crate::ClaudeTools> {
+    install_default_tools_with_providers(
+        workspace,
+        handle,
+        selected,
+        additive,
+        process_routes,
+        runner_pool,
+        executor,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_default_tools_with_providers(
+    workspace: PathBuf,
+    handle: &AgentHandle,
+    selected: Option<Tools>,
+    additive: Vec<Arc<dyn Tool>>,
+    process_routes: Option<Arc<dyn nanocode_tool_host::attachment::ProcessRouteStore>>,
+    runner_pool: Option<nanocode_tool_host::attachment::RunnerRouting>,
+    executor: Arc<dyn nanocode_process_contracts::ForegroundExecutor>,
+    providers: &[Arc<dyn nanocode_tool_host::runtime::DynamicToolProvider>],
+) -> Result<crate::ClaudeTools> {
     let jobs = Arc::new(crate::claude_bash::Jobs::default());
     let selected = match selected {
         Some(tools) => tools,
@@ -130,8 +153,11 @@ pub fn install_default_tools_with_executor(
             None => selected,
         }
     };
-    let mut selected = selected
-        .into_builder()
+    let mut selected = providers
+        .iter()
+        .fold(selected.into_builder(), |builder, provider| {
+            builder.shared_provider(provider.clone())
+        })
         .exposure(nanocode_tool_host::ToolExposure::CodeModeOnly)
         .build()
         .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;

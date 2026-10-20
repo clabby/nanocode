@@ -24,6 +24,8 @@ pub struct ModelClients {
     status: Option<std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     notices: Option<std::sync::Arc<dyn Fn() -> Notices + Send + Sync>>,
     panel: Option<PanelSource>,
+    tool_environment: Vec<(String, String)>,
+    mcp_servers: Vec<(String, nanocode::tools::mcp::McpServer)>,
 }
 
 #[derive(Clone)]
@@ -166,6 +168,29 @@ impl ModelClients {
             about,
             panel: std::sync::Arc::new(panel),
         });
+        self
+    }
+
+    #[must_use]
+    pub fn tool_environment(
+        mut self,
+        variables: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.tool_environment.extend(
+            variables
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
+        self
+    }
+
+    #[must_use]
+    pub fn mcp_server(
+        mut self,
+        name: impl Into<String>,
+        server: nanocode::tools::mcp::McpServer,
+    ) -> Self {
+        self.mcp_servers.push((name.into(), server));
         self
     }
 
@@ -396,7 +421,20 @@ impl Host {
         let mut builder = Nanocode::builder()
             .openai(codex)
             .claude(claude)
-            .workspace(config.workspace.clone());
+            .workspace(config.workspace.clone())
+            .tool_environment(config.clients.tool_environment.clone());
+        if !config.clients.mcp_servers.is_empty() {
+            let mcp = config
+                .clients
+                .mcp_servers
+                .iter()
+                .fold(
+                    nanocode::tools::mcp::Mcp::builder(),
+                    |mcp, (name, server)| mcp.server(name, server.clone()),
+                )
+                .build()?;
+            builder = builder.tool_provider(mcp);
+        }
         for runner in &config.runners {
             builder = builder.runner(runner.clone());
         }

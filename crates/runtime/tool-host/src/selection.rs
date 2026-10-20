@@ -676,8 +676,13 @@ impl ToolsBuilder {
 
     #[must_use]
     #[cfg(not(target_family = "wasm"))]
-    pub fn provider<P: DynamicToolProvider + 'static>(mut self, provider: P) -> Self {
-        let provider: Arc<dyn DynamicToolProvider> = Arc::new(provider);
+    pub fn provider<P: DynamicToolProvider + 'static>(self, provider: P) -> Self {
+        self.shared_provider(Arc::new(provider))
+    }
+
+    #[must_use]
+    #[cfg(not(target_family = "wasm"))]
+    pub fn shared_provider(mut self, provider: Arc<dyn DynamicToolProvider>) -> Self {
         self.tools.providers.push(provider);
         self.refresh_provider_direct();
         self

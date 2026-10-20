@@ -37,6 +37,7 @@ pub(crate) struct ClientInner {
 const MCP_CREDENTIAL_META_KEY: &str = "org.paymentauth/credential";
 const MCP_PAYMENT_REQUIRED_CODE: i64 = -32042;
 const MCP_PAYMENT_REQUIRED_META_KEY: &str = "org.paymentauth/payment-required";
+const MCP_RECEIPT_META_KEY: &str = "org.paymentauth/receipt";
 
 impl ClientInner {
     pub(crate) async fn call_tool(&self, params: CallToolParams) -> Result<CallToolResult, String> {
@@ -70,6 +71,14 @@ impl ClientInner {
                 Ok(result)
             }
             Ok(result) => {
+                let mut pending = pending;
+                if let Some(receipt) = result
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get(MCP_RECEIPT_META_KEY))
+                {
+                    pending.receipt(receipt);
+                }
                 pending.commit().await?;
                 Ok(result)
             }

@@ -510,6 +510,28 @@ impl<B, D: NativeDefaults> RuntimeBuilder<B, D> {
         self.defaults.computer(None);
         self
     }
+    #[must_use]
+    pub fn tool_environment<K, V>(mut self, variables: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
+        self.defaults.tool_environment(
+            variables
+                .into_iter()
+                .map(|(name, value)| (name.into(), value.into()))
+                .collect(),
+        );
+        self
+    }
+    #[must_use]
+    pub fn tool_provider(
+        mut self,
+        provider: impl nanocode_tool_host::runtime::DynamicToolProvider + 'static,
+    ) -> Self {
+        self.data.settings.providers.push(Arc::new(provider));
+        self
+    }
 }
 
 fn backend_recipe(

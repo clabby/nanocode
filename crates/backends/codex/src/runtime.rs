@@ -139,6 +139,8 @@ impl RuntimeBackend for CodexHarness {
                 );
             }
             {
+                #[cfg(not(target_family = "wasm"))]
+                let providers = settings.providers;
                 let tools = settings
                     .tools
                     .unwrap_or_else(|| AgentTools::Shared(nanocode_tool_host::Tools::default()));
@@ -175,8 +177,12 @@ impl RuntimeBackend for CodexHarness {
                     selected = shared
                         .iter()
                         .try_fold(selected, |tools, tool| tools.add_shared_tool(tool.clone()))?;
-                    selected
-                        .into_builder()
+                    let builder = selected.into_builder();
+                    #[cfg(not(target_family = "wasm"))]
+                    let builder = providers.iter().fold(builder, |builder, provider| {
+                        builder.shared_provider(provider.clone())
+                    });
+                    builder
                         .exposure(nanocode_tool_host::ToolExposure::CodeModeOnly)
                         .build()
                 });
