@@ -138,7 +138,7 @@ pub enum OpenAiError {
 
 #[doc(hidden)]
 pub fn apply_mode_defaults(config: &mut ModelConfig, mode: OpenAiAuthMode) {
-    config.store_responses = mode.supports_stored_responses();
+    config.store_responses = false;
     config.responses_history = ResponsesHistory::Incremental;
     mode.default_websocket_url()
         .clone_into(&mut config.websocket_url);
