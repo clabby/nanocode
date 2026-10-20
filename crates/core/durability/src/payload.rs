@@ -322,6 +322,31 @@ impl EncodedPayload {
         self.load_record(reader, state_id, record).await
     }
 
+    pub async fn read_many(
+        values: &[Self],
+        reader: &mut dyn crate::StateReader,
+        state_id: &str,
+    ) -> Result<Vec<Self>> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<_> = values.iter().map(|value| value.key.to_string()).collect();
+        let records = reader.read_records(state_id, &keys).await?;
+        if records.len() != values.len() {
+            return Err(Error::InvalidState("record batch length mismatch".into()));
+        }
+        let records = values
+            .iter()
+            .zip(records)
+            .map(|(value, record)| {
+                record.ok_or_else(|| {
+                    Error::InvalidState(format!("missing payload record {}", value.key))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::load_records(values, reader, state_id, records).await
+    }
+
     pub async fn load_many(
         values: &[Self],
         store: &mut dyn crate::StateStore,

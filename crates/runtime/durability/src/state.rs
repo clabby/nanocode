@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use crate::{EncodedPayload, Result, SessionRecord, StoreRecord};
+use crate::{EncodedPayload, Result, SessionRecord, StateReader, StateStore, StoreRecord};
 use nanocode_durability_core::{DurableCheckpoint, JournalState};
 
 pub use nanocode_durability_core::{
@@ -33,6 +33,11 @@ impl DurableState {
     }
 
     #[must_use]
+    pub fn has_operations(&self) -> bool {
+        self.journal.has_operations()
+    }
+
+    #[must_use]
     pub fn pending_operations(&self) -> Vec<(&str, &OperationState)> {
         self.journal.pending_operations()
     }
@@ -55,7 +60,7 @@ impl DurableState {
 
     pub(crate) fn set_session(&mut self, session: Option<SessionRecord>) {
         self.session = session;
-        if self.operations().is_empty()
+        if !self.has_operations()
             && let Some(checkpoint) = self.journal.latest_checkpoint()
         {
             pin_start(self.session.as_mut(), checkpoint);
@@ -86,6 +91,37 @@ impl DurableState {
         self.journal.checkpoint_payload(self.session.as_ref())
     }
 
+    pub(crate) fn seal_receipts(&mut self) -> Result<()> {
+        self.journal.seal_receipts()
+    }
+
+    pub(crate) async fn hydrate(
+        &mut self,
+        store: &mut dyn StateStore,
+        state_id: &str,
+        read: &mut HashSet<String>,
+    ) -> Result<()> {
+        let mut pages = self.journal.receipt_pages();
+        while !pages.is_empty() {
+            let loaded = EncodedPayload::load_many_noting(&pages, store, state_id, read).await?;
+            pages = self.journal.absorb_receipt_pages(loaded)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn hydrate_read(
+        &mut self,
+        reader: &mut dyn StateReader,
+        state_id: &str,
+    ) -> Result<()> {
+        let mut pages = self.journal.receipt_pages();
+        while !pages.is_empty() {
+            let loaded = EncodedPayload::read_many(&pages, reader, state_id).await?;
+            pages = self.journal.absorb_receipt_pages(loaded)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn retain_terminal_receipts(&mut self, limit: usize) -> bool {
         let before = self.operations().len();
         let changed = self.journal.retain_terminal_receipts(limit);
@@ -105,8 +141,7 @@ impl DurableState {
     }
 
     pub(crate) fn apply_transition(&mut self, revision: u64, entry: Transition) -> Result<()> {
-        let pin =
-            self.operations().is_empty() && matches!(entry, Transition::CheckpointCommitted { .. });
+        let pin = !self.has_operations() && matches!(entry, Transition::CheckpointCommitted { .. });
         self.journal.apply_transition(revision, entry)?;
         if pin && let Some(checkpoint) = self.journal.latest_checkpoint() {
             pin_start(self.session.as_mut(), checkpoint);
@@ -115,8 +150,7 @@ impl DurableState {
     }
 
     pub(crate) fn apply_within(&mut self, revision: u64, entry: Transition) -> Result<()> {
-        let pin =
-            self.operations().is_empty() && matches!(entry, Transition::CheckpointCommitted { .. });
+        let pin = !self.has_operations() && matches!(entry, Transition::CheckpointCommitted { .. });
         self.journal.apply_within(revision, entry)?;
         if pin && let Some(checkpoint) = self.journal.latest_checkpoint() {
             pin_start(self.session.as_mut(), checkpoint);

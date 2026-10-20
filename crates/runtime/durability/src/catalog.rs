@@ -358,11 +358,14 @@ mod store {
         }
 
         pub async fn state(&self, session_id: &str) -> Result<Option<DurableState>> {
-            let stored = self.reader.clone().read_state(session_id).await?;
+            let mut reader = self.reader.clone();
+            let stored = reader.read_state(session_id).await?;
             if stored.payload.is_none() {
                 return Ok(None);
             }
-            reduce_peeked(stored).map(Some)
+            let mut state = reduce_peeked(stored)?;
+            state.hydrate_read(&mut reader, session_id).await?;
+            Ok(Some(state))
         }
 
         pub async fn resolve(
@@ -668,13 +671,18 @@ mod store {
         }
 
         pub async fn pending_turns(&self, id: &str) -> Result<Vec<StoredTurn>> {
-            let state = self.require(id).await?;
+            let state = self.require_head(id).await?;
             self.stored_turns(id, state.pending_operations(), false)
                 .await
         }
 
         pub async fn turn(&self, id: &str, request_id: &str) -> Result<Option<StoredTurn>> {
-            let state = self.require(id).await?;
+            let mut state = self.require_head(id).await?;
+            if state.operation(request_id).is_none() {
+                state
+                    .hydrate(&mut self.store.clone(), id, &mut HashSet::new())
+                    .await?;
+            }
             let Some(operation) = state.operation(request_id) else {
                 return Ok(None);
             };
@@ -809,7 +817,7 @@ mod store {
             id: &str,
             loaded: Option<(&str, &Value)>,
         ) -> Result<Option<SessionRecord>> {
-            let state = self.require(id).await?;
+            let state = self.require_head(id).await?;
             if state.session().is_some() {
                 return Ok(None);
             }
@@ -1050,6 +1058,16 @@ mod store {
         }
 
         async fn peek(&self, id: &str) -> Result<Option<DurableState>> {
+            let Some(mut state) = self.peek_head(id).await? else {
+                return Ok(None);
+            };
+            state
+                .hydrate(&mut self.store.clone(), id, &mut HashSet::new())
+                .await?;
+            Ok(Some(state))
+        }
+
+        async fn peek_head(&self, id: &str) -> Result<Option<DurableState>> {
             let stored = self.store.clone().peek(id).await?;
             if stored.payload.is_none() {
                 return Ok(None);
@@ -1061,6 +1079,14 @@ mod store {
             self.peek(id).await?.ok_or_else(|| Error::SessionNotFound {
                 session_id: id.to_owned(),
             })
+        }
+
+        async fn require_head(&self, id: &str) -> Result<DurableState> {
+            self.peek_head(id)
+                .await?
+                .ok_or_else(|| Error::SessionNotFound {
+                    session_id: id.to_owned(),
+                })
         }
 
         async fn load_payload(&self, id: &str, payload: &EncodedPayload) -> Result<EncodedPayload> {
@@ -1318,10 +1344,7 @@ mod store {
             )
         });
         let has_events = state.session().is_some_and(|record| record.has_events);
-        !state.operations().is_empty()
-            || state.latest_checkpoint().is_some()
-            || created_child
-            || has_events
+        state.has_operations() || state.latest_checkpoint().is_some() || created_child || has_events
     }
 
     pub(crate) fn summarize(

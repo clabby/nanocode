@@ -31,10 +31,17 @@ impl<S: StateStore> CheckpointBranch<S> {
             .ok_or_else(|| Error::InvalidState("source journal does not exist".into()))?;
         let retained: RetainedCheckpoint =
             serde_json::from_str(&payload).map_err(Error::InvalidPayload)?;
-        let state = DurableState::from_checkpoint(
+        let mut state = DurableState::from_checkpoint(
             acquired.state.revision,
             retained.nanocode_durable_state,
         )?;
+        state
+            .hydrate(
+                &mut store,
+                &source_id,
+                &mut std::collections::HashSet::new(),
+            )
+            .await?;
         if !state.pending_operations().is_empty() {
             return Err(Error::InvalidState(
                 "conversation rewind refuses pending operations; settle or reconcile them first"

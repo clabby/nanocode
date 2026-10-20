@@ -1200,17 +1200,28 @@ impl Driver {
                 return Err(error.into());
             }
         };
-        let state = match reduce(acquired.state) {
+        let mut state = match reduce(acquired.state) {
             Ok(state) => state,
             Err(error) => {
                 self.poisoned = true;
                 return Err(error);
             }
         };
+        self.committed_records.clear();
+        if let Err(error) = state
+            .hydrate(
+                &mut *self.store,
+                &self.state_id,
+                &mut self.committed_records,
+            )
+            .await
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
         self.owner = Some(acquired.owner);
         self.pending_record = None;
         self.state = state;
-        self.committed_records.clear();
         self.next_event = None;
         Ok(committed.load(Ordering::Acquire))
     }
@@ -1905,6 +1916,9 @@ impl Driver {
         if let Some(record) = next.session_mut() {
             record.record_events(&events);
         }
+        if self.terminal_receipt_limit.is_none() {
+            next.seal_receipts()?;
+        }
         let committed = &self.committed_records;
         let records = next.stage_records_unless(&|key| committed.contains(key));
         if let Some(session) = next.session_mut() {
@@ -2132,9 +2146,7 @@ fn update_session(
         merged.initial = Some(initial);
     }
     let checkpoint = checkpoint.filter(|_| {
-        state.session().is_none()
-            && state.latest_checkpoint().is_none()
-            && state.operations().is_empty()
+        state.session().is_none() && state.latest_checkpoint().is_none() && !state.has_operations()
     });
     let Some(checkpoint) = checkpoint else {
         if state.session() == merged.as_ref() {

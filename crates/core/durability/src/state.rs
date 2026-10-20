@@ -1,8 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{EncodedPayload, Error, Result};
+use crate::{EncodedPayload, Error, Result, StoreRecord};
 
 const STATE_FORMAT: u8 = 4;
+
+const SEALED_STATE_FORMAT: u8 = 5;
+
+const RECEIPT_PAGE: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -207,6 +211,35 @@ impl OperationState {
             || !self.steers.is_empty()
     }
 
+    fn stage_unless(&mut self, records: &mut Vec<StoreRecord>, known: &dyn Fn(&str) -> bool) {
+        self.input.stage_unless(records, known);
+        if let Some(value) = &mut self.continuation {
+            value.stage_unless(records, known);
+        }
+        match &mut self.status {
+            OperationStatus::Completed { checkpoint, output } => {
+                checkpoint.stage_unless(records, known);
+                output.stage_unless(records, known);
+            }
+            OperationStatus::Failed { checkpoint, .. } => {
+                checkpoint.stage_unless(records, known);
+            }
+            OperationStatus::Cancelled {
+                checkpoint: Some(value),
+            } => value.stage_unless(records, known),
+            _ => {}
+        }
+        for step in self.steps.values_mut() {
+            step.input.stage_unless(records, known);
+            if let StepStatus::Completed(output) = &mut step.status {
+                output.stage_unless(records, known);
+            }
+        }
+        for steer in &mut self.steers {
+            steer.input.stage_unless(records, known);
+        }
+    }
+
     fn retire_steps(&mut self) {
         for (id, step) in &self.steps {
             if step.kind == "model_call"
@@ -234,11 +267,65 @@ impl OperationState {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct SealedReceipts {
+    count: u64,
+    through: u64,
+    levels: Vec<Vec<EncodedPayload>>,
+}
+
+impl SealedReceipts {
+    const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptPage {
+    #[serde(default)]
+    operations: BTreeMap<String, OperationState>,
+    #[serde(default)]
+    pages: Vec<EncodedPayload>,
+}
+
+#[derive(serde::Serialize)]
+struct LeafPage<'a> {
+    operations: PageOperations<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct NodePage<'a> {
+    pages: &'a [EncodedPayload],
+}
+
+struct PageOperations<'a> {
+    ids: &'a [String],
+    operations: &'a BTreeMap<String, OperationState>,
+}
+
+impl serde::Serialize for PageOperations<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.ids
+                .iter()
+                .filter_map(|id| Some((id, self.operations.get(id)?))),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct JournalState {
     revision: u64,
     operations: BTreeMap<String, OperationState>,
     latest_checkpoint: Option<(u64, EncodedPayload)>,
+    sealed: SealedReceipts,
+    unloaded: u64,
+    staged: Vec<StoreRecord>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -247,6 +334,8 @@ pub struct DurableCheckpoint {
     format: u8,
     operations: BTreeMap<String, OperationState>,
     latest_checkpoint: Option<EncodedPayload>,
+    #[serde(default, skip_serializing_if = "SealedReceipts::is_empty")]
+    sealed: SealedReceipts,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -262,8 +351,28 @@ pub struct RetainedCheckpoint<R> {
 #[derive(serde::Serialize)]
 struct DurableCheckpointRef<'a> {
     format: u8,
-    operations: &'a BTreeMap<String, OperationState>,
+    operations: HeadOperations<'a>,
     latest_checkpoint: Option<&'a EncodedPayload>,
+    #[serde(skip_serializing_if = "SealedReceipts::is_empty")]
+    sealed: &'a SealedReceipts,
+}
+
+struct HeadOperations<'a> {
+    operations: &'a BTreeMap<String, OperationState>,
+    through: u64,
+}
+
+impl serde::Serialize for HeadOperations<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.operations
+                .iter()
+                .filter(|(_, operation)| operation.accepted_order > self.through),
+        )
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -282,34 +391,18 @@ impl JournalState {
         &mut self,
         known: &dyn Fn(&str) -> bool,
     ) -> Vec<crate::StoreRecord> {
-        let mut records = Vec::new();
-        for operation in self.operations.values_mut() {
-            operation.input.stage_unless(&mut records, known);
-            if let Some(value) = &mut operation.continuation {
-                value.stage_unless(&mut records, known);
-            }
-            match &mut operation.status {
-                OperationStatus::Completed { checkpoint, output } => {
-                    checkpoint.stage_unless(&mut records, known);
-                    output.stage_unless(&mut records, known);
-                }
-                OperationStatus::Failed { checkpoint, .. } => {
-                    checkpoint.stage_unless(&mut records, known);
-                }
-                OperationStatus::Cancelled {
-                    checkpoint: Some(value),
-                } => value.stage_unless(&mut records, known),
-                _ => {}
-            }
-            for step in operation.steps.values_mut() {
-                step.input.stage_unless(&mut records, known);
-                if let StepStatus::Completed(output) = &mut step.status {
-                    output.stage_unless(&mut records, known);
-                }
-            }
-            for steer in &mut operation.steers {
-                steer.input.stage_unless(&mut records, known);
-            }
+        let mut records: Vec<_> = self
+            .staged
+            .drain(..)
+            .filter(|record| !known(&record.key))
+            .collect();
+        let through = self.sealed.through;
+        for operation in self
+            .operations
+            .values_mut()
+            .filter(|operation| operation.accepted_order > through)
+        {
+            operation.stage_unless(&mut records, known);
         }
         if let Some((_, value)) = &mut self.latest_checkpoint {
             value.stage_unless(&mut records, known);
@@ -330,6 +423,132 @@ impl JournalState {
     }
 
     #[must_use]
+    pub fn has_operations(&self) -> bool {
+        !self.operations.is_empty() || !self.sealed.is_empty()
+    }
+
+    #[must_use]
+    pub fn receipt_pages(&self) -> Vec<EncodedPayload> {
+        if self.unloaded == 0 {
+            return Vec::new();
+        }
+        self.sealed.levels.iter().flatten().cloned().collect()
+    }
+
+    pub fn absorb_receipt_pages(
+        &mut self,
+        pages: Vec<EncodedPayload>,
+    ) -> Result<Vec<EncodedPayload>> {
+        let mut children = Vec::new();
+        for page in pages {
+            let ReceiptPage { operations, pages } = page.decode()?;
+            if operations.is_empty() == pages.is_empty() {
+                return Err(Error::InvalidState(format!(
+                    "sealed receipt page {} must hold either receipts or pages",
+                    page.key()
+                )));
+            }
+            children.extend(pages);
+            for (operation_id, operation) in operations {
+                validate_operation(&operation_id, &operation, self.sealed.through)?;
+                if !operation.status.is_terminal() {
+                    return Err(Error::InvalidState(format!(
+                        "sealed receipt page {} holds unfinished operation `{operation_id}`",
+                        page.key()
+                    )));
+                }
+                if self.unloaded == 0 || self.operations.contains_key(&operation_id) {
+                    return Err(Error::InvalidState(format!(
+                        "sealed operation `{operation_id}` appears more than once"
+                    )));
+                }
+                self.operations.insert(operation_id, operation);
+                self.unloaded -= 1;
+            }
+        }
+        if children.is_empty() && self.unloaded != 0 {
+            return Err(Error::InvalidState(format!(
+                "sealed receipt pages hold {} fewer operations than their head records",
+                self.unloaded
+            )));
+        }
+        if children.is_empty() {
+            let mut orders = BTreeSet::new();
+            if !self
+                .operations
+                .values()
+                .all(|operation| orders.insert(operation.accepted_order))
+            {
+                return Err(Error::InvalidState(
+                    "sealed operations repeat an acceptance order".to_owned(),
+                ));
+            }
+        }
+        Ok(children)
+    }
+
+    pub fn seal_receipts(&mut self) -> Result<()> {
+        if self.unloaded != 0 {
+            return Err(Error::InvalidState(
+                "receipts cannot be sealed before the sealed pages are loaded".to_owned(),
+            ));
+        }
+        let through = self.sealed.through;
+        let mut head = self
+            .operations
+            .iter()
+            .filter(|(_, operation)| operation.accepted_order > through)
+            .map(|(id, operation)| (id.as_str(), operation))
+            .collect::<Vec<_>>();
+        sort_accepted(&mut head);
+        let settled = head
+            .iter()
+            .take_while(|(_, operation)| operation.status.is_terminal())
+            .count();
+        let sealed = head[..settled / RECEIPT_PAGE * RECEIPT_PAGE]
+            .iter()
+            .map(|(id, _)| (*id).to_owned())
+            .collect::<Vec<_>>();
+        for chunk in sealed.chunks(RECEIPT_PAGE) {
+            for operation_id in chunk {
+                if let Some(operation) = self.operations.get_mut(operation_id) {
+                    operation.stage_unless(&mut self.staged, &|_| false);
+                }
+            }
+            let page = EncodedPayload::encode(&LeafPage {
+                operations: PageOperations {
+                    ids: chunk,
+                    operations: &self.operations,
+                },
+            })?;
+            self.push_receipt_page(page)?;
+            if let Some(operation) = chunk.last().and_then(|id| self.operations.get(id)) {
+                self.sealed.through = operation.accepted_order;
+            }
+            self.sealed.count += RECEIPT_PAGE as u64;
+        }
+        Ok(())
+    }
+
+    fn push_receipt_page(&mut self, mut page: EncodedPayload) -> Result<()> {
+        let mut level = 0;
+        loop {
+            page.stage(&mut self.staged);
+            if self.sealed.levels.len() == level {
+                self.sealed.levels.push(Vec::new());
+            }
+            let entries = &mut self.sealed.levels[level];
+            entries.push(page.reference());
+            if entries.len() < RECEIPT_PAGE {
+                return Ok(());
+            }
+            let pages = std::mem::take(entries);
+            page = EncodedPayload::encode(&NodePage { pages: &pages })?;
+            level += 1;
+        }
+    }
+
+    #[must_use]
     pub fn operation(&self, operation_id: &str) -> Option<&OperationState> {
         self.operations.get(operation_id)
     }
@@ -342,7 +561,7 @@ impl JournalState {
             .filter(|(_, operation)| !operation.status.is_terminal())
             .map(|(id, operation)| (id.as_str(), operation))
             .collect::<Vec<_>>();
-        operations.sort_by_key(|(_, operation)| operation.accepted_order);
+        sort_accepted(&mut operations);
         operations
     }
 
@@ -371,9 +590,17 @@ impl JournalState {
     pub fn checkpoint_payload<R: serde::Serialize>(&self, session: Option<&R>) -> Result<String> {
         serde_json::to_string(&RetainedCheckpointRef {
             nanocode_durable_state: DurableCheckpointRef {
-                format: STATE_FORMAT,
-                operations: &self.operations,
+                format: if self.sealed.is_empty() {
+                    STATE_FORMAT
+                } else {
+                    SEALED_STATE_FORMAT
+                },
+                operations: HeadOperations {
+                    operations: &self.operations,
+                    through: self.sealed.through,
+                },
                 latest_checkpoint: self.latest_checkpoint(),
+                sealed: &self.sealed,
             },
             nanocode_session: session,
         })
@@ -381,9 +608,14 @@ impl JournalState {
     }
 
     pub fn retain_terminal_receipts(&mut self, limit: usize) -> bool {
+        let mut changed = false;
+        if !self.sealed.is_empty() && self.unloaded == 0 {
+            self.sealed = SealedReceipts::default();
+            changed = true;
+        }
         let before = self.operations.len();
         Self::retain_terminal_operations(&mut self.operations, limit);
-        let mut changed = self.operations.len() != before;
+        changed |= self.operations.len() != before;
         for operation in self
             .operations
             .values_mut()
@@ -405,9 +637,7 @@ impl JournalState {
             .collect::<Vec<_>>();
         terminal_orders.sort_unstable_by(|left, right| right.cmp(left));
         terminal_orders.truncate(limit);
-        let retained = terminal_orders
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
+        let retained = terminal_orders.into_iter().collect::<BTreeSet<_>>();
         operations.retain(|_, operation| {
             !operation.status.is_terminal() || retained.contains(&operation.accepted_order)
         });
@@ -419,87 +649,31 @@ impl JournalState {
                 "a compacted state checkpoint must have a positive revision".to_owned(),
             ));
         }
-        if checkpoint.format != STATE_FORMAT {
+        let sealed = checkpoint.sealed;
+        if !(checkpoint.format == STATE_FORMAT && sealed.is_empty()
+            || checkpoint.format == SEALED_STATE_FORMAT)
+        {
             return Err(Error::InvalidState(format!(
                 "unsupported state format {}",
                 checkpoint.format
             )));
         }
-        let mut accepted_orders = std::collections::BTreeSet::new();
+        if sealed.through > revision
+            || sealed.count > sealed.through
+            || sealed.is_empty() != sealed.levels.iter().all(Vec::is_empty)
+        {
+            return Err(Error::InvalidState(
+                "sealed receipts do not match their head".to_owned(),
+            ));
+        }
+        let mut accepted_orders = BTreeSet::new();
         for (operation_id, operation) in &checkpoint.operations {
-            ensure_nonempty(operation_id, "operation ID")?;
-            if operation.accepted_order == 0
-                || operation.accepted_order > revision
+            validate_operation(operation_id, operation, revision)?;
+            if operation.accepted_order <= sealed.through
                 || !accepted_orders.insert(operation.accepted_order)
             {
                 return Err(Error::InvalidState(format!(
                     "operation `{operation_id}` has an invalid compacted acceptance order"
-                )));
-            }
-            if operation.status.is_terminal() && operation.continuation.is_some() {
-                return Err(Error::InvalidState(
-                    "terminal operation retained active execution state".into(),
-                ));
-            }
-            if !operation.status.is_terminal()
-                && operation.retired_model_calls != 0
-                && operation.continuation.is_none()
-            {
-                return Err(Error::InvalidState(
-                    "retired model batches have no current conversation".into(),
-                ));
-            }
-            for (step_id, step) in &operation.steps {
-                ensure_nonempty(step_id, "step ID")?;
-                ensure_nonempty(&step.kind, "step kind")?;
-                if step.attempts == 0 {
-                    return Err(Error::InvalidState(format!(
-                        "step `{step_id}` in operation `{operation_id}` has no committed start"
-                    )));
-                }
-            }
-            let mut previous_model_call_index = None;
-            let mut saw_unbound_steer = false;
-            for (offset, steer) in operation.steers.iter().enumerate() {
-                if steer.accepted_after_model_call_index == 0
-                    || steer.model_call_index.is_some_and(|model_call_index| {
-                        model_call_index <= steer.accepted_after_model_call_index
-                    })
-                {
-                    return Err(Error::InvalidState(format!(
-                        "steer {} in operation `{operation_id}` has an invalid model boundary",
-                        offset + 1 + operation.retired_steers as usize
-                    )));
-                }
-                match steer.model_call_index {
-                    Some(current) => {
-                        if saw_unbound_steer {
-                            return Err(Error::InvalidState(format!(
-                                "steer {} in operation `{operation_id}` was bound after an unbound steer",
-                                offset + 1 + operation.retired_steers as usize
-                            )));
-                        }
-                        if previous_model_call_index.is_some_and(|previous| current < previous) {
-                            return Err(Error::InvalidState(format!(
-                                "steer {} in operation `{operation_id}` moved before an earlier steer",
-                                offset + 1 + operation.retired_steers as usize
-                            )));
-                        }
-                        previous_model_call_index = Some(current);
-                    }
-                    None => saw_unbound_steer = true,
-                }
-            }
-            if matches!(operation.status, OperationStatus::Completed { .. }) {
-                ensure_completed_steers_consumed(operation_id, operation)?;
-            }
-            if matches!(
-                &operation.status,
-                OperationStatus::Cancelled { checkpoint: None }
-            ) && operation.cancellation_requires_checkpoint()
-            {
-                return Err(Error::InvalidState(format!(
-                    "started operation `{operation_id}` was cancelled without a checkpoint"
                 )));
             }
         }
@@ -522,6 +696,9 @@ impl JournalState {
             revision,
             operations: checkpoint.operations,
             latest_checkpoint,
+            unloaded: sealed.count,
+            sealed,
+            staged: Vec::new(),
         };
         for (operation_id, operation) in &state.operations {
             if matches!(
@@ -619,6 +796,11 @@ impl JournalState {
                 }
             }
             Transition::OperationAccepted { operation_id, .. } => {
+                if self.unloaded != 0 {
+                    return Err(Error::InvalidState(format!(
+                        "operation `{operation_id}` was accepted before the sealed receipts were loaded"
+                    )));
+                }
                 if self.operations.contains_key(operation_id) {
                     return Err(Error::InvalidState(format!(
                         "operation `{operation_id}` was accepted more than once"
@@ -1046,6 +1228,86 @@ impl JournalState {
         }
         Ok(())
     }
+}
+
+fn sort_accepted(operations: &mut [(&str, &OperationState)]) {
+    operations.sort_by_key(|(_, operation)| operation.accepted_order);
+}
+
+fn validate_operation(operation_id: &str, operation: &OperationState, revision: u64) -> Result<()> {
+    ensure_nonempty(operation_id, "operation ID")?;
+    if operation.accepted_order == 0 || operation.accepted_order > revision {
+        return Err(Error::InvalidState(format!(
+            "operation `{operation_id}` has an invalid compacted acceptance order"
+        )));
+    }
+    if operation.status.is_terminal() && operation.continuation.is_some() {
+        return Err(Error::InvalidState(
+            "terminal operation retained active execution state".into(),
+        ));
+    }
+    if !operation.status.is_terminal()
+        && operation.retired_model_calls != 0
+        && operation.continuation.is_none()
+    {
+        return Err(Error::InvalidState(
+            "retired model batches have no current conversation".into(),
+        ));
+    }
+    for (step_id, step) in &operation.steps {
+        ensure_nonempty(step_id, "step ID")?;
+        ensure_nonempty(&step.kind, "step kind")?;
+        if step.attempts == 0 {
+            return Err(Error::InvalidState(format!(
+                "step `{step_id}` in operation `{operation_id}` has no committed start"
+            )));
+        }
+    }
+    let mut previous_model_call_index = None;
+    let mut saw_unbound_steer = false;
+    for (offset, steer) in operation.steers.iter().enumerate() {
+        if steer.accepted_after_model_call_index == 0
+            || steer.model_call_index.is_some_and(|model_call_index| {
+                model_call_index <= steer.accepted_after_model_call_index
+            })
+        {
+            return Err(Error::InvalidState(format!(
+                "steer {} in operation `{operation_id}` has an invalid model boundary",
+                offset + 1 + operation.retired_steers as usize
+            )));
+        }
+        match steer.model_call_index {
+            Some(current) => {
+                if saw_unbound_steer {
+                    return Err(Error::InvalidState(format!(
+                        "steer {} in operation `{operation_id}` was bound after an unbound steer",
+                        offset + 1 + operation.retired_steers as usize
+                    )));
+                }
+                if previous_model_call_index.is_some_and(|previous| current < previous) {
+                    return Err(Error::InvalidState(format!(
+                        "steer {} in operation `{operation_id}` moved before an earlier steer",
+                        offset + 1 + operation.retired_steers as usize
+                    )));
+                }
+                previous_model_call_index = Some(current);
+            }
+            None => saw_unbound_steer = true,
+        }
+    }
+    if matches!(operation.status, OperationStatus::Completed { .. }) {
+        ensure_completed_steers_consumed(operation_id, operation)?;
+    }
+    if matches!(
+        &operation.status,
+        OperationStatus::Cancelled { checkpoint: None }
+    ) && operation.cancellation_requires_checkpoint()
+    {
+        return Err(Error::InvalidState(format!(
+            "started operation `{operation_id}` was cancelled without a checkpoint"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_completed_steers_consumed(operation_id: &str, operation: &OperationState) -> Result<()> {
