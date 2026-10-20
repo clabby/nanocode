@@ -1,8 +1,11 @@
+use std::fmt;
+
 use super::{AgentRuntime, catalog_error};
 use crate::{
-    Agent, ExecutionPolicyDisposition, NanocodeError, PromptRequest, durability::TurnStatus,
-    input::Prompt,
+    Agent, ExecutionPolicyDisposition, HarnessFamily, NanocodeError, PromptRequest,
+    durability::TurnStatus, input::Prompt,
 };
+use nanocode_subagents::COMPLETION_REQUEST_PREFIX;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableOutcome {
@@ -11,6 +14,52 @@ pub enum DurableOutcome {
     Cancelled,
     Waiting,
     Interrupted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PromptRejection {
+    ReservedRequestId(String),
+    HarnessChanged {
+        recorded: HarnessFamily,
+        requested: HarnessFamily,
+    },
+}
+
+impl fmt::Display for PromptRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReservedRequestId(request_id) => write!(
+                formatter,
+                "request ID `{request_id}` uses the prefix `{COMPLETION_REQUEST_PREFIX}` reserved for subagent completion turns"
+            ),
+            Self::HarnessChanged {
+                recorded,
+                requested,
+            } => write!(
+                formatter,
+                "the session runs on the {recorded} harness and cannot continue on {requested}; start a new session"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PromptRejection {}
+
+pub fn admit_prompt(
+    recorded: Option<&HarnessFamily>,
+    requested: &HarnessFamily,
+    request_id: &str,
+) -> Result<(), PromptRejection> {
+    if request_id.starts_with(COMPLETION_REQUEST_PREFIX) {
+        return Err(PromptRejection::ReservedRequestId(request_id.into()));
+    }
+    match recorded {
+        Some(recorded) if recorded != requested => Err(PromptRejection::HarnessChanged {
+            recorded: recorded.clone(),
+            requested: requested.clone(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 impl AgentRuntime {

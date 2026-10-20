@@ -93,8 +93,8 @@ pub type Nanocode = nanocode_agent::Runtime<Defaults>;
 pub type NanocodeBuilder<B = nanocode_agent::Unselected> =
     nanocode_agent::RuntimeBuilder<B, Defaults>;
 pub use nanocode_agent::{
-    DurableOutcome, EventSink, SessionEvent, SessionEvents, SpawnBuilder, SubagentUpdates,
-    Unselected,
+    DurableOutcome, EventSink, PromptRejection, SessionEvent, SessionEvents, SpawnBuilder,
+    SubagentUpdates, Unselected, admit_prompt,
 };
 
 pub mod agent {

@@ -1,6 +1,6 @@
 mod turns;
 
-pub use turns::DurableOutcome;
+pub use turns::{DurableOutcome, PromptRejection, admit_prompt};
 
 use crate::{
     Agent, AgentEvents, HarnessFamily, ModelSelection, NanocodeError, SessionCheckpoint, Thinking,

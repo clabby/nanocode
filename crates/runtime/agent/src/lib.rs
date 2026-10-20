@@ -9,7 +9,7 @@ pub use router::{
     CheckpointFormats, Harness, HarnessBuilder, HarnessRequest, NoFormats, session_store,
 };
 pub use runtime::{
-    AgentRuntime, DurableOutcome, Runtime, RuntimeBuilder, SpawnBuilder, SubagentUpdates,
-    Unselected,
+    AgentRuntime, DurableOutcome, PromptRejection, Runtime, RuntimeBuilder, SpawnBuilder,
+    SubagentUpdates, Unselected, admit_prompt,
 };
 pub use session_events::{EventSink, SessionEvent, SessionEvents};

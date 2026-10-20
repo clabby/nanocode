@@ -39,6 +39,8 @@ pub use tools::{
 
 pub const DEFAULT_MAX_SUBAGENTS: usize = usize::MAX;
 
+pub const COMPLETION_REQUEST_PREFIX: &str = "subagent-completion:";
+
 pub const DEFAULT_MAX_RESIDENT_SUBAGENTS: usize = 16;
 
 pub const DURABLE_MAX_RESIDENT_SUBAGENTS: usize = 2;

@@ -3515,7 +3515,10 @@ impl Registry {
                 nanocode_agent_core::PromptRequest::new(completion_continuation_prompt(
                     id, &status,
                 ))
-                .request_id(format!("subagent-completion:{session_id}:{revision}")),
+                .request_id(format!(
+                    "{}{session_id}:{revision}",
+                    crate::COMPLETION_REQUEST_PREFIX
+                )),
             )
             .await
         {
