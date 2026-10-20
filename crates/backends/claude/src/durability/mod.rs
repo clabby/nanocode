@@ -79,7 +79,8 @@ impl DurableAgentExt for ClaudeBuilder {
             .abandon_stale_kinds(MAINTENANCE_KINDS)
             .await
             .map_err(agent_error)?;
-        drop(state.take_checkpoint_preload(""));
+        let preloaded =
+            state.take_checkpoint_preload(checkpoint.as_ref().map_or("", EncodedPayload::key));
         let record = state.record().await.map_err(agent_error)?;
         let branches = Branches {
             store: state.shared_store(),
@@ -104,9 +105,10 @@ impl DurableAgentExt for ClaudeBuilder {
         } else {
             builder
         };
-        let checkpoint = match checkpoint {
-            Some(value) => Some(value.decode::<Value>().map_err(agent_error)?),
-            None => {
+        let checkpoint = match (checkpoint, preloaded) {
+            (Some(_), Some(preloaded)) => Some(preloaded),
+            (Some(value), None) => Some(value.decode::<Value>().map_err(agent_error)?),
+            (None, _) => {
                 let imported = builder.configured_checkpoint()?;
                 if let Some(checkpoint) = &imported
                     && state

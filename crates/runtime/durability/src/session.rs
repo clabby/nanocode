@@ -292,6 +292,7 @@ enum Command {
         initial: Option<crate::InitialSettings>,
         checkpoint: Option<EncodedPayload>,
         journal: Option<crate::child_journal::Seed>,
+        preloaded: Option<LoadedCheckpoint>,
         result: oneshot::Sender<Result<AgentAcquisition>>,
     },
     Admit {
@@ -728,9 +729,12 @@ impl Driver {
                 initial,
                 checkpoint,
                 journal,
+                preloaded,
                 result,
             } => {
-                let outcome = self.acquire_agent(initial, checkpoint, journal).await;
+                let outcome = self
+                    .acquire_agent(initial, checkpoint, journal, preloaded)
+                    .await;
                 let generation = outcome.as_ref().ok().map(|owner| owner.generation);
                 if result.send(outcome).is_err()
                     && let Some(generation) = generation
@@ -1216,6 +1220,7 @@ impl Driver {
         initial: Option<crate::InitialSettings>,
         checkpoint: Option<EncodedPayload>,
         journal: Option<crate::child_journal::Seed>,
+        preloaded: Option<LoadedCheckpoint>,
     ) -> Result<AgentAcquisition> {
         let initial_committed = self.acquire(initial, checkpoint, journal).await?;
         let generation = match self.next_agent_generation.checked_add(1) {
@@ -1235,13 +1240,21 @@ impl Driver {
             generation,
             checkpoint: match self.state.latest_checkpoint() {
                 Some(value) => Some(
-                    value
-                        .load_noting(
-                            &mut *self.store,
-                            &self.state_id,
-                            &mut self.committed_records,
-                        )
-                        .await?,
+                    match preloaded.filter(|(payload, _)| payload.key() == value.key()) {
+                        Some((payload, records)) => {
+                            self.committed_records.extend(records.iter().cloned());
+                            payload
+                        }
+                        None => {
+                            value
+                                .load_noting(
+                                    &mut *self.store,
+                                    &self.state_id,
+                                    &mut self.committed_records,
+                                )
+                                .await?
+                        }
+                    },
                 ),
                 None => None,
             },
@@ -2227,8 +2240,16 @@ pub struct DurableSession {
     caller_id: OwnerId,
     active_claims: AtomicUsize,
     described: Option<crate::SessionRecord>,
-    preload: Arc<ArcSwapOption<(String, serde_json::Value)>>,
+    preload: Arc<ArcSwapOption<CheckpointPreload>>,
     adopted: Arc<ArcSwapOption<crate::JournalClaim>>,
+}
+
+pub(crate) type LoadedCheckpoint = (EncodedPayload, Arc<HashSet<String>>);
+
+struct CheckpointPreload {
+    key: String,
+    checkpoint: serde_json::Value,
+    loaded: Option<LoadedCheckpoint>,
 }
 
 impl Clone for DurableSession {
@@ -2378,17 +2399,29 @@ impl DurableSession {
         })
     }
 
-    pub(crate) fn preload_checkpoint(&self, key: String, checkpoint: serde_json::Value) {
-        self.preload.store(Some(Arc::new((key, checkpoint))));
+    pub(crate) fn preload_checkpoint(
+        &self,
+        key: String,
+        checkpoint: serde_json::Value,
+        loaded: Option<LoadedCheckpoint>,
+    ) {
+        let loaded = loaded.filter(|(payload, _)| payload.key() == key);
+        self.preload.store(Some(Arc::new(CheckpointPreload {
+            key,
+            checkpoint,
+            loaded,
+        })));
     }
 
     pub fn take_checkpoint_preload(&self, key: &str) -> Option<serde_json::Value> {
         self.preload
             .swap(None)
-            .filter(|preloaded| preloaded.0 == key)
+            .filter(|preloaded| preloaded.key == key)
             .map(|preloaded| {
-                Arc::try_unwrap(preloaded)
-                    .map_or_else(|shared| shared.1.clone(), |(_, checkpoint)| checkpoint)
+                Arc::try_unwrap(preloaded).map_or_else(
+                    |shared| shared.checkpoint.clone(),
+                    |preloaded| preloaded.checkpoint,
+                )
             })
     }
 
@@ -2574,10 +2607,16 @@ impl DurableSession {
         journal: Option<crate::child_journal::Seed>,
     ) -> Result<(DurableOwner, Option<EncodedPayload>, bool)> {
         let (result, receiver) = oneshot::channel();
+        let preloaded = self
+            .preload
+            .load()
+            .as_ref()
+            .and_then(|preload| preload.loaded.clone());
         self.send(Command::AcquireAgent {
             initial,
             checkpoint,
             journal,
+            preloaded,
             result,
         })
         .await?;

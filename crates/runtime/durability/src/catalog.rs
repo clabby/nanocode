@@ -220,7 +220,11 @@ fn now_ms() -> u64 {
 pub use store::*;
 
 mod store {
-    use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+    use std::{
+        collections::{BTreeMap, HashSet},
+        path::PathBuf,
+        sync::Arc,
+    };
 
     use nanocode_agent_core::{
         HarnessFamily, Lineage, ModelSelection, Origin,
@@ -415,6 +419,7 @@ mod store {
         store: WeakSharedStore,
         state_id: String,
         checkpoint_key: Option<String>,
+        checkpoint_payload: Option<(EncodedPayload, Arc<HashSet<String>>)>,
         record_inferred: bool,
     }
 
@@ -584,7 +589,12 @@ mod store {
 
         pub async fn load(&self, id: &str) -> Result<StoredSession> {
             let state = self.require(id).await?;
-            let checkpoint = self.native_checkpoint(id, &state).await?;
+            let (checkpoint, checkpoint_payload) = match self.loaded_checkpoint(id, &state).await? {
+                Some((checkpoint, payload, records)) => {
+                    (Some(checkpoint), Some((payload, Arc::new(records))))
+                }
+                None => (None, None),
+            };
             let record = match (state.session(), &checkpoint) {
                 (Some(record), _) => record.clone(),
                 (None, Some(checkpoint)) => self.infer_record(id, checkpoint)?,
@@ -630,6 +640,7 @@ mod store {
                     checkpoint_key: state
                         .latest_checkpoint()
                         .map(|payload| payload.key().to_owned()),
+                    checkpoint_payload,
                     record_inferred: state.session().is_none(),
                 },
             })
@@ -765,7 +776,11 @@ mod store {
             if let (Some(key), Some(checkpoint)) =
                 (&stored.loaded.checkpoint_key, &stored.checkpoint)
             {
-                state.preload_checkpoint(key.clone(), checkpoint.clone());
+                state.preload_checkpoint(
+                    key.clone(),
+                    checkpoint.clone(),
+                    stored.loaded.checkpoint_payload.clone(),
+                );
             }
             Ok(state)
         }
@@ -1040,6 +1055,15 @@ mod store {
             family: Option<HarnessFamily>,
         ) -> Result<Value> {
             let value: Value = self.load_payload(id, payload).await?.decode()?;
+            self.hydrate_value(id, value, family).await
+        }
+
+        async fn hydrate_value(
+            &self,
+            id: &str,
+            value: Value,
+            family: Option<HarnessFamily>,
+        ) -> Result<Value> {
             if is_portable(&value) {
                 return Ok(value);
             }
@@ -1154,6 +1178,28 @@ mod store {
                 steers.extend(instruction_text(&prompt.instruction));
             }
             Ok(Some((operation_id.to_owned(), view, steers)))
+        }
+
+        async fn loaded_checkpoint(
+            &self,
+            id: &str,
+            state: &DurableState,
+        ) -> Result<Option<(Value, EncodedPayload, HashSet<String>)>> {
+            let Some(payload) = state.latest_checkpoint() else {
+                return Ok(None);
+            };
+            let mut records = HashSet::new();
+            let loaded = payload
+                .load_noting(&mut self.store.clone(), id, &mut records)
+                .await?;
+            let value = self
+                .hydrate_value(
+                    id,
+                    loaded.decode()?,
+                    state.session().map(SessionRecord::family),
+                )
+                .await?;
+            Ok(Some((value, loaded, records)))
         }
 
         async fn native_checkpoint(&self, id: &str, state: &DurableState) -> Result<Option<Value>> {
