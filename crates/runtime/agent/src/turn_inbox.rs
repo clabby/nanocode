@@ -18,7 +18,10 @@ use crate::{
     Agent, AgentRuntime, DurableOutcome, EventSink, NanocodeError, PromptRequest, SessionEvent,
     SessionEvents, TurnControl,
     durability::{SessionRecord, SessionStore, Sql, StoreError},
-    input::Prompt,
+    events::{
+        AGENT_EVENT_PROTOCOL_VERSION, AcceptedInput, AgentEvent, AgentEventKind, AgentEventTiming,
+    },
+    input::{Prompt, PromptInput},
     session_log::{LogEntry, LoggedEvent, SessionLog, Started, TurnRecord, TurnState},
 };
 
@@ -139,6 +142,46 @@ struct Envelope<'a> {
     annotation: &'a Map<String, Value>,
 }
 
+pub(crate) fn accepted_bytes(
+    request_id: &str,
+    input: &PromptInput,
+) -> Result<usize, serde_json::Error> {
+    let generated = nanocode_platform::uuid_v7().to_string();
+    let turn = if request_id.len() > generated.len() {
+        request_id
+    } else {
+        &generated
+    };
+    let empty = PromptInput::Text(String::new());
+    let payload = serde_json::value::to_raw_value(&AcceptedInput {
+        session_id: generated.clone(),
+        turn_id: turn.to_owned(),
+        item_id: format!("{turn}:prompt"),
+        kind: "prompt".into(),
+        request_id: Some(request_id.to_owned()),
+        input: empty.clone(),
+    })?;
+    let event = SessionEvent::Agent {
+        event: AgentEvent {
+            protocol_version: AGENT_EVENT_PROTOCOL_VERSION,
+            request_id: generated.as_str().into(),
+            seq: u64::MAX,
+            kind: AgentEventKind::InputAccepted,
+            payload: payload.into(),
+        },
+        timing: AgentEventTiming {
+            emitted_ns: 10_u64.pow(u64::MAX.ilog10()),
+            source_received_ns: Some(u64::MAX),
+        },
+        received_ns: u64::MAX,
+    };
+    let envelope = serde_json::value::to_raw_value(&Envelope {
+        event: &event,
+        annotation: &Map::new(),
+    })?;
+    Ok(envelope.get().len() - serde_json::to_vec(&empty)?.len() + serde_json::to_vec(input)?.len())
+}
+
 impl<H: ?Sized> Shared<H> {
     fn attribute(&self, event: &SessionEvent) -> Option<String> {
         let (event, agent) = match event {
@@ -181,15 +224,26 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
     fn deliver(&self, events: Vec<SessionEvent>) -> HostFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let annotation = self.0.host.annotate();
+            let unannotated = Map::new();
             let entries = events
                 .iter()
                 .map(|event| {
-                    Ok(LogEntry {
-                        request_id: self.0.attribute(event),
-                        event: serde_json::value::to_raw_value(&Envelope {
+                    let request_id = self.0.attribute(event);
+                    let mut body = serde_json::value::to_raw_value(&Envelope {
+                        event,
+                        annotation: &annotation,
+                    })?;
+                    if !annotation.is_empty()
+                        && !self.0.log.event_fits(request_id.as_deref(), body.get())
+                    {
+                        body = serde_json::value::to_raw_value(&Envelope {
                             event,
-                            annotation: &annotation,
-                        })?,
+                            annotation: &unannotated,
+                        })?;
+                    }
+                    Ok(LogEntry {
+                        request_id,
+                        event: body,
                     })
                 })
                 .collect::<Result<Vec<_>, serde_json::Error>>()

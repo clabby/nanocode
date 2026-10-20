@@ -12,6 +12,7 @@ use serde_json::{Map, Value, value::RawValue};
 use crate::{
     durability::{EncodedPayload, Sql, SqlRow, SqlStatement, StoreError},
     input::Prompt,
+    turn_inbox::accepted_bytes,
 };
 
 const SCHEMA: [&str; 2] = [
@@ -45,6 +46,12 @@ const TURN_START: &str =
 const IMPORT: &str = "INSERT INTO turns (scope, request_id, digest, status, prompt, hand, metadata, cancel_requested, note, first_seq, last_seq) SELECT ?1, json_extract(value, '$.request_id'), json_extract(value, '$.digest'), json_extract(value, '$.status'), json_extract(value, '$.prompt'), json_extract(value, '$.hand'), json_extract(value, '$.metadata'), json_extract(value, '$.cancel_requested'), json_extract(value, '$.note'), json_extract(value, '$.first_seq'), json_extract(value, '$.last_seq') FROM json_each(?2) WHERE true ON CONFLICT DO NOTHING";
 const IMPORT_RESULT: &str = "INSERT INTO events (scope, request_id, body, created_at) SELECT ?1, ?2, ?3, CAST(?4 AS INTEGER) WHERE EXISTS (SELECT 1 FROM turns WHERE scope = ?1 AND request_id = ?2 AND status IN ('completed', 'failed', 'cancelled') AND last_seq IS NULL)";
 const IMPORT_FINISH: &str = "UPDATE turns SET last_seq = (SELECT MAX(seq) FROM events) WHERE scope = ?1 AND request_id = ?2 AND status IN ('completed', 'failed', 'cancelled') AND last_seq IS NULL";
+const VARINT_BYTES: usize = 9;
+const INTEGER_BYTES: usize = 8;
+const EVENT_TEXTS: usize = 3;
+const EVENT_INTEGERS: usize = 1;
+const TURN_TEXTS: usize = 9;
+const TURN_INTEGERS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,6 +157,10 @@ pub enum Submitted {
     },
     Existing(TurnRecord),
     Conflict(TurnRecord),
+    TooLarge {
+        bytes: usize,
+        limit: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +234,17 @@ struct Outcome<'a> {
 }
 
 #[derive(Serialize)]
+struct Omitted<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<&'a str>,
+    source: Option<String>,
+    event_type: Option<String>,
+    bytes: usize,
+}
+
+#[derive(Serialize)]
 struct Imported<'a> {
     request_id: &'a str,
     digest: String,
@@ -286,6 +308,37 @@ fn present(rows: &[SqlRow]) -> Result<bool, StoreError> {
 
 fn raw(json: String) -> Result<Box<RawValue>, StoreError> {
     RawValue::from_string(json).map_err(|error| invalid(format!("stored JSON: {error}")))
+}
+
+const fn record_bytes(texts: usize, text_bytes: usize, integers: usize) -> usize {
+    VARINT_BYTES * (1 + texts + integers) + INTEGER_BYTES * integers + text_bytes
+}
+
+const fn event_bytes(scope: &str, request_id: Option<&str>, body: usize) -> usize {
+    let request_id = match request_id {
+        Some(request_id) => request_id.len(),
+        None => 0,
+    };
+    record_bytes(EVENT_TEXTS, scope.len() + request_id + body, EVENT_INTEGERS)
+}
+
+fn omitted(request_id: Option<&str>, body: &str) -> Result<Box<RawValue>, StoreError> {
+    let described = serde_json::from_str::<Value>(body).unwrap_or_default();
+    let named = |pointer: &str| described.pointer(pointer).and_then(Value::as_str);
+    let source = named("/source").map(str::to_owned);
+    let event_type = named("/event/type")
+        .or_else(|| named("/update/event/type"))
+        .or_else(|| named("/update/type"))
+        .or_else(|| named("/type"))
+        .map(str::to_owned);
+    serde_json::value::to_raw_value(&Omitted {
+        kind: "omitted",
+        request_id,
+        source,
+        event_type,
+        bytes: body.len(),
+    })
+    .map_err(encoding)
 }
 
 fn now() -> u64 {
@@ -361,6 +414,7 @@ pub struct SessionLog<H: ?Sized> {
     host: Arc<H>,
     scope: Arc<str>,
     ready: AtomicBool,
+    limit: Option<usize>,
 }
 
 impl<H: Sql + ?Sized> SessionLog<H> {
@@ -369,7 +423,19 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             host,
             scope: scope.into(),
             ready: AtomicBool::new(false),
+            limit: None,
         }
+    }
+
+    #[must_use]
+    pub const fn value_limit(mut self, bytes: usize) -> Self {
+        self.limit = Some(bytes);
+        self
+    }
+
+    pub(crate) fn event_fits(&self, request_id: Option<&str>, body: &str) -> bool {
+        self.limit
+            .is_none_or(|limit| event_bytes(&self.scope, request_id, body.len()) <= limit)
     }
 
     pub fn scope(&self) -> &str {
@@ -441,6 +507,28 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         .map_err(encoding)?;
         let created = now().to_string();
         let metadata = submission.metadata.get();
+        if let Some(limit) = self.limit {
+            let row = record_bytes(
+                TURN_TEXTS,
+                self.scope.len()
+                    + id.len()
+                    + digest.len()
+                    + TurnState::Running.as_str().len()
+                    + prompt.len()
+                    + submission.hand.as_deref().map_or(0, str::len)
+                    + metadata.len(),
+                TURN_INTEGERS,
+            );
+            let accepted = event_bytes(
+                &self.scope,
+                Some(id),
+                accepted_bytes(id, &submission.prompt.instruction).map_err(encoding)?,
+            );
+            let bytes = row.max(accepted);
+            if bytes > limit {
+                return Ok(Submitted::TooLarge { bytes, limit });
+            }
+        }
         let turn = match submission.hand.as_deref() {
             Some(hand) => statement(
                 NEW_PLACED_TURN,
@@ -533,13 +621,37 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 state.as_str()
             )));
         }
-        let body = serde_json::to_string(&Outcome {
+        let mut state = state;
+        let mut body = serde_json::to_string(&Outcome {
             kind: "result",
             request_id,
             status: state.as_str(),
             fields,
         })
         .map_err(encoding)?;
+        if let Some(limit) = self
+            .limit
+            .filter(|_| !self.event_fits(Some(request_id), &body))
+        {
+            let mut failure = Map::new();
+            failure.insert(
+                "error".into(),
+                format!(
+                    "the turn's {} result is {} bytes, more than the {limit} bytes the session log stores in one event",
+                    state.as_str(),
+                    body.len()
+                )
+                .into(),
+            );
+            state = TurnState::Failed;
+            body = serde_json::to_string(&Outcome {
+                kind: "result",
+                request_id,
+                status: state.as_str(),
+                fields: &failure,
+            })
+            .map_err(encoding)?;
+        }
         let created = now().to_string();
         let results = self
             .transaction(
@@ -649,31 +761,40 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         }
         let created = now();
         let at = created.to_string();
+        let bodies = entries
+            .iter()
+            .map(|entry| {
+                let request_id = entry.request_id.as_deref();
+                if self.event_fits(request_id, entry.event.get()) {
+                    Ok(entry.event.clone())
+                } else {
+                    omitted(request_id, entry.event.get())
+                }
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
         let statements = entries
             .iter()
-            .map(|entry| match entry.request_id.as_deref() {
-                Some(request_id) => statement(
-                    APPEND,
-                    vec![&self.scope, request_id, entry.event.get(), &at],
-                ),
-                None => statement(
-                    APPEND_UNATTRIBUTED,
-                    vec![&self.scope, entry.event.get(), &at],
-                ),
+            .zip(&bodies)
+            .map(|(entry, body)| match entry.request_id.as_deref() {
+                Some(request_id) => {
+                    statement(APPEND, vec![&self.scope, request_id, body.get(), &at])
+                }
+                None => statement(APPEND_UNATTRIBUTED, vec![&self.scope, body.get(), &at]),
             })
             .collect();
         let results = self.transaction("append", statements).await?;
         entries
             .iter()
+            .zip(bodies)
             .zip(&results)
-            .map(|(entry, rows)| {
+            .map(|((entry, event), rows)| {
                 let row =
                     single(rows)?.ok_or_else(|| invalid("an appended event has no sequence"))?;
                 Ok(LoggedEvent {
                     seq: counter(text(row, 0)?)?,
                     request_id: entry.request_id.clone(),
                     created_at: created,
-                    event: entry.event.clone(),
+                    event,
                 })
             })
             .collect()
@@ -739,7 +860,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
-        let encoded = serde_json::to_string(&rows).map_err(encoding)?;
+        let batches = self.batches(&rows)?;
         let created = now().to_string();
         let results: Vec<_> = turns
             .iter()
@@ -757,7 +878,10 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             })
             .collect::<Result<_, _>>()
             .map_err(encoding)?;
-        let mut statements = vec![statement(IMPORT, vec![&self.scope, &encoded])];
+        let mut statements: Vec<_> = batches
+            .iter()
+            .map(|batch| statement(IMPORT, vec![&self.scope, batch]))
+            .collect();
         for (request_id, body) in &results {
             statements.push(statement(
                 IMPORT_RESULT,
@@ -767,5 +891,28 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         }
         self.transaction("import", statements).await?;
         Ok(rows.len())
+    }
+
+    fn batches(&self, rows: &[Imported<'_>]) -> Result<Vec<String>, StoreError> {
+        let mut batches = Vec::new();
+        let mut batch = String::from("[");
+        for row in rows {
+            let encoded = serde_json::to_string(row).map_err(encoding)?;
+            if batch.len() > 1
+                && self
+                    .limit
+                    .is_some_and(|limit| batch.len() + encoded.len() + 2 > limit)
+            {
+                batch.push(']');
+                batches.push(std::mem::replace(&mut batch, String::from("[")));
+            }
+            if batch.len() > 1 {
+                batch.push(',');
+            }
+            batch.push_str(&encoded);
+        }
+        batch.push(']');
+        batches.push(batch);
+        Ok(batches)
     }
 }
