@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     sync::{
         Arc,
@@ -81,17 +81,46 @@ pub enum Driven {
     Interrupted(String),
 }
 
-#[derive(Clone)]
-struct Live {
+#[derive(Clone, Default)]
+struct Request {
+    running: bool,
     inbox: bool,
+    cancelled: bool,
     control: Option<TurnControl>,
+}
+
+#[derive(Clone, Default)]
+struct Requests {
+    requests: HashMap<String, Request>,
+    turns: HashMap<String, String>,
+}
+
+impl Requests {
+    fn cancelled(&self, id: &str) -> bool {
+        self.requests
+            .get(id)
+            .is_some_and(|request| request.cancelled)
+    }
+
+    fn idle(&self) -> bool {
+        !self.requests.values().any(|request| request.running)
+    }
+
+    fn tidy(&mut self, id: &str) {
+        if self
+            .requests
+            .get(id)
+            .is_some_and(|request| !request.running && !request.cancelled)
+        {
+            self.requests.remove(id);
+        }
+    }
 }
 
 struct Shared<H: ?Sized> {
     log: Arc<SessionLog<H>>,
     host: Arc<dyn InboxHost>,
-    live: Atom<HashMap<String, Live>>,
-    turns: Atom<HashMap<String, String>>,
+    state: Atom<Requests>,
 }
 
 #[derive(Default, Deserialize)]
@@ -124,18 +153,21 @@ impl<H: ?Sized> Shared<H> {
         match (ids.turn_id, ids.request_id) {
             (Some(turn), _) if !agent => Some(turn),
             (Some(turn), Some(accepted))
-                if self
-                    .live
-                    .read(|live| live.get(&accepted).is_some_and(|entry| entry.inbox)) =>
+                if self.state.read(|state| {
+                    state
+                        .requests
+                        .get(&accepted)
+                        .is_some_and(|request| request.running && request.inbox)
+                }) =>
             {
-                self.turns.update(|turns| {
-                    turns.insert(turn.clone(), accepted.clone());
+                self.state.update(|state| {
+                    state.turns.insert(turn.clone(), accepted.clone());
                 });
                 Some(accepted)
             }
             (Some(turn), _) => Some(
-                self.turns
-                    .read(|turns| turns.get(&turn).cloned())
+                self.state
+                    .read(|state| state.turns.get(&turn).cloned())
                     .unwrap_or(turn),
             ),
             (None, accepted) => accepted,
@@ -177,8 +209,12 @@ struct Claim<'a, H: ?Sized>(&'a Shared<H>, &'a str);
 
 impl<H: ?Sized> Drop for Claim<'_, H> {
     fn drop(&mut self) {
-        self.0.live.update(|live| {
-            live.remove(self.1);
+        self.0.state.update(|state| {
+            if let Some(request) = state.requests.get_mut(self.1) {
+                request.running = false;
+                request.control = None;
+            }
+            state.tidy(self.1);
         });
     }
 }
@@ -211,7 +247,6 @@ pub struct TurnInbox<H: ?Sized> {
     agent: Agent,
     events: SessionEvents,
     model: String,
-    cancelled: Atom<HashSet<String>>,
     busy: AtomicBool,
 }
 
@@ -235,8 +270,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         let shared = Arc::new(Shared {
             log,
             host,
-            live: Atom::default(),
-            turns: Atom::default(),
+            state: Atom::default(),
         });
         let (events, pump) =
             SessionEvents::start(stream, subagents, window, LogSink(Arc::clone(&shared)));
@@ -247,7 +281,6 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
                 agent,
                 events,
                 model: stored.summary.record.model.as_str().to_owned(),
-                cancelled: Atom::default(),
                 busy: AtomicBool::new(false),
             },
             pump,
@@ -327,13 +360,19 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             self.publish(event).await?;
         }
         if record.state == TurnState::Running {
-            self.cancelled.update(|cancelled| {
-                cancelled.insert(request_id.to_owned());
+            self.shared.state.update(|state| {
+                state
+                    .requests
+                    .entry(request_id.to_owned())
+                    .or_default()
+                    .cancelled = true;
             });
-            let live = self
-                .shared
-                .live
-                .read(|live| live.get(request_id).and_then(|entry| entry.control.clone()));
+            let live = self.shared.state.read(|state| {
+                state
+                    .requests
+                    .get(request_id)
+                    .and_then(|request| request.control.clone())
+            });
             if let Some(control) = live {
                 ignore_inactive(control.cancel().await)?;
             }
@@ -357,7 +396,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
     }
 
     fn idle(&self) -> bool {
-        self.shared.live.read(HashMap::is_empty) && self.shared.host.idle()
+        self.shared.state.read(Requests::idle) && self.shared.host.idle()
     }
 
     async fn publish(&self, event: LoggedEvent) -> Result<(), InboxError> {
@@ -439,7 +478,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             return Ok(Driven::Resumed(id));
         };
         self.shared.host.place(self.session_id(), hand.as_deref());
-        let cancel = self.cancelled.read(|cancelled| cancelled.contains(&id));
+        let cancel = self.shared.state.read(|state| state.cancelled(&id));
         Ok(match self.execute(&id, prompt, cancel, false).await {
             DurableOutcome::Waiting => Driven::Waiting(id),
             DurableOutcome::Interrupted => Driven::Interrupted(id),
@@ -455,8 +494,11 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
     ) -> Result<Driven, InboxError> {
         outcome.extend(self.shared.host.finishing(id).await);
         let finished = self.shared.log.finish(id, state, &outcome).await?;
-        self.cancelled.update(|cancelled| {
-            cancelled.remove(id);
+        self.shared.state.update(|state| {
+            if let Some(request) = state.requests.get_mut(id) {
+                request.cancelled = false;
+            }
+            state.tidy(id);
         });
         let Some((record, event)) = finished else {
             return Ok(match self.shared.log.turn(id).await? {
@@ -469,17 +511,14 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
     }
 
     async fn execute(&self, id: &str, prompt: Prompt, cancel: bool, inbox: bool) -> DurableOutcome {
-        let claimed = self.shared.live.update(|live| {
-            if live.contains_key(id) {
+        let claimed = self.shared.state.update(|state| {
+            let request = state.requests.entry(id.to_owned()).or_default();
+            if request.running {
                 return false;
             }
-            live.insert(
-                id.to_owned(),
-                Live {
-                    inbox,
-                    control: None,
-                },
-            );
+            request.running = true;
+            request.inbox = inbox;
+            request.control = None;
             true
         });
         if !claimed {
@@ -490,8 +529,8 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         if self.events.drained().await.is_err() {
             return DurableOutcome::Interrupted;
         }
-        self.shared.turns.update(|turns| {
-            turns.retain(|_, request| request != id);
+        self.shared.state.update(|state| {
+            state.turns.retain(|_, request| request != id);
         });
         self.runtime
             .durable_outcome(self.session_id(), id, outcome)
@@ -504,16 +543,16 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         prompt: Prompt,
         cancel: bool,
     ) -> Result<String, NanocodeError> {
-        let cancelled = || self.cancelled.read(|cancelled| cancelled.contains(id));
+        let cancelled = || self.shared.state.read(|state| state.cancelled(id));
         let mut request = PromptRequest::new(prompt).request_id(id);
         if cancel || cancelled() {
             request = request.cancel_on_admission();
         }
         let turn = self.agent.prompt(request).await?;
         let control = turn.control();
-        self.shared.live.update(|live| {
-            if let Some(entry) = live.get_mut(id) {
-                entry.control = Some(control.clone());
+        self.shared.state.update(|state| {
+            if let Some(request) = state.requests.get_mut(id) {
+                request.control = Some(control.clone());
             }
         });
         if cancelled() {
