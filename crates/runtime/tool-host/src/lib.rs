@@ -10,6 +10,8 @@ pub mod contract {
 }
 
 pub mod embedded;
+mod function_tool;
+pub use function_tool::{FunctionHandler, FunctionTool};
 mod policy;
 mod selection;
 pub use nanocode_code_mode::CodeModeToolObservation;

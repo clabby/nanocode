@@ -41,7 +41,7 @@ pub use nanocode_code_mode::remote::{
     CodeModeExecutors, ExecutorSelection, RemoteCodeModeHost, RemoteTransport,
 };
 pub use nanocode_code_mode::tool;
-pub use nanocode_tool_runtime::Tools;
+pub use nanocode_tool_runtime::{FunctionHandler, FunctionTool, Tools};
 
 pub use nanocode_durability::DurableAgentExt;
 
