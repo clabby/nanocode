@@ -526,7 +526,7 @@ impl Inner {
             self.catalog.send_replace(Some(specs));
         }
         self.failure.send_replace(None);
-        self.connected.send_replace(true);
+        self.publish_connection();
         Ok((generation, receiver, backlog))
     }
 
@@ -539,8 +539,15 @@ impl Inner {
                 .then(|| state.connection = None)
         });
         if detached.is_some() {
-            self.connected.send_replace(false);
+            self.publish_connection();
         }
+    }
+
+    fn publish_connection(&self) {
+        self.connected.send_if_modified(|connected| {
+            let current = self.state.read(|state| state.connection.is_some());
+            std::mem::replace(connected, current) != current
+        });
     }
 
     fn claim(&self, generation: u64, call_id: &str) -> Option<String> {
