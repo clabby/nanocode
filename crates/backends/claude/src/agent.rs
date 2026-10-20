@@ -135,6 +135,7 @@ type Handler = Arc<dyn Fn(Value, ClaudeToolInvocation) -> ToolResultFuture + Sen
 type ToolCleanup = Arc<dyn Fn() -> BackendFuture<()> + Send + Sync>;
 type CodeTurnCleanup = Arc<dyn Fn(ClaudeToolProgress) -> BackendFuture<()> + Send + Sync>;
 type NestedToolLookup = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type AgentBound = Arc<dyn Fn(&Agent) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeToolInvocation {
@@ -221,6 +222,7 @@ pub struct ClaudeTools {
     pub(crate) shared_catalog: Option<(nanocode_tool_host::Tools, std::path::PathBuf, AgentHandle)>,
     pub(crate) shared_tool_names: HashSet<String>,
     pub(crate) shared_shutdown: Option<ToolCleanup>,
+    pub(crate) agent_bound: Vec<AgentBound>,
 }
 impl nanocode_tools::ToolCollection for ClaudeTools {
     type Error = NanocodeError;
@@ -297,6 +299,12 @@ impl ClaudeTools {
     {
         self.code_turn_settle
             .push(Arc::new(move || Box::pin(settle())));
+        self
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn agent_bound(mut self, bound: impl Fn(&Agent) + Send + Sync + 'static) -> Self {
+        self.agent_bound.push(Arc::new(bound));
         self
     }
 
@@ -1202,6 +1210,7 @@ impl ClaudeBuilder {
         let mut code_turn_cleanup = Vec::new();
         let mut code_turn_preempt = Vec::new();
         let mut code_turn_settle = Vec::new();
+        let mut agent_bound = Vec::new();
         let mut nested_tools = None;
         if let Some(factory) = &self.tools_factory {
             let native = factory(handle.clone())?;
@@ -1215,6 +1224,7 @@ impl ClaudeBuilder {
             code_turn_cleanup.extend(native.code_turn_cleanup);
             code_turn_preempt.extend(native.code_turn_preempt);
             code_turn_settle.extend(native.code_turn_settle);
+            agent_bound.extend(native.agent_bound);
         }
 
         if self.claude.model.trim().is_empty()
@@ -1404,6 +1414,7 @@ impl ClaudeBuilder {
                 shared_catalog: None,
                 shared_tool_names: HashSet::new(),
                 shared_shutdown: None,
+                agent_bound: Vec::new(),
             };
             let adapted = adapter(catalog)?;
             nested_tools = adapted.nested_tools;
@@ -1422,6 +1433,7 @@ impl ClaudeBuilder {
             code_turn_cleanup.extend(adapted.code_turn_cleanup);
             code_turn_preempt.extend(adapted.code_turn_preempt);
             code_turn_settle.extend(adapted.code_turn_settle);
+            agent_bound.extend(adapted.agent_bound);
             self.client_tool_search = false;
         }
         let mut names = handlers.keys().map(String::as_str).collect::<HashSet<_>>();
@@ -1569,7 +1581,11 @@ impl ClaudeBuilder {
         });
         native_factory.state.set(Arc::downgrade(&state));
         let driver = Driver { state, handle };
-        Ok((runtime.bind(driver), events))
+        let agent = runtime.bind(driver);
+        for bound in &agent_bound {
+            bound(&agent);
+        }
+        Ok((agent, events))
     }
 }
 

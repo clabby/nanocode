@@ -1,5 +1,6 @@
 use crate::tools::{BashExecution, BashExecutor, BashRequest, BashResult, ClaudeBash};
 use async_trait::async_trait;
+use nanocode_agent_core::{Agent, PromptRequest, WeakAgent};
 use nanocode_sync::{Atom, Signal};
 use nanocode_tool_host::{
     SessionEnvironment, Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult,
@@ -11,7 +12,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -22,6 +23,20 @@ struct Job {
     result: watch::Receiver<Option<Outcome>>,
     finished: Arc<Signal>,
     abort: tokio::task::AbortHandle,
+    waiting: AtomicUsize,
+    delivered: AtomicBool,
+}
+struct Waiting<'a>(&'a Job);
+impl<'a> Waiting<'a> {
+    fn new(job: &'a Job) -> Self {
+        job.waiting.fetch_add(1, Ordering::SeqCst);
+        Self(job)
+    }
+}
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 struct Finished(Arc<Signal>);
 impl Drop for Finished {
@@ -43,8 +58,36 @@ struct Entries {
 pub(super) struct Jobs {
     next: AtomicU64,
     entries: Atom<Entries>,
+    agent: Atom<Option<WeakAgent>>,
 }
 impl Jobs {
+    pub(super) fn bind(&self, agent: &Agent) {
+        let agent = agent.downgrade();
+        self.agent.update(|bound| *bound = Some(agent.clone()));
+    }
+    fn watch(&self, id: String, job: Arc<Job>, label: String) {
+        let Some(agent) = self.agent.read(Clone::clone) else {
+            return;
+        };
+        drop(tokio::spawn(async move {
+            let outcome = completion(&job).await;
+            if job.result.borrow().is_none()
+                || job.waiting.load(Ordering::SeqCst) > 0
+                || job.delivered.swap(true, Ordering::SeqCst)
+            {
+                return;
+            }
+            let Some(agent) = agent.upgrade() else {
+                return;
+            };
+            if let Err(error) = agent
+                .route_prompt_request(PromptRequest::new(notification(&id, &label, &outcome)))
+                .await
+            {
+                tracing::warn!(%error, task_id = %id, "background Bash notification did not reach the agent");
+            }
+        }));
+    }
     pub(super) async fn shutdown(&self) {
         let jobs = self.entries.update(|entries| {
             entries.closed = true;
@@ -118,6 +161,10 @@ impl BashExecutor for LocalBash {
                 .map_or("local", SessionEnvironment::session_id),
             self.jobs.next.fetch_add(1, Ordering::Relaxed)
         );
+        let label = request
+            .description
+            .clone()
+            .unwrap_or_else(|| request.command.clone());
         let (sender, receiver) = watch::channel(None);
         let job = {
             let workspace = self.workspace.clone();
@@ -136,6 +183,8 @@ impl BashExecutor for LocalBash {
                 abort: task.abort_handle(),
                 finished,
                 result: receiver,
+                waiting: AtomicUsize::new(0),
+                delivered: AtomicBool::new(false),
             });
             self.jobs
                 .entries
@@ -167,8 +216,26 @@ impl BashExecutor for LocalBash {
             return result.map(BashExecution::Completed);
         }
         admission.0 = None;
+        self.jobs.watch(id.clone(), job, label);
         Ok(BashExecution::Background { task_id: id })
     }
+}
+fn notification(id: &str, label: &str, outcome: &Outcome) -> String {
+    let (status, summary) = match outcome {
+        Ok(result) if result.exit_code == 0 => ("completed", "completed (exit code 0)".to_owned()),
+        Ok(result) => (
+            "failed",
+            format!("failed with exit code {}", result.exit_code),
+        ),
+        Err(_) => ("failed", "failed".to_owned()),
+    };
+    let label = label
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        "<task-notification>\n<task-id>{id}</task-id>\n<status>{status}</status>\n<summary>Background command \"{label}\" {summary}</summary>\n</task-notification>"
+    )
 }
 async fn completion(job: &Job) -> Outcome {
     let mut receiver = job.result.clone();
@@ -317,6 +384,7 @@ impl TaskTool {
             .map_or(Some(30000), Value::as_u64)
             .filter(|v| *v <= 300000)
             .ok_or("timeout must be 0..300000 milliseconds")?;
+        let waiting = block.then(|| Waiting::new(&job));
         let result = if block {
             tokio::time::timeout(Duration::from_millis(timeout), completion(&job))
                 .await
@@ -328,6 +396,10 @@ impl TaskTool {
                     .then(|| Err("Bash task stopped".into()))
             })
         };
+        if result.is_some() {
+            job.delivered.store(true, Ordering::SeqCst);
+        }
+        drop(waiting);
         Ok(match result {
             None => json!({"task_id":id,"status":"running"}),
             Some(Err(error)) => json!({"task_id":id,"status":"error","error":error}),

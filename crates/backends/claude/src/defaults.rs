@@ -164,12 +164,16 @@ pub(crate) fn install_default_tools_with_providers(
     for tool in additive {
         selected = selected.add_shared_tool(tool)?;
     }
-    Ok(
+    let bound = (handle.root_session_id() == handle.session_id()).then(|| jobs.clone());
+    let tools =
         crate::claude_tools::install(&selected, workspace, handle)?.adapter_shutdown(move || {
             let jobs = jobs.clone();
             async move {
                 jobs.shutdown().await;
             }
-        }),
-    )
+        });
+    Ok(match bound {
+        Some(jobs) => tools.agent_bound(move |agent| jobs.bind(agent)),
+        None => tools,
+    })
 }
