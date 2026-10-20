@@ -73,6 +73,7 @@ impl Tool for FunctionTool {
         Box::pin(async move {
             let input = input.decode_json()?;
             Ok(match self.handler.call(&self.name, input, context).await {
+                Ok(Value::String(output)) => ToolOutput::text(output),
                 Ok(output) => ToolOutput::from_json(output, true),
                 Err(error) => ToolOutput::error(error),
             })
