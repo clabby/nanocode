@@ -39,6 +39,7 @@ struct PanelSource {
 pub struct Panel {
     pub title: String,
     pub rows: Vec<Vec<String>>,
+    pub accent: Vec<usize>,
 }
 
 impl Panel {

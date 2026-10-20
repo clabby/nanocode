@@ -399,6 +399,7 @@ fn panel_lines(app: &App, panel: &crate::host::Panel, theme: &Theme) -> Vec<Line
                 spans.push(Span::raw("  "));
             }
             let color = match column {
+                _ if panel.accent.contains(&column) => theme.accent(),
                 0 => theme.text(),
                 _ => theme.muted(),
             };
