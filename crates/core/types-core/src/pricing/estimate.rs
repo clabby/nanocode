@@ -243,7 +243,8 @@ pub struct ReportedCost {
 }
 
 impl ReportedCost {
-    fn as_cost(self, service_tier: ServiceTier) -> EstimatedUsdCost {
+    #[must_use]
+    pub fn as_cost(self, service_tier: ServiceTier) -> EstimatedUsdCost {
         let input = self.input_usd.unwrap_or_default().min(self.usd);
         EstimatedUsdCost {
             amount: self.usd,
@@ -314,7 +315,7 @@ pub fn estimate_for_model(
     model: Model,
     service_tier: ServiceTier,
 ) -> EstimatedUsdCost {
-    if let Some(reported) = &usage.reported_cost {
+    if let Some(reported) = usage.provider_cost() {
         return reported.as_cost(service_tier.effective_for_model(model));
     }
     let cached_input_tokens = usage

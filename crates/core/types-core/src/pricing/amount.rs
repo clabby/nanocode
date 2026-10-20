@@ -44,6 +44,38 @@ impl UsdAmount {
     }
 }
 
+pub mod usd_number {
+    use super::UsdAmount;
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S>(value: &Option<UsdAmount>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(amount) => serializer.serialize_f64(amount.as_f64()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<UsdAmount>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<f64>::deserialize(deserializer)?
+            .map(|usd| {
+                if !usd.is_finite() || usd < 0.0 {
+                    return Err(de::Error::custom("cost must be a non-negative USD amount"));
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let nano_usd = (usd * 1e9).round() as u64;
+                Ok(UsdAmount::from_nano_usd(nano_usd))
+            })
+            .transpose()
+    }
+}
+
 impl fmt::Display for UsdAmount {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "${}", self.decimal())

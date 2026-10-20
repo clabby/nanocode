@@ -6,6 +6,7 @@ compile_error!(
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::{Stream, StreamExt, stream};
+use nanocode_agent_types::UsdAmount;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -899,6 +900,12 @@ pub struct Usage {
     pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(
+        default,
+        with = "nanocode_agent_types::usage::usd_number",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cost: Option<UsdAmount>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -920,6 +927,8 @@ pub struct UsageDelta {
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    #[serde(default, with = "nanocode_agent_types::usage::usd_number")]
+    pub cost: Option<UsdAmount>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -2500,6 +2509,9 @@ impl MessageAccumulator {
                 }
                 if let Some(output) = usage.output_tokens {
                     self.message.usage.output_tokens = output;
+                }
+                if let Some(cost) = usage.cost {
+                    self.message.usage.cost = Some(cost);
                 }
             }
             StreamEvent::MessageStop => {

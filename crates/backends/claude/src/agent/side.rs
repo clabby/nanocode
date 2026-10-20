@@ -253,8 +253,12 @@ impl State {
                     .saturating_add(usage.cache_read_input_tokens)
                     .saturating_add(usage.cache_creation_input_tokens)
                     .saturating_add(usage.output_tokens),
-                estimated_cost: None,
-                cost_status: CostStatus::Other,
+                estimated_cost: usage.cost.map(super::reported_cost),
+                cost_status: if usage.cost.is_some() {
+                    CostStatus::ReportedByProvider
+                } else {
+                    CostStatus::Other
+                },
             })),
         ))
     }

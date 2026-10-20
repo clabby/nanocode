@@ -244,7 +244,7 @@ impl UsageTotals {
         service_tier: ServiceTier,
     ) {
         self.reported = true;
-        self.rate_estimated |= usage.reported_cost.is_none();
+        self.rate_estimated |= usage.provider_cost().is_none();
         self.input_tokens += usage.input_tokens;
         self.cached_input_tokens += usage
             .input_tokens_details

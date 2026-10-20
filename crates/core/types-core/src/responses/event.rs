@@ -16,6 +16,25 @@ pub struct Usage {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_cost: Option<crate::pricing::ReportedCost>,
+
+    #[serde(
+        default,
+        with = "crate::pricing::usd_number",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cost: Option<crate::pricing::UsdAmount>,
+}
+
+impl Usage {
+    #[must_use]
+    pub fn provider_cost(&self) -> Option<crate::pricing::ReportedCost> {
+        self.reported_cost.or_else(|| {
+            self.cost.map(|usd| crate::pricing::ReportedCost {
+                usd,
+                input_usd: None,
+            })
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

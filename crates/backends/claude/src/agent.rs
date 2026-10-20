@@ -5,10 +5,11 @@ use crate::{
 };
 use futures_util::{FutureExt as _, StreamExt};
 use nanocode_agent_core::{
-    Agent, AgentEvents, AgentHandle, AgentSessionContext, Capabilities, CostStatus, ForkPoint,
-    ForkRequest, HarnessFamily, Lineage, ModelSelection, ModelTransport, Mutability, NanocodeError,
-    Origin, Persistence, ReportedTurnUsage, Result, SessionCheckpoint, SpawnOptions, Thinking,
-    TurnResult, TurnUsage,
+    Agent, AgentEvents, AgentHandle, AgentSessionContext, Capabilities, CostStatus,
+    EstimatedUsdCost, ForkPoint, ForkRequest, HarnessFamily, Lineage, ModelSelection,
+    ModelTransport, Mutability, NanocodeError, Origin, Persistence, ReportedCost,
+    ReportedTurnUsage, Result, ServiceTier, SessionCheckpoint, SpawnOptions, Thinking, TurnResult,
+    TurnUsage, UsdAmount,
     backend::{
         AgentFactory, BackendFuture, BackendPrompt, BackendPromptRoute, BackendRuntime,
         BackendTurn, BackendTurnKey, BuilderBackend, LifecycleBackend, TurnBoundary,
@@ -116,6 +117,17 @@ fn bound_tool_result(content: ToolResultContent) -> ToolResultContent {
 }
 
 const fn add_usage(total: &mut Usage, usage: &Usage) {
+    let first = total.input_tokens == 0
+        && total.cache_read_input_tokens == 0
+        && total.cache_creation_input_tokens == 0
+        && total.output_tokens == 0;
+    total.cost = match (total.cost, usage.cost) {
+        (Some(sum), Some(cost)) => Some(UsdAmount::from_nano_usd(
+            sum.nano_usd().saturating_add(cost.nano_usd()),
+        )),
+        (None, cost) if first => cost,
+        _ => None,
+    };
     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
     total.cache_read_input_tokens = total
         .cache_read_input_tokens
@@ -124,6 +136,14 @@ const fn add_usage(total: &mut Usage, usage: &Usage) {
         .cache_creation_input_tokens
         .saturating_add(usage.cache_creation_input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+}
+
+fn reported_cost(usd: UsdAmount) -> EstimatedUsdCost {
+    ReportedCost {
+        usd,
+        input_usd: None,
+    }
+    .as_cost(ServiceTier::default())
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -6503,8 +6523,12 @@ impl State {
                         .saturating_add(usage.cache_read_input_tokens)
                         .saturating_add(usage.cache_creation_input_tokens)
                         .saturating_add(usage.output_tokens),
-                    estimated_cost: None,
-                    cost_status: CostStatus::Other,
+                    estimated_cost: usage.cost.map(reported_cost),
+                    cost_status: if usage.cost.is_some() {
+                        CostStatus::ReportedByProvider
+                    } else {
+                        CostStatus::Other
+                    },
                 })),
                 None,
             ));

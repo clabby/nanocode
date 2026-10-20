@@ -1,4 +1,6 @@
-pub use nanocode_types_core::pricing::{CostStatus, EstimatedUsdCost, ServiceTier, UsdAmount};
+pub use nanocode_types_core::pricing::{
+    CostStatus, EstimatedUsdCost, ReportedCost, ServiceTier, UsdAmount, usd_number,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

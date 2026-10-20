@@ -3,7 +3,7 @@ mod estimate;
 
 use serde::{Deserialize, Serialize};
 
-pub use amount::UsdAmount;
+pub use amount::{UsdAmount, usd_number};
 pub use estimate::{EstimatedUsdCost, ReportedCost, ServiceTier, estimate, estimate_for_model};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
