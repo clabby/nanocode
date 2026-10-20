@@ -1,10 +1,12 @@
 mod kv;
 mod payload;
+mod sql;
 mod state;
 mod store;
 
 pub use kv::{KeyValue, KeyValueStore, Versioned};
 pub use payload::EncodedPayload;
+pub use sql::{Sql, SqlRow, SqlStatement, SqlStore};
 pub use state::{
     DurableCheckpoint, IdentifiedSteerReceipt, JournalState, OperationState, OperationStatus,
     RetainedCheckpoint, SteerState, StepState, StepStatus, Transition,

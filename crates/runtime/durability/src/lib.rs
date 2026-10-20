@@ -24,9 +24,10 @@ pub use memory::MemoryStore;
 pub use nanocode_durability_core::{
     Committed, EncodedPayload, Error, EventCursor, EventHit, EventHits, EventOrder, EventPage,
     EventQuery, EventRange, IndexedState, KeyValue, KeyValueStore, OwnedCommit, OwnedState,
-    OwnerId, OwnerToken, Result, StateCommit, StateCursor, StatePage, StateQuery, StateReader,
-    StateStore, StateSummary, StoreError, StoreEvent, StoreFuture, StoreRecord, StoreReplacement,
-    StoreUpdate, StoredEvent, StoredState, SummaryUpdate, Versioned,
+    OwnerId, OwnerToken, Result, Sql, SqlRow, SqlStatement, SqlStore, StateCommit, StateCursor,
+    StatePage, StateQuery, StateReader, StateStore, StateSummary, StoreError, StoreEvent,
+    StoreFuture, StoreRecord, StoreReplacement, StoreUpdate, StoredEvent, StoredState,
+    SummaryUpdate, Versioned,
 };
 pub use paged::{PagedWriter, PayloadReader, Prepared, Sequence, SequenceCache, load_sequence};
 pub use session::{
