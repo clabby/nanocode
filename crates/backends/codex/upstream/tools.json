@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/openai/codex",
-  "revision": "ac9db7d8b556c7c34a73793aed34b1f980a4fe39",
+  "revision": "c6e4438a5d5befe6c8e59b01b6534eb8f0792230",
   "profile": {
     "platform": "non-Windows schema profile, also used by WASM hosts",
     "exec_permission_approvals_enabled": false,
@@ -15,7 +15,7 @@
     },
     {
       "path": "codex-rs/core/src/tools/handlers/shell_spec.rs",
-      "sha256": "9ce069d9e1cb1edda8b71620f3e29809f6eead49e5f71d96df5727ca18ed6d5e"
+      "sha256": "295ccf74418667b379b01879a1832eb755c41e50dac600df6929d114919aa8f2"
     },
     {
       "path": "codex-rs/core/src/tools/handlers/apply_patch_spec.rs",
@@ -43,7 +43,7 @@
     },
     {
       "path": "codex-rs/tools/src/json_schema/types.rs",
-      "sha256": "17b11a7cf8530b9df722d382cad8066aca6c2a5d27d593e937ffdd3304f64d4a"
+      "sha256": "20e6c81ed17bb75110d3b8ea224b975ce8266a0d23411854ce3f5522365be1a5"
     }
   ],
   "local_artifacts": [

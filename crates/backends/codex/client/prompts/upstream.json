@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/openai/codex",
-  "revision": "ac9db7d8b556c7c34a73793aed34b1f980a4fe39",
+  "revision": "c6e4438a5d5befe6c8e59b01b6534eb8f0792230",
   "source_url": "https://raw.githubusercontent.com/openai/codex/ac9db7d8b556c7c34a73793aed34b1f980a4fe39/codex-rs/models-manager/models.json",
   "source_sha256": "943ca7fe1d19ed019054158303f0dbbd80b3bef43b3aa425a71aa7cb3fb52c2b",
   "extraction": "UTF-8 encoding of the decoded instructions_template JSON string, with no trimming or added newline.",

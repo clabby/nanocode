@@ -13,12 +13,12 @@ pub use process::ProcessGroupGuard;
 pub use process::ambient_sensitive_environment;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -31,6 +31,8 @@ pub use nanocode_process_contracts::{
     MAX_POLL_YIELD_MS,
 };
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
+const MAX_SESSIONS: usize = 64;
+const PROTECTED_SESSIONS: usize = 8;
 
 pub use nanocode_process_contracts::{
     ExecCommand, ExecCommandResult, ForegroundCommand, ForegroundExecutor, ProcessExecutors,
@@ -94,6 +96,7 @@ type Sessions = Arc<Atom<HashMap<i64, Arc<Session>>>>;
 
 pub struct ShellSessions {
     terminations: AtomicU64,
+    uses: AtomicU64,
     sessions: Sessions,
     next_session_id: AtomicI64,
     default_shell: selection::Shell,
@@ -104,6 +107,7 @@ impl ShellSessions {
     pub fn with_environment(environment: Arc<Vec<(OsString, OsString)>>) -> Self {
         Self {
             terminations: AtomicU64::new(0),
+            uses: AtomicU64::new(0),
             sessions: Arc::default(),
             next_session_id: AtomicI64::new(1),
             default_shell: selection::default_user_shell(),
@@ -172,12 +176,23 @@ impl ShellSessions {
                 MAX_EXEC_YIELD_MS,
             );
             let max_output_tokens = command.max_output_tokens;
+            session
+                .last_used
+                .store(self.uses.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+            let busy = Busy::new(&session);
             let initial = session.owner.run(move |state| {
                 Box::pin(state.wait_for_output(yield_time, max_output_tokens, started_at))
             });
-            self.sessions.update(|sessions| {
+            let pruned = self.sessions.update(|sessions| {
+                let pruned = prune(sessions);
                 sessions.insert(session_id, Arc::clone(&session));
+                pruned
             });
+            if let Some(pruned) = pruned {
+                tokio::spawn(async move {
+                    pruned.terminate().await;
+                });
+            }
             if self.terminations.load(Ordering::SeqCst) != terminations {
                 self.forget(session_id);
                 session.process_group.terminate_and_disarm();
@@ -186,6 +201,7 @@ impl ShellSessions {
             let result = initial
                 .await
                 .unwrap_or_else(|_| session.stopped(started_at));
+            drop(busy);
             cancellation.session = None;
             if result.exit_code.is_some() {
                 self.forget(session_id);
@@ -230,6 +246,10 @@ impl ShellSessions {
             let yield_time = duration_ms(request.yield_time_ms, default, minimum, maximum);
             let max_output_tokens = request.max_output_tokens;
             let chars = request.chars;
+            session
+                .last_used
+                .store(self.uses.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+            let busy = Busy::new(&session);
             let result = session
                 .owner
                 .run(move |state| {
@@ -254,6 +274,7 @@ impl ShellSessions {
                 })
                 .await
                 .unwrap_or_else(|_| session.stopped(started_at));
+            drop(busy);
             if result.exit_code.is_some() {
                 self.forget(session_id);
             }
@@ -285,6 +306,43 @@ struct Session {
     tty: bool,
     process_group: process::SharedProcessGroup,
     owner: Actor<SessionState>,
+    last_used: AtomicU64,
+    busy: AtomicUsize,
+}
+
+struct Busy<'a>(&'a Session);
+
+impl<'a> Busy<'a> {
+    fn new(session: &'a Session) -> Self {
+        session.busy.fetch_add(1, Ordering::SeqCst);
+        Self(session)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn prune(sessions: &mut HashMap<i64, Arc<Session>>) -> Option<Arc<Session>> {
+    if sessions.len() < MAX_SESSIONS {
+        return None;
+    }
+    let mut recent = sessions
+        .values()
+        .map(|session| (session.last_used.load(Ordering::Relaxed), session.id))
+        .collect::<Vec<_>>();
+    recent.sort_unstable_by(|left, right| right.cmp(left));
+    let protected = recent
+        .iter()
+        .take(PROTECTED_SESSIONS)
+        .map(|(_, id)| *id)
+        .collect::<HashSet<_>>();
+    let victim = recent.iter().rev().find_map(|(_, id)| {
+        (!protected.contains(id) && sessions[id].busy.load(Ordering::SeqCst) == 0).then_some(*id)
+    })?;
+    sessions.remove(&victim)
 }
 
 struct SessionState {
@@ -331,6 +389,8 @@ impl Session {
             tty,
             process_group,
             owner,
+            last_used: AtomicU64::new(0),
+            busy: AtomicUsize::new(0),
         }))
     }
 
