@@ -21,8 +21,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    RemoteCodeModeHost, RemoteContext, RemoteFrame as Frame, RemoteOperation, RemoteTransport,
-    deliver_update,
+    ReceivedCalls, RemoteCodeModeHost, RemoteContext, RemoteFrame as Frame, RemoteOperation,
+    RemoteTransport, output_to_wire,
 };
 use crate::{
     Tool, ToolDefinition, ToolInput,
@@ -68,7 +68,7 @@ impl Observer {
         let Some(mut observer) = self.current.take() else {
             return Ok(());
         };
-        let delivered = deliver_update(observer.as_mut(), update);
+        let delivered = ReceivedCalls::default().deliver(Some(observer.as_mut()), update);
         if let Some(newer) = self.current.put(observer) {
             self.current.put(newer);
         }
@@ -279,9 +279,10 @@ impl Client {
                 freeform,
                 context,
                 hand,
+                compact,
             } => {
                 return Ok(Some(
-                    self.callback(id, name, input, freeform, context, hand),
+                    self.callback(id, name, input, freeform, context, hand, compact),
                 ));
             }
             _ => return Err(error("unexpected runner frame")),
@@ -289,6 +290,7 @@ impl Client {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn callback(
         self: &Arc<Self>,
         id: u64,
@@ -297,6 +299,7 @@ impl Client {
         freeform: bool,
         context: RemoteContext,
         hand: Option<String>,
+        compact: bool,
     ) -> HostFuture<'static, ()> {
         let key = (
             context.session_id.clone(),
@@ -342,8 +345,7 @@ impl Client {
                         authoritative.call_id = context.call_id;
                         let owned = authoritative.owned();
                         let output = hands.call(&hand, &name, input, owned.as_context()).await;
-                        return serde_json::to_value(output.into_wire().map_err(error)?)
-                            .map_err(error);
+                        return output_to_wire(output, compact);
                     }
                     let Some((Some(tool), mut authoritative)) = local else {
                         return Err(error(format!("brain callback tool `{name}` unavailable")));
@@ -364,7 +366,7 @@ impl Client {
                         .execute(input, owned.as_context())
                         .await
                         .map_err(error)?;
-                    serde_json::to_value(output.into_wire().map_err(error)?).map_err(error)
+                    output_to_wire(output, compact)
                 },
                 registration,
             );
@@ -430,6 +432,7 @@ impl Client {
             id,
             operation,
             max_frame_bytes: self.max_frame_bytes,
+            compact: true,
         }
     }
 
@@ -669,21 +672,21 @@ impl RemoteTransport for RemoteClient {
                 .dispatch(frame, RemoteDelivery::Durable)
                 .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
             let reply = async {
+                let mut received = ReceivedCalls::default();
                 while let Some(frame) = replies.recv().await {
                     match frame {
                         Frame::Reply { result, .. } => {
                             return result
                                 .map_err(error)?
-                                .map(|value| {
+                                .map(|mut value| {
+                                    received.execution(&mut value)?;
                                     serde_json::from_value::<CodeModeExecution>(value)
                                         .map_err(error)
                                 })
                                 .transpose();
                         }
                         Frame::Update { update, .. } => {
-                            if let Some(observer) = observer.as_deref_mut() {
-                                deliver_update(observer, update)?;
-                            }
+                            received.deliver(observer.as_deref_mut(), update)?;
                         }
                         _ => return Err(error("unexpected operation reply")),
                     }

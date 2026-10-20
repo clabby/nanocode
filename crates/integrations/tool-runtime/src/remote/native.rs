@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     ToolInput, ToolOutput,
-    contract::{ToolError, ToolOutputWire, ToolResult},
+    contract::{ToolError, ToolResult},
     embedded::{CodeModeUpdate, HandCalls},
     runtime::ToolRuntime,
 };
@@ -638,24 +638,10 @@ impl Outgoing {
         &self,
         frame: &Frame,
         fallback: impl FnOnce(&CodeModeHostError) -> Frame,
-    ) -> Result<(), CodeModeHostError> {
+    ) -> Result<bool, CodeModeHostError> {
         match self.encode(frame) {
-            Ok(text) => self.push(text),
-            Err(issue) => self.send(&fallback(&issue)),
-        }
-    }
-}
-
-fn update_wire(update: &CodeModeUpdate<'_>) -> Value {
-    match update {
-        CodeModeUpdate::NestedCallStarted {
-            call_id,
-            name,
-            input,
-        } => json!({"call_id":call_id,"name":name,"input":input}),
-        CodeModeUpdate::NestedCallCompleted(call) => json!({"completed":nested(call)}),
-        CodeModeUpdate::Notification(notification) => {
-            json!({"notification":{"call_id":notification.call_id,"text":notification.text}})
+            Ok(text) => self.push(text).map(|()| true),
+            Err(issue) => self.send(&fallback(&issue)).map(|()| false),
         }
     }
 }
@@ -727,7 +713,11 @@ fn reply(
         return;
     };
     if let Some(Value::Array(calls)) = execution.get_mut("nested_calls") {
-        for call in calls.iter_mut().filter_map(Value::as_object_mut) {
+        for call in calls
+            .iter_mut()
+            .filter_map(Value::as_object_mut)
+            .filter(|call| !call.contains_key("delivered"))
+        {
             call.insert("input".into(), Value::Null);
             call.insert(
                 "output".into(),
@@ -767,20 +757,24 @@ fn reply(
 struct Observer {
     id: u64,
     outgoing: Outgoing,
+    calls: SentCalls,
 }
 impl CodeModeObserver for Observer {
     fn update(&mut self, update: CodeModeUpdate<'_>) {
         let id = self.id;
-        let _ = self.outgoing.send_or(
+        let sent = self.outgoing.send_or(
             &Frame::Update {
                 id,
-                update: update_wire(&update),
+                update: self.calls.update(&update),
             },
             |issue| Frame::Update {
                 id,
                 update: unsent_update(&update, issue),
             },
         );
+        if matches!(sent, Ok(true)) {
+            self.calls.sent(&update);
+        }
     }
 }
 
@@ -789,6 +783,7 @@ struct DetachedObserver {
     origin_call_id: String,
     outgoing: Outgoing,
     catalog: CallbackCatalog,
+    calls: SentCalls,
 }
 impl CodeModeObserver for DetachedObserver {
     fn update(&mut self, update: CodeModeUpdate<'_>) {
@@ -799,7 +794,7 @@ impl CodeModeObserver for DetachedObserver {
         };
         let _ = self
             .outgoing
-            .send_or(&frame(update_wire(&update)), |issue| {
+            .send_or(&frame(self.calls.update(&update)), |issue| {
                 frame(unsent_update(&update, issue))
             });
     }
@@ -863,7 +858,7 @@ async fn callback(bus: &Arc<CallbackBus>, frame: impl FnOnce(u64) -> Frame) -> T
         None => rx.await,
     };
     let value = result.map_err(|e| -> ToolError { e.to_string().into() })??;
-    ToolOutput::from_wire(serde_json::from_value::<ToolOutputWire>(value)?).map_err(Into::into)
+    output_from_wire(value).map_err(Into::into)
 }
 
 struct CallbackTool {
@@ -888,6 +883,7 @@ impl Tool for CallbackTool {
             freeform,
             context,
             hand: None,
+            compact: true,
         })
         .await
     }
@@ -919,6 +915,7 @@ impl HandCalls for HandCallbacks {
                 freeform: false,
                 context,
                 hand: Some(hand.into()),
+                compact: true,
             })
             .await
             .unwrap_or_else(|error| ToolOutput::error(error.to_string()))
@@ -1227,7 +1224,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     let Some(frame) = frame? else { return Ok(()); };
                     match frame {
                         Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.update(|pending| pending.remove(&id)).and_then(|tx| tx.take()) { let _ = tx.send(result); } },
-                        Frame::Request { id, operation, max_frame_bytes } => {
+                        Frame::Request { id, operation, max_frame_bytes, compact } => {
                             if let Some(bytes) = max_frame_bytes { outgoing.limit.fetch_min(bytes, Ordering::Relaxed); }
                             let session_id = match &operation { RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } | RemoteOperation::Call { context, .. } => &context.session_id, RemoteOperation::Cancel { session_id } | RemoteOperation::CancelTurn { session_id } | RemoteOperation::DetachTurn { session_id } | RemoteOperation::BeginTurn { session_id } | RemoteOperation::Preempt { session_id } | RemoteOperation::SettlePreempt { session_id } => session_id }.clone();
                             if matches!(&operation, RemoteOperation::Execute { .. } | RemoteOperation::Call { .. }) && !runtimes.contains_key(&session_id) {
@@ -1261,10 +1258,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             });
                             if let Some((runtime, catalog, turn)) = &runtime {
                                 match &operation {
-                                    RemoteOperation::CancelTurn { .. } => { runtime.control().cancel_turn_with_updates(&mut Observer { id, outgoing:outgoing.clone() }).await; catalog.finish_turn(Some(*turn)); outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
+                                    RemoteOperation::CancelTurn { .. } => { runtime.control().cancel_turn_with_updates(&mut Observer { id, outgoing:outgoing.clone(), calls:SentCalls::new(compact) }).await; catalog.finish_turn(Some(*turn)); outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
                                     RemoteOperation::BeginTurn { .. } => { runtime.control().begin_turn(); catalog.begin_turn(); outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
                                     RemoteOperation::SettlePreempt { .. } => { runtime.control().settle_preempt(); outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
-                                    RemoteOperation::DetachTurn { session_id } => { runtime.control().detach_turn_with_updates(&mut |origin| Box::new(DetachedObserver { session_id:session_id.clone(), origin_call_id:origin.into(), outgoing:outgoing.clone(), catalog:catalog.clone() })).await; outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
+                                    RemoteOperation::DetachTurn { session_id } => { runtime.control().detach_turn_with_updates(&mut |origin| Box::new(DetachedObserver { session_id:session_id.clone(), origin_call_id:origin.into(), outgoing:outgoing.clone(), catalog:catalog.clone(), calls:SentCalls::new(compact) })).await; outgoing.send(&Frame::Reply { id, result:Ok(None) })?; continue; },
                                     _ => {},
                                 }
                             }
@@ -1275,13 +1272,13 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     let Some((runtime, catalog, turn)) = runtime else {
                                         return match operation { RemoteOperation::Execute { .. } | RemoteOperation::Wait { .. } | RemoteOperation::Call { .. } => Err(error("this hand has no cells for the session: it restarted or reconnected since the cell started, so the cell's outcome is unknown")), _ => Ok(None) };
                                     };
-                                    let mut observer = Observer { id, outgoing:outgoing.clone() };
+                                    let mut observer = Observer { id, outgoing:outgoing.clone(), calls:SentCalls::new(compact) };
                                     match operation {
                                         RemoteOperation::Execute { source, context, .. } => {
                                             let mut origin = CallbackOriginGuard { catalog:catalog.clone(), origin:context.call_id.clone(), retained:false };
                                             let result = runtime.execute_code_owned_with_updates(&source, context.owned(), &mut observer).await;
                                             origin.retained = result.as_ref().is_ok_and(|execution| execution.cell.as_ref().is_some_and(|cell| cell.running));
-                                            result.map(|value| { status = Some(status_line(&value)); Some(execution_to_wire(value)) })
+                                            result.map(|value| { status = Some(status_line(&value)); Some(observer.calls.execution(value)) })
                                         },
                                         RemoteOperation::Wait { input, context } => {
                                             let execution = runtime.wait_for_code_with_updates(&input, context.owned().as_context(), &mut observer).await?;
@@ -1290,16 +1287,16 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                                 else { catalog.finish(&cell.origin_call_id); }
                                             }
                                             status = Some(status_line(&execution));
-                                            Ok(Some(execution_to_wire(execution)))
+                                            Ok(Some(observer.calls.execution(execution)))
                                         },
                                         RemoteOperation::Call { name, input, context } => {
                                             let owned = context.owned();
                                             let output = runtime.execute_nested_tool(&name, input, owned.as_context()).await;
-                                            serde_json::to_value(output.into_wire().map_err(error)?).map(Some).map_err(error)
+                                            output_to_wire(output, compact).map(Some)
                                         },
                                         RemoteOperation::Cancel { .. } => { runtime.control().cancel_with_updates(&mut observer).await; catalog.finish_turn(None); Ok(None) },
                                         RemoteOperation::CancelTurn { .. } => { runtime.control().cancel_turn_with_updates(&mut observer).await; catalog.finish_turn(Some(turn)); Ok(None) },
-                                        RemoteOperation::DetachTurn { session_id } => { runtime.control().detach_turn_with_updates(&mut |origin| Box::new(DetachedObserver { session_id:session_id.clone(), origin_call_id:origin.into(), outgoing:outgoing.clone(), catalog:catalog.clone() })).await; Ok(None) },
+                                        RemoteOperation::DetachTurn { session_id } => { runtime.control().detach_turn_with_updates(&mut |origin| Box::new(DetachedObserver { session_id:session_id.clone(), origin_call_id:origin.into(), outgoing:outgoing.clone(), catalog:catalog.clone(), calls:SentCalls::new(compact) })).await; Ok(None) },
                                     RemoteOperation::BeginTurn { .. } => { runtime.control().begin_turn(); catalog.begin_turn(); Ok(None) },
                                         RemoteOperation::Preempt { .. } => { runtime.control().preempt_turn().await; Ok(None) },
                                         RemoteOperation::SettlePreempt { .. } => { runtime.control().settle_preempt(); Ok(None) },

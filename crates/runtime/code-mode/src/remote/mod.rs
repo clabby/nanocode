@@ -1,4 +1,5 @@
 mod client;
+mod compact;
 mod executors;
 
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use nanocode_sync::Atom;
 pub use client::{
     LOCAL_CLOSED, PEER_CLOSED, RemoteActivity, RemoteClient, RemoteDelivery, RemoteLink,
 };
+pub use compact::{ReceivedCalls, SentCalls, output_from_wire, output_to_wire};
 pub use executors::{
     CodeModeExecutors, ExecutorSelection, HandRoute, HandsTool, PLACEMENT_INSTRUCTIONS, Placement,
 };
@@ -18,7 +20,6 @@ use serde_json::{Value, json};
 
 use crate::{
     Tool, ToolContext, ToolDefinition, ToolOutput,
-    contract::ToolOutputWire,
     embedded::{
         CodeModeExecution, CodeModeHost, CodeModeHostError, CodeModeObserver, EmbeddedToolMode,
         HandCalls, HostFuture, OwnedToolContext,
@@ -245,12 +246,7 @@ impl CodeModeHost for RemoteCodeModeHost {
             input,
             context: RemoteContext::from_context(context),
         };
-        Box::pin(async move {
-            let value = self.transport.call(operation).await?;
-            let wire = serde_json::from_value::<ToolOutputWire>(value)
-                .map_err(|error| CodeModeHostError::new(error.to_string()))?;
-            ToolOutput::from_wire(wire).map_err(|error| CodeModeHostError::new(error.to_string()))
-        })
+        Box::pin(async move { output_from_wire(self.transport.call(operation).await?) })
     }
     fn route_hands(&self, name: &str, hands: Arc<dyn HandCalls>) {
         self.hand.set(Some(name.into()));
@@ -384,6 +380,8 @@ pub enum RemoteFrame {
         operation: RemoteOperation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_frame_bytes: Option<usize>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compact: bool,
     },
     Reply {
         id: u64,
@@ -401,6 +399,8 @@ pub enum RemoteFrame {
         context: RemoteContext,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hand: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compact: bool,
     },
     CallbackCancel {
         id: u64,
