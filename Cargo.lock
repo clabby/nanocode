@@ -1764,6 +1764,7 @@ dependencies = [
  "nanocode-code-mode",
  "nanocode-durability",
  "nanocode-home",
+ "nanocode-http",
  "nanocode-media",
  "nanocode-platform",
  "nanocode-process",

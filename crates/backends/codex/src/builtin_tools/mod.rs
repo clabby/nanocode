@@ -68,6 +68,7 @@ pub fn tool_runtime(
                 tools.web_search_enabled().then(|| WebSearchConfig {
                     endpoint: config.search_endpoint(),
                     auth: config.auth.clone(),
+                    http_layer: config.http_layer.clone(),
                 }),
                 tools
                     .image_generation_enabled()
@@ -75,6 +76,7 @@ pub fn tool_runtime(
                         api_base_url: config.api_base_url.clone(),
                         auth: config.auth.clone(),
                         save_root: workspace.to_path_buf(),
+                        http_layer: config.http_layer.clone(),
                     }),
                 tools.remote_http_client().unwrap_or_default(),
             )

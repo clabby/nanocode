@@ -28,6 +28,7 @@ pub struct WebSearchHandler {
     client: reqwest::Client,
     endpoint: String,
     auth: OpenAiAuth,
+    http_layer: Option<std::sync::Arc<dyn nanocode_http::layer::Layer>>,
 }
 
 impl WebSearchHandler {
@@ -36,6 +37,7 @@ impl WebSearchHandler {
             client,
             endpoint: config.endpoint,
             auth: config.auth,
+            http_layer: config.http_layer,
         }
     }
 
@@ -165,13 +167,15 @@ impl WebSearchHandler {
         if auth.is_fedramp() {
             request = request.header("X-OpenAI-Fedramp", "true");
         }
-        request
-            .json(body)
-            .send()
+        let request = request.json(body).build().map_err(|error| RequestFailure {
+            message: format!("standalone web search request failed: {error}"),
+            retryable: false,
+        })?;
+        nanocode_http::execute(&self.client, self.http_layer.as_deref(), request)
             .await
             .map_err(|error| RequestFailure {
                 message: format!("standalone web search request failed: {error}"),
-                retryable: true,
+                retryable: error.is_retryable() || error.is_unsent(),
             })
     }
 

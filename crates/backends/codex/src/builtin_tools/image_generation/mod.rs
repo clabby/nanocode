@@ -29,6 +29,7 @@ pub struct ImageGenerationHandler {
     edit_endpoint: String,
     auth: OpenAiAuth,
     save_root: PathBuf,
+    http_layer: Option<std::sync::Arc<dyn nanocode_http::layer::Layer>>,
 }
 
 impl ImageGenerationHandler {
@@ -40,6 +41,7 @@ impl ImageGenerationHandler {
             edit_endpoint: format!("{api_base_url}/images/edits"),
             auth: config.auth,
             save_root: config.save_root,
+            http_layer: config.http_layer,
         }
     }
 
@@ -217,9 +219,11 @@ impl ImageGenerationHandler {
         if auth.is_fedramp() {
             request = request.header("X-OpenAI-Fedramp", "true");
         }
-        request
+        let request = request
             .json(body)
-            .send()
+            .build()
+            .map_err(|error| format!("image request failed: {error}"))?;
+        nanocode_http::execute(&self.client, self.http_layer.as_deref(), request)
             .await
             .map_err(|error| format!("image request failed: {error}"))
     }

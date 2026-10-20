@@ -57,6 +57,7 @@ nanocode-tool-contracts.workspace = true
 "reqwest" = { "workspace" = true  }
 "nanocode-tls" = { "workspace" = true }
 "nanocode-process" = { "workspace" = true }
+"nanocode-http" = { "workspace" = true }
 "async-trait" = { "workspace" = true }
 
 ["target"."cfg(target_os = \"macos\")"]

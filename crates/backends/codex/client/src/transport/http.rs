@@ -18,6 +18,22 @@ const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 #[cfg(not(target_family = "wasm"))]
 const ZSTD_LEVEL: i32 = 3;
+#[cfg(not(target_family = "wasm"))]
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(not(target_family = "wasm"))]
+async fn idle<T>(read: impl std::future::Future<Output = T>) -> Result<T, ResponsesError> {
+    tokio::time::timeout(STREAM_IDLE_TIMEOUT, read)
+        .await
+        .map_err(|_| ResponsesError::HttpRequest {
+            detail: format!(
+                "the Responses stream sent no data for {} s; the stream stalled",
+                STREAM_IDLE_TIMEOUT.as_secs()
+            ),
+            retryable: true,
+            timeout: true,
+        })
+}
 
 #[derive(Clone)]
 pub(crate) struct ResponsesHttp {
@@ -159,7 +175,9 @@ impl ResponsesHttp {
         if let Some(layer) = &self.layer {
             return self.send_layered(layer.as_ref(), request).await;
         }
-        let response = self.client.execute(request).await.map_err(map_http_error)?;
+        let response = idle(self.client.execute(request))
+            .await?
+            .map_err(map_http_error)?;
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(response.headers());
@@ -213,12 +231,9 @@ impl ResponsesHttp {
                 .map(<[u8]>::to_vec)
                 .unwrap_or_default(),
         };
-        let sender = ReqwestSender {
-            client: &self.client,
-        };
-        let response = layer
-            .send(request, layer::Next::new(&sender))
-            .await
+        let sender = nanocode_http::ReqwestSender::new(&self.client);
+        let response = idle(layer.send(request, layer::Next::new(&sender)))
+            .await?
             .map_err(map_layer_error)?;
         let (status, headers, body, events) = response.into_parts();
         if !status.is_success() {
@@ -258,59 +273,6 @@ impl ResponsesHttp {
             metadata,
         ))
     }
-}
-
-#[cfg(not(target_family = "wasm"))]
-struct ReqwestSender<'a> {
-    client: &'a reqwest::Client,
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl layer::Sender for ReqwestSender<'_> {
-    fn send(
-        &self,
-        request: layer::Request,
-    ) -> layer::BoxFuture<'_, Result<layer::Response, layer::Error>> {
-        Box::pin(async move {
-            use futures_util::TryStreamExt;
-
-            let response = self
-                .client
-                .request(request.method, request.url)
-                .headers(request.headers)
-                .body(request.body)
-                .send()
-                .await
-                .map_err(reqwest_layer_error)?;
-            let status = response.status();
-            let headers = response.headers().clone();
-            Ok(layer::Response::new(
-                status,
-                headers,
-                Box::pin(
-                    response
-                        .bytes_stream()
-                        .map_ok(Vec::from)
-                        .map_err(reqwest_layer_error),
-                ),
-            ))
-        })
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn reqwest_layer_error(error: reqwest::Error) -> layer::Error {
-    let mut detail = error.to_string();
-    let mut source = std::error::Error::source(&error);
-    while let Some(cause) = source {
-        detail.push_str(": ");
-        detail.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    layer::Error::new(detail)
-        .retryable(error.is_connect() || error.is_body() || error.is_request())
-        .timeout(error.is_timeout())
-        .unsent(error.is_connect() || error.is_builder())
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -376,7 +338,7 @@ impl ResponsesHttpStream {
                 .as_mut()
                 .and_then(|layered| layered.pending.take())
             {
-                pending.await.map_err(map_layer_error)?;
+                idle(pending).await?.map_err(map_layer_error)?;
             }
             if let Some(text) = self.buffered_text()? {
                 return Ok(text);
@@ -394,24 +356,21 @@ impl ResponsesHttpStream {
             }
             #[cfg(not(target_family = "wasm"))]
             let pushed = if let Some(host) = self.host.as_mut() {
-                host.next()
-                    .await
+                idle(host.next())
+                    .await?
                     .map_err(map_host_error)?
                     .map(|chunk| self.decoder.push(&chunk))
             } else if let Some(layered) = self.layered.as_mut() {
                 use futures_util::StreamExt;
 
-                layered
-                    .body
-                    .next()
-                    .await
+                idle(layered.body.next())
+                    .await?
                     .transpose()
                     .map_err(map_layer_error)?
                     .map(|chunk| self.decoder.push(&chunk))
             } else if let Some(response) = self.response.as_mut() {
-                response
-                    .chunk()
-                    .await
+                idle(response.chunk())
+                    .await?
                     .map_err(map_http_error)?
                     .map(|chunk| self.decoder.push(&chunk))
             } else {
