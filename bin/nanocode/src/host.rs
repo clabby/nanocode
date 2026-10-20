@@ -40,6 +40,7 @@ pub struct Panel {
     pub title: String,
     pub rows: Vec<Vec<String>>,
     pub accent: Vec<usize>,
+    pub refresh: bool,
 }
 
 impl Panel {

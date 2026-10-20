@@ -245,10 +245,12 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
     } else {
         u16::try_from(tree_lines.len() + 1).unwrap_or(u16::MAX)
     };
-    let panel_lines = app
+    let panel = app
         .show_panel
         .then(|| app.host.config.clients.render_panel())
-        .flatten()
+        .flatten();
+    app.panel_refresh = panel.as_ref().is_some_and(|panel| panel.refresh);
+    let panel_lines = panel
         .map(|panel| panel_lines(app, &panel, &theme))
         .unwrap_or_default();
     let panel_height = u16::try_from(panel_lines.len()).unwrap_or(u16::MAX);

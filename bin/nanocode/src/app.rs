@@ -267,6 +267,7 @@ pub struct App {
     pub tree: AgentTree,
     pub show_tree: bool,
     pub show_panel: bool,
+    pub(crate) panel_refresh: bool,
     pub theme: Theme,
     pub status: Option<(String, Instant)>,
     pub starting: bool,
@@ -341,6 +342,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         tree: AgentTree::default(),
         show_tree: true,
         show_panel: true,
+        panel_refresh: false,
         theme: Theme::default(),
         status: None,
         starting: true,
@@ -757,9 +759,11 @@ impl App {
                 scheduler.presented(Instant::now());
                 if self.animating() {
                     scheduler.request_at(self.spinner.next_deadline(Instant::now()));
-                    if let Some(at) = full_at {
-                        scheduler.request_at(at);
-                    }
+                }
+                if (self.animating() || self.panel_refresh)
+                    && let Some(at) = full_at
+                {
+                    scheduler.request_at(at);
                 }
                 if let Some((_, at)) = &self.status {
                     let expiry = *at + view::STATUS_VISIBLE;
