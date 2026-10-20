@@ -2345,10 +2345,7 @@ async fn accept_execution_command(
                 drop(accepted.send(Err(error)));
                 return None;
             }
-            if accepted.send(Ok(operation_id.clone())).is_err() {
-                execution.release_claim(&operation_id).await;
-                return None;
-            }
+            drop(accepted.send(Ok(operation_id.clone())));
             Some(Command::Prompt {
                 key,
                 prompt,
@@ -2375,10 +2372,7 @@ async fn accept_execution_command(
                 drop(accepted.send(Err(error)));
                 return None;
             }
-            if accepted.send(Ok(operation_id.clone())).is_err() {
-                execution.release_claim(&operation_id).await;
-                return None;
-            }
+            drop(accepted.send(Ok(operation_id.clone())));
             Some(Command::Prompt {
                 key,
                 prompt,
@@ -2538,15 +2532,9 @@ async fn accept_idle_route(
                 drop(route_result.send(Err(error)));
                 return None;
             }
-            if route_result
-                .send(Ok(PromptRouteKind::Started {
-                    request_id: Some(operation_id.clone()),
-                }))
-                .is_err()
-            {
-                execution.release_claim(&operation_id).await;
-                return None;
-            }
+            drop(route_result.send(Ok(PromptRouteKind::Started {
+                request_id: Some(operation_id.clone()),
+            })));
             Some(Command::Prompt {
                 key,
                 prompt,
@@ -2573,15 +2561,9 @@ async fn accept_idle_route(
                 drop(route_result.send(Err(error)));
                 return None;
             }
-            if route_result
-                .send(Ok(PromptRouteKind::Started {
-                    request_id: Some(operation_id.clone()),
-                }))
-                .is_err()
-            {
-                execution.release_claim(&operation_id).await;
-                return None;
-            }
+            drop(route_result.send(Ok(PromptRouteKind::Started {
+                request_id: Some(operation_id.clone()),
+            })));
             Some(Command::Prompt {
                 key,
                 prompt,
