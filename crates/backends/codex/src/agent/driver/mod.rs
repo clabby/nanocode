@@ -194,101 +194,104 @@ impl AgentDriver {
                                     result,
                                 };
                             }
-                            turn_index += 1;
-                            let prompt_content = tracing::enabled!(
-                                target: "nanocode",
-                                tracing::Level::INFO
-                            )
-                            .then(|| serde_json::to_string(&prompt).ok())
-                            .flatten();
-                            let turn_span = agent_turn_span(
-                                parent.as_ref(),
-                                session_id.as_str(),
-                                self.spawner.lineage_id.as_ref(),
-                                &self.origin,
-                                ReasoningSettings {
-                                    model: thread_model,
-                                    mode: self.spawner.config.reasoning_mode,
-                                    effort: thinking,
-                                },
-                                turn_index,
-                                prompt.text_bytes(),
-                            );
-                            drop(parent);
-                            turn_span.record("status", "cancelled");
-                            turn_span.record("otel.status_code", "ERROR");
-                            if let Some(prompt_content) = &prompt_content {
-                                turn_span.in_scope(|| {
-                                    info!(
-                                        target: "nanocode",
-                                        content_kind = "prompt",
-                                        content = prompt_content.as_str(),
-                                        "turn content"
-                                    );
-                                });
-                            }
-                            let _guard = turn_span.enter();
-                            let persisted = if cancellation_committed {
-                                Ok(())
-                            } else if let Some(operation) = &execution_operation {
-                                self.execution
-                                    .cancel_operation(operation.id(), &prompt)
-                                    .await
-                            } else {
-                                Ok(())
-                            };
-                            developer_checkpoint_ready &= persisted.is_ok();
-                            let outcome = match persisted {
-                                Ok(()) => {
-                                    model.set_events(events);
-                                    let emitted = model.emit_cancelled_before_start(
-                                        &prompt,
-                                        self.workspace.as_deref(),
-                                        thinking,
-                                        service_tier,
-                                        &NanocodeError::TurnCancelled,
-                                    );
-                                    model.set_events(self.events.clone());
-                                    emitted.and(Err(NanocodeError::TurnCancelled))
-                                }
-                                Err(error) => {
-                                    model.set_events(events);
-                                    let emitted = model.emit_failed_before_start(
-                                        &prompt,
-                                        self.workspace.as_deref(),
-                                        thinking,
-                                        service_tier,
-                                        &error,
-                                    );
-                                    model.set_events(self.events.clone());
-                                    emitted.and(Err(error))
-                                }
-                            };
-                            let outcome = self
-                                .execution
-                                .recover_failure(
-                                    execution_operation.as_ref().map(ExecutionOperation::id),
-                                    outcome,
+                            let cancelled: ExecutionFuture<'_, ()> = Box::pin(async {
+                                turn_index += 1;
+                                let prompt_content = tracing::enabled!(
+                                    target: "nanocode",
+                                    tracing::Level::INFO
                                 )
-                                .await;
-                            if !commands_open
-                                && let Err(error) = &outcome
-                                && !matches!(error, NanocodeError::TurnCancelled)
-                            {
-                                shutdown_failures.push(error.to_string());
-                            }
-                            if commands_open && outcome_requires_reopen(&outcome) {
-                                begin_shutdown(
-                                    &mut self.commands,
-                                    &mut queued_turns,
-                                    default_thinking,
-                                    default_service_tier,
-                                )
-                                .await;
-                                commands_open = false;
-                            }
-                            drop(_guard);
-                            drop(result.send(outcome));
+                                .then(|| serde_json::to_string(&prompt).ok())
+                                .flatten();
+                                let turn_span = agent_turn_span(
+                                    parent.as_ref(),
+                                    session_id.as_str(),
+                                    self.spawner.lineage_id.as_ref(),
+                                    &self.origin,
+                                    ReasoningSettings {
+                                        model: thread_model,
+                                        mode: self.spawner.config.reasoning_mode,
+                                        effort: thinking,
+                                    },
+                                    turn_index,
+                                    prompt.text_bytes(),
+                                );
+                                drop(parent);
+                                turn_span.record("status", "cancelled");
+                                turn_span.record("otel.status_code", "ERROR");
+                                if let Some(prompt_content) = &prompt_content {
+                                    turn_span.in_scope(|| {
+                                        info!(
+                                            target: "nanocode",
+                                            content_kind = "prompt",
+                                            content = prompt_content.as_str(),
+                                            "turn content"
+                                        );
+                                    });
+                                }
+                                let _guard = turn_span.enter();
+                                let persisted = if cancellation_committed {
+                                    Ok(())
+                                } else if let Some(operation) = &execution_operation {
+                                    self.execution
+                                        .cancel_operation(operation.id(), &prompt)
+                                        .await
+                                } else {
+                                    Ok(())
+                                };
+                                developer_checkpoint_ready &= persisted.is_ok();
+                                let outcome = match persisted {
+                                    Ok(()) => {
+                                        model.set_events(events);
+                                        let emitted = model.emit_cancelled_before_start(
+                                            &prompt,
+                                            self.workspace.as_deref(),
+                                            thinking,
+                                            service_tier,
+                                            &NanocodeError::TurnCancelled,
+                                        );
+                                        model.set_events(self.events.clone());
+                                        emitted.and(Err(NanocodeError::TurnCancelled))
+                                    }
+                                    Err(error) => {
+                                        model.set_events(events);
+                                        let emitted = model.emit_failed_before_start(
+                                            &prompt,
+                                            self.workspace.as_deref(),
+                                            thinking,
+                                            service_tier,
+                                            &error,
+                                        );
+                                        model.set_events(self.events.clone());
+                                        emitted.and(Err(error))
+                                    }
+                                };
+                                let outcome = self
+                                    .execution
+                                    .recover_failure(
+                                        execution_operation.as_ref().map(ExecutionOperation::id),
+                                        outcome,
+                                    )
+                                    .await;
+                                if !commands_open
+                                    && let Err(error) = &outcome
+                                    && !matches!(error, NanocodeError::TurnCancelled)
+                                {
+                                    shutdown_failures.push(error.to_string());
+                                }
+                                if commands_open && outcome_requires_reopen(&outcome) {
+                                    begin_shutdown(
+                                        &mut self.commands,
+                                        &mut queued_turns,
+                                        default_thinking,
+                                        default_service_tier,
+                                    )
+                                    .await;
+                                    commands_open = false;
+                                }
+                                drop(_guard);
+                                drop(result.send(outcome));
+                            });
+                            cancelled.await;
                             continue;
                         }
                         QueuedTurn::Stopped {
@@ -320,66 +323,69 @@ impl AgentDriver {
                 }
 
                 if developer_checkpoint_ready && !pending_developer_messages.is_empty() {
-                    let mut developer_messages = pending_developer_messages.drain(..);
-                    while let Some((text, message_result)) = developer_messages.next() {
-                        if message_result
-                            .prefix()
-                            .is_some_and(|prefix| model.developer_notice_current(prefix, &text))
-                        {
-                            message_result.skip();
-                            continue;
-                        }
-                        let committed = commit_developer_message(
-                            &mut model,
-                            &self.execution,
-                            Arc::clone(&self.spawner.lineage_id),
-                            (thread_model, default_thinking, default_service_tier),
-                            text,
-                            self.workspace.as_deref(),
-                        )
-                        .await;
-                        let committed = match committed {
-                            Ok(checkpoint) => {
-                                if let Some(checkpoint) = checkpoint {
-                                    latest_fork_checkpoint = Some(checkpoint);
-                                }
-                                Ok(())
+                    let delivered: ExecutionFuture<'_, ()> = Box::pin(async {
+                        let mut developer_messages = pending_developer_messages.drain(..);
+                        while let Some((text, message_result)) = developer_messages.next() {
+                            if message_result
+                                .prefix()
+                                .is_some_and(|prefix| model.developer_notice_current(prefix, &text))
+                            {
+                                message_result.skip();
+                                continue;
                             }
-                            Err(error) => {
-                                model = model_from_checkpoint(
-                                    &self.events,
-                                    &self.transport_stats,
-                                    &self.tools,
-                                    &self.spawner,
-                                    &prompt_cache,
-                                    latest_fork_checkpoint.as_deref(),
-                                );
-                                Err(error)
-                            }
-                        };
-                        let message_reopens =
-                            complete_developer_message(message_result, committed, || {
-                                agent_session_context(
-                                    latest_fork_checkpoint.as_deref(),
-                                    self.workspace.as_deref(),
-                                    &self.spawner.context_source,
-                                )
-                            });
-                        if message_reopens {
-                            begin_shutdown(
-                                &mut self.commands,
-                                &mut queued_turns,
-                                default_thinking,
-                                default_service_tier,
+                            let committed = commit_developer_message(
+                                &mut model,
+                                &self.execution,
+                                Arc::clone(&self.spawner.lineage_id),
+                                (thread_model, default_thinking, default_service_tier),
+                                text,
+                                self.workspace.as_deref(),
                             )
                             .await;
-                            commands_open = false;
-                            for (_, pending_result) in developer_messages {
-                                pending_result.fail(NanocodeError::AgentStopped);
+                            let committed = match committed {
+                                Ok(checkpoint) => {
+                                    if let Some(checkpoint) = checkpoint {
+                                        latest_fork_checkpoint = Some(checkpoint);
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => {
+                                    model = model_from_checkpoint(
+                                        &self.events,
+                                        &self.transport_stats,
+                                        &self.tools,
+                                        &self.spawner,
+                                        &prompt_cache,
+                                        latest_fork_checkpoint.as_deref(),
+                                    );
+                                    Err(error)
+                                }
+                            };
+                            let message_reopens =
+                                complete_developer_message(message_result, committed, || {
+                                    agent_session_context(
+                                        latest_fork_checkpoint.as_deref(),
+                                        self.workspace.as_deref(),
+                                        &self.spawner.context_source,
+                                    )
+                                });
+                            if message_reopens {
+                                begin_shutdown(
+                                    &mut self.commands,
+                                    &mut queued_turns,
+                                    default_thinking,
+                                    default_service_tier,
+                                )
+                                .await;
+                                commands_open = false;
+                                for (_, pending_result) in developer_messages {
+                                    pending_result.fail(NanocodeError::AgentStopped);
+                                }
+                                break;
                             }
-                            break;
                         }
-                    }
+                    });
+                    delivered.await;
                 }
                 if commands_open {
                     let Some(command) = self.commands.recv().await else {
@@ -510,64 +516,67 @@ impl AgentDriver {
                     continue;
                 }
                 if let Command::AppendDeveloperMessage { text, result } = command {
-                    if !pending_developer_messages.is_empty() {
-                        pending_developer_messages.push((text, result));
-                        continue;
-                    }
-                    if result
-                        .prefix()
-                        .is_some_and(|prefix| model.developer_notice_current(prefix, &text))
-                    {
-                        result.skip();
-                        continue;
-                    }
-                    let committed =
-                        match model.append_developer_message(text, self.workspace.as_deref()) {
-                            Ok(snapshot) => {
-                                let checkpoint = Arc::new(CommittedSession::new(
-                                    Arc::clone(&self.spawner.lineage_id),
-                                    thread_model,
-                                    default_thinking,
-                                    default_service_tier,
-                                    snapshot,
-                                ));
-                                match self.execution.commit_checkpoint(&checkpoint).await {
-                                    Ok(()) => {
-                                        latest_fork_checkpoint = Some(checkpoint);
-                                        Ok(())
-                                    }
-                                    Err(error) => {
-                                        model = model_from_checkpoint(
-                                            &self.events,
-                                            &self.transport_stats,
-                                            &self.tools,
-                                            &self.spawner,
-                                            &prompt_cache,
-                                            latest_fork_checkpoint.as_deref(),
-                                        );
-                                        Err(error)
+                    let appended: ExecutionFuture<'_, ()> = Box::pin(async {
+                        if !pending_developer_messages.is_empty() {
+                            pending_developer_messages.push((text, result));
+                            return;
+                        }
+                        if result
+                            .prefix()
+                            .is_some_and(|prefix| model.developer_notice_current(prefix, &text))
+                        {
+                            result.skip();
+                            return;
+                        }
+                        let committed =
+                            match model.append_developer_message(text, self.workspace.as_deref()) {
+                                Ok(snapshot) => {
+                                    let checkpoint = Arc::new(CommittedSession::new(
+                                        Arc::clone(&self.spawner.lineage_id),
+                                        thread_model,
+                                        default_thinking,
+                                        default_service_tier,
+                                        snapshot,
+                                    ));
+                                    match self.execution.commit_checkpoint(&checkpoint).await {
+                                        Ok(()) => {
+                                            latest_fork_checkpoint = Some(checkpoint);
+                                            Ok(())
+                                        }
+                                        Err(error) => {
+                                            model = model_from_checkpoint(
+                                                &self.events,
+                                                &self.transport_stats,
+                                                &self.tools,
+                                                &self.spawner,
+                                                &prompt_cache,
+                                                latest_fork_checkpoint.as_deref(),
+                                            );
+                                            Err(error)
+                                        }
                                     }
                                 }
-                            }
-                            Err(error) => Err(error),
-                        };
-                    let reopen = complete_developer_message(result, committed, || {
-                        agent_session_context(
-                            latest_fork_checkpoint.as_deref(),
-                            self.workspace.as_deref(),
-                            &self.spawner.context_source,
-                        )
+                                Err(error) => Err(error),
+                            };
+                        let reopen = complete_developer_message(result, committed, || {
+                            agent_session_context(
+                                latest_fork_checkpoint.as_deref(),
+                                self.workspace.as_deref(),
+                                &self.spawner.context_source,
+                            )
+                        });
+                        if reopen {
+                            begin_shutdown(
+                                &mut self.commands,
+                                &mut queued_turns,
+                                default_thinking,
+                                default_service_tier,
+                            )
+                            .await;
+                            commands_open = false;
+                        }
                     });
-                    if reopen {
-                        begin_shutdown(
-                            &mut self.commands,
-                            &mut queued_turns,
-                            default_thinking,
-                            default_service_tier,
-                        )
-                        .await;
-                        commands_open = false;
-                    }
+                    appended.await;
                     continue;
                 }
                 if let Command::Context { result } = command {
@@ -613,29 +622,83 @@ impl AgentDriver {
                     continue;
                 }
                 if let Command::Compact { parent, result } = command {
-                    logical_turn_index = logical_turn_index.saturating_add(1);
-                    let span = agent_compact_span(
-                        parent.as_ref(),
-                        session_id.as_str(),
-                        self.spawner.lineage_id.as_ref(),
-                        &self.origin,
-                    );
-                    drop(parent);
-                    let compact_started = nanocode_platform::Instant::now();
-                    let compact_base_checkpoint = latest_fork_checkpoint.clone();
-                    let admitted = self
-                        .execution
-                        .admit_compaction(
-                            compact_base_checkpoint.as_deref(),
-                            thread_model,
+                    let compaction: ExecutionFuture<'_, ()> = Box::pin(async {
+                        logical_turn_index = logical_turn_index.saturating_add(1);
+                        let span = agent_compact_span(
+                            parent.as_ref(),
+                            session_id.as_str(),
+                            self.spawner.lineage_id.as_ref(),
+                            &self.origin,
+                        );
+                        drop(parent);
+                        let compact_started = nanocode_platform::Instant::now();
+                        let compact_base_checkpoint = latest_fork_checkpoint.clone();
+                        let admitted = self
+                            .execution
+                            .admit_compaction(
+                                compact_base_checkpoint.as_deref(),
+                                thread_model,
+                                default_thinking,
+                                default_service_tier,
+                                self.workspace.as_deref(),
+                            )
+                            .await;
+                        let (compaction_operation_id, compaction_input, admission) = match admitted
+                        {
+                            Ok(admitted) => admitted,
+                            Err(error) => {
+                                let reopen = matches!(
+                                    error.execution_policy_disposition(),
+                                    Some(crate::ExecutionPolicyDisposition::Reopen)
+                                );
+                                span.record("status", "failed");
+                                span.record("otel.status_code", "ERROR");
+                                span.record(
+                                    "duration_ns",
+                                    u64::try_from(compact_started.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX),
+                                );
+                                drop(result.send(Err(error)));
+                                if reopen {
+                                    begin_shutdown(
+                                        &mut self.commands,
+                                        &mut queued_turns,
+                                        default_thinking,
+                                        default_service_tier,
+                                    )
+                                    .await;
+                                    commands_open = false;
+                                }
+                                return;
+                            }
+                        };
+                        if !matches!(
+                            admission,
+                            AdmittedExecution::Execute | AdmittedExecution::Resume
+                        ) {
+                            let error = NanocodeError::InvalidExecutionPolicy(
+                            "standalone compaction identity resolved to an unexpected terminal operation"
+                                .to_owned(),
+                        );
+                            span.record("status", "failed");
+                            span.record("otel.status_code", "ERROR");
+                            span.record(
+                                "duration_ns",
+                                u64::try_from(compact_started.elapsed().as_nanos())
+                                    .unwrap_or(u64::MAX),
+                            );
+                            drop(result.send(Err(error)));
+                            return;
+                        }
+                        let execution_turn = self.execution.start_compaction(
                             default_thinking,
-                            default_service_tier,
-                            self.workspace.as_deref(),
-                        )
-                        .await;
-                    let (compaction_operation_id, compaction_input, admission) = match admitted {
-                        Ok(admitted) => admitted,
-                        Err(error) => {
+                            compaction_operation_id.clone(),
+                            compaction_input,
+                        );
+                        if let Err(error) = execution_turn.begin().await {
+                            if let Some(operation_id) = &compaction_operation_id {
+                                self.execution.release_claim(operation_id).await;
+                            }
                             let reopen = matches!(
                                 error.execution_policy_disposition(),
                                 Some(crate::ExecutionPolicyDisposition::Reopen)
@@ -658,140 +721,65 @@ impl AgentDriver {
                                 .await;
                                 commands_open = false;
                             }
-                            continue;
+                            return;
                         }
-                    };
-                    if !matches!(
-                        admission,
-                        AdmittedExecution::Execute | AdmittedExecution::Resume
-                    ) {
-                        let error = NanocodeError::InvalidExecutionPolicy(
-                            "standalone compaction identity resolved to an unexpected terminal operation"
-                                .to_owned(),
-                        );
-                        span.record("status", "failed");
-                        span.record("otel.status_code", "ERROR");
-                        span.record(
-                            "duration_ns",
-                            u64::try_from(compact_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                        );
-                        drop(result.send(Err(error)));
-                        continue;
-                    }
-                    let execution_turn = self.execution.start_compaction(
-                        default_thinking,
-                        compaction_operation_id.clone(),
-                        compaction_input,
-                    );
-                    if let Err(error) = execution_turn.begin().await {
-                        if let Some(operation_id) = &compaction_operation_id {
-                            self.execution.release_claim(operation_id).await;
-                        }
-                        let reopen = matches!(
-                            error.execution_policy_disposition(),
-                            Some(crate::ExecutionPolicyDisposition::Reopen)
-                        );
-                        span.record("status", "failed");
-                        span.record("otel.status_code", "ERROR");
-                        span.record(
-                            "duration_ns",
-                            u64::try_from(compact_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                        );
-                        drop(result.send(Err(error)));
-                        if reopen {
-                            begin_shutdown(
-                                &mut self.commands,
-                                &mut queued_turns,
-                                default_thinking,
-                                default_service_tier,
-                            )
-                            .await;
-                            commands_open = false;
-                        }
-                        continue;
-                    }
-                    let execution_steps = execution_turn.steps();
-                    let mut compact_replaced = false;
-                    let (cancel_compaction, mut cancel_compaction_rx) = oneshot::channel();
-                    let mut cancel_compaction = Some(cancel_compaction);
-                    let mut execution: ExecutionFuture<'_, Result<ModelCompactOutcome>> = Box::pin(
-                        model
-                            .compact(
-                                self.workspace.clone(),
-                                default_thinking,
-                                default_service_tier,
-                                logical_turn_index,
-                                &mut cancel_compaction_rx,
-                                execution_steps,
-                            )
-                            .instrument(span.clone()),
-                    );
-                    let completed = loop {
-                        if !commands_open {
-                            break execution.as_mut().await;
-                        }
-                        tokio::select! {
-                            biased;
-                            outcome = &mut execution => break outcome,
-                            command = self.commands.recv() => {
-                                let mut reopen = false;
-                                let command = match command {
-                                    Some(command) => match accept_execution_command(
-                                        &self.execution,
-                                        &self.checkpoints,
-                                        &self.spawner.config,
-                                        default_thinking,
-                                        command,
-                                        &mut reopen,
-                                    ).await {
-                                        Some(command) => Some(command),
-                                        None if reopen => None,
-                                        None => continue,
-                                    },
-                                    None => None,
-                                };
-                                if reopen {
-                                    if let Some(cancel) = cancel_compaction.take() {
-                                        let _ = cancel.send(());
-                                    }
-                                    begin_shutdown(
-                                        &mut self.commands,
-                                        &mut queued_turns,
+                        let execution_steps = execution_turn.steps();
+                        let mut compact_replaced = false;
+                        let (cancel_compaction, mut cancel_compaction_rx) = oneshot::channel();
+                        let mut cancel_compaction = Some(cancel_compaction);
+                        let mut execution: ExecutionFuture<'_, Result<ModelCompactOutcome>> =
+                            Box::pin(
+                                model
+                                    .compact(
+                                        self.workspace.clone(),
                                         default_thinking,
                                         default_service_tier,
+                                        logical_turn_index,
+                                        &mut cancel_compaction_rx,
+                                        execution_steps,
                                     )
-                                    .await;
-                                    commands_open = false;
-                                    break execution.as_mut().await;
-                                }
-                                match command {
-                                    Some(Command::Prompt {
-                                        key,
-                                        prompt,
-                                        execution_operation,
-                                        accepted: _,
-                                        cancel_on_admission,
-                                        thinking: _,
-                                        service_tier: _,
-                                        parent,
-                                        events,
-                                        result,
-                                    }) => {
-                                        queued_turns.push_back(queued_prompt(
-                                            key,
-                                            prompt,
-                                            execution_operation,
-                                            cancel_on_admission,
+                                    .instrument(span.clone()),
+                            );
+                        let completed = loop {
+                            if !commands_open {
+                                break execution.as_mut().await;
+                            }
+                            tokio::select! {
+                                biased;
+                                outcome = &mut execution => break outcome,
+                                command = self.commands.recv() => {
+                                    let mut reopen = false;
+                                    let command = match command {
+                                        Some(command) => match accept_execution_command(
+                                            &self.execution,
+                                            &self.checkpoints,
+                                            &self.spawner.config,
+                                            default_thinking,
+                                            command,
+                                            &mut reopen,
+                                        ).await {
+                                            Some(command) => Some(command),
+                                            None if reopen => None,
+                                            None => continue,
+                                        },
+                                        None => None,
+                                    };
+                                    if reopen {
+                                        if let Some(cancel) = cancel_compaction.take() {
+                                            let _ = cancel.send(());
+                                        }
+                                        begin_shutdown(
+                                            &mut self.commands,
+                                            &mut queued_turns,
                                             default_thinking,
                                             default_service_tier,
-                                            parent,
-                                            events,
-                                            result,
-                                        ));
+                                        )
+                                        .await;
+                                        commands_open = false;
+                                        break execution.as_mut().await;
                                     }
-                                    Some(command @ Command::RoutePrompt { .. }) => {
-                                        let mut reopen = false;
-                                        let Some(Command::Prompt {
+                                    match command {
+                                        Some(Command::Prompt {
                                             key,
                                             prompt,
                                             execution_operation,
@@ -802,16 +790,127 @@ impl AgentDriver {
                                             parent,
                                             events,
                                             result,
-                                        }) = accept_idle_route(
-                                            &self.execution,
-                                            &self.checkpoints,
-                                            &self.spawner.config,
-                                            default_thinking,
-                                            command,
-                                            &mut reopen,
-                                        )
-                                        .await
-                                        else {
+                                        }) => {
+                                            queued_turns.push_back(queued_prompt(
+                                                key,
+                                                prompt,
+                                                execution_operation,
+                                                cancel_on_admission,
+                                                default_thinking,
+                                                default_service_tier,
+                                                parent,
+                                                events,
+                                                result,
+                                            ));
+                                        }
+                                        Some(command @ Command::RoutePrompt { .. }) => {
+                                            let mut reopen = false;
+                                            let Some(Command::Prompt {
+                                                key,
+                                                prompt,
+                                                execution_operation,
+                                                accepted: _,
+                                                cancel_on_admission,
+                                                thinking: _,
+                                                service_tier: _,
+                                                parent,
+                                                events,
+                                                result,
+                                            }) = accept_idle_route(
+                                                &self.execution,
+                                                &self.checkpoints,
+                                                &self.spawner.config,
+                                                default_thinking,
+                                                command,
+                                                &mut reopen,
+                                            )
+                                            .await
+                                            else {
+                                                if reopen {
+                                                    if let Some(cancel) = cancel_compaction.take() {
+                                                        let _ = cancel.send(());
+                                                    }
+                                                    begin_shutdown(
+                                                        &mut self.commands,
+                                                        &mut queued_turns,
+                                                        default_thinking,
+                                                        default_service_tier,
+                                                    )
+                                                    .await;
+                                                    commands_open = false;
+                                                    break execution.as_mut().await;
+                                                }
+                                                continue;
+                                            };
+                                            queued_turns.push_back(queued_prompt(
+                                                key,
+                                                prompt,
+                                                execution_operation,
+                                                cancel_on_admission,
+                                                default_thinking,
+                                                default_service_tier,
+                                                parent,
+                                                events,
+                                                result,
+                                            ));
+                                        }
+                                        Some(Command::Compact { parent, result }) => {
+                                            compact_replaced = true;
+                                            pending_compact = Some((parent, result));
+                                            if let Some(cancel) = cancel_compaction.take() {
+                                                let _ = cancel.send(());
+                                            }
+                                            break execution.as_mut().await;
+                                        }
+                                        Some(Command::CancelActive { result }) => {
+                                            drop(result.send(Err(NanocodeError::TurnNotCancellable)));
+                                        }
+                                        Some(Command::Cancel { key, result }) => {
+                                            let outcome = match queued_execution_operation(
+                                                &queued_turns,
+                                                key,
+                                            ) {
+                                                Some((operation, prompt)) => {
+                                                    let recovered = operation
+                                                        .as_ref()
+                                                        .is_some_and(ExecutionOperation::is_recovered);
+                                                    let (persisted, committed) = match operation.as_ref() {
+                                                        Some(operation) if !recovered => (
+                                                            self.execution
+                                                                .cancel_operation(
+                                                                    operation.id(),
+                                                                    &prompt,
+                                                                )
+                                                                .await,
+                                                            true,
+                                                        ),
+
+                                                        Some(operation) => (
+                                                            Ok(()),
+                                                            self.execution
+                                                                .cancel_unstarted(operation.id())
+                                                                .await,
+                                                        ),
+                                                        None => (Ok(()), false),
+                                                    };
+                                                    persisted.and_then(|()| {
+                                                        if settle_cancelled_queued_turn(
+                                                            &mut queued_turns,
+                                                            key,
+                                                            recovered,
+                                                            committed,
+                                                            &self.spawner.config,
+                                                        ) {
+                                                            Ok(())
+                                                        } else {
+                                                            Err(NanocodeError::TurnNotCancellable)
+                                                        }
+                                                    })
+                                                }
+                                                None => Err(NanocodeError::TurnNotCancellable),
+                                            };
+                                            let reopen = outcome_requires_reopen(&outcome);
+                                            drop(result.send(outcome));
                                             if reopen {
                                                 if let Some(cancel) = cancel_compaction.take() {
                                                     let _ = cancel.send(());
@@ -826,78 +925,78 @@ impl AgentDriver {
                                                 commands_open = false;
                                                 break execution.as_mut().await;
                                             }
-                                            continue;
-                                        };
-                                        queued_turns.push_back(queued_prompt(
-                                            key,
-                                            prompt,
-                                            execution_operation,
-                                            cancel_on_admission,
-                                            default_thinking,
-                                            default_service_tier,
-                                            parent,
-                                            events,
-                                            result,
-                                        ));
-                                    }
-                                    Some(Command::Compact { parent, result }) => {
-                                        compact_replaced = true;
-                                        pending_compact = Some((parent, result));
-                                        if let Some(cancel) = cancel_compaction.take() {
-                                            let _ = cancel.send(());
                                         }
-                                        break execution.as_mut().await;
-                                    }
-                                    Some(Command::CancelActive { result }) => {
-                                        drop(result.send(Err(NanocodeError::TurnNotCancellable)));
-                                    }
-                                    Some(Command::Cancel { key, result }) => {
-                                        let outcome = match queued_execution_operation(
-                                            &queued_turns,
-                                            key,
-                                        ) {
-                                            Some((operation, prompt)) => {
-                                                let recovered = operation
-                                                    .as_ref()
-                                                    .is_some_and(ExecutionOperation::is_recovered);
-                                                let (persisted, committed) = match operation.as_ref() {
-                                                    Some(operation) if !recovered => (
-                                                        self.execution
-                                                            .cancel_operation(
-                                                                operation.id(),
-                                                                &prompt,
-                                                            )
-                                                            .await,
-                                                        true,
-                                                    ),
-
-                                                    Some(operation) => (
-                                                        Ok(()),
-                                                        self.execution
-                                                            .cancel_unstarted(operation.id())
-                                                            .await,
-                                                    ),
-                                                    None => (Ok(()), false),
-                                                };
-                                                persisted.and_then(|()| {
-                                                    if settle_cancelled_queued_turn(
-                                                        &mut queued_turns,
-                                                        key,
-                                                        recovered,
-                                                        committed,
-                                                        &self.spawner.config,
-                                                    ) {
-                                                        Ok(())
-                                                    } else {
-                                                        Err(NanocodeError::TurnNotCancellable)
-                                                    }
-                                                })
-                                            }
-                                            None => Err(NanocodeError::TurnNotCancellable),
-                                        };
-                                        let reopen = outcome_requires_reopen(&outcome);
-                                        drop(result.send(outcome));
-                                        if reopen {
+                                        Some(Command::WithdrawSteer { result, .. }) => {
+                                            drop(result.send(Ok(false)));
+                                        }
+                                        Some(Command::SteerWithId { result, .. } | Command::Steer { result, .. }) => {
+                                            drop(result.send(Err(NanocodeError::TurnNotSteerable)));
+                                        }
+                                        Some(command @ Command::SideQuestion { .. }) => {
+                                            handle_idle_command(
+                                                command,
+                                                latest_fork_checkpoint.as_ref(),
+                                                &self.spawner,
+                                                TurnDefaults {
+                                                    model: thread_model,
+                                                    thinking: default_thinking,
+                                                    service_tier: default_service_tier,
+                                                }
+                                                .latest_request(&prompt_cache),
+                                                session_id.as_str(),
+                                                self.workspace.clone(),
+                                                &self.execution,
+                                            );
+                                        }
+                                        Some(command @ (Command::ChildSnapshot { .. } | Command::Fork { .. } | Command::Spawn { .. } | Command::SpawnBatch { .. })) => {
+                                            handle_idle_command(
+                                                command,
+                                                latest_fork_checkpoint.as_ref(),
+                                                &self.spawner,
+                                                TurnDefaults {
+                                                    model: thread_model,
+                                                    thinking: default_thinking,
+                                                    service_tier: default_service_tier,
+                                                },
+                                                session_id.as_str(),
+                                                self.workspace.clone(),
+                                                &self.execution,
+                                            );
+                                        }
+                                        Some(Command::SetThinking { thinking, result }) => {
+                                            let outcome = validate_model_thinking(
+                                                thread_model,
+                                                thinking,
+                                            )
+                                            .map(|()| {
+                                                default_thinking = thinking;
+                                            });
+                                            drop(result.send(outcome));
+                                        }
+                                        Some(Command::Preconnect { result }) => {
+                                            drop(result.send(Ok(())));
+                                        }
+                                        Some(Command::SetServiceTier { service_tier, result }) => {
+                                            let outcome = crate::ModelSelection::Codex(thread_model)
+                                                .capabilities(crate::ModelTransport::Native)
+                                                .check_service_tier(service_tier)
+                                                .map(|()| default_service_tier = service_tier);
+                                            drop(result.send(outcome));
+                                        }
+                                        Some(Command::SetModel { result, .. }) => {
+                                            drop(result.send(Err(model_change_locked())));
+                                        }
+                                        Some(Command::AppendDeveloperMessage { text, result }) => {
+                                            pending_developer_messages.push((text, result));
+                                        }
+                                        Some(Command::Context { result }) => {
+                                            drop(result.send(agent_session_context(
+                                                latest_fork_checkpoint.as_deref(),
+                                                self.workspace.as_deref(),
+                                                &self.spawner.context_source,
+                                            )));
+                                        }
+                                        Some(Command::Shutdown) => {
                                             if let Some(cancel) = cancel_compaction.take() {
                                                 let _ = cancel.send(());
                                             }
@@ -911,247 +1010,164 @@ impl AgentDriver {
                                             commands_open = false;
                                             break execution.as_mut().await;
                                         }
-                                    }
-                                    Some(Command::WithdrawSteer { result, .. }) => {
-                                        drop(result.send(Ok(false)));
-                                    }
-                                    Some(Command::SteerWithId { result, .. } | Command::Steer { result, .. }) => {
-                                        drop(result.send(Err(NanocodeError::TurnNotSteerable)));
-                                    }
-                                    Some(command @ Command::SideQuestion { .. }) => {
-                                        handle_idle_command(
-                                            command,
-                                            latest_fork_checkpoint.as_ref(),
-                                            &self.spawner,
-                                            TurnDefaults {
-                                                model: thread_model,
-                                                thinking: default_thinking,
-                                                service_tier: default_service_tier,
-                                            }
-                                            .latest_request(&prompt_cache),
-                                            session_id.as_str(),
-                                            self.workspace.clone(),
-                                            &self.execution,
-                                        );
-                                    }
-                                    Some(command @ (Command::ChildSnapshot { .. } | Command::Fork { .. } | Command::Spawn { .. } | Command::SpawnBatch { .. })) => {
-                                        handle_idle_command(
-                                            command,
-                                            latest_fork_checkpoint.as_ref(),
-                                            &self.spawner,
-                                            TurnDefaults {
-                                                model: thread_model,
-                                                thinking: default_thinking,
-                                                service_tier: default_service_tier,
-                                            },
-                                            session_id.as_str(),
-                                            self.workspace.clone(),
-                                            &self.execution,
-                                        );
-                                    }
-                                    Some(Command::SetThinking { thinking, result }) => {
-                                        let outcome = validate_model_thinking(
-                                            thread_model,
-                                            thinking,
-                                        )
-                                        .map(|()| {
-                                            default_thinking = thinking;
-                                        });
-                                        drop(result.send(outcome));
-                                    }
-                                    Some(Command::Preconnect { result }) => {
-                                        drop(result.send(Ok(())));
-                                    }
-                                    Some(Command::SetServiceTier { service_tier, result }) => {
-                                        let outcome = crate::ModelSelection::Codex(thread_model)
-                                            .capabilities(crate::ModelTransport::Native)
-                                            .check_service_tier(service_tier)
-                                            .map(|()| default_service_tier = service_tier);
-                                        drop(result.send(outcome));
-                                    }
-                                    Some(Command::SetModel { result, .. }) => {
-                                        drop(result.send(Err(model_change_locked())));
-                                    }
-                                    Some(Command::AppendDeveloperMessage { text, result }) => {
-                                        pending_developer_messages.push((text, result));
-                                    }
-                                    Some(Command::Context { result }) => {
-                                        drop(result.send(agent_session_context(
-                                            latest_fork_checkpoint.as_deref(),
-                                            self.workspace.as_deref(),
-                                            &self.spawner.context_source,
-                                        )));
-                                    }
-                                    Some(Command::Shutdown) => {
-                                        if let Some(cancel) = cancel_compaction.take() {
-                                            let _ = cancel.send(());
+                                        None => {
+                                            commands_open = false;
+                                            detached = true;
+                                            break execution.as_mut().await;
                                         }
-                                        begin_shutdown(
-                                            &mut self.commands,
-                                            &mut queued_turns,
-                                            default_thinking,
-                                            default_service_tier,
-                                        )
-                                        .await;
-                                        commands_open = false;
-                                        break execution.as_mut().await;
-                                    }
-                                    None => {
-                                        commands_open = false;
-                                        detached = true;
-                                        break execution.as_mut().await;
                                     }
                                 }
                             }
-                        }
-                    };
-                    drop(execution);
-                    let mut compact_checkpoint_committed = false;
-                    let outcome = match completed {
-                        Ok(ModelCompactOutcome::Completed(checkpoint)) => {
-                            let checkpoint = Arc::new(CommittedSession::new(
-                                Arc::clone(&self.spawner.lineage_id),
-                                thread_model,
-                                default_thinking,
-                                default_service_tier,
-                                checkpoint,
-                            ));
-                            let persisted = self
-                                .execution
-                                .persist_compaction(
-                                    &checkpoint,
-                                    execution_turn.completed_without_message(),
-                                )
-                                .await;
-                            if persisted.is_ok() {
-                                compact_checkpoint_committed = true;
-                                latest_fork_checkpoint = Some(checkpoint);
-                            }
-                            persisted
-                        }
-                        Ok(ModelCompactOutcome::Cancelled(checkpoint)) => {
-                            let checkpoint = Arc::new(CommittedSession::new(
-                                Arc::clone(&self.spawner.lineage_id),
-                                thread_model,
-                                default_thinking,
-                                default_service_tier,
-                                checkpoint,
-                            ));
-                            let execution_turn = execution_turn.interrupted();
-                            let execution_turn = if compact_replaced {
-                                execution_turn.replaced()
-                            } else {
-                                execution_turn
-                            };
-                            let persisted = self
-                                .execution
-                                .persist(&checkpoint, execution_turn)
-                                .instrument(span.clone())
-                                .await;
-                            match persisted {
-                                Ok(()) => {
+                        };
+                        drop(execution);
+                        let mut compact_checkpoint_committed = false;
+                        let outcome = match completed {
+                            Ok(ModelCompactOutcome::Completed(checkpoint)) => {
+                                let checkpoint = Arc::new(CommittedSession::new(
+                                    Arc::clone(&self.spawner.lineage_id),
+                                    thread_model,
+                                    default_thinking,
+                                    default_service_tier,
+                                    checkpoint,
+                                ));
+                                let persisted = self
+                                    .execution
+                                    .persist_compaction(
+                                        &checkpoint,
+                                        execution_turn.completed_without_message(),
+                                    )
+                                    .await;
+                                if persisted.is_ok() {
                                     compact_checkpoint_committed = true;
                                     latest_fork_checkpoint = Some(checkpoint);
-                                    model.replace_client((self.spawner.service_factory)(
-                                        Arc::clone(&self.spawner.config),
-                                    ));
-                                    Err(NanocodeError::TurnCancelled)
                                 }
-                                Err(error) => Err(error),
+                                persisted
                             }
-                        }
-                        Ok(ModelCompactOutcome::Failed { error, checkpoint }) => {
-                            let checkpoint = Arc::new(CommittedSession::new(
-                                Arc::clone(&self.spawner.lineage_id),
-                                thread_model,
-                                default_thinking,
-                                default_service_tier,
-                                checkpoint,
-                            ));
-                            let persisted = self
-                                .execution
-                                .persist(
-                                    &checkpoint,
-                                    execution_turn.failed(
-                                        error.to_string(),
-                                        matches!(
-                                            error.execution_policy_disposition(),
-                                            Some(crate::ExecutionPolicyDisposition::Retry)
-                                        ),
-                                    ),
-                                )
-                                .instrument(span.clone())
-                                .await;
-                            match persisted {
-                                Ok(()) => {
-                                    if error.execution_policy_disposition()
-                                        != Some(crate::ExecutionPolicyDisposition::Retry)
-                                    {
+                            Ok(ModelCompactOutcome::Cancelled(checkpoint)) => {
+                                let checkpoint = Arc::new(CommittedSession::new(
+                                    Arc::clone(&self.spawner.lineage_id),
+                                    thread_model,
+                                    default_thinking,
+                                    default_service_tier,
+                                    checkpoint,
+                                ));
+                                let execution_turn = execution_turn.interrupted();
+                                let execution_turn = if compact_replaced {
+                                    execution_turn.replaced()
+                                } else {
+                                    execution_turn
+                                };
+                                let persisted = self
+                                    .execution
+                                    .persist(&checkpoint, execution_turn)
+                                    .instrument(span.clone())
+                                    .await;
+                                match persisted {
+                                    Ok(()) => {
                                         compact_checkpoint_committed = true;
                                         latest_fork_checkpoint = Some(checkpoint);
+                                        model.replace_client((self.spawner.service_factory)(
+                                            Arc::clone(&self.spawner.config),
+                                        ));
+                                        Err(NanocodeError::TurnCancelled)
                                     }
-                                    Err(error)
+                                    Err(error) => Err(error),
                                 }
-                                Err(error) => Err(error),
                             }
+                            Ok(ModelCompactOutcome::Failed { error, checkpoint }) => {
+                                let checkpoint = Arc::new(CommittedSession::new(
+                                    Arc::clone(&self.spawner.lineage_id),
+                                    thread_model,
+                                    default_thinking,
+                                    default_service_tier,
+                                    checkpoint,
+                                ));
+                                let persisted = self
+                                    .execution
+                                    .persist(
+                                        &checkpoint,
+                                        execution_turn.failed(
+                                            error.to_string(),
+                                            matches!(
+                                                error.execution_policy_disposition(),
+                                                Some(crate::ExecutionPolicyDisposition::Retry)
+                                            ),
+                                        ),
+                                    )
+                                    .instrument(span.clone())
+                                    .await;
+                                match persisted {
+                                    Ok(()) => {
+                                        if error.execution_policy_disposition()
+                                            != Some(crate::ExecutionPolicyDisposition::Retry)
+                                        {
+                                            compact_checkpoint_committed = true;
+                                            latest_fork_checkpoint = Some(checkpoint);
+                                        }
+                                        Err(error)
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        };
+                        let outcome = self
+                            .execution
+                            .recover_failure(compaction_operation_id.as_deref(), outcome)
+                            .await;
+                        if !compact_checkpoint_committed && outcome.is_err() {
+                            latest_fork_checkpoint = compact_base_checkpoint;
+                            model = model_from_checkpoint(
+                                &self.events,
+                                &self.transport_stats,
+                                &self.tools,
+                                &self.spawner,
+                                &prompt_cache,
+                                latest_fork_checkpoint.as_deref(),
+                            );
                         }
-                        Err(error) => Err(error),
-                    };
-                    let outcome = self
-                        .execution
-                        .recover_failure(compaction_operation_id.as_deref(), outcome)
-                        .await;
-                    if !compact_checkpoint_committed && outcome.is_err() {
-                        latest_fork_checkpoint = compact_base_checkpoint;
-                        model = model_from_checkpoint(
-                            &self.events,
-                            &self.transport_stats,
-                            &self.tools,
-                            &self.spawner,
-                            &prompt_cache,
-                            latest_fork_checkpoint.as_deref(),
+                        span.record(
+                            "status",
+                            if matches!(&outcome, Err(NanocodeError::TurnCancelled)) {
+                                "cancelled"
+                            } else if outcome.is_ok() {
+                                "completed"
+                            } else {
+                                "failed"
+                            },
                         );
-                    }
-                    span.record(
-                        "status",
-                        if matches!(&outcome, Err(NanocodeError::TurnCancelled)) {
-                            "cancelled"
-                        } else if outcome.is_ok() {
-                            "completed"
-                        } else {
-                            "failed"
-                        },
-                    );
-                    span.record(
-                        "otel.status_code",
-                        if outcome.is_ok() { "OK" } else { "ERROR" },
-                    );
-                    span.record(
-                        "duration_ns",
-                        u64::try_from(compact_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    );
-                    let reopen_after_compaction = outcome_requires_reopen(&outcome);
-                    developer_checkpoint_ready =
-                        compact_checkpoint_committed && !reopen_after_compaction;
-                    if !developer_checkpoint_ready && let Err(error) = &outcome {
-                        let detail = error.to_string();
-                        for (_, message_result) in pending_developer_messages.drain(..) {
-                            message_result.fail(NanocodeError::InvalidExecutionPolicy(format!(
+                        span.record(
+                            "otel.status_code",
+                            if outcome.is_ok() { "OK" } else { "ERROR" },
+                        );
+                        span.record(
+                            "duration_ns",
+                            u64::try_from(compact_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                        let reopen_after_compaction = outcome_requires_reopen(&outcome);
+                        developer_checkpoint_ready =
+                            compact_checkpoint_committed && !reopen_after_compaction;
+                        if !developer_checkpoint_ready && let Err(error) = &outcome {
+                            let detail = error.to_string();
+                            for (_, message_result) in pending_developer_messages.drain(..) {
+                                message_result.fail(NanocodeError::InvalidExecutionPolicy(format!(
                                 "developer message was not committed because the preceding compaction failed: {detail}"
                             )));
+                            }
                         }
-                    }
-                    drop(result.send(outcome));
-                    if commands_open && reopen_after_compaction {
-                        begin_shutdown(
-                            &mut self.commands,
-                            &mut queued_turns,
-                            default_thinking,
-                            default_service_tier,
-                        )
-                        .await;
-                        commands_open = false;
-                    }
+                        drop(result.send(outcome));
+                        if commands_open && reopen_after_compaction {
+                            begin_shutdown(
+                                &mut self.commands,
+                                &mut queued_turns,
+                                default_thinking,
+                                default_service_tier,
+                            )
+                            .await;
+                            commands_open = false;
+                        }
+                    });
+                    compaction.await;
                     continue;
                 }
                 handle_idle_command(

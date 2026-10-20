@@ -5300,6 +5300,13 @@ impl State {
         event_id: &str,
         event: crate::ClaudeLifecycleEvent,
     ) -> Result<crate::ClaudeLifecycleOutcome> {
+        if !self
+            .tool_hooks
+            .iter()
+            .any(|hook| hook.handles_lifecycle(&event))
+        {
+            return Ok(crate::ClaudeLifecycleOutcome::default());
+        }
         let invocation = crate::ClaudeLifecycleInvocation {
             session_id: self.session_id.clone(),
             root_session_id: self.lineage.root_session_id.clone(),
