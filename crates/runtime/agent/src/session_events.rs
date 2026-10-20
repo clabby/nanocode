@@ -10,6 +10,7 @@ use futures_util::future::select;
 use nanocode_platform::Instant;
 use nanocode_subagents::{AgentUpdate, ScopedAgentUpdate};
 use nanocode_tool_host::embedded::HostFuture;
+use serde::{Serialize, Serializer, ser::SerializeMap};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot};
 
@@ -93,6 +94,96 @@ impl SessionEvent {
             ) => left_root == right_root && left == right,
             _ => false,
         }
+    }
+}
+
+struct SdkTiming {
+    emitted_ns: u64,
+    received_ns: u64,
+    source_received_ns: Option<u64>,
+}
+
+impl Serialize for SdkTiming {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(4))?;
+        map.serialize_entry("emitted_ns", &self.emitted_ns)?;
+        map.serialize_entry("received_ns", &self.received_ns)?;
+        map.serialize_entry(
+            "queue_ns",
+            &self.received_ns.saturating_sub(self.emitted_ns),
+        )?;
+        map.serialize_entry("source_received_ns", &self.source_received_ns)?;
+        map.end()
+    }
+}
+
+struct Update<'a>(&'a AgentUpdate);
+
+impl Serialize for Update<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        match self.0 {
+            AgentUpdate::Added(agent) => {
+                map.serialize_entry("type", "added")?;
+                map.serialize_entry("agent", agent)?;
+            }
+            AgentUpdate::Event { id, event } => {
+                map.serialize_entry("type", "event")?;
+                map.serialize_entry("id", id)?;
+                map.serialize_entry("event", event)?;
+            }
+            AgentUpdate::Status { id, status } => {
+                map.serialize_entry("type", "status")?;
+                map.serialize_entry("id", id)?;
+                map.serialize_entry("status", status)?;
+            }
+            AgentUpdate::Completion {
+                id,
+                status,
+                revision,
+            } => {
+                map.serialize_entry("type", "completion")?;
+                map.serialize_entry("id", id)?;
+                map.serialize_entry("status", status)?;
+                map.serialize_entry("revision", revision)?;
+            }
+            AgentUpdate::Message(message) => {
+                map.serialize_entry("type", "message")?;
+                map.serialize_entry("message", message)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl Serialize for SessionEvent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::Agent {
+                event,
+                timing,
+                received_ns,
+            } => {
+                map.serialize_entry("source", "agent")?;
+                map.serialize_entry("event", event)?;
+                map.serialize_entry(
+                    "sdk_timing",
+                    &SdkTiming {
+                        emitted_ns: timing.emitted_ns,
+                        received_ns: *received_ns,
+                        source_received_ns: timing.source_received_ns,
+                    },
+                )?;
+            }
+            Self::Subagent(update) => {
+                map.serialize_entry("source", "subagent")?;
+                map.serialize_entry("root_session_id", &update.root_session_id)?;
+                map.serialize_entry("detach", &update.detach)?;
+                map.serialize_entry("update", &Update(&update.update))?;
+            }
+        }
+        map.end()
     }
 }
 

@@ -97,6 +97,13 @@ pub use nanocode_agent::{
     SubagentUpdates, Unselected, admit_prompt,
 };
 
+pub mod session_host {
+    pub use nanocode_agent::{
+        Driven, ImportedTurn, InboxError, InboxHost, LogEntry, LogPage, LoggedEvent, SessionLog,
+        Started, Submission, Submitted, TurnInbox, TurnRecord, TurnState, submission_digest,
+    };
+}
+
 pub mod agent {
 
     pub use crate::durability;

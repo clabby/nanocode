@@ -5,6 +5,8 @@ pub use nanocode_durability as durability;
 mod router;
 mod runtime;
 mod session_events;
+mod session_log;
+mod turn_inbox;
 pub use router::{
     CheckpointFormats, Harness, HarnessBuilder, HarnessRequest, NoFormats, session_store,
 };
@@ -13,3 +15,8 @@ pub use runtime::{
     SubagentUpdates, Unselected, admit_prompt,
 };
 pub use session_events::{EventSink, SessionEvent, SessionEvents};
+pub use session_log::{
+    ImportedTurn, LogEntry, LogPage, LoggedEvent, SessionLog, Started, Submission, Submitted,
+    TurnRecord, TurnState, submission_digest,
+};
+pub use turn_inbox::{Driven, InboxError, InboxHost, TurnInbox};
