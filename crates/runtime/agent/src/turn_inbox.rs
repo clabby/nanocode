@@ -325,7 +325,10 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             return match self.shared.log.turn(&first).await? {
                 Some(record) if !record.state.is_terminal() => self.run(&first, true).await,
                 record => {
-                    self.resume(first, record.and_then(|record| record.hand))
+                    let abandoned = record
+                        .as_ref()
+                        .is_some_and(|record| record.state != TurnState::Completed);
+                    self.resume(first, record.and_then(|record| record.hand), abandoned)
                         .await
                 }
             };
@@ -473,12 +476,17 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         }
     }
 
-    async fn resume(&self, id: String, hand: Option<String>) -> Result<Driven, InboxError> {
+    async fn resume(
+        &self,
+        id: String,
+        hand: Option<String>,
+        abandoned: bool,
+    ) -> Result<Driven, InboxError> {
         let Some(prompt) = self.runtime.durable_prompt(&self.agent, &id).await? else {
             return Ok(Driven::Resumed(id));
         };
         self.shared.host.place(self.session_id(), hand.as_deref());
-        let cancel = self.shared.state.read(|state| state.cancelled(&id));
+        let cancel = abandoned || self.shared.state.read(|state| state.cancelled(&id));
         Ok(match self.execute(&id, prompt, cancel, false).await {
             DurableOutcome::Waiting => Driven::Waiting(id),
             DurableOutcome::Interrupted => Driven::Interrupted(id),

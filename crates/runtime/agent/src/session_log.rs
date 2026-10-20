@@ -6,7 +6,8 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use serde::{Serialize, Serializer, ser::SerializeMap};
+use nanocode_sync::SingleFlight;
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use serde_json::{Map, Value, value::RawValue};
 
 use crate::{
@@ -16,21 +17,26 @@ use crate::{
 
 const SCHEMA: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, scope TEXT NOT NULL, request_id TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS turns (scope TEXT NOT NULL, request_id TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL, prompt TEXT, hand TEXT, metadata TEXT NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0, note TEXT, first_seq INTEGER NOT NULL, last_seq INTEGER, PRIMARY KEY (scope, request_id)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS turns (scope TEXT NOT NULL, request_id TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL, prompt TEXT, hand TEXT, metadata TEXT NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0, note TEXT, first_seq INTEGER NOT NULL, last_seq INTEGER, retry TEXT, PRIMARY KEY (scope, request_id)) WITHOUT ROWID",
 ];
-const TURN: &str = "SELECT turns.request_id, turns.status, turns.digest, turns.prompt, turns.hand, turns.metadata, CAST(turns.cancel_requested AS TEXT), turns.note, CAST(turns.first_seq AS TEXT), CAST(turns.last_seq AS TEXT), events.body FROM turns LEFT JOIN events ON events.seq = turns.last_seq WHERE turns.scope = ?1 AND turns.request_id = ?2";
-const PENDING: &str = "SELECT request_id, status, digest, prompt, hand, metadata, CAST(cancel_requested AS TEXT), note, CAST(first_seq AS TEXT), NULL, NULL FROM turns WHERE scope = ?1 AND status IN ('queued', 'running') ORDER BY first_seq";
+const RETRY_COLUMN: &str =
+    "SELECT CAST(COUNT(*) AS TEXT) FROM pragma_table_info('turns') WHERE name = 'retry'";
+const ADD_RETRY_COLUMN: &str = "ALTER TABLE turns ADD COLUMN retry TEXT";
+const TURN: &str = "SELECT turns.request_id, turns.status, turns.digest, turns.prompt, turns.hand, turns.metadata, CAST(turns.cancel_requested AS TEXT), turns.note, CAST(turns.first_seq AS TEXT), CAST(turns.last_seq AS TEXT), events.body, turns.retry FROM turns LEFT JOIN events ON events.seq = turns.last_seq WHERE turns.scope = ?1 AND turns.request_id = ?2";
+const PENDING: &str = "SELECT request_id, status, digest, prompt, hand, metadata, CAST(cancel_requested AS TEXT), note, CAST(first_seq AS TEXT), NULL, NULL, retry FROM turns WHERE scope = ?1 AND status IN ('queued', 'running') ORDER BY first_seq";
 const UNFINISHED_EVENT: &str = "INSERT INTO events (scope, request_id, body, created_at) SELECT ?1, ?2, ?3, CAST(?4 AS INTEGER) WHERE EXISTS (SELECT 1 FROM turns WHERE scope = ?1 AND request_id = ?2 AND status IN ('queued', 'running')) RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT)";
 const QUEUED_EVENT: &str = "INSERT INTO events (scope, request_id, body, created_at) SELECT ?1, ?2, ?3, CAST(?4 AS INTEGER) WHERE EXISTS (SELECT 1 FROM turns WHERE scope = ?1 AND request_id = ?2 AND status = 'queued') RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT)";
 const NEW_EVENT: &str = "INSERT INTO events (scope, request_id, body, created_at) SELECT ?1, ?2, ?3, CAST(?4 AS INTEGER) WHERE NOT EXISTS (SELECT 1 FROM turns WHERE scope = ?1 AND request_id = ?2) RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT)";
 const NEW_TURN: &str = "INSERT INTO turns (scope, request_id, digest, status, prompt, hand, metadata, cancel_requested, first_seq) SELECT ?1, ?2, ?3, 'queued', ?4, NULL, ?5, 0, (SELECT MAX(seq) FROM events) WHERE NOT EXISTS (SELECT 1 FROM turns WHERE scope = ?1 AND request_id = ?2)";
 const NEW_PLACED_TURN: &str = "INSERT INTO turns (scope, request_id, digest, status, prompt, hand, metadata, cancel_requested, first_seq) SELECT ?1, ?2, ?3, 'queued', ?4, ?6, ?5, 0, (SELECT MAX(seq) FROM events) WHERE NOT EXISTS (SELECT 1 FROM turns WHERE scope = ?1 AND request_id = ?2)";
-const START: &str = "UPDATE turns SET status = 'running', note = NULL WHERE scope = ?1 AND request_id = ?2 AND status IN ('queued', 'running')";
-const FINISH: &str = "UPDATE turns SET status = ?3, prompt = NULL, note = NULL, last_seq = (SELECT MAX(seq) FROM events) WHERE scope = ?1 AND request_id = ?2 AND status IN ('queued', 'running')";
+const START: &str = "UPDATE turns SET status = 'running', note = NULL, retry = NULL WHERE scope = ?1 AND request_id = ?2 AND status IN ('queued', 'running')";
+const FINISH: &str = "UPDATE turns SET status = ?3, prompt = NULL, note = NULL, retry = NULL, last_seq = (SELECT MAX(seq) FROM events) WHERE scope = ?1 AND request_id = ?2 AND status IN ('queued', 'running')";
 const REQUEST_CANCEL: &str = "UPDATE turns SET cancel_requested = 1 WHERE scope = ?1 AND request_id = ?2 AND status = 'running' AND cancel_requested = 0";
-const CANCEL_QUEUED: &str = "UPDATE turns SET status = 'cancelled', prompt = NULL, note = NULL, last_seq = (SELECT MAX(seq) FROM events) WHERE scope = ?1 AND request_id = ?2 AND status = 'queued'";
+const CANCEL_QUEUED: &str = "UPDATE turns SET status = 'cancelled', prompt = NULL, note = NULL, retry = NULL, last_seq = (SELECT MAX(seq) FROM events) WHERE scope = ?1 AND request_id = ?2 AND status = 'queued'";
 const NOTE: &str =
     "UPDATE turns SET note = ?3 WHERE scope = ?1 AND request_id = ?2 AND status = 'running'";
+const RETRY_EVENT: &str = "INSERT INTO events (scope, request_id, body, created_at) SELECT ?1, ?2, json_object('type', 'retrying', 'request_id', ?2, 'error', ?3, 'kind', ?4, 'attempts', COALESCE(json_extract(retry, '$.attempts'), 0) + 1, 'retry_at', CAST(?5 AS INTEGER)), CAST(?6 AS INTEGER) FROM turns WHERE scope = ?1 AND request_id = ?2 AND status IN ('queued', 'running') AND (retry IS NULL OR json_extract(retry, '$.error') IS NOT ?3 OR json_extract(retry, '$.kind') IS NOT ?4) RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT), body";
+const RETRY: &str = "UPDATE turns SET retry = json_object('error', ?3, 'kind', ?4, 'attempts', COALESCE(json_extract(retry, '$.attempts'), 0) + 1, 'retry_at', CAST(?5 AS INTEGER)) WHERE scope = ?1 AND request_id = ?2 AND status IN ('queued', 'running')";
 const APPEND: &str = "INSERT INTO events (scope, request_id, body, created_at) VALUES (?1, ?2, ?3, CAST(?4 AS INTEGER)) RETURNING CAST(seq AS TEXT)";
 const APPEND_UNATTRIBUTED: &str = "INSERT INTO events (scope, request_id, body, created_at) VALUES (?1, NULL, ?2, CAST(?3 AS INTEGER)) RETURNING CAST(seq AS TEXT)";
 const PAGE: &str = "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body FROM events WHERE scope = ?1 AND seq > CAST(?2 AS INTEGER) ORDER BY seq LIMIT CAST(?3 AS INTEGER)";
@@ -80,6 +86,14 @@ impl TurnState {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TurnRetry {
+    pub error: String,
+    pub kind: String,
+    pub attempts: u64,
+    pub retry_at: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct TurnRecord {
     pub request_id: String,
@@ -93,6 +107,7 @@ pub struct TurnRecord {
     pub first_seq: u64,
     pub last_seq: Option<u64>,
     pub result: Option<Box<RawValue>>,
+    pub retry: Option<TurnRetry>,
 }
 
 impl TurnRecord {
@@ -109,6 +124,12 @@ impl TurnRecord {
         report.insert("status".into(), self.state.as_str().into());
         if let Some(note) = &self.note {
             report.insert("error".into(), note.clone().into());
+        }
+        if let Some(retry) = &self.retry {
+            report.insert("error".into(), retry.error.clone().into());
+            report.insert("kind".into(), retry.kind.clone().into());
+            report.insert("attempts".into(), retry.attempts.into());
+            report.insert("retry_at".into(), retry.retry_at.into());
         }
         Ok(report)
     }
@@ -288,6 +309,11 @@ fn record(row: &SqlRow) -> Result<TurnRecord, StoreError> {
         result: optional(row, 10)
             .map(|body| raw(body.to_owned()))
             .transpose()?,
+        retry: optional(row, 11)
+            .map(|retry| {
+                serde_json::from_str(retry).map_err(|error| invalid(format!("retry: {error}")))
+            })
+            .transpose()?,
     })
 }
 
@@ -329,6 +355,7 @@ pub struct SessionLog<H: ?Sized> {
     host: Arc<H>,
     scope: Arc<str>,
     ready: AtomicBool,
+    schema: SingleFlight<Result<(), StoreError>>,
 }
 
 impl<H: Sql + ?Sized> SessionLog<H> {
@@ -337,6 +364,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             host,
             scope: scope.into(),
             ready: AtomicBool::new(false),
+            schema: SingleFlight::default(),
         }
     }
 
@@ -348,22 +376,12 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         &self.host
     }
 
-    async fn transaction(
+    async fn run(
         &self,
         operation: &'static str,
-        statements: Vec<SqlStatement<'_>>,
+        statements: &[SqlStatement<'_>],
     ) -> Result<Vec<Vec<SqlRow>>, StoreError> {
-        let schema = if self.ready.load(Ordering::Acquire) {
-            0
-        } else {
-            SCHEMA.len()
-        };
-        let statements: Vec<_> = SCHEMA[..schema]
-            .iter()
-            .map(|sql| statement(sql, Vec::new()))
-            .chain(statements)
-            .collect();
-        let mut results = self.host.transaction(operation, &statements).await?;
+        let results = self.host.transaction(operation, statements).await?;
         if results.len() != statements.len() {
             return Err(StoreError::Backend(format!(
                 "SQL host answered {} of {} session log statements",
@@ -371,9 +389,37 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 statements.len()
             )));
         }
-        results.drain(..schema);
-        self.ready.store(true, Ordering::Release);
         Ok(results)
+    }
+
+    async fn migrate(&self) -> Result<(), StoreError> {
+        let statements: Vec<_> = SCHEMA
+            .iter()
+            .chain([&RETRY_COLUMN])
+            .map(|sql| statement(sql, Vec::new()))
+            .collect();
+        let results = self.run("schema", &statements).await?;
+        let present = single(&results[SCHEMA.len()])?
+            .map(|row| text(row, 0))
+            .transpose()?
+            .is_some_and(|count| count != "0");
+        if !present {
+            self.run("schema", &[statement(ADD_RETRY_COLUMN, Vec::new())])
+                .await?;
+        }
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn transaction(
+        &self,
+        operation: &'static str,
+        statements: Vec<SqlStatement<'_>>,
+    ) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+        if !self.ready.load(Ordering::Acquire) {
+            self.schema.run(|| self.migrate()).await?;
+        }
+        self.run(operation, &statements).await
     }
 
     pub async fn submit(&self, submission: &Submission) -> Result<Submitted, StoreError> {
@@ -538,6 +584,44 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         };
         let event = single(&results[1])?
             .map(|row| logged(row, request_id, raw(body)?))
+            .transpose()?;
+        Ok(Some((record(current)?, event)))
+    }
+
+    pub async fn retry(
+        &self,
+        request_id: &str,
+        error: &str,
+        kind: &str,
+        retry_at: u64,
+    ) -> Result<Option<(TurnRecord, Option<LoggedEvent>)>, StoreError> {
+        let at = retry_at.to_string();
+        let created = now().to_string();
+        let results = self
+            .transaction(
+                "retry",
+                vec![
+                    statement(
+                        RETRY_EVENT,
+                        vec![&self.scope, request_id, error, kind, &at, &created],
+                    ),
+                    statement(RETRY, vec![&self.scope, request_id, error, kind, &at]),
+                    statement(TURN, vec![&self.scope, request_id]),
+                ],
+            )
+            .await?;
+        let Some(current) = single(&results[2])? else {
+            return Ok(None);
+        };
+        let event = single(&results[0])?
+            .map(|row| {
+                Ok::<_, StoreError>(LoggedEvent {
+                    seq: counter(text(row, 0)?)?,
+                    request_id: Some(request_id.to_owned()),
+                    created_at: counter(text(row, 1)?)?,
+                    event: raw(text(row, 2)?.to_owned())?,
+                })
+            })
             .transpose()?;
         Ok(Some((record(current)?, event)))
     }

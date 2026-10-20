@@ -100,7 +100,8 @@ pub use nanocode_agent::{
 pub mod session_host {
     pub use nanocode_agent::{
         Driven, ImportedTurn, InboxError, InboxHost, LogEntry, LogPage, LoggedEvent, SessionLog,
-        Started, Submission, Submitted, TurnInbox, TurnRecord, TurnState, submission_digest,
+        Started, Submission, Submitted, TurnInbox, TurnRecord, TurnRetry, TurnState,
+        submission_digest,
     };
 }
 
