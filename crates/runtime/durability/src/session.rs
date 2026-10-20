@@ -367,6 +367,7 @@ enum Command {
         operation_id: String,
         step_id: String,
         output: EncodedPayload,
+        deferred: bool,
         result: oneshot::Sender<Result<()>>,
     },
     CommitWrites {
@@ -948,9 +949,11 @@ impl Driver {
                 operation_id,
                 step_id,
                 output,
+                deferred,
                 result,
             } => {
                 let outcome = match self.authorize(&caller) {
+                    Ok(()) if deferred => self.defer_step(&caller, operation_id, step_id, output),
                     Ok(()) => {
                         self.complete_step(&caller, operation_id, step_id, output)
                             .await
@@ -1653,6 +1656,42 @@ impl Driver {
                     output,
                 })
                 .await
+            }
+        }
+    }
+
+    fn defer_step(
+        &mut self,
+        caller: &Caller,
+        operation_id: String,
+        step_id: String,
+        output: EncodedPayload,
+    ) -> Result<()> {
+        self.require_claimed(caller, &operation_id)?;
+        self.require_running(&operation_id)?;
+        match self
+            .state
+            .operation(&operation_id)
+            .and_then(|operation| operation.steps.get(&step_id))
+            .map(|step| &step.status)
+        {
+            None => Err(Error::StepNotStarted {
+                operation_id,
+                step_id,
+            }),
+            Some(StepStatus::Completed(_)) => Err(Error::InvalidState(format!(
+                "step `{step_id}` in operation `{operation_id}` already completed"
+            ))),
+            Some(StepStatus::EffectPending) => {
+                let revision = self.state.revision();
+                self.state.apply_within(
+                    revision,
+                    Transition::StepCompleted {
+                        operation_id,
+                        step_id,
+                        output,
+                    },
+                )
             }
         }
     }
@@ -2894,6 +2933,7 @@ impl DurableSession {
             operation_id: operation_id.into(),
             step_id: step_id.into(),
             output: EncodedPayload::encode(output)?,
+            deferred: false,
             result,
         })
         .await?;
@@ -3326,12 +3366,34 @@ impl DurableOwner {
         step_id: String,
         output: &T,
     ) -> Result<()> {
+        self.send_completion(operation_id, step_id, output, false)
+            .await
+    }
+
+    pub async fn complete_step_deferred<T: Serialize + ?Sized>(
+        &self,
+        operation_id: String,
+        step_id: String,
+        output: &T,
+    ) -> Result<()> {
+        self.send_completion(operation_id, step_id, output, true)
+            .await
+    }
+
+    async fn send_completion<T: Serialize + ?Sized>(
+        &self,
+        operation_id: String,
+        step_id: String,
+        output: &T,
+        deferred: bool,
+    ) -> Result<()> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::CompleteStep {
             caller: self.caller()?,
             operation_id,
             step_id,
             output: EncodedPayload::encode(output)?,
+            deferred,
             result,
         })
         .await?;

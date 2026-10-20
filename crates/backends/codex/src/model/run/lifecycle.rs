@@ -154,14 +154,17 @@ impl ModelRun {
         Ok(true)
     }
 
+    pub(super) fn sends_warmup(&self) -> bool {
+        !matches!(self.config.responses_transport, ResponsesTransport::Https)
+            && self.config.websocket_warmup
+    }
+
     pub(super) async fn perform_warmup(
         &mut self,
         factory: &ResponsesAttemptFactory,
         request_effort: Thinking,
     ) -> Result<WarmupOutcome> {
-        if matches!(self.config.responses_transport, ResponsesTransport::Https)
-            || !self.config.websocket_warmup
-        {
+        if !self.sends_warmup() {
             return Ok(WarmupOutcome {
                 baseline_established: false,
                 response_id: None,

@@ -302,6 +302,15 @@ pub trait ExecutionPolicy: Send + Sync {
         output_json: String,
     ) -> ExecutionFuture<'a, Result<()>>;
 
+    fn complete_model_step<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        output_json: String,
+    ) -> ExecutionFuture<'a, Result<()>> {
+        self.complete_step(operation_id, step_id, output_json)
+    }
+
     fn complete<'a>(
         &'a self,
         operation_id: String,
@@ -536,6 +545,15 @@ pub trait ExecutionPolicy: Send + Sync {
         step_id: String,
         output_json: String,
     ) -> ExecutionFuture<'a, Result<()>>;
+
+    fn complete_model_step<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        output_json: String,
+    ) -> ExecutionFuture<'a, Result<()>> {
+        self.complete_step(operation_id, step_id, output_json)
+    }
 
     fn complete<'a>(
         &'a self,
@@ -1208,6 +1226,16 @@ impl ExecutionSteps {
     ) -> Result<()> {
         self.policy
             .complete_step(self.operation_id.clone(), step_id.into(), encode(output)?)
+            .await
+    }
+
+    pub(crate) async fn complete_model<O: Serialize + ?Sized>(
+        &self,
+        step_id: impl Into<String>,
+        output: &O,
+    ) -> Result<()> {
+        self.policy
+            .complete_model_step(self.operation_id.clone(), step_id.into(), encode(output)?)
             .await
     }
 }

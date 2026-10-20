@@ -594,7 +594,11 @@ impl ModelRun {
         };
 
         if !resumed {
-            self.retain_execution(&mut session, phase).await?;
+            if phase == ExecutionPhase::Warmup && !self.sends_warmup() {
+                session.conversation.commit_tail();
+            } else {
+                self.retain_execution(&mut session, phase).await?;
+            }
         }
         match phase {
             ExecutionPhase::PrepareTurn => {

@@ -631,6 +631,21 @@ impl ExecutionPolicy for DurableExecution {
         })
     }
 
+    fn complete_model_step<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        output_json: String,
+    ) -> ExecutionFuture<'a, AgentResult<()>> {
+        Box::pin(async move {
+            let output = raw(output_json)?;
+            self.owner
+                .complete_step_deferred(operation_id, step_id, &output)
+                .await
+                .map_err(agent_error)
+        })
+    }
+
     fn complete<'a>(
         &'a self,
         operation_id: String,
@@ -1136,6 +1151,20 @@ impl ExecutionPolicy for LazyExecution {
             self.get()
                 .await?
                 .complete_step(operation_id, step_id, output_json)
+                .await
+        })
+    }
+
+    fn complete_model_step<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        output_json: String,
+    ) -> ExecutionFuture<'a, AgentResult<()>> {
+        Box::pin(async move {
+            self.get()
+                .await?
+                .complete_model_step(operation_id, step_id, output_json)
                 .await
         })
     }

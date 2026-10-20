@@ -186,7 +186,7 @@ impl ModelRun {
             };
             validate_provider_response_id(&output.response.id)?;
             if let Some(steps) = &execution_steps {
-                steps.complete(&step_id, &output).await?;
+                steps.complete_model(&step_id, &output).await?;
             }
             (output, true)
         };
