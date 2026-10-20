@@ -106,7 +106,7 @@ impl BashExecutor for LocalBash {
     ) -> Result<BashExecution, String> {
         let foreground_timeout = Duration::from_millis(request.timeout_ms);
         let hard_timeout = if background {
-            foreground_timeout
+            Duration::MAX
         } else {
             foreground_timeout + Duration::from_secs(1800)
         };
