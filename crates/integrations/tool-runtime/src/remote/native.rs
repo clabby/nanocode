@@ -1273,7 +1273,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 let mut status = None;
                                 let result = async {
                                     let Some((runtime, catalog, turn)) = runtime else {
-                                        return match operation { RemoteOperation::Execute { .. } | RemoteOperation::Wait { .. } | RemoteOperation::Call { .. } => Err(error("unknown runner session")), _ => Ok(None) };
+                                        return match operation { RemoteOperation::Execute { .. } | RemoteOperation::Wait { .. } | RemoteOperation::Call { .. } => Err(error("this hand has no cells for the session: it restarted or reconnected since the cell started, so the cell's outcome is unknown")), _ => Ok(None) };
                                     };
                                     let mut observer = Observer { id, outgoing:outgoing.clone() };
                                     match operation {
