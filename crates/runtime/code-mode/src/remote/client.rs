@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     RemoteCodeModeHost, RemoteContext, RemoteFrame as Frame, RemoteOperation, RemoteTransport,
-    deliver_update, oversized,
+    deliver_update,
 };
 use crate::{
     Tool, ToolDefinition, ToolInput,
@@ -127,14 +127,7 @@ fn origin(call_id: &str) -> &str {
 }
 
 fn fits(frame: &Frame, max_frame_bytes: Option<usize>) -> Result<(), CodeModeHostError> {
-    let Some(limit) = max_frame_bytes else {
-        return Ok(());
-    };
-    let bytes = frame.encoded_len()?;
-    if bytes > limit {
-        return Err(oversized(bytes, limit));
-    }
-    Ok(())
+    max_frame_bytes.map_or(Ok(()), |limit| frame.encode(limit).map(drop))
 }
 
 fn requested_yield(operation: &RemoteOperation) -> Duration {

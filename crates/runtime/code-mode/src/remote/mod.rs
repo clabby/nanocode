@@ -441,22 +441,6 @@ impl RemoteFrame {
         }
         Ok(text)
     }
-    pub fn encoded_len(&self) -> Result<usize, CodeModeHostError> {
-        struct Count(usize);
-        impl std::io::Write for Count {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 += bytes.len();
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut count = Count(0);
-        serde_json::to_writer(&mut count, self)
-            .map_err(|error| CodeModeHostError::new(error.to_string()))?;
-        Ok(count.0)
-    }
     pub fn decode(text: &str, max_frame_bytes: usize) -> Result<Self, CodeModeHostError> {
         if text.len() > max_frame_bytes {
             return Err(CodeModeHostError::new(
