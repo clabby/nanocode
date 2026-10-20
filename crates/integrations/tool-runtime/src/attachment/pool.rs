@@ -711,11 +711,33 @@ impl RunnerPool {
             }
         };
         self.inner.publish(revision, Vec::new());
-        self.inner.code_mode.insert(name.as_str(), host);
+        self.inner
+            .code_mode
+            .insert(name.as_str(), Arc::clone(&host));
         if mode == RemoteMode::Replace {
             self.inner
                 .code_mode
                 .set_default(Some(Arc::from(name.as_str())));
+        }
+        let current = self.inner.state.read(|state| {
+            state
+                .executors
+                .get(&name)
+                .map(|current| Arc::clone(&current.host))
+        });
+        if !current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &host))
+        {
+            if self.inner.code_mode.remove_host(&name, &host)
+                && let Some(current) = current.clone()
+            {
+                self.inner.code_mode.insert(name.as_str(), current);
+            }
+            if current.is_none() && mode == RemoteMode::Replace {
+                self.inner.code_mode.clear_selections(&name);
+            }
+            return Ok(handle);
         }
         let info = entry.info(&name);
         tracing::info!(target: "nanocode_code_mode::attachment", runner = name, "Code Mode executor registered");
