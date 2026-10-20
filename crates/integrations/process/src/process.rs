@@ -452,10 +452,13 @@ impl ProcessGroupGuard {
         let Some(process_group) = self.process_group else {
             return Ok(());
         };
-        match killpg(process_group, Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => Ok(()),
-            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+        for signal in [Signal::SIGSTOP, Signal::SIGKILL] {
+            match killpg(process_group, signal) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+            }
         }
+        Ok(())
     }
 
     #[cfg(windows)]
