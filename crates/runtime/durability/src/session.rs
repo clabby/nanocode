@@ -607,7 +607,13 @@ impl Driver {
                     .map_or(Ok(()), |caller| self.authorize(caller))
                 {
                     Ok(()) => {
-                        EncodedPayload::load_many(&payloads, &mut *self.store, &self.state_id).await
+                        EncodedPayload::load_many_noting(
+                            &payloads,
+                            &mut *self.store,
+                            &self.state_id,
+                            &mut self.committed_records,
+                        )
+                        .await
                     }
                     Err(error) => Err(error),
                 };
@@ -622,7 +628,15 @@ impl Driver {
                     .as_ref()
                     .map_or(Ok(()), |caller| self.authorize(caller))
                 {
-                    Ok(()) => payload.load(&mut *self.store, &self.state_id).await,
+                    Ok(()) => {
+                        payload
+                            .load_noting(
+                                &mut *self.store,
+                                &self.state_id,
+                                &mut self.committed_records,
+                            )
+                            .await
+                    }
                     Err(error) => Err(error),
                 };
                 drop(result.send(outcome));
@@ -1220,7 +1234,15 @@ impl Driver {
         Ok(AgentAcquisition {
             generation,
             checkpoint: match self.state.latest_checkpoint() {
-                Some(value) => Some(value.load(&mut *self.store, &self.state_id).await?),
+                Some(value) => Some(
+                    value
+                        .load_noting(
+                            &mut *self.store,
+                            &self.state_id,
+                            &mut self.committed_records,
+                        )
+                        .await?,
+                ),
                 None => None,
             },
             initial_committed,

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -286,6 +286,15 @@ impl EncodedPayload {
     }
 
     pub async fn load(&self, store: &mut dyn crate::StateStore, state_id: &str) -> Result<Self> {
+        self.load_noting(store, state_id, &mut HashSet::new()).await
+    }
+
+    pub async fn load_noting(
+        &self,
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+        read: &mut HashSet<String>,
+    ) -> Result<Self> {
         if self.content.is_some() {
             return Ok(self.clone());
         }
@@ -293,7 +302,9 @@ impl EncodedPayload {
             .read_record(state_id, &self.key)
             .await?
             .ok_or_else(|| Error::InvalidState(format!("missing payload record {}", self.key)))?;
-        self.load_record(store, state_id, record).await
+        read.insert(self.key.to_string());
+        self.load_record(&mut Noting { store, read }, state_id, record)
+            .await
     }
 
     pub async fn read(&self, reader: &mut dyn crate::StateReader, state_id: &str) -> Result<Self> {
@@ -314,11 +325,21 @@ impl EncodedPayload {
         store: &mut dyn crate::StateStore,
         state_id: &str,
     ) -> Result<Vec<Self>> {
+        Self::load_many_noting(values, store, state_id, &mut HashSet::new()).await
+    }
+
+    pub async fn load_many_noting(
+        values: &[Self],
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+        read: &mut HashSet<String>,
+    ) -> Result<Vec<Self>> {
         if values.is_empty() {
             return Ok(Vec::new());
         }
         let keys: Vec<_> = values.iter().map(|value| value.key.to_string()).collect();
-        let records = store.read_records(state_id, &keys).await?;
+        let mut source = Noting { store, read };
+        let records = source.records(state_id, &keys).await?;
         if records.len() != values.len() {
             return Err(Error::InvalidState("record batch length mismatch".into()));
         }
@@ -327,7 +348,7 @@ impl EncodedPayload {
             let record = record.ok_or_else(|| {
                 Error::InvalidState(format!("missing payload record {}", value.key))
             })?;
-            result.push(value.load_record(store, state_id, record).await?);
+            result.push(value.load_record(&mut source, state_id, record).await?);
         }
         Ok(result)
     }
@@ -493,6 +514,29 @@ impl RecordSource for dyn crate::StateStore + '_ {
         keys: &'a [String],
     ) -> crate::StoreFuture<'a, std::result::Result<Vec<Option<String>>, crate::StoreError>> {
         self.read_records(state_id, keys)
+    }
+}
+
+struct Noting<'a, 'store> {
+    store: &'a mut (dyn crate::StateStore + 'store),
+    read: &'a mut HashSet<String>,
+}
+
+impl RecordSource for Noting<'_, '_> {
+    fn records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+        keys: &'a [String],
+    ) -> crate::StoreFuture<'a, std::result::Result<Vec<Option<String>>, crate::StoreError>> {
+        Box::pin(async move {
+            let records = self.store.read_records(state_id, keys).await?;
+            for (key, record) in keys.iter().zip(&records) {
+                if record.is_some() {
+                    self.read.insert(key.clone());
+                }
+            }
+            Ok(records)
+        })
     }
 }
 
