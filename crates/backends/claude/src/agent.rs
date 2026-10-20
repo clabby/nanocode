@@ -6344,12 +6344,10 @@ impl LifecycleBackend for Driver {
         capabilities
     }
     fn persistence(&self) -> Option<Persistence> {
-        let durable = self
-            .state
+        self.state
             .policy
             .as_ref()
-            .map(|policy| Persistence::durable(policy.state_id()));
-        durable
+            .map(|policy| Persistence::durable(policy.state_id()))
     }
     fn checkpoint(&self) -> BackendFuture<Result<SessionCheckpoint>> {
         let state = self.state.clone();

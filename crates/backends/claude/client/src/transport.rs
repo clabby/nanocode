@@ -235,8 +235,9 @@ impl layer::Sender for TransportSender<'_> {
         request: layer::Request,
     ) -> layer::BoxFuture<'_, Result<layer::Response, layer::Error>> {
         Box::pin(async move {
-            let body = String::from_utf8(request.body)
-                .map_err(|_| layer::Error::new("Messages request body is not UTF-8").unsent(true))?;
+            let body = String::from_utf8(request.body).map_err(|_| {
+                layer::Error::new("Messages request body is not UTF-8").unsent(true)
+            })?;
             self.transport
                 .post(HttpRequest {
                     endpoint: request.url,

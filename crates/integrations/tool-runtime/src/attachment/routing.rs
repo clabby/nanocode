@@ -503,30 +503,28 @@ impl Tool for RoutedTool {
         }
         if let ToolDefinition::Function { parameters, .. } = &mut definition {
             let mut schema = parameters.as_value().clone();
-            if let Some(object) = schema.as_object_mut() {
-                if !keeps_own_paths(self.routing) {
-                    if let Some(properties) = object
-                        .entry("properties")
-                        .or_insert_with(|| serde_json::json!({}))
-                        .as_object_mut()
-                    {
-                        properties.insert("workdir".into(), serde_json::json!({"type":"string","description":"Logical workspace root selecting the local host or a remote runner."}));
-                    }
-                }
+            if let Some(object) = schema.as_object_mut()
+                && !keeps_own_paths(self.routing)
+                && let Some(properties) = object
+                    .entry("properties")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+            {
+                properties.insert("workdir".into(), serde_json::json!({"type":"string","description":"Logical workspace root selecting the local host or a remote runner."}));
             }
-            if cua(definition_name(&self.local).as_str()) {
-                if let Some(object) = schema.as_object_mut() {
-                    let required = object
-                        .entry("required")
-                        .or_insert_with(|| serde_json::json!([]));
-                    if let Some(required) = required.as_array_mut() {
-                        if !required.iter().any(|field| field == "workdir") {
-                            required.push("workdir".into());
-                        }
-                    }
-                    if definition_name(&self.local) == "mcp__cua_repl__js" {
-                        object.insert("required".into(), serde_json::json!(["workdir"]));
-                    }
+            if cua(definition_name(&self.local).as_str())
+                && let Some(object) = schema.as_object_mut()
+            {
+                let required = object
+                    .entry("required")
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(required) = required.as_array_mut()
+                    && !required.iter().any(|field| field == "workdir")
+                {
+                    required.push("workdir".into());
+                }
+                if definition_name(&self.local) == "mcp__cua_repl__js" {
+                    object.insert("required".into(), serde_json::json!(["workdir"]));
                 }
             }
             *parameters = schema.into();
@@ -574,10 +572,10 @@ impl RoutedTool {
             self.sessions
                 .remember_mounts(context.session_id(), &pool.reserved_mounts())
                 .await?;
-            if let Some(name) = pool.replacement() {
-                if !routes.iter().any(|route| route.namespace() == name) {
-                    return Err(format!("replacement runner `{name}` is unavailable").into());
-                }
+            if let Some(name) = pool.replacement()
+                && !routes.iter().any(|route| route.namespace() == name)
+            {
+                return Err(format!("replacement runner `{name}` is unavailable").into());
             }
         }
         let definition = self.local.definition();
@@ -708,10 +706,10 @@ impl RoutedTool {
                     value["command"] =
                         format!("cd '{}' && {command}", workdir.replace('\'', "'\\''")).into();
                 }
-                if !keeps_own_paths(self.routing) {
-                    if let Some(object) = value.as_object_mut() {
-                        object.remove("workdir");
-                    }
+                if !keeps_own_paths(self.routing)
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.remove("workdir");
                 }
                 ToolInput::Function(serde_json::value::to_raw_value(&value)?)
             }
@@ -753,17 +751,16 @@ impl RoutedTool {
                                 "*** Delete File: ",
                                 "*** Move to: ",
                             ] {
-                                if let Some(path) = line.strip_prefix(prefix) {
-                                    if let Ok(relative) =
+                                if let Some(path) = line.strip_prefix(prefix)
+                                    && let Ok(relative) =
                                         normalize(Path::new(path)).and_then(|path| {
                                             Ok(path.strip_prefix(route.mount())?.to_path_buf())
                                         })
-                                    {
-                                        return format!(
-                                            "{prefix}{}",
-                                            route.workspace.join(relative).display()
-                                        );
-                                    }
+                                {
+                                    return format!(
+                                        "{prefix}{}",
+                                        route.workspace.join(relative).display()
+                                    );
                                 }
                             }
                             line.to_owned()

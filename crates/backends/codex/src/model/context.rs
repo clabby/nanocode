@@ -371,7 +371,7 @@ fn push_filesystem(output: &mut String, cwd: &str) {
 }
 
 #[cfg(target_family = "wasm")]
-fn push_filesystem(_output: &mut String, _cwd: &str) {}
+const fn push_filesystem(_output: &mut String, _cwd: &str) {}
 
 fn push_xml_line(output: &mut String, tag: &str, value: &str) {
     output.push_str("  <");

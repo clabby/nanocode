@@ -17,12 +17,10 @@ pub(crate) struct PreparedTools {
 
 impl PreparedTools {
     pub(crate) fn prepare(tools: &Tools) -> Result<Self, PreparedToolError> {
-        if tools.workspace_enabled() {
-            if tools.workspace_source().is_none() {
-                return Err(PreparedToolError::NonAttachable(
-                    "enabled workspace tools require a pinned WorkspaceTools source".into(),
-                ));
-            }
+        if tools.workspace_enabled() && tools.workspace_source().is_none() {
+            return Err(PreparedToolError::NonAttachable(
+                "enabled workspace tools require a pinned WorkspaceTools source".into(),
+            ));
         }
         if tools.web_search_enabled() {
             return Err(PreparedToolError::NonAttachable(

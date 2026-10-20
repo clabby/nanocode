@@ -63,7 +63,7 @@ impl SubagentControl {
         self.registry.update_spawn_policy(update);
     }
 
-    pub fn registry(&self) -> &Arc<Registry> {
+    pub const fn registry(&self) -> &Arc<Registry> {
         &self.registry
     }
 }

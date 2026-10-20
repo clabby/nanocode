@@ -90,7 +90,6 @@ pub(crate) use transport::http;
 pub(crate) use transport::{socket, telemetry};
 
 #[doc(hidden)]
-
 pub mod __private {
     pub use crate::client::{
         events::stream::EventSink,

@@ -584,16 +584,16 @@ impl ShellExecutor for ShellSessions {
         command: ExecCommand,
         workspace: &'a Path,
     ) -> nanocode_process_contracts::ProcessFuture<'a, ExecCommandResult> {
-        ShellSessions::execute(self, command, workspace)
+        Self::execute(self, command, workspace)
     }
     fn write_stdin(
         &self,
         request: WriteStdin,
     ) -> nanocode_process_contracts::ProcessFuture<'_, ExecCommandResult> {
-        ShellSessions::write_stdin(self, request)
+        Self::write_stdin(self, request)
     }
     fn terminate_all(&self) -> nanocode_process_contracts::ProcessFuture<'_, ()> {
-        ShellSessions::terminate_all(self)
+        Self::terminate_all(self)
     }
 }
 

@@ -56,14 +56,17 @@ impl Instant {
         Self::now().duration_since(*self)
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     pub fn duration_since(&self, earlier: Self) -> Duration {
         self.0.saturating_sub(earlier.0)
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     pub fn saturating_duration_since(&self, earlier: Self) -> Duration {
         self.0.saturating_sub(earlier.0)
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     pub fn checked_duration_since(&self, earlier: Self) -> Option<Duration> {
         self.0.checked_sub(earlier.0)
     }

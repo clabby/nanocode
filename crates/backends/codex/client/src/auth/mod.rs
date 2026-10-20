@@ -148,10 +148,8 @@ pub enum OpenAiAuthError {
 }
 
 #[cfg(not(target_family = "wasm"))]
-
 pub type OpenAiAuthFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(target_family = "wasm")]
-
 pub type OpenAiAuthFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 #[doc(hidden)]

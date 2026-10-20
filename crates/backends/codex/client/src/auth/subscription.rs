@@ -24,10 +24,8 @@ const REFRESH_EARLY_MILLIS: i64 = 5 * 60 * 1_000;
 const MAX_RESPONSE_BYTES: usize = 16 * 1_024;
 
 #[cfg(not(target_family = "wasm"))]
-
 pub type SubscriptionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(target_family = "wasm")]
-
 pub type SubscriptionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 #[derive(Clone, Debug, thiserror::Error)]

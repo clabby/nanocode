@@ -14,7 +14,11 @@ pub type Body = Pin<Box<dyn Stream<Item = Result<Vec<u8>, Error>> + Send>>;
 pub type Body = Pin<Box<dyn Stream<Item = Result<Vec<u8>, Error>>>>;
 
 pub trait Layer: Send + Sync + 'static {
-    fn send<'a>(&'a self, request: Request, next: Next<'a>) -> BoxFuture<'a, Result<Response, Error>>;
+    fn send<'a>(
+        &'a self,
+        request: Request,
+        next: Next<'a>,
+    ) -> BoxFuture<'a, Result<Response, Error>>;
 }
 
 pub trait Sender: Send + Sync {

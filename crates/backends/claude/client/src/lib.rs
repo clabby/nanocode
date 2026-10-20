@@ -1221,6 +1221,7 @@ impl ClaudeClient {
         self.subscription_compatibility
     }
 
+    #[cfg_attr(target_family = "wasm", allow(clippy::missing_const_for_fn))]
     pub fn subscription_compatibility(mut self) -> Self {
         self.subscription_compatibility = true;
         #[cfg(not(target_family = "wasm"))]
@@ -1383,7 +1384,7 @@ impl ClaudeClient {
         }
         .legacy_durable_input()
     }
-    fn decode_block(&self, block: &mut ContentBlock) {
+    const fn decode_block(&self, block: &mut ContentBlock) {
         if self.subscription_compatibility
             && let ContentBlock::ToolUse { name, .. } = block
         {
@@ -1791,7 +1792,7 @@ impl PreparedWire {
         })?)
     }
 
-    fn wire_name(&self) -> &'static str {
+    const fn wire_name(&self) -> &'static str {
         if self.subscription {
             "subscription_wire_v1"
         } else {

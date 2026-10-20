@@ -65,7 +65,7 @@ impl ClaudeWorkspaceFiles {
     }
 
     #[must_use]
-    pub fn with_read_token_budget(mut self, tokens: usize) -> Self {
+    pub const fn with_read_token_budget(mut self, tokens: usize) -> Self {
         self.read_token_budget = tokens;
         self
     }

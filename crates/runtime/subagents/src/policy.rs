@@ -125,7 +125,7 @@ pub(crate) struct SpawnParent {
 }
 
 impl SpawnPolicy {
-    pub fn is_unrestricted(&self) -> bool {
+    pub const fn is_unrestricted(&self) -> bool {
         self.models.is_none()
             && self.model_ladder.is_empty()
             && self.min_thinking.is_none()
@@ -175,7 +175,7 @@ impl SpawnPolicy {
         Ok(())
     }
 
-    pub fn admit_thinking(
+    pub const fn admit_thinking(
         &self,
         parent: Option<Thinking>,
         thinking: Thinking,

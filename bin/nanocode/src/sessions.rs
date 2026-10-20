@@ -61,9 +61,8 @@ pub fn session_at<'a>(
 }
 
 pub fn replay(transcript: &mut Transcript, history: Vec<TranscriptItem>) {
-    let _span =
-        tracing::info_span!(target: "nanocode", "nc.session.replay", items = history.len())
-            .entered();
+    let _span = tracing::info_span!(target: "nanocode", "nc.session.replay", items = history.len())
+        .entered();
     let mut mapper = crate::events::EventMapper::default();
     for item in history {
         match item {

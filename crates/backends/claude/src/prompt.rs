@@ -326,7 +326,7 @@ fn local_image(path: &std::path::Path) -> std::result::Result<String, &'static s
 }
 
 #[cfg(target_family = "wasm")]
-fn local_image(_path: &std::path::Path) -> std::result::Result<String, &'static str> {
+const fn local_image(_path: &std::path::Path) -> std::result::Result<String, &'static str> {
     Err("requires a native filesystem")
 }
 

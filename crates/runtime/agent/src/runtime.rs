@@ -35,6 +35,11 @@ type Recipe = Arc<dyn Fn(AgentSpec) -> BackendFuture<AgentResult> + Send + Sync>
 pub type SubagentUpdates =
     tokio::sync::mpsc::UnboundedReceiver<nanocode_subagents::ScopedAgentUpdate>;
 type UpdateSlot = Arc<ArcSwapOption<SubagentUpdates>>;
+#[cfg(not(target_family = "wasm"))]
+type RunnerFuture<'a, H, T> = nanocode_tool_host::embedded::HostFuture<
+    'a,
+    std::result::Result<T, <H as RunnerServices>::Error>,
+>;
 
 fn take_updates(slot: &UpdateSlot) -> Option<SubagentUpdates> {
     slot.swap(None)
@@ -184,7 +189,7 @@ impl<B, D: RuntimeDefaults> RuntimeBuilder<B, D> {
     }
 
     #[must_use]
-    pub fn thinking(mut self, thinking: Thinking) -> Self {
+    pub const fn thinking(mut self, thinking: Thinking) -> Self {
         self.data.thinking = Some(thinking);
         self
     }
@@ -1758,26 +1763,14 @@ where
     pub fn connect_runner(
         &self,
         runner: <D::Host as RunnerServices>::Runner,
-    ) -> nanocode_tool_host::embedded::HostFuture<
-        '_,
-        std::result::Result<
-            <D::Host as RunnerServices>::Handle,
-            <D::Host as RunnerServices>::Error,
-        >,
-    > {
+    ) -> RunnerFuture<'_, D::Host, <D::Host as RunnerServices>::Handle> {
         self.host.connect_runner(runner)
     }
 
     pub fn listen_for_runners(
         &self,
         config: <D::Host as RunnerServices>::ServerConfig,
-    ) -> nanocode_tool_host::embedded::HostFuture<
-        '_,
-        std::result::Result<
-            <D::Host as RunnerServices>::Server,
-            <D::Host as RunnerServices>::Error,
-        >,
-    > {
+    ) -> RunnerFuture<'_, D::Host, <D::Host as RunnerServices>::Server> {
         self.host.listen_for_runners(config)
     }
 

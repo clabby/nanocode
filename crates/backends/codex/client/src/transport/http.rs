@@ -159,11 +159,7 @@ impl ResponsesHttp {
         if let Some(layer) = &self.layer {
             return self.send_layered(layer.as_ref(), request).await;
         }
-        let response = self
-            .client
-            .execute(request)
-            .await
-            .map_err(map_http_error)?;
+        let response = self.client.execute(request).await.map_err(map_http_error)?;
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(response.headers());

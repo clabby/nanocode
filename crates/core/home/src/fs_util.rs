@@ -69,10 +69,8 @@ pub(crate) fn read_bounded(path: &Path, limit: usize) -> io::Result<(String, boo
     let truncated = data.len() > limit;
     data.truncate(limit);
     let mut text = String::from_utf8_lossy(&data).into_owned();
-    if truncated {
-        if text.ends_with('\u{fffd}') {
-            text.pop();
-        }
+    if truncated && text.ends_with('\u{fffd}') {
+        text.pop();
     }
     Ok((text, truncated))
 }

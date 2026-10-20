@@ -1350,6 +1350,7 @@ fn running_observation(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observed_execution(
     tools: &dyn CodeModeToolset,
     status: &str,

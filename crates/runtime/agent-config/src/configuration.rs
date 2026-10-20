@@ -15,7 +15,7 @@ pub enum AgentTools {
 }
 
 impl AgentTools {
-    pub fn has_code_mode_host(&self) -> bool {
+    pub const fn has_code_mode_host(&self) -> bool {
         match self {
             Self::Shared(tools) => tools.has_code_mode_host(),
             Self::PerAgent(_) => false,

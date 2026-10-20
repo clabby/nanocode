@@ -446,7 +446,7 @@ impl BackendRuntime {
     }
 
     #[must_use]
-    pub fn with_driver_turn_ids(mut self) -> Self {
+    pub const fn with_driver_turn_ids(mut self) -> Self {
         self.driver_turn_ids = true;
         self
     }

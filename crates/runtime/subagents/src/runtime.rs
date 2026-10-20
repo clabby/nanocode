@@ -959,6 +959,7 @@ impl RegistryState {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_message(
         &mut self,
         session_id: &str,

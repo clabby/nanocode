@@ -143,13 +143,13 @@ impl BashExecutor for LocalBash {
             }
         }
         let mut admission = Admission(Some(job.abort.clone()));
-        if !background {
-            if let Ok(result) = tokio::time::timeout(foreground_timeout, completion(&job)).await {
-                self.jobs.entries.update(|entries| {
-                    entries.remove(&id);
-                });
-                return result.map(BashExecution::Completed);
-            }
+        if !background
+            && let Ok(result) = tokio::time::timeout(foreground_timeout, completion(&job)).await
+        {
+            self.jobs.entries.update(|entries| {
+                entries.remove(&id);
+            });
+            return result.map(BashExecution::Completed);
         }
         admission.0 = None;
         Ok(BashExecution::Background { task_id: id })

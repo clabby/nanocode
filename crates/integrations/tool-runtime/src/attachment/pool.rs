@@ -101,15 +101,15 @@ impl Runner {
         self.named = true;
         self
     }
-    pub fn alongside(mut self) -> Self {
+    pub const fn alongside(mut self) -> Self {
         self.mode = RemoteMode::Alongside;
         self
     }
-    pub fn replace(mut self) -> Self {
+    pub const fn replace(mut self) -> Self {
         self.mode = RemoteMode::Replace;
         self
     }
-    pub fn call_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn call_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
@@ -177,15 +177,15 @@ impl RunnerServerConfig {
         self.token = Some(token.into());
         self
     }
-    pub fn alongside(mut self) -> Self {
+    pub const fn alongside(mut self) -> Self {
         self.mode = RemoteMode::Alongside;
         self
     }
-    pub fn replace(mut self) -> Self {
+    pub const fn replace(mut self) -> Self {
         self.mode = RemoteMode::Replace;
         self
     }
-    pub fn call_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn call_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
@@ -415,11 +415,11 @@ impl RunnerPool {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn with_model_management(mut self, enabled: bool) -> Self {
+    pub const fn with_model_management(mut self, enabled: bool) -> Self {
         self.model_management = enabled;
         self
     }
-    pub fn model_management_enabled(&self) -> bool {
+    pub const fn model_management_enabled(&self) -> bool {
         self.model_management
     }
     pub fn code_mode_executors(&self) -> CodeModeExecutors {
@@ -1381,6 +1381,7 @@ impl fmt::Debug for RunnerServer {
             .finish_non_exhaustive()
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn accept(
     listener: TcpListener,
     pool: Weak<PoolInner>,

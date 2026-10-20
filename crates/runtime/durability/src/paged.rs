@@ -80,7 +80,7 @@ pub struct SequenceCache {
 }
 
 impl SequenceCache {
-    pub fn committed(&mut self) {
+    pub const fn committed(&mut self) {
         self.durable_items = self.items.len();
         self.durable_pages = self.pages.len();
     }

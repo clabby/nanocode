@@ -127,7 +127,7 @@ pub(crate) fn hex_digest(input: &[u8]) -> String {
 pub fn prefix(name: &str) -> String {
     name.into()
 }
-pub fn strip(_: &mut String) {}
+pub const fn strip(_: &mut String) {}
 fn fingerprint<M: WireMessage>(messages: &[M], version: &str) -> String {
     let first = messages
         .iter()

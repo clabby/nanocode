@@ -408,7 +408,7 @@ impl EncodedPayload {
             }
             let hashes: String = level.iter().map(|text| &text[1..]).collect();
             if hashes.is_empty()
-                || hashes.len() % HASH_HEX != 0
+                || !hashes.len().is_multiple_of(HASH_HEX)
                 || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
             {
                 return Err(Error::InvalidState("invalid payload chunk manifest".into()));
@@ -449,7 +449,7 @@ impl EncodedPayload {
         verify: bool,
     ) -> Result<String> {
         if hashes.is_empty()
-            || hashes.len() % 64 != 0
+            || !hashes.len().is_multiple_of(64)
             || !hashes.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(Error::InvalidState("invalid payload chunk manifest".into()));

@@ -214,6 +214,7 @@ impl HarnessHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn(
     root_session_id: String,
     id: AgentId,
