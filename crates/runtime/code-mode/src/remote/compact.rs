@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::nested;
@@ -217,7 +216,8 @@ impl ReceivedCalls {
         if let Some(call) = update.get_mut("completed") {
             self.expand(call)?;
             if let Some(observer) = observer {
-                let call = NestedToolCall::deserialize(&update["completed"]).map_err(error)?;
+                let call = serde_json::from_value::<NestedToolCall>(update["completed"].clone())
+                    .map_err(error)?;
                 observer.update(CodeModeUpdate::NestedCallCompleted(&call));
             }
             if let Some(Value::Object(fields)) = update
@@ -232,7 +232,8 @@ impl ReceivedCalls {
         if let Some(notification) = update.get("notification") {
             if let Some(observer) = observer {
                 let notification =
-                    CodeModeNotification::deserialize(notification).map_err(error)?;
+                    serde_json::from_value::<CodeModeNotification>(notification.clone())
+                        .map_err(error)?;
                 observer.update(CodeModeUpdate::Notification(&notification));
             }
             return Ok(());
