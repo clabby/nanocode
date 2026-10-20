@@ -170,6 +170,7 @@ async fn prepare(
     args: &SessionArgs,
     clients: ModelClients,
     notify: &mut dyn FnMut(&str),
+    headless: bool,
 ) -> Result<Prepared> {
     let workspace = match &args.workspace {
         Some(path) => std::fs::canonicalize(path)
@@ -232,6 +233,7 @@ async fn prepare(
         runner_servers,
         gateway,
         clients,
+        headless,
     };
     let host = tracing::Instrument::instrument(
         Host::build(config, &model, thinking),
@@ -296,7 +298,7 @@ async fn interactive(mut args: SessionArgs, clients: ModelClients) -> Result<()>
             keyboard_enhancement: true,
         })?;
     nanocode_tui::highlight::prewarm();
-    let prepared = prepare(&args, clients, &mut |_| {}).await;
+    let prepared = prepare(&args, clients, &mut |_| {}, false).await;
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -369,9 +371,14 @@ async fn exec(args: SessionArgs, clients: ModelClients) -> Result<()> {
         .clone()
         .filter(|prompt| !prompt.trim().is_empty())
         .ok_or("exec requires a prompt")?;
-    let prepared = prepare(&args, clients, &mut |message| {
-        eprintln!("nanocode: {message}");
-    })
+    let prepared = prepare(
+        &args,
+        clients,
+        &mut |message| {
+            eprintln!("nanocode: {message}");
+        },
+        true,
+    )
     .await?;
     let host = prepared.host;
     let resume = match (&args.resume, args.continue_last) {

@@ -232,6 +232,7 @@ pub struct HostConfig {
     pub runner_servers: Vec<RunnerServerConfig>,
     pub gateway: Option<Gateway>,
     pub clients: ModelClients,
+    pub headless: bool,
 }
 
 #[derive(Clone)]
@@ -419,7 +420,8 @@ impl Host {
                 .claude
                 .as_ref()
                 .map_or_else(ClaudeClient::default, |claude| claude()),
-        );
+        )
+        .headless(config.headless);
         let mut builder = Nanocode::builder()
             .openai(codex)
             .claude(claude)

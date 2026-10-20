@@ -107,6 +107,7 @@ pub fn install_default_tools_with_executor(
         runner_pool,
         executor,
         &[],
+        false,
     )
 }
 
@@ -120,6 +121,7 @@ pub(crate) fn install_default_tools_with_providers(
     runner_pool: Option<nanocode_tool_host::attachment::RunnerRouting>,
     executor: Arc<dyn nanocode_process_contracts::ForegroundExecutor>,
     providers: &[Arc<dyn nanocode_tool_host::runtime::DynamicToolProvider>],
+    headless: bool,
 ) -> Result<crate::ClaudeTools> {
     let jobs = Arc::new(crate::claude_bash::Jobs::default());
     let selected = match selected {
@@ -164,16 +166,25 @@ pub(crate) fn install_default_tools_with_providers(
     for tool in additive {
         selected = selected.add_shared_tool(tool)?;
     }
-    let bound = (handle.root_session_id() == handle.session_id()).then(|| jobs.clone());
-    let tools =
-        crate::claude_tools::install(&selected, workspace, handle)?.adapter_shutdown(move || {
+    let ends_with_turn = headless || handle.root_session_id() != handle.session_id();
+    let bound = jobs.clone();
+    let reaped = jobs.clone();
+    let tools = crate::claude_tools::install(&selected, workspace, handle)?
+        .adapter_shutdown(move || {
             let jobs = jobs.clone();
             async move {
                 jobs.shutdown().await;
             }
-        });
-    Ok(match bound {
-        Some(jobs) => tools.agent_bound(move |agent| jobs.bind(agent)),
-        None => tools,
+        })
+        .agent_bound(move |agent, steer| bound.bind(agent, steer, ends_with_turn));
+    Ok(if ends_with_turn {
+        tools.adapter_cleanup(move || {
+            let jobs = reaped.clone();
+            async move {
+                jobs.reap();
+            }
+        })
+    } else {
+        tools
     })
 }

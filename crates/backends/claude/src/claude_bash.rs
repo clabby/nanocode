@@ -1,6 +1,9 @@
-use crate::tools::{
-    BashExecution, BashExecutor, BashRequest, BashResult, ClaudeBash,
-    bash::DEFAULT_BACKGROUND_TIMEOUT_MS,
+use crate::{
+    agent::Steer,
+    tools::{
+        BashExecution, BashExecutor, BashRequest, BashResult, ClaudeBash,
+        bash::DEFAULT_BACKGROUND_TIMEOUT_MS,
+    },
 };
 use async_trait::async_trait;
 use nanocode_agent_core::{Agent, PromptRequest, WeakAgent};
@@ -29,6 +32,9 @@ const STALL_POLL: Duration = Duration::from_secs(5);
 const STALL_SILENCE: Duration = Duration::from_secs(45);
 const STALL_TAIL_BYTES: u64 = 1024;
 const DEADLINE_NOTE: &str = "If the work in progress still needs it, start it again with `run_in_background` and a longer `timeout`. If it already had the longest `timeout` allowed, do not restart it. Either way, report that it was stopped.";
+const OUTPUT_CAP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const OUTPUT_CAP_MARKER: &str = " [output truncated: exceeded 5GB disk cap] ";
+const ENDS_WITH_TURN: &str = "If it exits while you are still working you will be notified, but it is terminated when you give your final response and no notification can follow that \u{2014} so do not end your turn to wait for it; if you need its result, wait for it before giving your final response.";
 const UNWATCHED: &str = "Nothing notifies you when the command finishes: read the output file that the result names to check on it. The file gets no line when the command ends, so if you need to know that it has, end the command with an `echo` of your own.";
 
 type Outcome = Result<BashResult, String>;
@@ -38,7 +44,9 @@ struct Job {
     abort: tokio::task::AbortHandle,
     waiting: AtomicUsize,
     delivered: AtomicBool,
+    backgrounded: AtomicBool,
     expired: Arc<AtomicBool>,
+    capped: Arc<Signal>,
     written: Arc<Signal>,
     id: String,
     command: String,
@@ -49,7 +57,7 @@ struct Job {
 impl Job {
     fn status(&self) -> &'static str {
         match &*self.result.borrow() {
-            _ if self.expired.load(Ordering::SeqCst) => "killed",
+            _ if self.expired.load(Ordering::SeqCst) || self.capped.is_fired() => "killed",
             Some(Ok(result)) if result.exit_code == 0 => "completed",
             Some(_) => "failed",
             None if self.abort.is_finished() => "killed",
@@ -96,6 +104,9 @@ impl Job {
                 "",
             );
         }
+        if self.capped.is_fired() {
+            return self.notification(Some("killed"), "was stopped", "", "");
+        }
         let (status, summary) = match outcome {
             Ok(result) if result.exit_code == 0 => {
                 ("completed", "completed (exit code 0)".to_owned())
@@ -138,7 +149,11 @@ impl OutputSink for FileSink {
         let _ = self.0.send(bytes.to_vec());
     }
 }
-async fn output_file(session: &str, id: &str) -> Option<(PathBuf, FileSink, Arc<Signal>)> {
+async fn output_file(
+    session: &str,
+    id: &str,
+    capped: Arc<Signal>,
+) -> Option<(PathBuf, FileSink, Arc<Signal>)> {
     let directory = std::env::temp_dir()
         .join("nanocode")
         .join(session)
@@ -154,8 +169,19 @@ async fn output_file(session: &str, id: &str) -> Option<(PathBuf, FileSink, Arc<
     let written = Arc::new(Signal::new());
     let done = Arc::clone(&written);
     drop(tokio::spawn(async move {
+        let mut total = 0_u64;
         while let Some(chunk) = chunks.recv().await {
-            if file.write_all(&chunk).await.is_err() {
+            total = total.saturating_add(chunk.len() as u64);
+            let over = total > OUTPUT_CAP_BYTES;
+            let bytes = if over {
+                OUTPUT_CAP_MARKER.as_bytes()
+            } else {
+                &chunk
+            };
+            if file.write_all(bytes).await.is_err() || over {
+                if over {
+                    capped.fire();
+                }
                 break;
             }
         }
@@ -164,7 +190,7 @@ async fn output_file(session: &str, id: &str) -> Option<(PathBuf, FileSink, Arc<
     }));
     Some((path, FileSink(sender), written))
 }
-async fn stall(job: &Job, agent: &WeakAgent) {
+async fn stall(job: &Job, binding: &Binding) {
     let Some(path) = &job.output else {
         return;
     };
@@ -199,7 +225,7 @@ async fn stall(job: &Job, agent: &WeakAgent) {
                 tail.trim_end()
             ),
         );
-        route(agent.clone(), job.id.clone(), text);
+        route(binding.clone(), job.id.clone(), text);
         return;
     }
 }
@@ -259,9 +285,15 @@ fn prompting(tail: &str) -> bool {
         .iter()
         .any(|pattern| line.contains(pattern))
 }
-fn route(agent: WeakAgent, id: String, text: String) {
+fn route(binding: Binding, id: String, text: String) {
     drop(tokio::spawn(async move {
-        let Some(agent) = agent.upgrade() else {
+        if binding.ends_with_turn {
+            if !(binding.steer)(text).await {
+                tracing::debug!(task_id = %id, "background Bash notification found no running turn");
+            }
+            return;
+        }
+        let Some(agent) = binding.agent.upgrade() else {
             return;
         };
         if let Err(error) = agent.route_prompt_request(PromptRequest::new(text)).await {
@@ -284,7 +316,13 @@ fn whole_duration(milliseconds: u64) -> String {
         (hours, minutes) => format!("{hours}h {minutes}m"),
     }
 }
-fn started(id: &str, output: Option<&Path>, timed_out: Option<Duration>, watched: bool) -> String {
+#[derive(Clone, Copy)]
+enum Watch {
+    Notified,
+    EndsWithTurn,
+    Unwatched,
+}
+fn started(id: &str, output: Option<&Path>, timed_out: Option<Duration>, watch: Watch) -> String {
     let written = output.map_or_else(String::new, |path| {
         format!(" Output is being written to: {}.", path.display())
     });
@@ -295,12 +333,15 @@ fn started(id: &str, output: Option<&Path>, timed_out: Option<Duration>, watched
         ),
         None => format!("Command running in background with ID: {id}.{written}"),
     }];
-    parts.push(if watched {
-        "You will be notified when it completes.".to_owned()
-    } else {
-        UNWATCHED.to_owned()
-    });
-    if watched && timed_out.is_some() {
+    parts.push(
+        match watch {
+            Watch::Notified => "You will be notified when it completes.",
+            Watch::EndsWithTurn => ENDS_WITH_TURN,
+            Watch::Unwatched => UNWATCHED,
+        }
+        .to_owned(),
+    );
+    if matches!(watch, Watch::Notified) && timed_out.is_some() {
         parts.push(format!(
             "If it is still running after {} in the background, it will be stopped and you will be notified.",
             whole_duration(DEFAULT_BACKGROUND_TIMEOUT_MS)
@@ -316,20 +357,45 @@ struct Entries {
     closed: bool,
     jobs: BTreeMap<String, Arc<Job>>,
 }
+#[derive(Clone)]
+struct Binding {
+    agent: WeakAgent,
+    steer: Steer,
+    ends_with_turn: bool,
+}
 #[derive(Default)]
 pub(super) struct Jobs {
     next: AtomicU64,
     entries: Atom<Entries>,
-    agent: Atom<Option<WeakAgent>>,
+    agent: Atom<Option<Binding>>,
 }
 impl Jobs {
-    pub(super) fn bind(&self, agent: &Agent) {
-        let agent = agent.downgrade();
-        self.agent.update(|bound| *bound = Some(agent.clone()));
+    pub(super) fn bind(&self, agent: &Agent, steer: &Steer, ends_with_turn: bool) {
+        let binding = Binding {
+            agent: agent.downgrade(),
+            steer: Arc::clone(steer),
+            ends_with_turn,
+        };
+        self.agent.update(|bound| *bound = Some(binding.clone()));
     }
-    fn watch(&self, job: Arc<Job>) -> bool {
-        let Some(agent) = self.agent.read(Clone::clone) else {
-            return false;
+    pub(super) fn reap(&self) {
+        let jobs = self
+            .entries
+            .read(|entries| entries.jobs.values().cloned().collect::<Vec<_>>());
+        for job in jobs {
+            if job.backgrounded.load(Ordering::SeqCst) && job.status() == "running" {
+                job.abort.abort();
+            }
+        }
+    }
+    fn watch(&self, job: Arc<Job>) -> Watch {
+        let Some(binding) = self.agent.read(Clone::clone) else {
+            return Watch::Unwatched;
+        };
+        let watch = if binding.ends_with_turn {
+            Watch::EndsWithTurn
+        } else {
+            Watch::Notified
         };
         drop(tokio::spawn(async move {
             let finished = async {
@@ -341,7 +407,7 @@ impl Jobs {
             let outcome = tokio::select! {
                 biased;
                 outcome = &mut finished => outcome,
-                () = stall(&job, &agent) => finished.await,
+                () = stall(&job, &binding) => finished.await,
             };
             if job.result.borrow().is_none()
                 || job.waiting.load(Ordering::SeqCst) > 0
@@ -349,9 +415,13 @@ impl Jobs {
             {
                 return;
             }
-            route(agent, job.id.clone(), job.completion_notification(&outcome));
+            route(
+                binding,
+                job.id.clone(),
+                job.completion_notification(&outcome),
+            );
         }));
-        true
+        watch
     }
     fn forget(&self, id: &str) {
         self.entries.update(|entries| {
@@ -439,7 +509,8 @@ impl BashExecutor for LocalBash {
             "{session}-bash-{}",
             self.jobs.next.fetch_add(1, Ordering::Relaxed)
         );
-        let (output, sink, written) = match output_file(&session, &id).await {
+        let capped = Arc::new(Signal::new());
+        let (output, sink, written) = match output_file(&session, &id, Arc::clone(&capped)).await {
             Some((path, sink, written)) => (Some(path), Some(sink), written),
             None => {
                 let written = Arc::new(Signal::new());
@@ -458,6 +529,7 @@ impl BashExecutor for LocalBash {
             let guard = Finished(Arc::clone(&finished));
             let start = Arc::clone(&admitted);
             let stopped = Arc::clone(&expired);
+            let over = Arc::clone(&capped);
             let command = request.command.clone();
             let label = request
                 .description
@@ -485,6 +557,7 @@ impl BashExecutor for LocalBash {
                         stopped.store(true, Ordering::SeqCst);
                         Err("Bash command stopped after reaching its background time limit".into())
                     }
+                    () = over.wait() => Err("Command killed: output file exceeded 5GB".into()),
                 };
                 drop(sink);
                 let _ = sender.send(Some(result));
@@ -495,7 +568,9 @@ impl BashExecutor for LocalBash {
                 result: receiver,
                 waiting: AtomicUsize::new(0),
                 delivered: AtomicBool::new(false),
+                backgrounded: AtomicBool::new(false),
                 expired,
+                capped,
                 written,
                 id: id.clone(),
                 command,
@@ -548,10 +623,11 @@ impl BashExecutor for LocalBash {
             }
         };
         admission.0 = None;
+        job.backgrounded.store(true, Ordering::SeqCst);
         let output_file = job.output.clone();
-        let watched = self.jobs.watch(job);
+        let watch = self.jobs.watch(job);
         Ok(BashExecution::Background {
-            message: started(&id, output_file.as_deref(), timed_out, watched),
+            message: started(&id, output_file.as_deref(), timed_out, watch),
             output_file: output_file.map(|path| path.display().to_string()),
             task_id: id,
         })

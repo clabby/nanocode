@@ -135,7 +135,8 @@ type Handler = Arc<dyn Fn(Value, ClaudeToolInvocation) -> ToolResultFuture + Sen
 type ToolCleanup = Arc<dyn Fn() -> BackendFuture<()> + Send + Sync>;
 type CodeTurnCleanup = Arc<dyn Fn(ClaudeToolProgress) -> BackendFuture<()> + Send + Sync>;
 type NestedToolLookup = Arc<dyn Fn(&str) -> bool + Send + Sync>;
-type AgentBound = Arc<dyn Fn(&Agent) + Send + Sync>;
+pub(crate) type Steer = Arc<dyn Fn(String) -> BackendFuture<bool> + Send + Sync>;
+type AgentBound = Arc<dyn Fn(&Agent, &Steer) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeToolInvocation {
@@ -303,7 +304,10 @@ impl ClaudeTools {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn agent_bound(mut self, bound: impl Fn(&Agent) + Send + Sync + 'static) -> Self {
+    pub(crate) fn agent_bound(
+        mut self,
+        bound: impl Fn(&Agent, &Steer) + Send + Sync + 'static,
+    ) -> Self {
         self.agent_bound.push(Arc::new(bound));
         self
     }
@@ -1580,10 +1584,28 @@ impl ClaudeBuilder {
             code_call_summaries: Atom::default(),
         });
         native_factory.state.set(Arc::downgrade(&state));
+        let steering = Arc::downgrade(&state);
+        let steer: Steer = Arc::new(move |text| {
+            let state = steering.clone();
+            Box::pin(async move {
+                let Some(state) = state.upgrade() else {
+                    return false;
+                };
+                let mut turns = state.steering.acquire().await;
+                let Some((_, turn)) = turns
+                    .iter_mut()
+                    .filter(|(_, turn)| turn.accepting)
+                    .min_by_key(|(key, _)| key.0)
+                else {
+                    return false;
+                };
+                state.accept_steer(turn, None, text.into()).await.is_ok()
+            })
+        });
         let driver = Driver { state, handle };
         let agent = runtime.bind(driver);
         for bound in &agent_bound {
-            bound(&agent);
+            bound(&agent, &steer);
         }
         Ok((agent, events))
     }

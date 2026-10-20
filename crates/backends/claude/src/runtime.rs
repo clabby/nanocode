@@ -15,6 +15,7 @@ pub struct ClaudeHarness {
     client: ClaudeClient,
     settings: Settings,
     configure: Option<Hook>,
+    headless: bool,
 }
 impl ClaudeHarness {
     #[must_use]
@@ -23,7 +24,14 @@ impl ClaudeHarness {
             client,
             settings: Settings::default(),
             configure: None,
+            headless: false,
         }
+    }
+
+    #[must_use]
+    pub const fn headless(mut self, headless: bool) -> Self {
+        self.headless = headless;
+        self
     }
 
     #[must_use]
@@ -103,6 +111,7 @@ impl RuntimeBackend for ClaudeHarness {
         let client = self.client.clone();
         let settings = settings.or(&self.settings.clone().or(&defaults));
         let configure = self.configure.clone();
+        let headless = self.headless;
         Box::pin(async move {
             let remote = settings
                 .tools
@@ -178,6 +187,7 @@ impl RuntimeBackend for ClaudeHarness {
                         services.runner_routing(),
                         services.process_executors().foreground(),
                         &providers,
+                        headless,
                     )
                 }
                 #[cfg(target_family = "wasm")]
