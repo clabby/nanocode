@@ -180,9 +180,25 @@ pub(super) fn cancel_queued_turn(
     true
 }
 
-pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<QueuedTurn>) {
+pub(super) fn stop_queued_turns(queued_turns: &mut VecDeque<QueuedTurn>) {
     let accepted = std::mem::take(queued_turns);
     queued_turns.extend(accepted.into_iter().map(|queued| match queued {
+        QueuedTurn::Pending {
+            prompt,
+            execution_operation: Some(operation),
+            thinking,
+            service_tier,
+            events,
+            result,
+            ..
+        } if operation.survives_shutdown() => QueuedTurn::Stopped {
+            prompt,
+            operation_id: operation.into_id(),
+            thinking,
+            service_tier,
+            events,
+            result,
+        },
         QueuedTurn::Pending {
             key,
             prompt,
@@ -204,7 +220,7 @@ pub(super) fn mark_all_queued_turns_cancelled(queued_turns: &mut VecDeque<Queued
             events,
             result,
         },
-        queued @ QueuedTurn::Cancelled { .. } => queued,
+        queued @ (QueuedTurn::Cancelled { .. } | QueuedTurn::Stopped { .. }) => queued,
     }));
 }
 
@@ -295,7 +311,7 @@ pub(super) async fn begin_shutdown(
             Command::Shutdown => {}
         }
     }
-    mark_all_queued_turns_cancelled(queued_turns);
+    stop_queued_turns(queued_turns);
 }
 
 fn spawn_side_question(

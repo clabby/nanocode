@@ -148,6 +148,7 @@ pub(super) enum ExecutionOperation {
     Caller(String),
     Automatic(String),
     Admitted(String),
+    AdmittedCaller(String),
     Recovered(String),
 }
 
@@ -157,6 +158,7 @@ impl ExecutionOperation {
             Self::Caller(operation_id)
             | Self::Automatic(operation_id)
             | Self::Admitted(operation_id)
+            | Self::AdmittedCaller(operation_id)
             | Self::Recovered(operation_id) => operation_id,
         }
     }
@@ -166,12 +168,20 @@ impl ExecutionOperation {
             Self::Caller(operation_id)
             | Self::Automatic(operation_id)
             | Self::Admitted(operation_id)
+            | Self::AdmittedCaller(operation_id)
             | Self::Recovered(operation_id) => operation_id,
         }
     }
 
     pub(super) const fn is_recovered(&self) -> bool {
         matches!(self, Self::Recovered(_))
+    }
+
+    pub(super) const fn survives_shutdown(&self) -> bool {
+        matches!(
+            self,
+            Self::Caller(_) | Self::AdmittedCaller(_) | Self::Recovered(_)
+        )
     }
 }
 
@@ -199,6 +209,14 @@ pub(super) enum QueuedTurn {
         thinking: Thinking,
         service_tier: ServiceTier,
         parent: Option<tracing::Span>,
+        events: EventSink,
+        result: oneshot::Sender<Result<TurnResult>>,
+    },
+    Stopped {
+        prompt: Prompt,
+        operation_id: String,
+        thinking: Thinking,
+        service_tier: ServiceTier,
         events: EventSink,
         result: oneshot::Sender<Result<TurnResult>>,
     },

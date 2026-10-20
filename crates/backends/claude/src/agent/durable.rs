@@ -689,7 +689,7 @@ impl State {
         };
         let result = if interrupted {
             ContentBlock::tool_result_content(id, ToolResultContent::Text("Tool execution interrupted by a host crash; outcome unknown. Do not assume it did not run or automatically repeat it.".into()), true)
-        } else if cancel.flag.load(Ordering::SeqCst) {
+        } else if cancel.is_cancelled() {
             unknown()
         } else if self.code_only && cursor.recovered_code_index == Some(index) && name == "exec" {
             ContentBlock::tool_result_content(id, ToolResultContent::Text(

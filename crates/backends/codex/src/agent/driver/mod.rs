@@ -11,9 +11,8 @@ use super::*;
 pub(super) use branch::{AgentOrigin, BranchSpawner};
 pub(super) use control::DriverShutdown;
 use control::{
-    TurnDefaults, begin_shutdown, cancel_queued_turn, handle_idle_command,
-    mark_all_queued_turns_cancelled, model_change_locked, queued_execution_operation,
-    queued_prompt,
+    TurnDefaults, begin_shutdown, cancel_queued_turn, handle_idle_command, model_change_locked,
+    queued_execution_operation, queued_prompt,
 };
 use telemetry::{ReasoningSettings, agent_compact_span, agent_turn_span, emit_replayed_terminal};
 
@@ -247,6 +246,7 @@ impl AgentDriver {
                                         self.workspace.as_deref(),
                                         thinking,
                                         service_tier,
+                                        &NanocodeError::TurnCancelled,
                                     );
                                     model.set_events(self.events.clone());
                                     emitted.and(Err(NanocodeError::TurnCancelled))
@@ -289,6 +289,27 @@ impl AgentDriver {
                             }
                             drop(_guard);
                             drop(result.send(outcome));
+                            continue;
+                        }
+                        QueuedTurn::Stopped {
+                            prompt,
+                            operation_id,
+                            thinking,
+                            service_tier,
+                            events,
+                            result,
+                        } => {
+                            self.execution.release_claim(&operation_id).await;
+                            model.set_events(events);
+                            let emitted = model.emit_cancelled_before_start(
+                                &prompt,
+                                self.workspace.as_deref(),
+                                thinking,
+                                service_tier,
+                                &NanocodeError::TurnStopped,
+                            );
+                            model.set_events(self.events.clone());
+                            drop(result.send(emitted.and(Err(NanocodeError::TurnStopped))));
                             continue;
                         }
                     }
@@ -396,7 +417,6 @@ impl AgentDriver {
                             default_service_tier,
                         )
                         .await;
-                        mark_all_queued_turns_cancelled(&mut queued_turns);
                         commands_open = false;
                         continue;
                     }
@@ -973,7 +993,6 @@ impl AgentDriver {
                                             default_service_tier,
                                         )
                                         .await;
-                                        mark_all_queued_turns_cancelled(&mut queued_turns);
                                         commands_open = false;
                                         break execution.as_mut().await;
                                     }
@@ -1785,7 +1804,6 @@ impl AgentDriver {
                                     default_service_tier,
                                 )
                                 .await;
-                                mark_all_queued_turns_cancelled(&mut queued_turns);
                                 commands_open = false;
                             }
                             None => {
@@ -2295,6 +2313,10 @@ async fn accept_execution_command(
         return Some(command);
     };
     let replay_thinking = thinking.unwrap_or(default_thinking);
+    let caller = matches!(
+        operation,
+        ExecutionOperation::Caller(_) | ExecutionOperation::AdmittedCaller(_)
+    );
     let admission = match operation {
         ExecutionOperation::Caller(operation_id) => execution
             .admit(&operation_id, &prompt)
@@ -2305,7 +2327,8 @@ async fn accept_execution_command(
                 .admit_automatic(candidate_operation_id, &prompt)
                 .await
         }
-        ExecutionOperation::Admitted(operation_id) => {
+        ExecutionOperation::Admitted(operation_id)
+        | ExecutionOperation::AdmittedCaller(operation_id) => {
             Ok((operation_id, AdmittedExecution::Execute))
         }
         ExecutionOperation::Recovered(operation_id) => {
@@ -2329,7 +2352,11 @@ async fn accept_execution_command(
             Some(Command::Prompt {
                 key,
                 prompt,
-                execution_operation: Some(ExecutionOperation::Admitted(operation_id)),
+                execution_operation: Some(if caller {
+                    ExecutionOperation::AdmittedCaller(operation_id)
+                } else {
+                    ExecutionOperation::Admitted(operation_id)
+                }),
                 accepted: None,
                 cancel_on_admission,
                 thinking,
@@ -2494,6 +2521,7 @@ async fn accept_idle_route(
         });
     }
 
+    let caller = request_id.is_some();
     let admission = execution
         .admit_automatic(
             request_id.unwrap_or_else(|| SessionId::new().to_string()),
@@ -2522,7 +2550,11 @@ async fn accept_idle_route(
             Some(Command::Prompt {
                 key,
                 prompt,
-                execution_operation: Some(ExecutionOperation::Admitted(operation_id)),
+                execution_operation: Some(if caller {
+                    ExecutionOperation::AdmittedCaller(operation_id)
+                } else {
+                    ExecutionOperation::Admitted(operation_id)
+                }),
                 accepted: None,
                 cancel_on_admission,
                 thinking: None,

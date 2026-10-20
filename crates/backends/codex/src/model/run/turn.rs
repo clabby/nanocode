@@ -152,6 +152,7 @@ impl ModelRun {
         workspace: Option<&str>,
         thinking: Thinking,
         service_tier: ServiceTier,
+        error: &NanocodeError,
     ) -> Result<()> {
         self.thinking = thinking;
         self.service_tier = service_tier;
@@ -171,7 +172,6 @@ impl ModelRun {
                 instruction_bytes: task.text_bytes(),
             },
         )?;
-        let error = NanocodeError::TurnCancelled;
         let message = error.to_string();
         self.events
             .emit(AgentEventKind::RunError, RunError { message: &message })?;

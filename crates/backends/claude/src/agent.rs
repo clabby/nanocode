@@ -42,7 +42,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -2930,25 +2930,43 @@ impl Drop for LiveNestedCalls<'_> {
 }
 #[derive(Default)]
 struct Cancellation {
-    flag: AtomicBool,
+    state: AtomicU8,
     notify: Notify,
 }
 impl Cancellation {
+    const LIVE: u8 = 0;
+    const CANCELLED: u8 = 1;
+    const STOPPED: u8 = 2;
     fn cancel(&self) {
-        self.flag.store(true, Ordering::SeqCst);
+        self.end(Self::CANCELLED);
+    }
+    fn stop(&self) {
+        self.end(Self::STOPPED);
+    }
+    fn end(&self, state: u8) {
+        let _ = self
+            .state
+            .compare_exchange(Self::LIVE, state, Ordering::SeqCst, Ordering::SeqCst);
         self.notify.notify_waiters();
     }
     fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.state.load(Ordering::SeqCst) != Self::LIVE
+    }
+    fn interruption(&self, automatic: bool) -> NanocodeError {
+        if !automatic && self.state.load(Ordering::SeqCst) == Self::STOPPED {
+            NanocodeError::TurnStopped
+        } else {
+            NanocodeError::TurnCancelled
+        }
     }
     async fn cancelled(&self) {
-        if self.flag.load(Ordering::SeqCst) {
+        if self.is_cancelled() {
             return;
         }
         let notified = self.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if !self.flag.load(Ordering::SeqCst) {
+        if !self.is_cancelled() {
             notified.await;
         }
     }
@@ -3153,12 +3171,12 @@ async fn defer_turn(
             let mut retired = std::pin::pin!(state.idle.notified());
             retired.as_mut().enable();
             if cancellation.is_cancelled() {
-                break Err((NanocodeError::TurnCancelled, false));
+                break Err((cancellation.interruption(automatic), false));
             }
 
             let admission = tokio::select! {
                 admission = state.admission.enter() => admission,
-                () = cancellation.cancelled() => break Err((NanocodeError::TurnCancelled, false)),
+                () = cancellation.cancelled() => break Err((cancellation.interruption(automatic), false)),
             };
             if state.stopped.load(Ordering::SeqCst) {
                 break Err((NanocodeError::AgentStopped, false));
@@ -3246,6 +3264,7 @@ async fn abandon_deferred(
         waiters.remove(&order);
     });
     let cancelled = matches!(error, NanocodeError::TurnCancelled);
+    let stopped = matches!(error, NanocodeError::TurnStopped);
     if !begun {
         if automatic || cancelled {
             retire_unstarted(policy, id).await;
@@ -3267,7 +3286,7 @@ async fn abandon_deferred(
         events,
         AgentEventKind::RunFailed,
         json!({
-            "status": if cancelled { "cancelled" } else { "failed" },
+            "status": if cancelled || stopped { "cancelled" } else { "failed" },
             "model": state.model(),
             "effort": state.thinking().as_str(),
             "transport": "messages_sse",
@@ -4119,7 +4138,7 @@ impl State {
             request
                 .cache_system_prefix_with(&messages)
                 .map_err(provider_error)?;
-            if cancel.flag.load(Ordering::SeqCst) && context.effect.is_none() {
+            if cancel.is_cancelled() && context.effect.is_none() {
                 return Err(NanocodeError::TurnCancelled.into());
             }
             client
@@ -4234,7 +4253,7 @@ impl State {
         let mut attempt = 0;
         let mut dispatched: Option<u64> = None;
         loop {
-            if cancel.flag.load(Ordering::SeqCst) {
+            if cancel.is_cancelled() {
                 return Err(ResponseFailure {
                     error: NanocodeError::TurnCancelled,
                     recovery: if upgrade.is_some() { recovery } else { None },
@@ -5338,7 +5357,7 @@ impl State {
         if request.cancel_on_admission {
             cancel.cancel();
         }
-        if cancel.flag.load(Ordering::SeqCst) && self.policy.is_none() {
+        if cancel.is_cancelled() && self.policy.is_none() {
             return Err(NanocodeError::TurnCancelled);
         }
         self.publish_side_view(None);
@@ -5549,7 +5568,7 @@ impl State {
                         .await?;
                 }
             }
-            if cancel.flag.load(Ordering::SeqCst) && self.policy.is_none() {
+            if cancel.is_cancelled() && self.policy.is_none() {
                 return Err(NanocodeError::TurnCancelled);
             }
             if !replaying_boundary
@@ -5888,10 +5907,10 @@ impl State {
                         results[position] = Some(result);
                     }
                 }
-                interrupted = cancel.flag.load(Ordering::SeqCst);
+                interrupted = cancel.is_cancelled();
             } else {
                 for batch in batches {
-                    if cancel.flag.load(Ordering::SeqCst) {
+                    if cancel.is_cancelled() {
                         interrupted = true;
                         break;
                     }
@@ -5901,7 +5920,7 @@ impl State {
                         let (id, name, input, handler) = &tool_calls[position];
                         let cursor = &cursor;
                         calls.push(async move {
-                            let result = if cancel.flag.load(Ordering::SeqCst) {
+                            let result = if cancel.is_cancelled() {
                                 None
                             } else {
                                 Some(
@@ -6052,7 +6071,7 @@ impl State {
                 ));
             }
             if output_exhausted {
-                if cancel.flag.load(Ordering::SeqCst) {
+                if cancel.is_cancelled() {
                     return Err(NanocodeError::TurnCancelled);
                 }
 
@@ -6080,7 +6099,7 @@ impl State {
                 continue;
             }
             if exhausted {
-                if cancel.flag.load(Ordering::SeqCst) {
+                if cancel.is_cancelled() {
                     return Err(NanocodeError::TurnCancelled);
                 }
                 if cursor.context_recovery_attempted {
@@ -6125,7 +6144,7 @@ impl State {
                     response.stop_reason
                 )));
             }
-            if cancel.flag.load(Ordering::SeqCst) {
+            if cancel.is_cancelled() {
                 return Err(NanocodeError::TurnCancelled);
             }
 
@@ -6917,7 +6936,7 @@ impl LifecycleBackend for Driver {
                 cancel.cancel();
             }
             for cancel in state.cancellations.get().values() {
-                cancel.cancel();
+                cancel.stop();
             }
             let _admission = state.admission.enter().await;
             loop {
@@ -6929,7 +6948,7 @@ impl LifecycleBackend for Driver {
                     break;
                 }
                 for cancel in cancels.values() {
-                    cancel.cancel();
+                    cancel.stop();
                 }
                 drop(cancels);
                 notified.await;
