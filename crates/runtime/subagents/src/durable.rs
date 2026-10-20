@@ -3,6 +3,7 @@ use super::{
     runtime::{ChildSession, OutputContract},
 };
 use nanocode_agent_core::{Lineage, ModelSelection, SessionCheckpoint, Thinking};
+use nanocode_durability_core::EncodedPayload;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
@@ -170,13 +171,18 @@ const KEY_PREFIX: &str = "b3:";
 
 #[must_use]
 pub fn checkpoint_key(json: &str) -> String {
-    format!("{KEY_PREFIX}{}", blake3::hash(json.as_bytes()).to_hex())
+    record_key(json.into()).to_string()
+}
+
+fn record_key(json: Arc<str>) -> Arc<str> {
+    EncodedPayload::from_json(json).key().into()
 }
 
 fn key_matches(json: &str, key: &str) -> bool {
-    match key.strip_prefix(KEY_PREFIX) {
-        Some(hash) => blake3::hash(json.as_bytes()).to_hex().as_str() == hash,
-        None => sha256_key(json) == key,
+    if key.starts_with(KEY_PREFIX) {
+        checkpoint_key(json) == key
+    } else {
+        sha256_key(json) == key
     }
 }
 
@@ -223,7 +229,7 @@ pub(super) fn encoded<T: Serialize>(value: &T) -> std::io::Result<(Arc<str>, Arc
     let json: Arc<str> = serde_json::to_string(value)
         .map_err(std::io::Error::other)?
         .into();
-    Ok((checkpoint_key(&json).into(), json))
+    Ok((record_key(Arc::clone(&json)), json))
 }
 
 pub(super) async fn load_verified(

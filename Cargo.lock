@@ -2153,9 +2153,9 @@ name = "nanocode-subagents"
 version = "0.6.7"
 dependencies = [
  "async-trait",
- "blake3",
  "futures-util",
  "nanocode-agent-core",
+ "nanocode-durability-core",
  "nanocode-platform",
  "nanocode-schema",
  "nanocode-sync",
