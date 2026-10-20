@@ -2,7 +2,7 @@ use super::{process, selection};
 use std::{ffi::OsString, path::Path, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub use nanocode_process_contracts::ForegroundOutput;
+pub use nanocode_process_contracts::{ForegroundOutput, OutputSink};
 
 pub fn run_bash<'call>(
     workspace: &'call Path,
@@ -11,6 +11,7 @@ pub fn run_bash<'call>(
     max_stdout: usize,
     max_stderr: usize,
     session: Option<&'call crate::SessionEnvironment>,
+    output: Option<&'call dyn OutputSink>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ForegroundOutput, String>> + Send + 'call>,
 > {
@@ -22,9 +23,11 @@ pub fn run_bash<'call>(
         max_stderr,
         session,
         &[],
+        output,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_bash_with_environment<'call>(
     workspace: &'call Path,
     command: &'call str,
@@ -33,6 +36,7 @@ pub(crate) fn run_bash_with_environment<'call>(
     max_stderr: usize,
     session: Option<&'call crate::SessionEnvironment>,
     environment: &'call [(OsString, OsString)],
+    output: Option<&'call dyn OutputSink>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ForegroundOutput, String>> + Send + 'call>,
 > {
@@ -63,8 +67,8 @@ pub(crate) fn run_bash_with_environment<'call>(
         let outcome = tokio::time::timeout(timeout, async {
             let (status, stdout, stderr) = tokio::join!(
                 spawned.child.wait(),
-                capture(stdout, max_stdout),
-                capture(stderr, max_stderr)
+                capture(stdout, max_stdout, output),
+                capture(stderr, max_stderr, output)
             );
             let (stdout, stdout_cut) = stdout?;
             let (stderr, stderr_cut) = stderr?;
@@ -90,6 +94,7 @@ pub(crate) fn run_bash_with_environment<'call>(
 async fn capture<R: AsyncRead + Unpin>(
     pipe: Option<R>,
     limit: usize,
+    output: Option<&dyn OutputSink>,
 ) -> std::io::Result<(String, bool)> {
     let Some(mut pipe) = pipe else {
         return Ok((String::new(), false));
@@ -101,6 +106,9 @@ async fn capture<R: AsyncRead + Unpin>(
         let read = pipe.read(&mut buffer).await?;
         if read == 0 {
             break;
+        }
+        if let Some(output) = output {
+            output.write(&buffer[..read]);
         }
         let keep = read.min(limit.saturating_sub(bytes.len()));
         bytes.extend_from_slice(&buffer[..keep]);

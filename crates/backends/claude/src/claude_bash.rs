@@ -1,6 +1,10 @@
-use crate::tools::{BashExecution, BashExecutor, BashRequest, BashResult, ClaudeBash};
+use crate::tools::{
+    BashExecution, BashExecutor, BashRequest, BashResult, ClaudeBash,
+    bash::DEFAULT_BACKGROUND_TIMEOUT_MS,
+};
 use async_trait::async_trait;
 use nanocode_agent_core::{Agent, PromptRequest, WeakAgent};
+use nanocode_process_contracts::{ForegroundExecutor, OutputSink};
 use nanocode_sync::{Atom, Signal};
 use nanocode_tool_host::{
     SessionEnvironment, Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult,
@@ -9,14 +13,23 @@ use nanocode_tool_host::{
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::watch;
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::{mpsc, oneshot, watch},
+};
+
+const STALL_POLL: Duration = Duration::from_secs(5);
+const STALL_SILENCE: Duration = Duration::from_secs(45);
+const STALL_TAIL_BYTES: u64 = 1024;
+const DEADLINE_NOTE: &str = "If the work in progress still needs it, start it again with `run_in_background` and a longer `timeout`. If it already had the longest `timeout` allowed, do not restart it. Either way, report that it was stopped.";
+const UNWATCHED: &str = "Nothing notifies you when the command finishes: read the output file that the result names to check on it. The file gets no line when the command ends, so if you need to know that it has, end the command with an `echo` of your own.";
 
 type Outcome = Result<BashResult, String>;
 struct Job {
@@ -25,6 +38,76 @@ struct Job {
     abort: tokio::task::AbortHandle,
     waiting: AtomicUsize,
     delivered: AtomicBool,
+    expired: Arc<AtomicBool>,
+    written: Arc<Signal>,
+    id: String,
+    command: String,
+    label: String,
+    call_id: Option<String>,
+    output: Option<PathBuf>,
+}
+impl Job {
+    fn status(&self) -> &'static str {
+        match &*self.result.borrow() {
+            _ if self.expired.load(Ordering::SeqCst) => "killed",
+            Some(Ok(result)) if result.exit_code == 0 => "completed",
+            Some(_) => "failed",
+            None if self.abort.is_finished() => "killed",
+            None => "running",
+        }
+    }
+    fn notification(
+        &self,
+        status: Option<&str>,
+        summary: &str,
+        body: &str,
+        trailing: &str,
+    ) -> String {
+        let label = self
+            .label
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let summary = format!("Background command \"{label}\" {summary}");
+        let output = self.output.as_ref().map(|path| path.display().to_string());
+        let mut text = "<task-notification>".to_owned();
+        for (tag, value) in [
+            ("task-id", Some(self.id.as_str())),
+            ("tool-use-id", self.call_id.as_deref()),
+            ("output-file", output.as_deref()),
+            ("status", status),
+            ("summary", Some(summary.as_str())),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                text.push_str(&format!("\n<{tag}>{value}</{tag}>"));
+            }
+        }
+        text.push_str(body);
+        text.push_str("\n</task-notification>");
+        text.push_str(trailing);
+        text
+    }
+    fn completion_notification(&self, outcome: &Outcome) -> String {
+        if self.expired.load(Ordering::SeqCst) {
+            return self.notification(
+                Some("killed"),
+                "was stopped after reaching its background time limit",
+                &format!("\n<note>{DEADLINE_NOTE}</note>"),
+                "",
+            );
+        }
+        let (status, summary) = match outcome {
+            Ok(result) if result.exit_code == 0 => {
+                ("completed", "completed (exit code 0)".to_owned())
+            }
+            Ok(result) => (
+                "failed",
+                format!("failed with exit code {}", result.exit_code),
+            ),
+            Err(_) => ("failed", "failed".to_owned()),
+        };
+        self.notification(Some(status), &summary, "", "")
+    }
 }
 struct Waiting<'a>(&'a Job);
 impl<'a> Waiting<'a> {
@@ -49,6 +132,185 @@ impl Drop for Job {
         self.abort.abort();
     }
 }
+struct FileSink(mpsc::UnboundedSender<Vec<u8>>);
+impl OutputSink for FileSink {
+    fn write(&self, bytes: &[u8]) {
+        let _ = self.0.send(bytes.to_vec());
+    }
+}
+async fn output_file(session: &str, id: &str) -> Option<(PathBuf, FileSink, Arc<Signal>)> {
+    let directory = std::env::temp_dir()
+        .join("nanocode")
+        .join(session)
+        .join("tasks");
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(&directory).await.ok()?;
+    let path = directory.join(format!("{id}.output"));
+    let mut file = tokio::fs::File::create(&path).await.ok()?;
+    let (sender, mut chunks) = mpsc::unbounded_channel::<Vec<u8>>();
+    let written = Arc::new(Signal::new());
+    let done = Arc::clone(&written);
+    drop(tokio::spawn(async move {
+        while let Some(chunk) = chunks.recv().await {
+            if file.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+        let _ = file.flush().await;
+        done.fire();
+    }));
+    Some((path, FileSink(sender), written))
+}
+async fn stall(job: &Job, agent: &WeakAgent) {
+    let Some(path) = &job.output else {
+        return;
+    };
+    let mut size = 0;
+    let mut quiet = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(STALL_POLL).await;
+        let Ok(metadata) = tokio::fs::metadata(path).await else {
+            continue;
+        };
+        if metadata.len() > size {
+            size = metadata.len();
+            quiet = tokio::time::Instant::now();
+            continue;
+        }
+        if quiet.elapsed() < STALL_SILENCE {
+            continue;
+        }
+        let Some(tail) = tail(path, metadata.len()).await else {
+            continue;
+        };
+        if !prompting(&tail) {
+            quiet = tokio::time::Instant::now();
+            continue;
+        }
+        let text = job.notification(
+            None,
+            "appears to be waiting for interactive input",
+            "",
+            &format!(
+                "\nLast output:\n{}\n\nThe command is likely blocked on an interactive prompt. Stop this task and re-run with piped input (e.g., `echo y | command`) or a non-interactive flag if one exists.",
+                tail.trim_end()
+            ),
+        );
+        route(agent.clone(), job.id.clone(), text);
+        return;
+    }
+}
+async fn tail(path: &Path, size: u64) -> Option<String> {
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let start = size.saturating_sub(STALL_TAIL_BYTES);
+    file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+    let mut bytes = Vec::new();
+    file.take(STALL_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    Some(without_escapes(&String::from_utf8_lossy(&bytes)))
+}
+fn without_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.next_if_eq(&'[').is_some() {
+                while chars.next().is_some_and(|ch| !('@'..='~').contains(&ch)) {}
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+fn prompting(tail: &str) -> bool {
+    let line = tail
+        .trim_end()
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let question = line.trim_end_matches(' ').ends_with('?')
+        && ["do you", "would you", "shall i", "are you sure", "ready to"]
+            .iter()
+            .any(|phrase| {
+                line.match_indices(phrase).any(|(at, _)| {
+                    let before = line[..at].chars().next_back();
+                    let after = line[at + phrase.len()..].chars().next();
+                    !before.is_some_and(char::is_alphanumeric)
+                        && !after.is_some_and(char::is_alphanumeric)
+                })
+            });
+    question
+        || [
+            "(y/n)",
+            "[y/n]",
+            "(yes/no)",
+            "press any key",
+            "press enter",
+            "continue?",
+            "overwrite?",
+        ]
+        .iter()
+        .any(|pattern| line.contains(pattern))
+}
+fn route(agent: WeakAgent, id: String, text: String) {
+    drop(tokio::spawn(async move {
+        let Some(agent) = agent.upgrade() else {
+            return;
+        };
+        if let Err(error) = agent.route_prompt_request(PromptRequest::new(text)).await {
+            tracing::warn!(%error, task_id = %id, "background Bash notification did not reach the agent");
+        }
+    }));
+}
+fn sleeps(command: &str) -> bool {
+    command
+        .trim_start()
+        .split(|ch: char| ch.is_whitespace() || ";&|()".contains(ch))
+        .next()
+        == Some("sleep")
+}
+fn whole_duration(milliseconds: u64) -> String {
+    let minutes = milliseconds / 60_000;
+    match (minutes / 60, minutes % 60) {
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h {minutes}m"),
+    }
+}
+fn started(id: &str, output: Option<&Path>, timed_out: Option<Duration>, watched: bool) -> String {
+    let written = output.map_or_else(String::new, |path| {
+        format!(" Output is being written to: {}.", path.display())
+    });
+    let mut parts = vec![match timed_out {
+        Some(timeout) => format!(
+            "Command did not complete within its {}s timeout and was moved to the background (ID: {id}).{written}",
+            timeout.as_secs_f64().round().max(1.0)
+        ),
+        None => format!("Command running in background with ID: {id}.{written}"),
+    }];
+    parts.push(if watched {
+        "You will be notified when it completes.".to_owned()
+    } else {
+        UNWATCHED.to_owned()
+    });
+    if watched && timed_out.is_some() {
+        parts.push(format!(
+            "If it is still running after {} in the background, it will be stopped and you will be notified.",
+            whole_duration(DEFAULT_BACKGROUND_TIMEOUT_MS)
+        ));
+    }
+    if output.is_some() {
+        parts.push("To check interim output, use Read on that file path.".to_owned());
+    }
+    parts.join(" ")
+}
 #[derive(Clone, Default)]
 struct Entries {
     closed: bool,
@@ -65,28 +327,36 @@ impl Jobs {
         let agent = agent.downgrade();
         self.agent.update(|bound| *bound = Some(agent.clone()));
     }
-    fn watch(&self, id: String, job: Arc<Job>, label: String) {
+    fn watch(&self, job: Arc<Job>) -> bool {
         let Some(agent) = self.agent.read(Clone::clone) else {
-            return;
+            return false;
         };
         drop(tokio::spawn(async move {
-            let outcome = completion(&job).await;
+            let finished = async {
+                let outcome = completion(&job).await;
+                job.written.wait().await;
+                outcome
+            };
+            tokio::pin!(finished);
+            let outcome = tokio::select! {
+                biased;
+                outcome = &mut finished => outcome,
+                () = stall(&job, &agent) => finished.await,
+            };
             if job.result.borrow().is_none()
                 || job.waiting.load(Ordering::SeqCst) > 0
                 || job.delivered.swap(true, Ordering::SeqCst)
             {
                 return;
             }
-            let Some(agent) = agent.upgrade() else {
-                return;
-            };
-            if let Err(error) = agent
-                .route_prompt_request(PromptRequest::new(notification(&id, &label, &outcome)))
-                .await
-            {
-                tracing::warn!(%error, task_id = %id, "background Bash notification did not reach the agent");
-            }
+            route(agent, job.id.clone(), job.completion_notification(&outcome));
         }));
+        true
+    }
+    fn forget(&self, id: &str) {
+        self.entries.update(|entries| {
+            entries.jobs.remove(id);
+        });
     }
     pub(super) async fn shutdown(&self) {
         let jobs = self.entries.update(|entries| {
@@ -101,27 +371,38 @@ impl Jobs {
         }
     }
 }
+fn discard(job: &Job) {
+    let (Some(path), written) = (job.output.clone(), Arc::clone(&job.written)) else {
+        return;
+    };
+    drop(tokio::spawn(async move {
+        written.wait().await;
+        let _ = tokio::fs::remove_file(path).await;
+    }));
+}
 #[derive(Clone)]
 struct LocalBash {
     workspace: PathBuf,
     jobs: Arc<Jobs>,
-    executor: Arc<dyn nanocode_process_contracts::ForegroundExecutor>,
+    executor: Arc<dyn ForegroundExecutor>,
 }
 
 async fn run(
-    executor: &dyn nanocode_process_contracts::ForegroundExecutor,
-    workspace: PathBuf,
-    request: BashRequest,
+    executor: &dyn ForegroundExecutor,
+    workspace: &Path,
+    request: &BashRequest,
     duration: Duration,
+    output: Option<&dyn OutputSink>,
 ) -> Outcome {
     let output = executor
         .execute(nanocode_process_contracts::ForegroundCommand {
-            workspace: &workspace,
+            workspace,
             command: &request.command,
             timeout: duration,
             max_stdout: request.max_stdout_bytes,
             max_stderr: request.max_stderr_bytes,
             session: request.session.as_ref(),
+            output,
         })
         .await?;
     Ok(BashResult {
@@ -136,9 +417,10 @@ impl BashExecutor for LocalBash {
         let timeout = Duration::from_millis(request.timeout_ms);
         run(
             self.executor.as_ref(),
-            self.workspace.clone(),
-            request,
+            &self.workspace,
+            &request,
             timeout,
+            None,
         )
         .await
     }
@@ -147,25 +429,27 @@ impl BashExecutor for LocalBash {
         request: BashRequest,
         background: bool,
     ) -> Result<BashExecution, String> {
-        let foreground_timeout = Duration::from_millis(request.timeout_ms);
-        let hard_timeout = if background {
-            Duration::MAX
-        } else {
-            foreground_timeout + Duration::from_secs(1800)
-        };
+        let timeout = Duration::from_millis(request.timeout_ms);
+        let session = request
+            .session
+            .as_ref()
+            .map_or("local", SessionEnvironment::session_id)
+            .to_owned();
         let id = format!(
-            "{}-bash-{}",
-            request
-                .session
-                .as_ref()
-                .map_or("local", SessionEnvironment::session_id),
+            "{session}-bash-{}",
             self.jobs.next.fetch_add(1, Ordering::Relaxed)
         );
-        let label = request
-            .description
-            .clone()
-            .unwrap_or_else(|| request.command.clone());
+        let (output, sink, written) = match output_file(&session, &id).await {
+            Some((path, sink, written)) => (Some(path), Some(sink), written),
+            None => {
+                let written = Arc::new(Signal::new());
+                written.fire();
+                (None, None, written)
+            }
+        };
         let (sender, receiver) = watch::channel(None);
+        let (arm, armed) = oneshot::channel::<Duration>();
+        let expired = Arc::new(AtomicBool::new(false));
         let job = {
             let workspace = self.workspace.clone();
             let executor = self.executor.clone();
@@ -173,10 +457,36 @@ impl BashExecutor for LocalBash {
             let admitted = Arc::new(Signal::new());
             let guard = Finished(Arc::clone(&finished));
             let start = Arc::clone(&admitted);
+            let stopped = Arc::clone(&expired);
+            let command = request.command.clone();
+            let label = request
+                .description
+                .clone()
+                .unwrap_or_else(|| command.clone());
+            let call_id = request.call_id.clone();
             let task = tokio::spawn(async move {
                 let _finished = guard;
                 start.wait().await;
-                let result = run(executor.as_ref(), workspace, request, hard_timeout).await;
+                let deadline = async move {
+                    match armed.await {
+                        Ok(after) => tokio::time::sleep(after).await,
+                        Err(_) => std::future::pending().await,
+                    }
+                };
+                let result = tokio::select! {
+                    result = run(
+                        executor.as_ref(),
+                        &workspace,
+                        &request,
+                        Duration::MAX,
+                        sink.as_ref().map(|sink| sink as &dyn OutputSink),
+                    ) => result,
+                    () = deadline => {
+                        stopped.store(true, Ordering::SeqCst);
+                        Err("Bash command stopped after reaching its background time limit".into())
+                    }
+                };
+                drop(sink);
                 let _ = sender.send(Some(result));
             });
             let job = Arc::new(Job {
@@ -185,6 +495,13 @@ impl BashExecutor for LocalBash {
                 result: receiver,
                 waiting: AtomicUsize::new(0),
                 delivered: AtomicBool::new(false),
+                expired,
+                written,
+                id: id.clone(),
+                command,
+                label,
+                call_id,
+                output,
             });
             self.jobs
                 .entries
@@ -207,35 +524,38 @@ impl BashExecutor for LocalBash {
             }
         }
         let mut admission = Admission(Some(job.abort.clone()));
-        if !background
-            && let Ok(result) = tokio::time::timeout(foreground_timeout, completion(&job)).await
-        {
-            self.jobs.entries.update(|entries| {
-                entries.jobs.remove(&id);
-            });
-            return result.map(BashExecution::Completed);
-        }
+        let timed_out = if background {
+            let _ = arm.send(timeout);
+            None
+        } else {
+            match tokio::time::timeout(timeout, completion(&job)).await {
+                Ok(result) => {
+                    self.jobs.forget(&id);
+                    discard(&job);
+                    return result.map(BashExecution::Completed);
+                }
+                Err(_) if sleeps(&job.command) => {
+                    job.abort.abort();
+                    job.finished.wait().await;
+                    self.jobs.forget(&id);
+                    discard(&job);
+                    return Err("Bash command timed out".into());
+                }
+                Err(_) => {
+                    let _ = arm.send(Duration::from_millis(DEFAULT_BACKGROUND_TIMEOUT_MS));
+                    Some(timeout)
+                }
+            }
+        };
         admission.0 = None;
-        self.jobs.watch(id.clone(), job, label);
-        Ok(BashExecution::Background { task_id: id })
+        let output_file = job.output.clone();
+        let watched = self.jobs.watch(job);
+        Ok(BashExecution::Background {
+            message: started(&id, output_file.as_deref(), timed_out, watched),
+            output_file: output_file.map(|path| path.display().to_string()),
+            task_id: id,
+        })
     }
-}
-fn notification(id: &str, label: &str, outcome: &Outcome) -> String {
-    let (status, summary) = match outcome {
-        Ok(result) if result.exit_code == 0 => ("completed", "completed (exit code 0)".to_owned()),
-        Ok(result) => (
-            "failed",
-            format!("failed with exit code {}", result.exit_code),
-        ),
-        Err(_) => ("failed", "failed".to_owned()),
-    };
-    let label = label
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    format!(
-        "<task-notification>\n<task-id>{id}</task-id>\n<status>{status}</status>\n<summary>Background command \"{label}\" {summary}</summary>\n</task-notification>"
-    )
 }
 async fn completion(job: &Job) -> Outcome {
     let mut receiver = job.result.clone();
@@ -287,17 +607,18 @@ impl Tool for BashTool {
             schema["input_schema"].clone(),
         )
     }
-    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let input = input.decode_json::<Value>()?;
         Ok(
             match self
                 .bash
-                .execute_in_session("Bash", input, self.session.clone())
+                .execute_call("Bash", input, self.session.clone(), Some(context.call_id()))
                 .await
             {
                 Ok(output) => {
                     let value = serde_json::from_str::<Value>(&output).unwrap_or(Value::Null);
-                    ToolOutput::text(output).with_structured_result(value)
+                    let text = value["message"].as_str().map_or(output, str::to_owned);
+                    ToolOutput::text(text).with_structured_result(value)
                 }
                 Err(error) => ToolOutput::error(error),
             },
@@ -369,11 +690,18 @@ impl TaskTool {
             .read(|entries| entries.jobs.get(id).cloned())
             .ok_or("unknown task_id in this session")?;
         if self.name == "TaskStop" {
+            let status = job.status();
+            if status != "running" {
+                return Err(format!("Task {id} is not running (status: {status})"));
+            }
             job.abort.abort();
             job.finished.wait().await;
-            return Ok(
-                json!({"task_id":id,"status":if job.result.borrow().is_some() {"completed"} else {"stopped"}}),
-            );
+            return Ok(json!({
+                "message": format!("Successfully stopped task: {id} ({})", job.command),
+                "task_id": id,
+                "task_type": "local_bash",
+                "command": job.command,
+            }));
         }
         let block = input
             .get("block")

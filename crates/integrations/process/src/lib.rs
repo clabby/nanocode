@@ -85,6 +85,7 @@ impl ForegroundExecutor for EnvironmentForeground {
             request.max_stderr,
             request.session,
             &self.0,
+            request.output,
         )
     }
 }
@@ -610,6 +611,7 @@ impl ForegroundExecutor for NativeForeground {
             request.max_stdout,
             request.max_stderr,
             request.session,
+            request.output,
         )
     }
 }

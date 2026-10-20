@@ -95,6 +95,10 @@ pub trait ShellExecutor: Send + Sync {
     fn terminate_all(&self) -> ProcessFuture<'_, ()>;
 }
 
+pub trait OutputSink: Send + Sync {
+    fn write(&self, bytes: &[u8]);
+}
+
 pub struct ForegroundCommand<'a> {
     pub workspace: &'a Path,
     pub command: &'a str,
@@ -102,6 +106,7 @@ pub struct ForegroundCommand<'a> {
     pub max_stdout: usize,
     pub max_stderr: usize,
     pub session: Option<&'a SessionEnvironment>,
+    pub output: Option<&'a dyn OutputSink>,
 }
 
 pub trait ForegroundExecutor: Send + Sync {

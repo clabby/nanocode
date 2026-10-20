@@ -11,11 +11,17 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
+pub const DEFAULT_BACKGROUND_TIMEOUT_MS: u64 = 600_000;
+
+pub const MAX_BACKGROUND_TIMEOUT_MS: u64 = 7_200_000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BashRequest {
     pub command: String,
 
     pub description: Option<String>,
+
+    pub call_id: Option<String>,
 
     pub timeout_ms: u64,
 
@@ -54,7 +60,11 @@ pub trait SandboxBashExecutor: Send + Sync {
 pub enum BashExecution {
     Completed(BashResult),
 
-    Background { task_id: String },
+    Background {
+        task_id: String,
+        output_file: Option<String>,
+        message: String,
+    },
 }
 
 pub trait BashExecutor: Send + Sync {
@@ -110,6 +120,16 @@ impl<E: BashExecutor> ClaudeBash<E> {
         input: Value,
         session: Option<SessionEnvironment>,
     ) -> Result<String, String> {
+        self.execute_call(name, input, session, None).await
+    }
+
+    pub async fn execute_call(
+        &self,
+        name: &str,
+        input: Value,
+        session: Option<SessionEnvironment>,
+        call_id: Option<&str>,
+    ) -> Result<String, String> {
         if name != "Bash" {
             return Err(format!("unknown Claude Bash tool: {name}"));
         }
@@ -157,17 +177,22 @@ impl<E: BashExecutor> ClaudeBash<E> {
                 Some(text.to_owned())
             }
         };
+        let (default, maximum) = if background {
+            (DEFAULT_BACKGROUND_TIMEOUT_MS, MAX_BACKGROUND_TIMEOUT_MS)
+        } else {
+            (DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)
+        };
         let timeout_ms = fields
             .get("timeout")
-            .map_or(Some(DEFAULT_TIMEOUT_MS), Value::as_u64)
+            .map_or(Some(default), Value::as_u64)
             .ok_or("invalid timeout")?;
-        let maximum = MAX_TIMEOUT_MS;
         if !(1..=maximum).contains(&timeout_ms) {
             return Err(format!("timeout must be 1 to {maximum} milliseconds"));
         }
         let request = BashRequest {
             command: command.to_owned(),
             description,
+            call_id: call_id.map(str::to_owned),
             timeout_ms,
             max_stdout_bytes: MAX_STREAM_BYTES,
             max_stderr_bytes: MAX_STREAM_BYTES,
@@ -183,9 +208,14 @@ impl<E: BashExecutor> ClaudeBash<E> {
             })?;
         let result = match result {
             BashExecution::Completed(result) => result,
-            BashExecution::Background { task_id } => {
+            BashExecution::Background {
+                task_id,
+                output_file,
+                message,
+            } => {
                 return Ok(json!({
                     "task_id": task_id, "status": "running", "background": true,
+                    "output_file": output_file, "message": message,
                 })
                 .to_string());
             }
