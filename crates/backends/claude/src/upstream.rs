@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::ToolDefinition;
 
-pub const VERSION: &str = crate::subscription_wire::CLAUDE_CODE_VERSION;
+pub const VERSION: &str = "2.1.304";
 pub const PROVENANCE: &str = include_str!("../prompts/upstream.json");
 
 pub fn system_blocks() -> Vec<Value> {

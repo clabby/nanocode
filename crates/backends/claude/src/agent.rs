@@ -2073,6 +2073,7 @@ async fn web_fetch_with_source<P: crate::tools::web::ApprovedWebFetchSource>(
         .fetch_source(WebFetchRequest {
             url: url.into(),
             prompt: prompt.into(),
+            offset: None,
             max_output_bytes: 128 * 1024,
         })
         .await

@@ -111,7 +111,7 @@ if args.capture:
         env.update(ANTHROPIC_API_KEY='local-capture-fixture',
                    ANTHROPIC_BASE_URL=f'http://127.0.0.1:{server.server_port}',
                    CLAUDE_CONFIG_DIR=str(config), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1',
-                   DISABLE_AUTOUPDATER='1')
+                   DISABLE_AUTOUPDATER='1', ENABLE_TOOL_SEARCH='false')
         command = [str(installed), '-p', 'Return captured.', '--model', manifest['model'],
                    '--no-session-persistence', '--output-format', 'json', '--setting-sources', '',
                    '--settings', '{}', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',

@@ -2,6 +2,8 @@ use serde_json::Value;
 
 pub const MAX_WEB_OUTPUT_BYTES: usize = 32 * 1024;
 
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebSearchRequest {
     pub query: String,
@@ -18,6 +20,8 @@ pub struct WebFetchRequest {
     pub url: String,
 
     pub prompt: String,
+
+    pub offset: Option<u64>,
 
     pub max_output_bytes: usize,
 }
@@ -95,14 +99,24 @@ impl<P: ApprovedWebProvider> ClaudeWeb<P> {
                     .await
             }
             "WebFetch" => {
-                reject_extra(fields, &["url", "prompt"])?;
+                reject_extra(fields, &["url", "prompt", "offset"])?;
                 let url = required_text(fields, "url", 2048)?;
                 validate_url(url)?;
                 let prompt = required_text(fields, "prompt", 8 * 1024)?;
+                let offset = fields
+                    .get("offset")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .filter(|offset| *offset <= MAX_SAFE_INTEGER)
+                            .ok_or("offset must be a nonnegative integer")
+                    })
+                    .transpose()?;
                 self.provider
                     .fetch(WebFetchRequest {
                         url: url.to_owned(),
                         prompt: prompt.to_owned(),
+                        offset,
                         max_output_bytes: MAX_WEB_OUTPUT_BYTES,
                     })
                     .await

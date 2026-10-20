@@ -1,10 +1,10 @@
 {
   "package": "@anthropic-ai/claude-code",
-  "version": "2.1.283",
+  "version": "2.1.304",
   "platform_package": "@anthropic-ai/claude-code-darwin-arm64",
-  "platform_tarball": "https://registry.npmjs.org/@anthropic-ai/claude-code-darwin-arm64/-/claude-code-darwin-arm64-2.1.283.tgz",
-  "platform_integrity": "sha512-GczpJ+FvnOYvxn6XPGHbdqJEZMves6Vc0WKS/g1N2eG39EKKAHxG77e+w4Rjtmf8xgCxNY36Jf/IOfbcyus4zA==",
-  "executable_sha256": "d8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e",
+  "platform_tarball": "https://registry.npmjs.org/@anthropic-ai/claude-code-darwin-arm64/-/claude-code-darwin-arm64-2.1.304.tgz",
+  "platform_integrity": "sha512-io7hBh98nUB3wTzg+XKoh2pN4j71w155wj2jAoF9bwWrnT7u6gcm9vTh0geArjABGNSh2+GaApa+lYREWOOwxw==",
+  "executable_sha256": "b9ac5374839f14abf3f1f45610637c332b5daee5ce0d1634726cef87aab78e6a",
   "model": "claude-opus-5-5",
   "capture_flags": [
     "-p",
@@ -42,11 +42,11 @@
   "artifacts": [
     {
       "path": "prompts/claude-code-system.json",
-      "sha256": "1e7f77aa3df014730edb8b43a9f3366ec2c9cdbc54d00b1c8ea0df007d3c24da"
+      "sha256": "ad2302459b2f934c3dbdb892ac8b9f9c237aa3ef8bde8cc7eceea9c0f9bb7c8a"
     },
     {
       "path": "tools/src/tools/upstream.json",
-      "sha256": "ac40abb61905e286191b343bb0e24e54f827e7837981251c7bd5497743c4ec7d"
+      "sha256": "390d13a458e83c9addf410a47366e9a5bec058b15fab6a1066fbaf5812cfeea5"
     }
   ],
   "scope": "Exact SDK identity and core text blocks, and model-visible tool names, descriptions and input schemas from official CLI requests to a local Messages stub with a dummy API key. Request-specific billing, authentication, cache policy, environment, project memory and attribution remain separate host context. Bash uses the upstream default catalog profile, which has no Glob or Grep and searches through the shell. Captured contract availability is not a claim of implementing every Claude Code host action. TaskOutput, TodoWrite and Skill remain separately supplied SDK extensions when registered."
