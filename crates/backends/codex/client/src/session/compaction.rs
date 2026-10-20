@@ -474,7 +474,7 @@ fn original_image_bytes_estimate(image_url: &str) -> Option<usize> {
             .decode(payload)
             .ok()?;
 
-        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
             .with_guessed_format()
             .ok()?
             .into_dimensions()

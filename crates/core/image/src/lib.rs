@@ -621,7 +621,8 @@ fn load_for_prompt_bytes(
             },
         )
     } else {
-        let mut reader = ImageReader::with_format(Cursor::new(&file_bytes), guessed_format);
+        let mut reader =
+            ImageReader::with_format(Cursor::new(file_bytes.as_slice()), guessed_format);
         let mut decode_limits = image::Limits::default();
         decode_limits.max_alloc = Some(MAX_PROMPT_IMAGE_DECODE_BYTES);
         reader.limits(decode_limits);
