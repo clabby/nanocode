@@ -507,16 +507,6 @@ trait RecordSource {
     ) -> crate::StoreFuture<'a, std::result::Result<Vec<Option<String>>, crate::StoreError>>;
 }
 
-impl RecordSource for dyn crate::StateStore + '_ {
-    fn records<'a>(
-        &'a mut self,
-        state_id: &'a str,
-        keys: &'a [String],
-    ) -> crate::StoreFuture<'a, std::result::Result<Vec<Option<String>>, crate::StoreError>> {
-        self.read_records(state_id, keys)
-    }
-}
-
 struct Noting<'a, 'store> {
     store: &'a mut (dyn crate::StateStore + 'store),
     read: &'a mut HashSet<String>,
