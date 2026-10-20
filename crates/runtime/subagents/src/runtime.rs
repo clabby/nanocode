@@ -3316,6 +3316,24 @@ impl Registry {
             session.active = false;
             let revision = session.active_instruction_revision.take();
             session.steering = false;
+            if matches!(result, Err(NanocodeError::TurnStopped))
+                && session.submitted_output.is_none()
+                && !matches!(session.status, AgentStatus::Closing | AgentStatus::Closed)
+            {
+                let status = session.status.clone();
+                drop(state);
+                self.enqueue_status(
+                    root_session_id,
+                    id,
+                    OrderedJob::Settle {
+                        status,
+                        completion: None,
+                        harness: None,
+                    },
+                );
+                self.changed();
+                return;
+            }
 
             session.resume_attempts = 0;
             session.in_flight_calls.clear();
