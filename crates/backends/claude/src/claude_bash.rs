@@ -34,16 +34,22 @@ impl Drop for Job {
         self.abort.abort();
     }
 }
+#[derive(Clone, Default)]
+struct Entries {
+    closed: bool,
+    jobs: BTreeMap<String, Arc<Job>>,
+}
 #[derive(Default)]
 pub(super) struct Jobs {
     next: AtomicU64,
-    entries: Atom<BTreeMap<String, Arc<Job>>>,
+    entries: Atom<Entries>,
 }
 impl Jobs {
     pub(super) async fn shutdown(&self) {
-        let jobs = self
-            .entries
-            .read(|entries| entries.values().cloned().collect::<Vec<_>>());
+        let jobs = self.entries.update(|entries| {
+            entries.closed = true;
+            entries.jobs.values().cloned().collect::<Vec<_>>()
+        });
         for job in &jobs {
             job.abort.abort();
         }
@@ -117,9 +123,12 @@ impl BashExecutor for LocalBash {
             let workspace = self.workspace.clone();
             let executor = self.executor.clone();
             let finished = Arc::new(Signal::new());
+            let admitted = Arc::new(Signal::new());
             let guard = Finished(Arc::clone(&finished));
+            let start = Arc::clone(&admitted);
             let task = tokio::spawn(async move {
                 let _finished = guard;
+                start.wait().await;
                 let result = run(executor.as_ref(), workspace, request, hard_timeout).await;
                 let _ = sender.send(Some(result));
             });
@@ -128,9 +137,15 @@ impl BashExecutor for LocalBash {
                 finished,
                 result: receiver,
             });
-            self.jobs.entries.update(|entries| {
-                entries.insert(id.clone(), Arc::clone(&job));
-            });
+            self.jobs
+                .entries
+                .try_update(|entries| {
+                    (!entries.closed).then(|| {
+                        entries.jobs.insert(id.clone(), Arc::clone(&job));
+                    })
+                })
+                .ok_or("Bash is unavailable because the agent is shutting down")?;
+            admitted.fire();
             job
         };
 
@@ -147,7 +162,7 @@ impl BashExecutor for LocalBash {
             && let Ok(result) = tokio::time::timeout(foreground_timeout, completion(&job)).await
         {
             self.jobs.entries.update(|entries| {
-                entries.remove(&id);
+                entries.jobs.remove(&id);
             });
             return result.map(BashExecution::Completed);
         }
@@ -284,7 +299,7 @@ impl TaskTool {
         let job = self
             .jobs
             .entries
-            .read(|entries| entries.get(id).cloned())
+            .read(|entries| entries.jobs.get(id).cloned())
             .ok_or("unknown task_id in this session")?;
         if self.name == "TaskStop" {
             job.abort.abort();
