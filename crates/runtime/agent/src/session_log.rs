@@ -6,7 +6,6 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use nanocode_sync::SingleFlight;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use serde_json::{Map, Value, value::RawValue};
 
@@ -86,7 +85,7 @@ impl TurnState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TurnRetry {
     pub error: String,
     pub kind: String,
@@ -278,6 +277,13 @@ fn single(rows: &[SqlRow]) -> Result<Option<&SqlRow>, StoreError> {
     }
 }
 
+fn present(rows: &[SqlRow]) -> Result<bool, StoreError> {
+    Ok(single(rows)?
+        .map(|row| text(row, 0))
+        .transpose()?
+        .is_some_and(|count| count != "0"))
+}
+
 fn raw(json: String) -> Result<Box<RawValue>, StoreError> {
     RawValue::from_string(json).map_err(|error| invalid(format!("stored JSON: {error}")))
 }
@@ -355,7 +361,6 @@ pub struct SessionLog<H: ?Sized> {
     host: Arc<H>,
     scope: Arc<str>,
     ready: AtomicBool,
-    schema: SingleFlight<Result<(), StoreError>>,
 }
 
 impl<H: Sql + ?Sized> SessionLog<H> {
@@ -364,7 +369,6 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             host,
             scope: scope.into(),
             ready: AtomicBool::new(false),
-            schema: SingleFlight::default(),
         }
     }
 
@@ -399,13 +403,17 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             .map(|sql| statement(sql, Vec::new()))
             .collect();
         let results = self.run("schema", &statements).await?;
-        let present = single(&results[SCHEMA.len()])?
-            .map(|row| text(row, 0))
-            .transpose()?
-            .is_some_and(|count| count != "0");
-        if !present {
-            self.run("schema", &[statement(ADD_RETRY_COLUMN, Vec::new())])
-                .await?;
+        if !present(&results[SCHEMA.len()])?
+            && let Err(error) = self
+                .run("schema", &[statement(ADD_RETRY_COLUMN, Vec::new())])
+                .await
+            && !present(
+                &self
+                    .run("schema", &[statement(RETRY_COLUMN, Vec::new())])
+                    .await?[0],
+            )?
+        {
+            return Err(error);
         }
         self.ready.store(true, Ordering::Release);
         Ok(())
@@ -417,7 +425,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         statements: Vec<SqlStatement<'_>>,
     ) -> Result<Vec<Vec<SqlRow>>, StoreError> {
         if !self.ready.load(Ordering::Acquire) {
-            self.schema.run(|| self.migrate()).await?;
+            self.migrate().await?;
         }
         self.run(operation, &statements).await
     }
