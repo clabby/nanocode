@@ -458,10 +458,10 @@ use iana_time_zone::get_timezone as system_timezone;
 
 #[cfg(target_family = "wasm")]
 fn detected_execution_environment() -> ExecutionEnvironment {
+    use chrono::Datelike;
+    let date = chrono::DateTime::<chrono::Utc>::from(nanocode_platform::system_time()).date_naive();
     ExecutionEnvironment::new(
-        chrono::DateTime::<chrono::Utc>::from(nanocode_platform::system_time())
-            .format("%Y-%m-%d")
-            .to_string(),
+        format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day()),
         Arc::from("Etc/UTC"),
     )
 }
