@@ -892,8 +892,13 @@ fn spawn_agent_parameters_for(policy: &SpawnPolicy) -> Value {
     parameters
 }
 
+fn schema(text: &str) -> Value {
+    serde_json::from_str(text).expect("subagent tool schemas are valid JSON")
+}
+
 fn spawn_agent_parameters() -> Value {
-    json!({
+    schema(
+        r##"{
         "type": "object",
         "properties": {
             "role": { "type": "string", "description": "A short role describing the subagent's specialty." },
@@ -970,7 +975,8 @@ fn spawn_agent_parameters() -> Value {
                 "required": ["name", "schema", "required"], "additionalProperties": false
             }
         }
-    })
+    }"##,
+    )
 }
 
 #[derive(Deserialize)]
@@ -990,7 +996,7 @@ impl Tool for SubmitResult {
         ToolDefinition::function(
             SUBMIT_RESULT_TOOL,
             "Submits the current child subagent turn's final JSON output. This tool is unavailable to the root agent; root agents return final output as assistant text. Supply only output matching the task schema. After an accepted receipt, send a brief final assistant message with no further tool calls; do not finish with an empty response. If superseded, incorporate pending instructions and submit the updated result. Invalid values can be corrected and retried.",
-            json!({
+            schema(r##"{
                 "type": "object",
                 "properties": {
                     "output": {
@@ -1005,9 +1011,9 @@ impl Tool for SubmitResult {
                 },
                 "required": ["output"],
                 "additionalProperties": false
-            }),
+            }"##),
         )
-        .with_output_schema(json!({
+        .with_output_schema(schema(r##"{
             "type": "object",
             "properties": {
                 "accepted": { "type": "boolean" },
@@ -1018,7 +1024,7 @@ impl Tool for SubmitResult {
             },
             "required": ["accepted", "status"],
             "additionalProperties": false
-        }))
+        }"##))
     }
 
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
@@ -1061,7 +1067,9 @@ impl Tool for SendAgentMessage {
         ToolDefinition::function(
             SEND_AGENT_MESSAGE_TOOL,
             "Sends a bounded directed message to any other agent in the same task tree. Deferred messages start an idle agent or queue behind its active turn. If a send is queued, do not wait for it inside the current turn; finish the turn so queued messages can be delivered. Urgent messages steer a running agent at its next safe model boundary. Delegate messages replace the recipient's assigned task, retain its output schema, and require management authority.",
-            json!({
+            {
+                let mut parameters = schema(
+                    r##"{
                 "type": "object",
                 "properties": {
                     "agent_id": {
@@ -1072,7 +1080,6 @@ impl Tool for SendAgentMessage {
                     "message": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": MAX_MESSAGE_BYTES,
                         "description": "The focused message body. The runtime enforces a 64 KiB UTF-8 limit."
                     },
                     "priority": {
@@ -1095,7 +1102,11 @@ impl Tool for SendAgentMessage {
                 },
                 "required": ["agent_id", "message"],
                 "additionalProperties": false
-            }),
+            }"##,
+                );
+                parameters["properties"]["message"]["maxLength"] = MAX_MESSAGE_BYTES.into();
+                parameters
+            },
         )
     }
 
@@ -1157,7 +1168,8 @@ impl Tool for ListAgents {
         ToolDefinition::function(
             LIST_AGENTS_TOOL,
             "Lists agents in the same task tree. Pending, running, and recoverable interrupted agents are returned by default. Set include_completed to retrieve terminal statuses and completed results in status.output. After reuse or closure, last_output retains the latest completed result.",
-            json!({
+            schema(
+                r##"{
                 "type": "object",
                 "properties": {
                     "include_completed": {
@@ -1172,7 +1184,8 @@ impl Tool for ListAgents {
                     }
                 },
                 "additionalProperties": false
-            }),
+            }"##,
+            ),
         )
     }
 
@@ -1212,7 +1225,7 @@ impl Tool for WaitAgent {
         ToolDefinition::function(
             WAIT_AGENT_TOOL,
             description,
-            json!({
+            schema(r##"{
                 "type": "object",
                 "properties": {
                     "agent_ids": {
@@ -1229,7 +1242,7 @@ impl Tool for WaitAgent {
                 },
                 "required": ["agent_ids"],
                 "additionalProperties": false
-            }),
+            }"##),
         )
         .with_output_schema(WAIT_AGENT_OUTPUT_SCHEMA.clone())
     }
@@ -1291,7 +1304,8 @@ impl Tool for ChangeAgentLifecycle {
         ToolDefinition::function(
             self.tool_name(),
             description,
-            json!({
+            schema(
+                r##"{
                 "type": "object",
                 "properties": {
                     "agent_id": {
@@ -1302,7 +1316,8 @@ impl Tool for ChangeAgentLifecycle {
                 },
                 "required": ["agent_id"],
                 "additionalProperties": false
-            }),
+            }"##,
+            ),
         )
     }
 
@@ -1397,7 +1412,8 @@ static SPAWN_AGENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(spawn_agent_ou
 static WAIT_AGENT_OUTPUT_SCHEMA: LazyLock<Value> = LazyLock::new(wait_agent_output_schema);
 
 fn spawn_agent_output_schema() -> Value {
-    json!({
+    schema(
+        r##"{
         "type": "object",
         "properties": {
             "agent_id": { "type": "integer" },
@@ -1414,11 +1430,14 @@ fn spawn_agent_output_schema() -> Value {
         },
         "required": ["agent_id", "role", "status"],
         "additionalProperties": false
-    })
+    }"##,
+    )
 }
 
 fn wait_agent_output_schema() -> Value {
-    json!({
+    {
+        let mut output = schema(
+            r##"{
         "type": "object",
         "properties": {
             "agents": {
@@ -1430,7 +1449,6 @@ fn wait_agent_output_schema() -> Value {
                         "role": { "type": "string" },
                         "task": { "type": "string" },
                         "parent_agent_id": { "type": ["integer", "null"] },
-                        "status": agent_status_schema(),
                         "model": {},
                         "thinking": { "type": "string" },
                         "reasoning_mode": { "type": "string", "enum": ["standard", "pro"] },
@@ -1445,7 +1463,11 @@ fn wait_agent_output_schema() -> Value {
         },
         "required": ["agents", "timed_out"],
         "additionalProperties": false
-    })
+    }"##,
+        );
+        output["properties"]["agents"]["items"]["properties"]["status"] = agent_status_schema();
+        output
+    }
 }
 
 fn agent_status_schema() -> Value {
