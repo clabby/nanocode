@@ -15,7 +15,7 @@ use super::{
 };
 use futures_util::future::join_all;
 use nanocode_agent_core::{
-    Agent, AgentEvents, AgentHandle, ModelSelection, NanocodeError, ReasoningMode,
+    Agent, AgentEvents, AgentHandle, AgentUsage, ModelSelection, NanocodeError, ReasoningMode,
     Result as AgentResult, SessionCheckpoint, Thinking, TurnResult, events::AgentEventKind,
 };
 use nanocode_platform::Instant;
@@ -71,6 +71,8 @@ pub(super) struct ChildSession {
     pub(super) pending_completion: Option<u64>,
 
     pub(super) settled_revision: Option<u64>,
+
+    pub(super) usage: AgentUsage,
 
     pub(super) in_flight_progress: durable::OmittedProgress,
 
@@ -563,6 +565,9 @@ pub struct AgentSummary {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_revision: Option<u64>,
+
+    #[serde(skip_serializing_if = "AgentUsage::is_empty")]
+    pub usage: AgentUsage,
 }
 
 #[derive(Serialize)]
@@ -584,6 +589,9 @@ pub struct AgentDirectoryEntry {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_revision: Option<u64>,
+
+    #[serde(skip_serializing_if = "AgentUsage::is_empty")]
+    pub usage: AgentUsage,
 
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub resuming: bool,
@@ -953,6 +961,7 @@ impl RegistryState {
                     thinking: session.descriptor.thinking,
                     reasoning_mode: session.descriptor.reasoning_mode,
                     completion_revision: session.completion_revision(),
+                    usage: session.usage.clone(),
                     resuming: false,
                 })
             })
@@ -3139,6 +3148,7 @@ impl Registry {
                 in_flight_omitted: 0,
                 pending_completion: None,
                 settled_revision: None,
+                usage: AgentUsage::default(),
                 in_flight_progress: durable::OmittedProgress::default(),
                 announce: false,
                 journal_generation: 0,
@@ -3339,6 +3349,12 @@ impl Registry {
             session.in_flight_calls.clear();
             session.in_flight_omitted = 0;
             session.in_flight_progress = durable::OmittedProgress::default();
+            if let Ok(TurnResult {
+                usage: Some(usage), ..
+            }) = &result
+            {
+                session.usage.record(usage);
+            }
             let submitted_output = session.submitted_output.take();
 
             if let Some(output) = &submitted_output {
@@ -4651,6 +4667,7 @@ impl ChildSession {
             in_flight_omitted: 0,
             pending_completion: None,
             settled_revision: None,
+            usage: AgentUsage::default(),
             in_flight_progress: durable::OmittedProgress::default(),
             announce: true,
             journal_generation: 0,
@@ -4674,6 +4691,7 @@ impl ChildSession {
             reasoning_mode: self.descriptor.reasoning_mode,
             last_output,
             completion_revision: self.completion_revision(),
+            usage: self.usage.clone(),
         }
     }
 

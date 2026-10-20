@@ -14,6 +14,59 @@ pub struct TurnUsage {
     cost_status: CostStatus,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentUsage {
+    pub completed_turns: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<UsdAmount>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub estimated_cost_turns: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unpriced_turns: u64,
+}
+
+impl AgentUsage {
+    pub fn record(&mut self, turn: &TurnUsage) {
+        self.completed_turns = self.completed_turns.saturating_add(1);
+        self.input_tokens = self.input_tokens.saturating_add(turn.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(turn.cached_input_tokens);
+        self.cache_write_input_tokens = self
+            .cache_write_input_tokens
+            .saturating_add(turn.cache_write_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(turn.output_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(turn.reasoning_output_tokens);
+        let Some(cost) = turn.estimated_cost() else {
+            self.unpriced_turns = self.unpriced_turns.saturating_add(1);
+            return;
+        };
+        let total = self.cost_usd.unwrap_or_default().nano_usd();
+        self.cost_usd = Some(UsdAmount::from_nano_usd(
+            total.saturating_add(cost.amount().nano_usd()),
+        ));
+        if turn.cost_status != CostStatus::ReportedByProvider {
+            self.estimated_cost_turns = self.estimated_cost_turns.saturating_add(1);
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.completed_turns == 0
+    }
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReportedTurnUsage {
     pub input_tokens: u64,

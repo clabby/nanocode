@@ -19,7 +19,7 @@ pub use session::{
     SessionCheckpoint, SessionInfo,
 };
 pub use usage::{
-    CostStatus, EstimatedUsdCost, ReportedTurnUsage, ServiceTier, TurnUsage, UsdAmount,
+    AgentUsage, CostStatus, EstimatedUsdCost, ReportedTurnUsage, ServiceTier, TurnUsage, UsdAmount,
 };
 
 pub mod backend {

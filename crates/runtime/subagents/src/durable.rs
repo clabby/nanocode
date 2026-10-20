@@ -2,7 +2,7 @@ use super::{
     model::{AgentDescriptor, AgentId, AgentStatus},
     runtime::{ChildSession, OutputContract},
 };
-use nanocode_agent_core::{Lineage, ModelSelection, SessionCheckpoint, Thinking};
+use nanocode_agent_core::{AgentUsage, Lineage, ModelSelection, SessionCheckpoint, Thinking};
 use nanocode_durability_core::EncodedPayload;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -380,6 +380,8 @@ struct AgentRecord {
     pending_completion: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     settled_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "AgentUsage::is_empty")]
+    usage: AgentUsage,
 }
 
 fn encode_agent(
@@ -408,6 +410,7 @@ fn encode_agent(
         accepted_revision: agent.accepted_revision,
         pending_completion: agent.pending_completion,
         settled_revision: agent.settled_revision,
+        usage: agent.usage,
     })?;
     records.push((Arc::clone(&key), json));
     Ok(key)
@@ -453,6 +456,7 @@ pub(super) async fn load_agent(
         accepted_revision: record.accepted_revision,
         pending_completion: record.pending_completion,
         settled_revision: record.settled_revision,
+        usage: record.usage,
     };
     agent.expand();
     Ok(agent)
@@ -625,6 +629,9 @@ pub(super) struct PersistedAgent {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) settled_revision: Option<u64>,
+
+    #[serde(default, skip_serializing_if = "AgentUsage::is_empty")]
+    pub(super) usage: AgentUsage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -994,6 +1001,7 @@ pub(super) fn persist_agent(
             .flatten(),
         pending_completion: session.pending_completion,
         settled_revision: session.settled_revision,
+        usage: session.usage.clone(),
     })
 }
 
@@ -1137,6 +1145,7 @@ pub(super) fn restored_session(
         0
     };
     let binding_task = agent.binding_task;
+    let usage = agent.usage;
     let mut session = ChildSession::restored(
         agent.descriptor,
         agent.host_context.map(Arc::from),
@@ -1151,6 +1160,7 @@ pub(super) fn restored_session(
         session.binding_task = task;
     }
     session.resume_attempts = resume_attempts;
+    session.usage = usage;
 
     let accepted_revision = accepted_revision.unwrap_or(agent.next_instruction_revision);
     session.settled_revision = if completed_by_acceptance {
