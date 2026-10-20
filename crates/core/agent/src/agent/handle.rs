@@ -88,6 +88,28 @@ impl Resumption {
     }
 }
 
+struct ResumptionClaim<'a> {
+    interrupted: &'a Interrupted,
+    resumption: Arc<Resumption>,
+    resumed: usize,
+    remaining: Option<Vec<InterruptedTurn>>,
+}
+
+impl Drop for ResumptionClaim<'_> {
+    fn drop(&mut self) {
+        let remaining = self
+            .remaining
+            .take()
+            .unwrap_or_else(|| self.resumption.turns[self.resumed..].to_vec());
+        let next = (!remaining.is_empty()).then(|| Resumption::new(remaining));
+        self.interrupted.0.rcu(|current| match current {
+            Some(current) if Arc::ptr_eq(current, &self.resumption) => next.clone(),
+            other => other.clone(),
+        });
+        self.resumption.done.fire();
+    }
+}
+
 fn tracked(
     claim: Option<RequestClaim>,
     result: super::backend::BackendFuture<Result<TurnResult>>,
@@ -580,11 +602,16 @@ impl Agent {
                 resumption.done.wait().await;
                 continue;
             }
-            let (result, remaining) = self.resume_turns(&resumption.turns, request_id).await;
-            self.interrupted
-                .0
-                .store((!remaining.is_empty()).then(|| Resumption::new(remaining)));
-            resumption.done.fire();
+            let mut claim = ResumptionClaim {
+                interrupted: &self.interrupted,
+                resumption,
+                resumed: 0,
+                remaining: None,
+            };
+            let (result, remaining) = self
+                .resume_turns(&claim.resumption.turns, request_id, &mut claim.resumed)
+                .await;
+            claim.remaining = Some(remaining);
             return result;
         }
     }
@@ -593,6 +620,7 @@ impl Agent {
         &self,
         turns: &[InterruptedTurn],
         request_id: Option<&str>,
+        progress: &mut usize,
     ) -> (Result<()>, Vec<InterruptedTurn>) {
         let (resumed, mut kept) =
             match request_id.and_then(|id| turns.iter().position(|(turn, _)| turn == id)) {
@@ -611,6 +639,7 @@ impl Agent {
                     return (Err(error), remaining);
                 }
             }
+            *progress = index + 1;
         }
         (Ok(()), kept)
     }

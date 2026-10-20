@@ -94,6 +94,21 @@ struct Shared {
     closed: AtomicBool,
 }
 
+struct Healing<'a> {
+    healing: &'a ArcSwapOption<Signal>,
+    signal: Arc<Signal>,
+}
+
+impl Drop for Healing<'_> {
+    fn drop(&mut self) {
+        self.healing.rcu(|current| match current {
+            Some(current) if Arc::ptr_eq(current, &self.signal) => None,
+            other => other.clone(),
+        });
+        self.signal.fire();
+    }
+}
+
 impl Shared {
     fn backend(&self) -> Arc<dyn LifecycleBackend> {
         Arc::clone(&self.inner.load())
@@ -154,10 +169,11 @@ impl Shared {
                 running.wait().await;
                 continue;
             }
-            let outcome = self.reopen(events, retry.take()).await;
-            self.healing.store(None);
-            signal.fire();
-            return outcome;
+            let _healing = Healing {
+                healing: &self.healing,
+                signal,
+            };
+            return self.reopen(events, retry.take()).await;
         }
     }
 
