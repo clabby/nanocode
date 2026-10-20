@@ -183,6 +183,10 @@ impl<B: KeyValue + ?Sized> KeyValueStore<B> {
         format!("{}record/{}/{state_id}/{key}", self.prefix, state_id.len())
     }
 
+    fn records_of(&self, state_id: &str) -> String {
+        self.record_key(state_id, "")
+    }
+
     async fn acquire_owner(
         &self,
         state_id: &str,
@@ -310,12 +314,19 @@ impl<B: KeyValue + ?Sized> KeyValueStore<B> {
     }
 
     async fn state_ids(&self, limit: usize) -> Result<Vec<String>, StoreError> {
-        let prefix = self.states();
-        let keys = self.backend.list_keys(&prefix).await?;
+        self.listed(&self.states(), limit).await
+    }
+
+    async fn record_keys(&self, state_id: &str) -> Result<Vec<String>, StoreError> {
+        self.listed(&self.records_of(state_id), usize::MAX).await
+    }
+
+    async fn listed(&self, prefix: &str, limit: usize) -> Result<Vec<String>, StoreError> {
+        let keys = self.backend.list_keys(prefix).await?;
         keys.into_iter()
             .take(limit)
             .map(|key| {
-                key.strip_prefix(&prefix).map(str::to_owned).ok_or_else(|| {
+                key.strip_prefix(prefix).map(str::to_owned).ok_or_else(|| {
                     StoreError::Backend(format!(
                         "key-value store listed `{key}` outside the prefix `{prefix}`"
                     ))
@@ -360,6 +371,13 @@ impl<B: KeyValue + ?Sized + 'static> StateStore for KeyValueStore<B> {
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         Box::pin(self.state_ids(limit))
+    }
+
+    fn list_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(self.record_keys(state_id))
     }
 
     fn owner<'a>(

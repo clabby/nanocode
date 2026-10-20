@@ -167,8 +167,6 @@ const PAGE_MESSAGES: usize = 64;
 
 pub(super) const MIN_JOURNAL_VERSION: u32 = 1;
 
-const KEY_PREFIX: &str = "b3:";
-
 #[must_use]
 pub fn checkpoint_key(json: &str) -> String {
     record_key(json.into()).to_string()
@@ -179,22 +177,7 @@ fn record_key(json: Arc<str>) -> Arc<str> {
 }
 
 fn key_matches(json: &str, key: &str) -> bool {
-    if key.starts_with(KEY_PREFIX) {
-        checkpoint_key(json) == key
-    } else {
-        sha256_key(json) == key
-    }
-}
-
-fn sha256_key(json: &str) -> String {
-    use sha2::{Digest, Sha256};
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut key = String::with_capacity(64);
-    for byte in Sha256::digest(json.as_bytes()) {
-        key.push(HEX[usize::from(byte >> 4)] as char);
-        key.push(HEX[usize::from(byte & 15)] as char);
-    }
-    key
+    EncodedPayload::from_json(json.into()).matches_key(key)
 }
 
 #[derive(Clone)]

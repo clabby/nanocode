@@ -365,6 +365,10 @@ fn read_only_unsupported() -> StoreError {
     StoreError::Backend("this store does not support non-fencing reads".to_owned())
 }
 
+fn record_listing_unsupported() -> StoreError {
+    StoreError::Backend("this store does not list a state's records".to_owned())
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub trait StateStore: Send {
     fn read_record<'a>(
@@ -397,6 +401,13 @@ pub trait StateStore: Send {
         _limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         Box::pin(async { Err(read_only_unsupported()) })
+    }
+
+    fn list_records<'a>(
+        &'a mut self,
+        _state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(async { Err(record_listing_unsupported()) })
     }
 
     fn owner<'a>(
@@ -524,6 +535,13 @@ pub trait StateStore {
         _limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         Box::pin(async { Err(read_only_unsupported()) })
+    }
+
+    fn list_records<'a>(
+        &'a mut self,
+        _state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(async { Err(record_listing_unsupported()) })
     }
 
     fn owner<'a>(

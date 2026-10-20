@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{
         Arc, Weak,
@@ -178,6 +178,7 @@ struct SharedJournal {
     state_id: Arc<str>,
     store: SharedStore,
     writes: mpsc::UnboundedSender<Write>,
+    manifests: Arc<ArcSwapOption<HashMap<String, String>>>,
 }
 
 impl SharedJournal {
@@ -249,14 +250,57 @@ impl ChildJournalStore for SharedJournal {
     fn load_record(&self, key: String) -> BackendFuture<std::io::Result<String>> {
         let mut store = self.store.clone();
         let state_id = Arc::clone(&self.state_id);
+        let manifests = Arc::clone(&self.manifests);
         Box::pin(async move {
-            let loaded = EncodedPayload::by_key(&key)
+            let loaded = match EncodedPayload::by_key(&key)
                 .load(&mut store, &state_id)
                 .await
-                .map_err(std::io::Error::other)?;
+            {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    let Some(filed) =
+                        filed_by_content(&mut store, &state_id, &manifests, &key).await?
+                    else {
+                        return Err(std::io::Error::other(error));
+                    };
+                    EncodedPayload::by_key(&filed)
+                        .load(&mut store, &state_id)
+                        .await
+                        .map_err(std::io::Error::other)?
+                }
+            };
             Ok(loaded.json().map_err(std::io::Error::other)?.to_owned())
         })
     }
+}
+
+async fn filed_by_content(
+    store: &mut SharedStore,
+    state_id: &str,
+    manifests: &ArcSwapOption<HashMap<String, String>>,
+    key: &str,
+) -> std::io::Result<Option<String>> {
+    if store
+        .read_record(state_id, key)
+        .await
+        .map_err(std::io::Error::other)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let known = match manifests.load_full() {
+        Some(known) => known,
+        None => {
+            let scanned = Arc::new(
+                EncodedPayload::manifests_by_content(store, state_id)
+                    .await
+                    .map_err(std::io::Error::other)?,
+            );
+            manifests.store(Some(Arc::clone(&scanned)));
+            scanned
+        }
+    };
+    Ok(known.get(key).cloned())
 }
 
 fn journal(
@@ -280,6 +324,7 @@ fn journal(
         state_id,
         store,
         writes,
+        manifests: Arc::default(),
     }))
 }
 

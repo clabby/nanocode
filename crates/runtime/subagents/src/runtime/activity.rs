@@ -21,7 +21,6 @@ impl SubagentActivity {
     #[must_use]
     pub const fn is_quiescent(&self) -> bool {
         !self.restoring
-            && self.restore_failure.is_none()
             && self.active.is_empty()
             && self.resuming.is_empty()
             && self.pending_completions.is_empty()
@@ -47,11 +46,18 @@ impl Registry {
                 claims.reserved.contains_key(root_session_id),
             )
         });
-        let (restoring, restore_failure) = match gate {
-            None => (reserved, None),
-            Some(RestorationState::Ready) => (false, None),
-            Some(RestorationState::Failed(error)) => (false, Some(error)),
-            Some(RestorationState::Loading | RestorationState::Resuming) => (true, None),
+        let restoring = match gate {
+            None => reserved,
+            Some(RestorationState::Ready) => false,
+            Some(RestorationState::Failed(error)) => {
+                return SubagentActivity {
+                    revision,
+                    durable,
+                    restore_failure: Some(error),
+                    ..SubagentActivity::default()
+                };
+            }
+            Some(RestorationState::Loading | RestorationState::Resuming) => true,
         };
         let resuming = self
             .pending_resume
@@ -65,7 +71,6 @@ impl Registry {
             revision,
             durable,
             restoring,
-            restore_failure,
             resuming,
             checkpoint_captures,
             ..SubagentActivity::default()
@@ -143,6 +148,14 @@ impl Registry {
             {
                 return Ok(());
             }
+        }
+        if self.claims.read(|claims| {
+            claims
+                .restored
+                .get(root_session_id)
+                .is_some_and(|gate| matches!(*gate.borrow(), RestorationState::Failed(_)))
+        }) {
+            return Ok(());
         }
         self.persist_durably(root_session_id).await
     }

@@ -76,6 +76,10 @@ enum Command {
         limit: usize,
         result: oneshot::Sender<Result<Vec<String>, StoreError>>,
     },
+    ListRecords {
+        state_id: String,
+        result: oneshot::Sender<Result<Vec<String>, StoreError>>,
+    },
     Flush {
         result: oneshot::Sender<Result<(), StoreError>>,
     },
@@ -512,6 +516,9 @@ async fn run<S: StateStore + ?Sized>(store: &mut S, request: StoreRequest) {
             Command::ListStates { limit, result } => {
                 drop(result.send(store.list_states(limit).await));
             }
+            Command::ListRecords { state_id, result } => {
+                drop(result.send(store.list_records(&state_id).await));
+            }
             Command::Flush { result } => {
                 drop(result.send(store.flush().await));
             }
@@ -856,6 +863,33 @@ impl StateStore for SharedStore {
             self.commands
                 .send(StoreRequest {
                     command: Command::ListStates { limit, result },
+                    span,
+                    queued: Instant::now(),
+                })
+                .await
+                .map_err(|_| stopped())?;
+            receiver.await.map_err(|_| stopped())?
+        })
+    }
+
+    fn list_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        let span = tracing::info_span!(
+            "durability.store",
+            operation = "list_records",
+            state.id = state_id,
+            queue.duration_ms = tracing::field::Empty
+        );
+        Box::pin(async move {
+            let (result, receiver) = oneshot::channel();
+            self.commands
+                .send(StoreRequest {
+                    command: Command::ListRecords {
+                        state_id: state_id.to_owned(),
+                        result,
+                    },
                     span,
                     queued: Instant::now(),
                 })

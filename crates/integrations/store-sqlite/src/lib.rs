@@ -346,6 +346,18 @@ impl Database {
             .transpose()
     }
 
+    fn list_records(&self, state_id: &str) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT key FROM nanocode_durable_records WHERE state_id = ?1")
+            .map_err(backend)?;
+        statement
+            .query_map([state_id], |row| row.get::<_, String>(0))
+            .map_err(backend)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(backend)
+    }
+
     fn list_states(&self, limit: usize) -> Result<Vec<String>, StoreError> {
         let mut statement = self
             .connection
@@ -431,6 +443,14 @@ impl StateStore for SqliteStore {
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         self.read(move |database| database.list_states(limit))
+    }
+
+    fn list_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        let state_id = state_id.to_owned();
+        self.read(move |database| database.list_records(&state_id))
     }
 
     fn owner<'a>(

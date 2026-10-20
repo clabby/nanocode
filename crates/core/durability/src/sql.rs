@@ -55,6 +55,7 @@ const HEAD: &str = "SELECT owners.owner, owners.fence, COALESCE(states.revision,
 const RECORD: &str = "SELECT value FROM records WHERE state_id = ?1 AND key = ?2";
 const RECORDS: &str = "SELECT records.value FROM json_each(?2) AS keys LEFT JOIN records ON records.state_id = ?1 AND records.key = keys.value ORDER BY keys.key";
 const STATES: &str = "SELECT id FROM states ORDER BY rowid DESC LIMIT CAST(?1 AS INTEGER)";
+const RECORD_KEYS: &str = "SELECT key FROM records WHERE state_id = ?1";
 const ACQUIRE: &str = "INSERT INTO owners VALUES (?1, ?2, '1') ON CONFLICT (id) DO UPDATE SET owner = excluded.owner, fence = CAST(CAST(fence AS INTEGER) + 1 AS TEXT) WHERE CAST(fence AS INTEGER) < 9223372036854775807 RETURNING fence";
 const INSERT_RECORD: &str = "INSERT INTO records SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 ON CONFLICT DO NOTHING";
 const REPLACE: &str = "INSERT INTO states SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload RETURNING revision";
@@ -293,6 +294,15 @@ impl<H: Sql + ?Sized> SqlStore<H> {
             .collect()
     }
 
+    async fn record_keys(&mut self, state_id: &str) -> Result<Vec<String>, StoreError> {
+        let rows = self
+            .query("list_records", RECORD_KEYS, vec![state_id])
+            .await?;
+        rows.iter()
+            .map(|row| text(row, 0).map(str::to_owned))
+            .collect()
+    }
+
     async fn current_owner(&mut self, state_id: &str) -> Result<Option<OwnerToken>, StoreError> {
         let rows = self.query("owner", OWNER, vec![state_id]).await?;
         single(&rows)?
@@ -422,6 +432,13 @@ impl<H: Sql + ?Sized + 'static> StateStore for SqlStore<H> {
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         Box::pin(self.state_ids(limit))
+    }
+
+    fn list_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(self.record_keys(state_id))
     }
 
     fn owner<'a>(

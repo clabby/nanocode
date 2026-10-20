@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -172,11 +175,10 @@ impl EncodedPayload {
 
     pub fn matches_key(&self, key: &str) -> bool {
         self.key.as_ref() == key
-            || (!key.starts_with(KEY_PREFIX)
-                && self
-                    .content
-                    .as_deref()
-                    .is_some_and(|content| sha256_key(content) == key))
+            || self
+                .content
+                .as_deref()
+                .is_some_and(|content| key_matches(key, content))
     }
 
     pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Self> {
@@ -351,6 +353,37 @@ impl EncodedPayload {
             result.push(value.load_record(&mut source, state_id, record).await?);
         }
         Ok(result)
+    }
+
+    pub async fn manifests_by_content(
+        store: &mut dyn crate::StateStore,
+        state_id: &str,
+    ) -> Result<HashMap<String, String>> {
+        let mut manifests = HashMap::new();
+        for key in store.list_records(state_id).await? {
+            if !key.starts_with(KEY_PREFIX) {
+                continue;
+            }
+            let Some(record) = store.read_record(state_id, &key).await? else {
+                continue;
+            };
+            if !record.starts_with(MANIFEST_PREFIX) && !record.starts_with(TREE_PREFIX) {
+                continue;
+            }
+            let read = &mut HashSet::new();
+            let payload = Self::by_key(&key)
+                .load_record(
+                    &mut Noting {
+                        store: &mut *store,
+                        read,
+                    },
+                    state_id,
+                    record,
+                )
+                .await?;
+            manifests.insert(record_key(payload.json()?), key);
+        }
+        Ok(manifests)
     }
 
     async fn load_record<S: RecordSource + ?Sized>(

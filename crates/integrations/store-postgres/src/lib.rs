@@ -260,6 +260,25 @@ impl StateStore for PostgresStore {
                 .collect())
         })
     }
+
+    fn list_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(async move {
+            Ok(self
+                .client
+                .query(
+                    "SELECT key FROM nanocode_durable_records WHERE state_id = $1",
+                    &[&state_id],
+                )
+                .await
+                .map_err(backend)?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect())
+        })
+    }
 }
 
 async fn validate_schema(transaction: &tokio_postgres::Transaction<'_>) -> Result<(), StoreError> {

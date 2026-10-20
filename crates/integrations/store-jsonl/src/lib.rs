@@ -1075,6 +1075,18 @@ impl Journal {
             .copied())
     }
 
+    fn record_keys(&mut self, id: &str) -> Result<Vec<String>, StoreError> {
+        if let Err(error) = self.index.load_records(id) {
+            return Err(self.invalidated(error));
+        }
+        Ok(self
+            .index
+            .states
+            .get(id)
+            .map(|state| state.records.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
     fn record(&mut self, id: &str, key: &str) -> Result<Option<String>, StoreError> {
         match self.location(id, key)? {
             None => Ok(None),
@@ -1599,6 +1611,11 @@ impl Journal {
         Ok(self.index.owners.get(id).cloned())
     }
 
+    fn list_records(&mut self, id: &str) -> Result<Vec<String>, StoreError> {
+        self.sync()?;
+        self.rebuilt(|store| store.record_keys(id))
+    }
+
     fn list_states(&mut self, limit: usize) -> Result<Vec<String>, StoreError> {
         self.sync()?;
         Ok(self
@@ -2000,6 +2017,13 @@ impl StateStore for JsonlStore {
         limit: usize,
     ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
         self.read(move |journal| journal.list_states(limit))
+    }
+    fn list_records<'a>(
+        &'a mut self,
+        id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        let id = id.to_owned();
+        self.read(move |journal| journal.list_records(&id))
     }
     fn acquire<'a>(
         &'a mut self,

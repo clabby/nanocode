@@ -1546,10 +1546,15 @@ impl Registry {
             for (id, result) in registry.resume_interrupted(&root).await {
                 if let Err(error) = result {
                     tracing::warn!(%id, %error, "could not resume restored subagent");
-                    let _ = ready.send(RestorationState::Failed(format!(
-                        "could not resume restored subagent {id}: {error}"
-                    )));
-                    return;
+                    registry
+                        .fail_unresumable(
+                            &root,
+                            id,
+                            format!(
+                                "subagent {id} could not resume after a runtime restart: {error}"
+                            ),
+                        )
+                        .await;
                 }
             }
             let _ = ready.send(RestorationState::Ready);
@@ -2014,8 +2019,16 @@ impl Registry {
                 let store = self
                     .store_for(root_session_id)
                     .ok_or_else(|| std::io::Error::other("no subagent store is installed"))?;
-                let json = store.load_record(root_session_id, &key).await?;
-                durable::decode_checkpoint(&json, &key)
+                store
+                    .load_record(root_session_id, &key)
+                    .await
+                    .and_then(|json| durable::decode_checkpoint(&json, &key))
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("subagent {id}'s checkpoint {key} is unreadable: {error}"),
+                        )
+                    })
             }
         }
     }
@@ -2619,6 +2632,53 @@ impl Registry {
             results.push((id, result));
         }
         results
+    }
+
+    async fn fail_unresumable(&self, root_session_id: &str, id: AgentId, mut error: String) {
+        let settled = {
+            let mut state = self.state.acquire().await;
+            let Some(session) = state
+                .scopes
+                .get_mut(root_session_id)
+                .and_then(|scope| scope.sessions.get_mut(&id))
+                .filter(|session| {
+                    !session.active
+                        && session.harness.is_none()
+                        && matches!(session.status, AgentStatus::Interrupted)
+                })
+            else {
+                return;
+            };
+            if let Some(evidence) =
+                durable::in_flight_evidence(&session.in_flight_calls, session.in_flight_omitted)
+            {
+                error.push_str("\n\n");
+                error.push_str(&evidence);
+            }
+            session.status = AgentStatus::Failed { error };
+            session.resume_attempts = 0;
+            session.in_flight_calls.clear();
+            session.in_flight_omitted = 0;
+            session.in_flight_progress = durable::OmittedProgress::default();
+            let settled = session.next_instruction_revision;
+            session.settled_revision = Some(settled);
+            let completion = session.descriptor.parent.is_none().then_some(settled);
+            if completion.is_some() {
+                session.pending_completion = completion;
+            }
+            (session.status.clone(), completion)
+        };
+        let (status, completion) = settled;
+        self.enqueue_status(
+            root_session_id,
+            id,
+            OrderedJob::Settle {
+                status,
+                completion,
+                harness: None,
+            },
+        );
+        self.changed();
     }
 
     pub(super) fn reserve_turn(&self) -> std::io::Result<TurnCapacity> {
