@@ -86,8 +86,8 @@ pub struct OpenAiBuilder<F = StandardServiceFactory> {
 
 impl<F> OpenAiBuilder<F> {
     #[must_use]
-    pub const fn model(mut self, model: Model) -> Self {
-        self.config.model = model;
+    pub fn model(mut self, model: Model) -> Self {
+        self.config.retarget(model);
 
         if matches!(model, Model::Glm53 | Model::Kimi | Model::Mimo) {
             self.config.responses_transport = ResponsesTransport::Https;
@@ -223,7 +223,9 @@ impl<F> OpenAiBuilder<F> {
         if let Some(websocket_url) = gateway.websocket_url() {
             self.config.websocket_url = websocket_url;
         }
-        self.config.model_id_prefix = gateway.model_id_prefix().map(Arc::from);
+        self.config.model_id_prefix = gateway
+            .model_id_prefix_for(self.config.model)
+            .map(Arc::from);
         self.config.responses_gateway = Some(Arc::new(gateway));
         self.config.responses_transport = ResponsesTransport::Https;
         self.config.responses_history = ResponsesHistory::FullReplay;

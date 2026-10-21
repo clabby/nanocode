@@ -10,6 +10,9 @@ const VERCEL_API_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 const CLOUDFLARE_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
 const CLOUDFLARE_GATEWAY_BASE_URL: &str = "https://gateway.ai.cloudflare.com/v1";
 const OPENAI_VENDOR: &str = "openai";
+const ZAI_VENDOR: &str = "zai";
+const MOONSHOT_VENDOR: &str = "moonshotai";
+const XIAOMI_VENDOR: &str = "xiaomi";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Provider {
@@ -251,8 +254,20 @@ impl ResponsesGateway {
     }
 
     #[must_use]
+    pub const fn model_id_prefix_for(&self, model: Model) -> Option<&'static str> {
+        match (self.provider, model) {
+            (Provider::Vercel, Model::Glm53) => Some(ZAI_VENDOR),
+            (Provider::Vercel, Model::Kimi) => Some(MOONSHOT_VENDOR),
+            (Provider::Vercel, Model::Mimo) => Some(XIAOMI_VENDOR),
+            _ => self.model_id_prefix(),
+        }
+    }
+
+    #[must_use]
     pub const fn serves(&self, model: Model) -> bool {
         matches!(model, Model::Sol | Model::Luna | Model::Astra)
+            || matches!(self.provider, Provider::Vercel)
+                && matches!(model, Model::Glm53 | Model::Kimi | Model::Mimo)
     }
 
     #[must_use]

@@ -137,7 +137,7 @@ impl BranchSpawner {
         };
         spawner.host_context = host_context;
         let mut config = (*spawner.config).clone();
-        config.model = model;
+        config.retarget(model);
         config.thinking = thinking;
         config.service_tier = service_tier;
         spawner.config = Arc::new(config);
@@ -176,7 +176,7 @@ impl BranchSpawner {
             lineage.clone(),
         ))?;
         let mut config = (*self.config).clone();
-        config.model = model;
+        config.retarget(model);
         config.thinking = thinking;
         config.reasoning_mode = reasoning_mode;
         config.service_tier = service_tier;
@@ -258,7 +258,7 @@ impl BranchSpawner {
         spawner.host_context = host_context;
         spawner.lineage_id = Arc::clone(&snapshot.conversation_id);
         let mut config = (*spawner.config).clone();
-        config.model = snapshot.model;
+        config.retarget(snapshot.model);
         config.thinking = snapshot.thinking;
         config.reasoning_mode = snapshot.reasoning_mode;
         config.service_tier = snapshot.service_tier;

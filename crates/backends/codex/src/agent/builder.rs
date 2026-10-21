@@ -139,8 +139,8 @@ impl<F> CodexBuilder<F> {
     }
 
     #[must_use]
-    pub const fn model(mut self, model: Model) -> Self {
-        self.config.model = model;
+    pub fn model(mut self, model: Model) -> Self {
+        self.config.retarget(model);
         if !self.config.thinking_explicit {
             self.config.thinking = model.default_thinking();
         }
@@ -293,7 +293,7 @@ impl<F> CodexBuilder<F> {
 
     #[doc(hidden)]
     #[must_use]
-    pub const fn initial_settings(
+    pub fn initial_settings(
         mut self,
         model: Model,
         thinking: Thinking,

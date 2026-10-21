@@ -5,6 +5,8 @@ use ::tower::Layer;
 mod config;
 mod platform;
 
+pub(crate) use config::prefixed_model_id;
+
 use crate::client::{
     DefaultResponsesService, Model, OpenAiAuthError, OpenAiAuthMode, ResponsesHistory,
     ResponsesRetryPolicy, ResponsesTransport, transport::ResponsesGateway,
@@ -167,7 +169,7 @@ fn validate_responses_gateway(
     }
     if !gateway.serves(config.model) {
         return Err(OpenAiError::InvalidConfiguration {
-            detail: "Responses gateways serve the OpenAI Codex models Sol, Luna and Astra; use the Chat Completions gateway for GLM-5.3, Kimi and MiMo",
+            detail: "Responses gateways serve the OpenAI Codex models Sol, Luna and Astra, and the Vercel AI Gateway also GLM-5.3, Kimi and MiMo; use the Chat Completions gateway for those elsewhere",
         });
     }
     if matches!(config.responses_transport, ResponsesTransport::WebSocket)

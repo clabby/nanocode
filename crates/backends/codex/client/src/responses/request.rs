@@ -696,9 +696,9 @@ impl<'a> ResponseCreate<'a> {
         let model = retained.map_or_else(
             || config.wire_model_id(policy.model),
             |retained| {
-                retained.model_id_prefix.as_ref().map_or_else(
-                    || Cow::Borrowed(policy.model.as_str()),
-                    |prefix| Cow::Owned(format!("{prefix}/{}", policy.model.as_str())),
+                crate::client::openai::prefixed_model_id(
+                    retained.model_id_prefix.as_deref(),
+                    policy.model,
                 )
             },
         );

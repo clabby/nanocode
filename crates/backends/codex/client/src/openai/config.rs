@@ -10,6 +10,17 @@ const LUNA_SYSTEM_PROMPT: &str = include_str!("../../prompts/luna.md");
 const GLM_SYSTEM_PROMPT: &str = include_str!("../../prompts/glm.md");
 const ASTRA_SYSTEM_PROMPT: &str = include_str!("../../prompts/astra.md");
 
+pub(crate) fn prefixed_model_id(prefix: Option<&str>, model: Model) -> Cow<'static, str> {
+    let name = match model {
+        Model::Glm53 => "glm-5.3",
+        _ => model.as_str(),
+    };
+    match prefix {
+        Some(prefix) => Cow::Owned(format!("{prefix}/{name}")),
+        None => Cow::Borrowed(model.as_str()),
+    }
+}
+
 #[derive(Clone)]
 pub struct ModelConfig {
     pub model: Model,
@@ -62,10 +73,17 @@ pub struct ModelConfig {
 
 impl ModelConfig {
     pub(crate) fn wire_model_id(&self, model: Model) -> Cow<'static, str> {
-        match self.model_id_prefix.as_deref() {
-            Some(prefix) => Cow::Owned(format!("{prefix}/{}", model.as_str())),
-            None => Cow::Borrowed(model.as_str()),
+        prefixed_model_id(self.model_id_prefix.as_deref(), model)
+    }
+
+    #[doc(hidden)]
+    pub fn retarget(&mut self, model: Model) {
+        if let Some(gateway) = self.responses_gateway.as_deref()
+            && self.model_id_prefix.as_deref() == gateway.model_id_prefix_for(self.model)
+        {
+            self.model_id_prefix = gateway.model_id_prefix_for(model).map(Arc::from);
         }
+        self.model = model;
     }
 
     #[must_use]
