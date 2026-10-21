@@ -83,6 +83,8 @@ pub struct EncodedPayload {
     layout: Option<Arc<Layout>>,
     #[serde(skip)]
     pending: Vec<crate::StoreRecord>,
+    #[serde(skip)]
+    children: Vec<Self>,
 }
 
 #[derive(Debug)]
@@ -193,6 +195,7 @@ impl EncodedPayload {
             content: Some(json),
             layout,
             pending: Vec::new(),
+            children: Vec::new(),
         }
     }
 
@@ -202,6 +205,7 @@ impl EncodedPayload {
             content: None,
             layout: None,
             pending: Vec::new(),
+            children: Vec::new(),
         }
     }
 
@@ -231,6 +235,11 @@ impl EncodedPayload {
         self
     }
 
+    pub fn with_payloads(mut self, payloads: Vec<Self>) -> Self {
+        self.children = payloads;
+        self
+    }
+
     pub fn stage(&mut self, records: &mut Vec<crate::StoreRecord>) {
         self.stage_unless(records, &|_| false);
     }
@@ -241,6 +250,9 @@ impl EncodedPayload {
         known: &dyn Fn(&str) -> bool,
     ) {
         records.extend(self.pending.drain(..).filter(|record| !known(&record.key)));
+        for mut child in std::mem::take(&mut self.children) {
+            child.stage_unless(records, known);
+        }
         let Some(content) = self.content.take() else {
             return;
         };
@@ -472,6 +484,7 @@ impl EncodedPayload {
                 content: Some(content.into()),
                 layout: None,
                 pending: Vec::new(),
+                children: Vec::new(),
             });
         }
         Ok(loaded)

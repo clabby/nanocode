@@ -29,7 +29,9 @@ pub use nanocode_durability_core::{
     StoreFuture, StoreRecord, StoreReplacement, StoreUpdate, StoredEvent, StoredState,
     SummaryUpdate, Versioned,
 };
-pub use paged::{PagedWriter, PayloadReader, Prepared, Sequence, SequenceCache, load_sequence};
+pub use paged::{
+    PagedWriter, PayloadReader, Prepared, Sequence, SequenceCache, load_sequence, seal_sequence,
+};
 pub use session::{
     Admission, AutomaticAdmission, BeginStep, DurableOwner, DurableSession, InitialAcquisition,
     MetadataExpectation, MetadataWrite, OwnerWrite, SessionReceipt, SessionWrite, StoredSteer,

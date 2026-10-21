@@ -29,8 +29,15 @@ pub enum Step {
 }
 
 #[doc(hidden)]
+pub struct EncodedState {
+    pub json: Box<RawValue>,
+
+    pub records: Vec<nanocode_durability::EncodedPayload>,
+}
+
+#[doc(hidden)]
 pub enum JournalWrite {
-    Advance(Box<RawValue>),
+    Advance(EncodedState),
 
     Complete {
         step_id: String,
@@ -174,7 +181,9 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         Box::pin(async move {
             for write in writes {
                 match write {
-                    JournalWrite::Advance(state) => self.advance_encoded(id.clone(), state).await?,
+                    JournalWrite::Advance(state) => {
+                        self.advance_encoded(id.clone(), state.json).await?;
+                    }
                     JournalWrite::Complete { step_id, output } => {
                         let output = serde_json::from_str(output.get())
                             .map_err(crate::agent::provider_error)?;
@@ -205,16 +214,20 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
     fn cancel(&self, id: String, checkpoint: Value) -> PolicyFuture<'_, ()>;
 
     #[doc(hidden)]
-    #[allow(clippy::boxed_local)]
+    fn pages_messages(&self) -> bool {
+        false
+    }
+
+    #[doc(hidden)]
     fn settle_encoded(
         &self,
         id: String,
-        checkpoint: Box<RawValue>,
+        checkpoint: EncodedState,
         settlement: Settlement,
     ) -> PolicyFuture<'_, ()> {
         Box::pin(async move {
-            let checkpoint: Value =
-                serde_json::from_str(checkpoint.get()).map_err(crate::agent::provider_error)?;
+            let checkpoint: Value = serde_json::from_str(checkpoint.json.get())
+                .map_err(crate::agent::provider_error)?;
             match settlement {
                 Settlement::Complete(output) => {
                     let output =

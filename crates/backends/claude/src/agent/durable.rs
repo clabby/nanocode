@@ -1,5 +1,6 @@
 use super::*;
-use crate::execution::{BeginRequest, JournalWrite, Settlement};
+use crate::execution::{BeginRequest, EncodedState, JournalWrite, Settlement};
+use nanocode_durability::{EncodedPayload, Sequence};
 use serde_json::value::RawValue;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -234,7 +235,7 @@ pub(super) struct Journal {
     writes: Vec<JournalWrite>,
 }
 impl Journal {
-    fn advance(&mut self, state: Box<RawValue>) {
+    fn advance(&mut self, state: EncodedState) {
         self.writes
             .retain(|write| !matches!(write, JournalWrite::Advance(_)));
         self.writes.push(JournalWrite::Advance(state));
@@ -493,6 +494,12 @@ impl State {
         self.policy.is_some() && cursor.operation.is_some()
     }
 
+    fn pages_messages(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_some_and(|policy| policy.pages_messages())
+    }
+
     pub(super) fn retain_pending(&self, cursor: &mut Cursor, pending: &[HistoryMessage]) {
         if self.persists(cursor) {
             cursor.pending = pending.to_vec();
@@ -523,7 +530,7 @@ impl State {
         if self.persists(cursor) {
             cursor.snapshot = self.snapshot(&Conversation::default()).await?;
             cursor.snapshot.conversation = std::mem::take(conversation);
-            let encoded = encode_cursor(cursor);
+            let encoded = encode_cursor(cursor, self.pages_messages());
             *conversation = std::mem::take(&mut cursor.snapshot).conversation;
             journal.operation.clone_from(&cursor.operation);
             journal.advance(encoded?);
@@ -592,13 +599,7 @@ impl State {
         }
         let mut snapshot = self.snapshot(&Conversation::default()).await?;
         snapshot.conversation = std::mem::take(conversation);
-        let checkpoint = snapshot
-            .conversation
-            .messages
-            .iter()
-            .try_for_each(HistoryMessage::cache_json)
-            .and_then(|()| serde_json::value::to_raw_value(&snapshot))
-            .map_err(provider_error);
+        let checkpoint = encode_snapshot(&mut snapshot, policy.pages_messages());
         *conversation = snapshot.conversation;
         let checkpoint = checkpoint?;
         let settlement = match result {
@@ -784,7 +785,119 @@ impl State {
     }
 }
 
-fn encode_cursor(cursor: &mut Cursor) -> Result<Box<serde_json::value::RawValue>> {
+const PAGED_VERSION: u32 = 2;
+
+#[derive(Serialize)]
+struct PagedSnapshot<'a> {
+    provider: &'a str,
+    version: u32,
+    messages: Sequence,
+    snapshot: &'a RawValue,
+}
+
+#[derive(Serialize)]
+struct PagedCursor<'a> {
+    version: u32,
+    messages: Sequence,
+    pending: Sequence,
+    template: EncodedPayload,
+    cursor: &'a RawValue,
+}
+
+#[derive(Serialize)]
+struct TemplatePrompt<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<&'a Value>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    tools: &'a [ClaudeToolSpec],
+}
+
+fn page(messages: &[HistoryMessage], records: &mut Vec<EncodedPayload>) -> Result<Sequence> {
+    let items = messages
+        .iter()
+        .map(HistoryMessage::record)
+        .collect::<serde_json::Result<Vec<_>>>()
+        .map_err(provider_error)?;
+    let (sequence, pages) = nanocode_durability::seal_sequence(&items).map_err(provider_error)?;
+    records.extend(items);
+    records.extend(pages);
+    Ok(sequence)
+}
+
+fn encode_snapshot(snapshot: &mut Snapshot, paged: bool) -> Result<EncodedState> {
+    if !paged {
+        return snapshot
+            .conversation
+            .messages
+            .iter()
+            .try_for_each(HistoryMessage::cache_json)
+            .and_then(|()| serde_json::value::to_raw_value(&*snapshot))
+            .map(|json| EncodedState {
+                json,
+                records: Vec::new(),
+            })
+            .map_err(provider_error);
+    }
+    let messages = std::mem::take(&mut snapshot.conversation.messages);
+    let encoded = paged_snapshot(snapshot, &messages);
+    snapshot.conversation.messages = messages;
+    encoded
+}
+
+fn paged_snapshot(snapshot: &Snapshot, messages: &[HistoryMessage]) -> Result<EncodedState> {
+    let mut records = Vec::new();
+    let messages = page(messages, &mut records)?;
+    let inner = serde_json::value::to_raw_value(snapshot).map_err(provider_error)?;
+    let json = serde_json::value::to_raw_value(&PagedSnapshot {
+        provider: &snapshot.provider,
+        version: PAGED_VERSION,
+        messages,
+        snapshot: &inner,
+    })
+    .map_err(provider_error)?;
+    Ok(EncodedState { json, records })
+}
+
+fn paged_cursor(
+    cursor: &Cursor,
+    messages: &[HistoryMessage],
+    pending: &[HistoryMessage],
+    prompt: &TemplatePrompt<'_>,
+) -> Result<EncodedState> {
+    let mut records = Vec::new();
+    let messages = page(messages, &mut records)?;
+    let pending = page(pending, &mut records)?;
+    let template = EncodedPayload::encode(prompt).map_err(provider_error)?;
+    let inner = serde_json::value::to_raw_value(cursor).map_err(provider_error)?;
+    let json = serde_json::value::to_raw_value(&PagedCursor {
+        version: PAGED_VERSION,
+        messages,
+        pending,
+        template: template.reference(),
+        cursor: &inner,
+    })
+    .map_err(provider_error)?;
+    records.push(template);
+    Ok(EncodedState { json, records })
+}
+
+fn encode_cursor(cursor: &mut Cursor, paged: bool) -> Result<EncodedState> {
+    if paged {
+        let messages = std::mem::take(&mut cursor.snapshot.conversation.messages);
+        let pending = std::mem::take(&mut cursor.pending);
+        let system = cursor.template.system.take();
+        let tools = std::mem::take(&mut cursor.template.tools);
+        let prompt = TemplatePrompt {
+            system: system.as_ref(),
+            tools: &tools,
+        };
+        let encoded = paged_cursor(cursor, &messages, &pending, &prompt);
+        cursor.snapshot.conversation.messages = messages;
+        cursor.pending = pending;
+        cursor.template.system = system;
+        cursor.template.tools = tools;
+        return encoded;
+    }
     let shared = cursor
         .snapshot
         .conversation
@@ -807,7 +920,12 @@ fn encode_cursor(cursor: &mut Cursor) -> Result<Box<serde_json::value::RawValue>
         .and_then(|()| serde_json::value::to_raw_value(&*cursor));
     cursor.pending = pending;
     cursor.pending_base = None;
-    encoded.map_err(provider_error)
+    encoded
+        .map(|json| EncodedState {
+            json,
+            records: Vec::new(),
+        })
+        .map_err(provider_error)
 }
 
 pub(super) fn replay(operation: String, output: Value) -> Result<TurnResult> {

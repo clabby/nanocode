@@ -53,17 +53,35 @@ impl<'a> PayloadReader<'a> {
     }
 }
 
-const PAGE_ITEMS: usize = 64;
+const GROUP: usize = 16;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Sequence {
-    tail: Option<EncodedPayload>,
+    tail: Option<Tail>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum Tail {
+    Sealed(Sealed),
+    Chained(EncodedPayload),
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct Sealed {
+    levels: Vec<Vec<EncodedPayload>>,
+    items: Vec<EncodedPayload>,
+}
+
+#[derive(Deserialize)]
 struct Page {
     previous: Option<EncodedPayload>,
     items: Vec<EncodedPayload>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Group {
+    entries: Vec<EncodedPayload>,
 }
 
 pub struct Prepared {
@@ -74,15 +92,15 @@ pub struct Prepared {
 #[derive(Clone, Default)]
 pub struct SequenceCache {
     items: Vec<EncodedPayload>,
-    pages: Vec<EncodedPayload>,
+    pages: Vec<Vec<EncodedPayload>>,
     durable_items: usize,
-    durable_pages: usize,
+    durable_pages: Vec<usize>,
 }
 
 impl SequenceCache {
-    pub const fn committed(&mut self) {
+    pub fn committed(&mut self) {
         self.durable_items = self.items.len();
-        self.durable_pages = self.pages.len();
+        self.durable_pages = self.pages.iter().map(Vec::len).collect();
     }
 
     pub fn clear(&mut self) {
@@ -117,18 +135,7 @@ impl<'a> PagedWriter<'a> {
     }
 
     pub fn sequence<T: Serialize>(&mut self, items: &[T]) -> Result<Sequence> {
-        let mut previous = None;
-        for chunk in items.chunks(PAGE_ITEMS) {
-            let mut values = Vec::with_capacity(chunk.len());
-            for item in chunk {
-                values.push(self.record(item)?);
-            }
-            previous = Some(self.record(&Page {
-                previous,
-                items: values,
-            })?);
-        }
-        Ok(Sequence { tail: previous })
+        self.sequence_cached(items, 0, &mut SequenceCache::default())
     }
 
     pub fn sequence_cached<T: Serialize>(
@@ -141,26 +148,61 @@ impl<'a> PagedWriter<'a> {
             .min(items.len())
             .min(cache.durable_items)
             .min(cache.items.len());
-        let pages = (reused / PAGE_ITEMS)
-            .min(cache.durable_pages)
-            .min(cache.pages.len());
         cache.items.truncate(reused);
-        cache.pages.truncate(pages);
         cache.durable_items = cache.durable_items.min(reused);
-        cache.durable_pages = cache.durable_pages.min(pages);
         for item in &items[reused..] {
             let reference = self.record(item)?;
             cache.items.push(reference);
         }
-        for chunk in cache.items[pages * PAGE_ITEMS..].chunks(PAGE_ITEMS) {
-            let page = self.record(&Page {
-                previous: cache.pages.last().cloned(),
-                items: chunk.to_vec(),
-            })?;
-            cache.pages.push(page);
+        if cache.items.is_empty() {
+            cache.pages.clear();
+            cache.durable_pages.clear();
+            return Ok(Sequence::default());
         }
+        let mut valid = reused;
+        let mut level = 0;
+        loop {
+            let below = if level == 0 {
+                &cache.items
+            } else {
+                &cache.pages[level - 1]
+            };
+            let full = below.len() / GROUP;
+            if full == 0 {
+                break;
+            }
+            if cache.pages.len() == level {
+                cache.pages.push(Vec::new());
+                cache.durable_pages.push(0);
+            }
+            let kept = (valid / GROUP)
+                .min(full)
+                .min(cache.durable_pages[level])
+                .min(cache.pages[level].len());
+            let fresh = if level == 0 {
+                cache.items[kept * GROUP..full * GROUP].to_vec()
+            } else {
+                cache.pages[level - 1][kept * GROUP..full * GROUP].to_vec()
+            };
+            cache.pages[level].truncate(kept);
+            cache.durable_pages[level] = cache.durable_pages[level].min(kept);
+            for entries in fresh.chunks(GROUP) {
+                let page = self.record(&Group {
+                    entries: entries.to_vec(),
+                })?;
+                cache.pages[level].push(page);
+            }
+            valid = kept;
+            level += 1;
+        }
+        cache.pages.truncate(level);
+        cache.durable_pages.truncate(level);
+        let inline = |entries: &[EncodedPayload]| entries[entries.len() / GROUP * GROUP..].to_vec();
         Ok(Sequence {
-            tail: cache.pages.last().cloned(),
+            tail: Some(Tail::Sealed(Sealed {
+                levels: cache.pages.iter().map(|pages| inline(pages)).collect(),
+                items: inline(&cache.items),
+            })),
         })
     }
 
@@ -172,20 +214,52 @@ impl<'a> PagedWriter<'a> {
     }
 }
 
+pub fn seal_sequence(items: &[EncodedPayload]) -> Result<(Sequence, Vec<EncodedPayload>)> {
+    if items.is_empty() {
+        return Ok((Sequence::default(), Vec::new()));
+    }
+    let mut pages = Vec::new();
+    let mut inline = Vec::new();
+    let mut below: Vec<_> = items.iter().map(EncodedPayload::reference).collect();
+    loop {
+        let full = below.len() / GROUP * GROUP;
+        if full == 0 {
+            break;
+        }
+        let mut sealed = Vec::with_capacity(full / GROUP);
+        for entries in below[..full].chunks(GROUP) {
+            let page = EncodedPayload::encode(&Group {
+                entries: entries.to_vec(),
+            })?;
+            sealed.push(page.reference());
+            pages.push(page);
+        }
+        inline.push(below.split_off(full));
+        below = sealed;
+    }
+    inline.push(below);
+    let items = inline.remove(0);
+    Ok((
+        Sequence {
+            tail: Some(Tail::Sealed(Sealed {
+                levels: inline,
+                items,
+            })),
+        },
+        pages,
+    ))
+}
+
 pub async fn load_sequence<T: DeserializeOwned>(
     reader: PayloadReader<'_>,
     sequence: Sequence,
     keys: &mut HashSet<String>,
 ) -> Result<Vec<T>> {
-    let mut pages = Vec::new();
-    let mut next = sequence.tail;
-    while let Some(reference) = next {
-        keys.insert(reference.key().to_owned());
-        let page: Page = reader.load_payload(reference).await?.decode()?;
-        next = page.previous;
-        pages.push(page.items);
-    }
-    let references: Vec<_> = pages.into_iter().rev().flatten().collect();
+    let references = match sequence.tail {
+        None => return Ok(Vec::new()),
+        Some(Tail::Chained(tail)) => chained(reader, tail, keys).await?,
+        Some(Tail::Sealed(sealed)) => unsealed(reader, sealed, keys).await?,
+    };
     if references.is_empty() {
         return Ok(Vec::new());
     }
@@ -197,4 +271,48 @@ pub async fn load_sequence<T: DeserializeOwned>(
         items.push(payload.decode()?);
     }
     Ok(items)
+}
+
+async fn unsealed(
+    reader: PayloadReader<'_>,
+    sealed: Sealed,
+    keys: &mut HashSet<String>,
+) -> Result<Vec<EncodedPayload>> {
+    let mut levels = sealed.levels;
+    let mut pending = levels.pop().unwrap_or_default();
+    loop {
+        for reference in &pending {
+            keys.insert(reference.key().to_owned());
+        }
+        let mut entries = Vec::new();
+        for page in reader.load_payloads(std::mem::take(&mut pending)).await? {
+            entries.extend(page.decode::<Group>()?.entries);
+        }
+        match levels.pop() {
+            Some(inline) => {
+                entries.extend(inline);
+                pending = entries;
+            }
+            None => {
+                entries.extend(sealed.items);
+                return Ok(entries);
+            }
+        }
+    }
+}
+
+async fn chained(
+    reader: PayloadReader<'_>,
+    tail: EncodedPayload,
+    keys: &mut HashSet<String>,
+) -> Result<Vec<EncodedPayload>> {
+    let mut pages = Vec::new();
+    let mut next = Some(tail);
+    while let Some(reference) = next {
+        keys.insert(reference.key().to_owned());
+        let page: Page = reader.load_payload(reference).await?.decode()?;
+        next = page.previous;
+        pages.push(page.items);
+    }
+    Ok(pages.into_iter().rev().flatten().collect())
 }

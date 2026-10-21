@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use nanocode_agent_core::{
@@ -9,7 +12,8 @@ use nanocode_agent_core::{
 use nanocode_durability::{
     Admission, BeginStep, Branches, CheckpointFormat, DurableAgentExt, DurableBackendRegistration,
     DurableOwner, DurableSession, EncodedPayload, InitialAcquisition, InitialSettings,
-    JournalClaim, JournalSeed, OwnerWrite, SessionRecord, SharedStore, WriteOutcome, agent_error,
+    JournalClaim, JournalSeed, OwnerWrite, PayloadReader, SessionRecord, SharedStore, WriteOutcome,
+    agent_error,
 };
 use serde_json::{Value, value::RawValue};
 
@@ -17,7 +21,7 @@ use crate::{
     Claude, ClaudeBuilder,
     execution::{
         Admission as ClaudeAdmission, BeginRequest, ClaudeExecutionPolicy, ClaudeSteer,
-        JournalWrite, PolicyFuture, Settlement, Step,
+        EncodedState, JournalWrite, PolicyFuture, Settlement, Step,
     },
 };
 
@@ -106,8 +110,16 @@ impl DurableAgentExt for ClaudeBuilder {
             builder
         };
         let checkpoint = match (checkpoint, preloaded) {
-            (Some(_), Some(preloaded)) => Some(preloaded),
-            (Some(value), None) => Some(value.decode::<Value>().map_err(agent_error)?),
+            (Some(_), Some(preloaded)) => {
+                Some(hydrate(PayloadReader::from(&owner), preloaded).await?)
+            }
+            (Some(value), None) => Some(
+                hydrate(
+                    PayloadReader::from(&owner),
+                    value.decode().map_err(agent_error)?,
+                )
+                .await?,
+            ),
             (None, _) => {
                 let imported = builder.configured_checkpoint()?;
                 if let Some(checkpoint) = &imported
@@ -448,10 +460,14 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         Box::pin(async move { self.get().await?.cancel(id, checkpoint).await })
     }
 
+    fn pages_messages(&self) -> bool {
+        true
+    }
+
     fn settle_encoded(
         &self,
         id: String,
-        checkpoint: Box<RawValue>,
+        checkpoint: EncodedState,
         settlement: Settlement,
     ) -> PolicyFuture<'_, ()> {
         Box::pin(async move {
@@ -588,7 +604,19 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                     .map_err(agent_error)?;
                 (id, admission)
             };
-            Ok((id, map_admission(admission)))
+            let reader = PayloadReader::from(&self.owner);
+            let admission = match admission {
+                Admission::Completed { checkpoint, output } => ClaudeAdmission::Completed {
+                    checkpoint: hydrate(reader, checkpoint).await?,
+                    output,
+                },
+                Admission::Failed { checkpoint, error } => ClaudeAdmission::Failed {
+                    checkpoint: hydrate(reader, checkpoint).await?,
+                    error,
+                },
+                admission => map_admission(admission),
+            };
+            Ok((id, admission))
         })
     }
 
@@ -691,12 +719,16 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
     }
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>> {
         Box::pin(async move {
-            self.owner
-                .continuation(id)
-                .await
-                .map_err(agent_error)?
-                .map(|value| value.decode().map_err(agent_error))
-                .transpose()
+            let Some(value) = self.owner.continuation(id).await.map_err(agent_error)? else {
+                return Ok(None);
+            };
+            format::hydrate_cursor(
+                PayloadReader::from(&self.owner),
+                value.decode().map_err(agent_error)?,
+            )
+            .await
+            .map(Some)
+            .map_err(agent_error)
         })
     }
 
@@ -873,14 +905,19 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         })
     }
 
+    fn pages_messages(&self) -> bool {
+        true
+    }
+
     fn settle_encoded(
         &self,
         id: String,
-        checkpoint: Box<RawValue>,
+        checkpoint: EncodedState,
         settlement: Settlement,
     ) -> PolicyFuture<'_, ()> {
         Box::pin(async move {
-            let checkpoint = EncodedPayload::from_json(Arc::from(checkpoint.get()));
+            let checkpoint = EncodedPayload::from_json(Arc::from(checkpoint.json.get()))
+                .with_payloads(checkpoint.records);
             match settlement {
                 Settlement::Complete(output) => self.owner.complete(id, checkpoint, &*output).await,
                 Settlement::Fail(error) => self.owner.fail(id, checkpoint, error).await,
@@ -951,10 +988,17 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
     }
 }
 
+async fn hydrate(reader: PayloadReader<'_>, checkpoint: Value) -> AgentResult<Value> {
+    format::hydrate_snapshot(reader, checkpoint, &mut HashSet::new())
+        .await
+        .map_err(agent_error)
+}
+
 fn owner_write(write: &JournalWrite) -> OwnerWrite {
     match write {
         JournalWrite::Advance(state) => OwnerWrite::Advance {
-            continuation: EncodedPayload::from_json(Arc::from(state.get())),
+            continuation: EncodedPayload::from_json(Arc::from(state.json.get()))
+                .with_payloads(state.records.clone()),
         },
         JournalWrite::Complete { step_id, output } => OwnerWrite::CompleteStep {
             step_id: step_id.clone(),

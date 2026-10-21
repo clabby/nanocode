@@ -1,13 +1,82 @@
+use std::collections::HashSet;
+
 use nanocode_agent_core::{
     HarnessFamily, SessionCheckpoint,
     session::{ToolOutcome, TranscriptItem},
 };
 use nanocode_durability::{
-    AdmittedTurn, CheckpointFormat, Error, FormatFuture, PayloadReader, Result, SessionRecord,
+    AdmittedTurn, CheckpointFormat, EncodedPayload, Error, FormatFuture, PayloadReader, Result,
+    Sequence, SessionRecord, load_sequence,
 };
+use serde::Deserialize;
 use serde_json::Value;
 
 pub struct ClaudeCheckpointFormat;
+
+#[derive(Deserialize)]
+struct PagedSnapshot {
+    messages: Sequence,
+    snapshot: Value,
+}
+
+#[derive(Deserialize)]
+struct PagedCursor {
+    messages: Sequence,
+    pending: Sequence,
+    template: EncodedPayload,
+    cursor: Value,
+}
+
+fn paged(value: &Value) -> bool {
+    value.get("version").and_then(Value::as_u64) == Some(2)
+}
+
+fn object<'a>(
+    value: &'a mut Value,
+    pointer: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>> {
+    value
+        .pointer_mut(pointer)
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Error::InvalidState(format!("Claude checkpoint has no {pointer}")))
+}
+
+fn insert(value: &mut Value, pointer: &str, field: &str, items: Vec<Value>) -> Result<()> {
+    object(value, pointer)?.insert(field.into(), Value::Array(items));
+    Ok(())
+}
+
+pub(super) async fn hydrate_snapshot(
+    reader: PayloadReader<'_>,
+    stored: Value,
+    read: &mut HashSet<String>,
+) -> Result<Value> {
+    if !paged(&stored) {
+        return Ok(stored);
+    }
+    let paged: PagedSnapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let messages = load_sequence(reader, paged.messages, read).await?;
+    let mut snapshot = paged.snapshot;
+    insert(&mut snapshot, "/conversation", "messages", messages)?;
+    Ok(snapshot)
+}
+
+pub(super) async fn hydrate_cursor(reader: PayloadReader<'_>, stored: Value) -> Result<Value> {
+    if !paged(&stored) {
+        return Ok(stored);
+    }
+    let paged: PagedCursor = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let read = &mut HashSet::new();
+    let messages = load_sequence(reader, paged.messages, read).await?;
+    let pending = load_sequence(reader, paged.pending, read).await?;
+    let prompt: serde_json::Map<String, Value> =
+        reader.load_payload(paged.template).await?.decode()?;
+    let mut cursor = paged.cursor;
+    insert(&mut cursor, "/snapshot/conversation", "messages", messages)?;
+    insert(&mut cursor, "", "pending", pending)?;
+    object(&mut cursor, "/template")?.extend(prompt);
+    Ok(cursor)
+}
 
 impl CheckpointFormat for ClaudeCheckpointFormat {
     fn family(&self) -> HarnessFamily {
@@ -18,12 +87,30 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
         checkpoint.get("provider").and_then(Value::as_str) == Some("claude")
     }
 
+    fn hydrate<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        stored: Value,
+    ) -> FormatFuture<'a, Result<Value>> {
+        Box::pin(async move { hydrate_snapshot(reader, stored, &mut HashSet::new()).await })
+    }
+
+    fn hydrate_noting<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        stored: Value,
+        read: &'a mut HashSet<String>,
+    ) -> FormatFuture<'a, Result<Value>> {
+        Box::pin(hydrate_snapshot(reader, stored, read))
+    }
+
     fn hydrate_continuation<'a>(
         &'a self,
-        _reader: PayloadReader<'a>,
-        mut continuation: Value,
+        reader: PayloadReader<'a>,
+        continuation: Value,
     ) -> FormatFuture<'a, Result<Option<Value>>> {
         Box::pin(async move {
+            let mut continuation = hydrate_cursor(reader, continuation).await?;
             let Some(mut snapshot) = continuation
                 .get_mut("snapshot")
                 .map(Value::take)

@@ -1,4 +1,5 @@
 use crate::{ClaudeError, ContentBlock, Message, WireMessage};
+use nanocode_durability::EncodedPayload;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 use std::{
@@ -13,7 +14,8 @@ pub(super) struct HistoryMessage(Arc<Entry>);
 struct Entry {
     message: Message,
     wire: OnceLock<Box<str>>,
-    json: OnceLock<Box<RawValue>>,
+    json: OnceLock<Arc<str>>,
+    record: OnceLock<EncodedPayload>,
 }
 
 impl Clone for Entry {
@@ -22,6 +24,7 @@ impl Clone for Entry {
             message: self.message.clone(),
             wire: OnceLock::new(),
             json: OnceLock::new(),
+            record: OnceLock::new(),
         }
     }
 }
@@ -31,6 +34,7 @@ impl HistoryMessage {
         let entry = Arc::make_mut(&mut self.0);
         entry.wire = OnceLock::new();
         entry.json = OnceLock::new();
+        entry.record = OnceLock::new();
         &mut entry.message
     }
 
@@ -43,11 +47,23 @@ impl HistoryMessage {
     }
 
     pub(super) fn cache_json(&self) -> serde_json::Result<()> {
-        if self.0.json.get().is_none() {
-            let encoded = serde_json::value::to_raw_value(&self.0.message)?;
-            self.0.json.get_or_init(|| encoded);
+        self.json().map(drop)
+    }
+
+    fn json(&self) -> serde_json::Result<&Arc<str>> {
+        if let Some(json) = self.0.json.get() {
+            return Ok(json);
         }
-        Ok(())
+        let encoded = Arc::from(serde_json::to_string(&self.0.message)?);
+        Ok(self.0.json.get_or_init(|| encoded))
+    }
+
+    pub(super) fn record(&self) -> serde_json::Result<EncodedPayload> {
+        if let Some(record) = self.0.record.get() {
+            return Ok(record.clone());
+        }
+        let record = EncodedPayload::from_json(Arc::clone(self.json()?));
+        Ok(self.0.record.get_or_init(|| record).clone())
     }
 }
 
@@ -57,6 +73,7 @@ impl From<Message> for HistoryMessage {
             message,
             wire: OnceLock::new(),
             json: OnceLock::new(),
+            record: OnceLock::new(),
         }))
     }
 }
@@ -78,7 +95,9 @@ impl PartialEq for HistoryMessage {
 impl Serialize for HistoryMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.0.json.get() {
-            Some(json) => json.serialize(serializer),
+            Some(json) => serde_json::from_str::<&RawValue>(json)
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer),
             None => self.0.message.serialize(serializer),
         }
     }
@@ -113,11 +132,11 @@ impl WireMessage for HistoryMessage {
         let json = match self.0.json.get() {
             Some(json) => json,
             None => {
-                let encoded = RawValue::from_string(encode(&self.0.message)?)?;
+                let encoded = Arc::from(encode(&self.0.message)?);
                 self.0.json.get_or_init(|| encoded)
             }
         };
-        Ok(Cow::Borrowed(json.get()))
+        Ok(Cow::Borrowed(json))
     }
 }
 

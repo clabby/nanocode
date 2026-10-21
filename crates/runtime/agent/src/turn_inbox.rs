@@ -142,6 +142,38 @@ struct Envelope<'a> {
     annotation: &'a Map<String, Value>,
 }
 
+struct Stored<'a>(&'a SessionEvent);
+
+impl Serialize for Stored<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let SessionEvent::Agent { event, .. } = self.0 else {
+            return self.0.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("source", "agent")?;
+        match without_timing(event) {
+            Some(slim) => map.serialize_entry("event", &slim)?,
+            None => map.serialize_entry("event", event)?,
+        }
+        map.end()
+    }
+}
+
+fn without_timing(event: &AgentEvent) -> Option<AgentEvent> {
+    if !event.payload.get().contains("\"timing\"") {
+        return None;
+    }
+    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(event.payload.get()) else {
+        return None;
+    };
+    fields.remove("timing")?;
+    Some(AgentEvent {
+        payload: serde_json::value::to_raw_value(&fields).ok()?.into(),
+        ..event.clone()
+    })
+}
+
 pub(crate) fn accepted_bytes(
     request_id: &str,
     input: &PromptInput,
@@ -175,11 +207,8 @@ pub(crate) fn accepted_bytes(
         },
         received_ns: u64::MAX,
     };
-    let envelope = serde_json::value::to_raw_value(&Envelope {
-        event: &event,
-        annotation: &Map::new(),
-    })?;
-    Ok(envelope.get().len() - serde_json::to_vec(&empty)?.len() + serde_json::to_vec(input)?.len())
+    let stored = serde_json::value::to_raw_value(&Stored(&event))?;
+    Ok(stored.get().len() - serde_json::to_vec(&empty)?.len() + serde_json::to_vec(input)?.len())
 }
 
 impl<H: ?Sized> Shared<H> {
@@ -225,7 +254,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
         Box::pin(async move {
             let annotation = self.0.host.annotate();
             let unannotated = Map::new();
-            let entries = events
+            let (entries, live): (Vec<_>, Vec<_>) = events
                 .iter()
                 .map(|event| {
                     let request_id = self.0.attribute(event);
@@ -241,20 +270,37 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
                             annotation: &unannotated,
                         })?;
                     }
-                    Ok(LogEntry {
-                        request_id,
-                        event: body,
-                    })
+                    let stored = serde_json::value::to_raw_value(&Stored(event))?;
+                    Ok((
+                        LogEntry {
+                            request_id,
+                            event: stored,
+                        },
+                        body,
+                    ))
                 })
                 .collect::<Result<Vec<_>, serde_json::Error>>()
-                .map_err(|error| format!("encode agent event: {error}"))?;
+                .map_err(|error| format!("encode agent event: {error}"))?
+                .into_iter()
+                .unzip();
             let logged = self
                 .0
                 .log
                 .append(&entries)
                 .await
                 .map_err(|error| error.to_string())?;
-            self.0.host.publish(logged).await
+            let published = logged
+                .into_iter()
+                .zip(&entries)
+                .zip(live)
+                .map(|((mut logged, entry), live)| {
+                    if logged.event.get() == entry.event.get() {
+                        logged.event = live;
+                    }
+                    logged
+                })
+                .collect();
+            self.0.host.publish(published).await
         })
     }
 }
