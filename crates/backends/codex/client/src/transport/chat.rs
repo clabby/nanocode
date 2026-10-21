@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(target_family = "wasm"))]
 use http::header;
 use serde_json::{Map, Value, json};
 
@@ -12,12 +13,16 @@ use crate::client::{
     socket::ReceivedText,
 };
 
+#[cfg(not(target_family = "wasm"))]
+use super::RetryAfter;
 use super::{
-    RetryAfter,
-    http::{HttpMetadata, ResponsesHttpStream, SseDecoder},
+    host::{HostConnectRequest, HostHttpBody, HostTransport},
+    http::{HttpMetadata, ResponsesHttpStream, SseDecoder, map_host_error},
 };
 
 pub const OPENROUTER_API_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const WORKERS_AI_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
+const WORKERS_AI_MODEL_PREFIX: &str = "@cf/";
 
 pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -38,6 +43,7 @@ const SUMMARY_INSTRUCTIONS: &str = "Summarize the conversation so another assist
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatGateway {
     provider: Provider,
+    api_base_url: Arc<str>,
     stall_timeout: Duration,
     wire_model: Option<Arc<str>>,
 }
@@ -45,13 +51,28 @@ pub struct ChatGateway {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Provider {
     OpenRouter,
+    WorkersAi,
 }
 
 impl ChatGateway {
     #[must_use]
-    pub const fn openrouter() -> Self {
+    pub fn openrouter() -> Self {
         Self {
             provider: Provider::OpenRouter,
+            api_base_url: Arc::from(OPENROUTER_API_BASE_URL),
+            wire_model: None,
+            stall_timeout: DEFAULT_STALL_TIMEOUT,
+        }
+    }
+
+    #[must_use]
+    pub fn workers_ai(account_id: impl Into<String>) -> Self {
+        Self {
+            provider: Provider::WorkersAi,
+            api_base_url: Arc::from(format!(
+                "{WORKERS_AI_API_BASE_URL}/{}/ai/v1",
+                account_id.into().trim()
+            )),
             wire_model: None,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
         }
@@ -76,7 +97,19 @@ impl ChatGateway {
     pub(crate) fn wire_model_is_valid(&self) -> bool {
         self.wire_model
             .as_deref()
-            .is_none_or(Self::is_valid_wire_model)
+            .is_none_or(|model| match self.provider {
+                Provider::OpenRouter => Self::is_valid_wire_model(model),
+                Provider::WorkersAi => model
+                    .strip_prefix(WORKERS_AI_MODEL_PREFIX)
+                    .is_some_and(Self::is_valid_wire_model),
+            })
+    }
+
+    pub(crate) const fn wire_model_rule(&self) -> &'static str {
+        match self.provider {
+            Provider::OpenRouter => "the gateway model ID must be an OpenRouter vendor/model slug",
+            Provider::WorkersAi => "the gateway model ID must be a Workers AI @cf/vendor/model ID",
+        }
     }
 
     #[must_use]
@@ -100,9 +133,9 @@ impl ChatGateway {
         if url.trim_end_matches('/') == self.default_api_base_url() {
             return true;
         }
-        reqwest::Url::parse(url).is_ok_and(|url| {
-            matches!(url.scheme(), "http" | "https")
-                && url.host_str().is_some_and(|host| {
+        url.parse::<http::Uri>().is_ok_and(|url| {
+            matches!(url.scheme_str(), Some("http" | "https"))
+                && url.host().is_some_and(|host| {
                     host.eq_ignore_ascii_case("localhost")
                         || host
                             .trim_start_matches('[')
@@ -113,6 +146,7 @@ impl ChatGateway {
         })
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn http_client() -> reqwest::Client {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -121,10 +155,9 @@ impl ChatGateway {
     }
 
     #[doc(hidden)]
-    pub const fn default_api_base_url(&self) -> &'static str {
-        match self.provider {
-            Provider::OpenRouter => OPENROUTER_API_BASE_URL,
-        }
+    #[must_use]
+    pub fn default_api_base_url(&self) -> &str {
+        &self.api_base_url
     }
 
     #[must_use]
@@ -133,6 +166,23 @@ impl ChatGateway {
             model,
             Model::Glm53 | Model::Astra | Model::Kimi | Model::Mimo
         )
+    }
+
+    #[must_use]
+    pub const fn serves_model(&self, model: Model) -> bool {
+        match self.provider {
+            Provider::OpenRouter => Self::serves(model),
+            Provider::WorkersAi => matches!(model, Model::Glm53),
+        }
+    }
+
+    const fn served_models(&self) -> &'static str {
+        match self.provider {
+            Provider::OpenRouter => {
+                "this gateway serves GLM-5.3, GPT-6 Astra, Kimi K3 and MiMo only"
+            }
+            Provider::WorkersAi => "Workers AI serves GLM-5.3 only",
+        }
     }
 
     fn wire_model_for(&self, model: Model) -> &str {
@@ -144,29 +194,19 @@ impl ChatGateway {
             (Provider::OpenRouter, Model::Mimo) => "xiaomi/mimo-v2.6-pro",
             (Provider::OpenRouter, Model::Astra) => "openai/gpt-6-astra",
             (Provider::OpenRouter, _) => "z-ai/glm-5.3",
+            (Provider::WorkersAi, _) => "@cf/zai-org/glm-5.3",
         }
     }
 
-    pub(crate) async fn send(
-        &self,
-        client: &reqwest::Client,
-        api_base_url: &str,
-        auth: &OpenAiAuthSnapshot,
-        request: &str,
-    ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
+    fn prepare(&self, request: &str) -> Result<(String, ChatStream, bool), ResponsesError> {
         let body: Value = serde_json::from_str(request).map_err(ResponsesError::EncodeRequest)?;
 
         let model = body
             .get("model")
             .and_then(Value::as_str)
             .and_then(|model| model.parse::<Model>().ok())
-            .filter(|model| Self::serves(*model))
-            .ok_or_else(|| {
-                reject(
-                    "unsupported_model",
-                    "this gateway serves GLM-5.3, GPT-6 Astra, Kimi K3 and MiMo only",
-                )
-            })?;
+            .filter(|model| self.serves_model(*model))
+            .ok_or_else(|| reject("unsupported_model", self.served_models()))?;
         let translation = translate(&body, model)?;
         let mut chat = translation.chat;
         chat.insert(
@@ -179,6 +219,20 @@ impl ChatGateway {
         } else {
             chat.insert("stream".to_owned(), Value::Bool(true));
         }
+        let mut stream = ChatStream::new(model, translation.registry, translation.tool_choice);
+        stream.stall_timeout = self.stall_timeout;
+        Ok((Value::Object(chat).to_string(), stream, translation.compact))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) async fn send(
+        &self,
+        client: &reqwest::Client,
+        api_base_url: &str,
+        auth: &OpenAiAuthSnapshot,
+        request: &str,
+    ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
+        let (body, mut stream, compact) = self.prepare(request)?;
         let endpoint = format!("{}/chat/completions", api_base_url.trim_end_matches('/'));
         let pending = client
             .post(endpoint)
@@ -189,11 +243,10 @@ impl ChatGateway {
                 concat!("nanocode/", env!("CARGO_PKG_VERSION")),
             )
             .header("X-Title", "Nanocode")
-            .body(Value::Object(chat).to_string())
+            .body(body)
             .send();
-        let response = tokio::time::timeout(self.stall_timeout, pending)
-            .await
-            .map_err(|_| stalled(self.stall_timeout))?
+        let response = stall(self.stall_timeout, pending)
+            .await?
             .map_err(map_http_error)?;
         let status = response.status();
         if !status.is_success() {
@@ -206,27 +259,68 @@ impl ChatGateway {
             drop(response);
             return Err(provider_rejected(status.as_u16(), retry_after));
         }
-        let metadata = HttpMetadata {
-            reasoning_included: false,
-            turn_state: None,
-        };
-        let mut stream = ChatStream::new(model, translation.registry, translation.tool_choice);
-        stream.stall_timeout = self.stall_timeout;
-        if translation.compact {
-            let completion: Value = tokio::time::timeout(self.stall_timeout, response.json())
-                .await
-                .map_err(|_| stalled(self.stall_timeout))?
+        if compact {
+            let completion: Value = stall(self.stall_timeout, response.json())
+                .await?
                 .map_err(map_http_error)?;
             stream.compaction(&completion)?;
-            return Ok((ResponsesHttpStream::chat(stream), metadata));
+            return Ok((ResponsesHttpStream::chat(stream), chat_metadata()));
         }
-        stream.response = Some(response);
+        stream.body = Some(ChatBody::Http(response));
         stream.created();
-        Ok((ResponsesHttpStream::chat(stream), metadata))
+        Ok((ResponsesHttpStream::chat(stream), chat_metadata()))
+    }
+
+    pub(crate) async fn send_host(
+        &self,
+        host: &dyn HostTransport,
+        api_base_url: &str,
+        auth: &OpenAiAuthSnapshot,
+        session_id: &str,
+        thread_id: &str,
+        request: &str,
+    ) -> Result<(ResponsesHttpStream, HttpMetadata), ResponsesError> {
+        let (body, mut stream, compact) = self.prepare(request)?;
+        let endpoint = format!("{}/chat/completions", api_base_url.trim_end_matches('/'));
+        let response = stall(
+            self.stall_timeout,
+            host.http(
+                HostConnectRequest::new_with_thread_id(
+                    &endpoint,
+                    auth.bearer(),
+                    auth.account_id(),
+                    auth.is_fedramp(),
+                    session_id,
+                    thread_id,
+                    None,
+                ),
+                &body,
+            ),
+        )
+        .await?
+        .map_err(map_host_error)?;
+        let mut body = response.body;
+        if compact {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stall(self.stall_timeout, body.next())
+                .await?
+                .map_err(map_host_error)?
+            {
+                bytes.extend(chunk);
+            }
+            let completion: Value =
+                serde_json::from_slice(&bytes).map_err(|_| invalid("completion_json"))?;
+            stream.compaction(&completion)?;
+            return Ok((ResponsesHttpStream::chat(stream), chat_metadata()));
+        }
+        stream.body = Some(ChatBody::Host(body));
+        stream.created();
+        Ok((ResponsesHttpStream::chat(stream), chat_metadata()))
     }
 
     fn apply_provider_fields(&self, chat: &mut Map<String, Value>, model: Model) {
         match self.provider {
+            Provider::WorkersAi => {}
             Provider::OpenRouter => {
                 if matches!(model, Model::Kimi | Model::Mimo)
                     && let Some(tokens) = chat.remove("max_completion_tokens")
@@ -281,6 +375,43 @@ fn prepare_compaction(chat: &mut Map<String, Value>) {
     }
 }
 
+fn received(text: String) -> ReceivedText {
+    ReceivedText {
+        #[cfg(not(target_family = "wasm"))]
+        text: text.into(),
+        #[cfg(target_family = "wasm")]
+        text,
+        received_ns: monotonic_now_ns(),
+        retry_receipt: super::RetryReceipt::now(),
+    }
+}
+
+const fn chat_metadata() -> HttpMetadata {
+    HttpMetadata {
+        reasoning_included: false,
+        turn_state: None,
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn stall<T>(
+    timeout: Duration,
+    read: impl std::future::Future<Output = T>,
+) -> Result<T, ResponsesError> {
+    tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| stalled(timeout))
+}
+
+#[cfg(target_family = "wasm")]
+async fn stall<T>(
+    _timeout: Duration,
+    read: impl std::future::Future<Output = T>,
+) -> Result<T, ResponsesError> {
+    Ok(read.await)
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn map_http_error(error: reqwest::Error) -> ResponsesError {
     ResponsesError::HttpRequest {
         retryable: error.is_connect() || error.is_body() || error.is_request(),
@@ -289,6 +420,7 @@ fn map_http_error(error: reqwest::Error) -> ResponsesError {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn provider_rejected(status: u16, retry_after: Option<RetryAfter>) -> ResponsesError {
     let (code, message) = if (300..400).contains(&status) {
         (
@@ -308,6 +440,7 @@ fn provider_rejected(status: u16, retry_after: Option<RetryAfter>) -> ResponsesE
     }
 }
 
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 fn stalled(timeout: Duration) -> ResponsesError {
     ResponsesError::HttpRequest {
         detail: format!(
@@ -1255,8 +1388,14 @@ struct LiveItem {
     text: String,
 }
 
+enum ChatBody {
+    #[cfg(not(target_family = "wasm"))]
+    Http(reqwest::Response),
+    Host(Box<dyn HostHttpBody>),
+}
+
 pub(crate) struct ChatStream {
-    pub(super) response: Option<reqwest::Response>,
+    body: Option<ChatBody>,
     decoder: SseDecoder,
     ended: bool,
     queue: VecDeque<String>,
@@ -1278,7 +1417,7 @@ pub(crate) struct ChatStream {
 impl ChatStream {
     fn new(model: Model, registry: Registry, tool_choice: Option<Value>) -> Self {
         Self {
-            response: None,
+            body: None,
             decoder: SseDecoder::default(),
             ended: false,
             queue: VecDeque::new(),
@@ -1614,7 +1753,7 @@ impl ChatStream {
             self.emit(&kind, event);
         }
         self.finished = true;
-        self.response = None;
+        self.body = None;
         Ok(())
     }
 
@@ -1655,22 +1794,13 @@ impl ChatStream {
     }
 
     pub(crate) fn try_next_text(&mut self) -> Option<ReceivedText> {
-        let text = self.queue.pop_front()?;
-        Some(ReceivedText {
-            text: text.into(),
-            received_ns: monotonic_now_ns(),
-            retry_receipt: super::RetryReceipt::now(),
-        })
+        self.queue.pop_front().map(received)
     }
 
     pub(crate) async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError> {
         loop {
             if let Some(text) = self.queue.pop_front() {
-                return Ok(ReceivedText {
-                    text: text.into(),
-                    received_ns: monotonic_now_ns(),
-                    retry_receipt: super::RetryReceipt::now(),
-                });
+                return Ok(received(text));
             }
             if self.finished {
                 return Err(ResponsesError::UnexpectedEnd);
@@ -1685,18 +1815,21 @@ impl ChatStream {
                 self.complete()?;
                 continue;
             }
-            let Some(response) = self.response.as_mut() else {
-                return Err(ResponsesError::UnexpectedEnd);
+            let pushed = match self.body.as_mut() {
+                None => return Err(ResponsesError::UnexpectedEnd),
+                #[cfg(not(target_family = "wasm"))]
+                Some(ChatBody::Http(response)) => stall(self.stall_timeout, response.chunk())
+                    .await?
+                    .map_err(map_http_error)?
+                    .map(|chunk| self.decoder.push(&chunk)),
+                Some(ChatBody::Host(body)) => stall(self.stall_timeout, body.next())
+                    .await?
+                    .map_err(map_host_error)?
+                    .map(|chunk| self.decoder.push(&chunk)),
             };
-            let chunk = tokio::time::timeout(self.stall_timeout, response.chunk())
-                .await
-                .map_err(|_| stalled(self.stall_timeout))?;
-            match chunk.map_err(map_http_error)? {
-                Some(chunk) => self.decoder.push(&chunk),
-                None => {
-                    self.ended = true;
-                    self.decoder.finish();
-                }
+            if pushed.is_none() {
+                self.ended = true;
+                self.decoder.finish();
             }
         }
     }

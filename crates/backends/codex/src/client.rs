@@ -200,7 +200,6 @@ impl<F> OpenAiBuilder<F> {
         self
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[must_use]
     pub fn chat_gateway(mut self, gateway: crate::client::transport::ChatGateway) -> Self {
         self.config.api_base_url = gateway.default_api_base_url().to_owned();

@@ -26,6 +26,7 @@ impl ServicePlatform {
             host: config.host_transport.clone(),
             http: crate::client::http::ResponsesHttp::new(
                 config.host_transport.clone(),
+                config.chat_gateway.clone(),
                 config.responses_gateway.clone(),
             ),
         }

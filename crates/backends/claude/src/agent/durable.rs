@@ -922,11 +922,7 @@ pub fn session_checkpoint(
     let model = snapshot
         .model
         .clone()
-        .filter(|model| {
-            model
-                .parse::<ModelSelection>()
-                .is_ok_and(|model| model.family() == HarnessFamily::Claude)
-        })
+        .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| {
             NanocodeError::InvalidCheckpoint("checkpoint records no Claude model".into())
         })?;
@@ -976,10 +972,8 @@ impl Snapshot {
             .model
             .as_deref()
             .map(|model| {
-                model
-                    .parse::<ModelSelection>()
-                    .ok()
-                    .filter(|model| model.family() == HarnessFamily::Claude)
+                (!model.trim().is_empty())
+                    .then(|| super::claude_selection(model))
                     .ok_or_else(|| {
                         NanocodeError::InvalidCheckpoint(
                             "checkpoint model is not a Claude model".into(),

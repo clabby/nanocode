@@ -511,6 +511,15 @@ impl BuilderBackend for Claude {
     }
 }
 
+pub(crate) fn claude_selection(model: &str) -> ModelSelection {
+    model
+        .parse::<nanocode_agent_core::ClaudeModel>()
+        .map_or_else(
+            |_| ModelSelection::new(HarnessFamily::Claude, model),
+            ModelSelection::Claude,
+        )
+}
+
 fn model_max_tokens(model: &str) -> Option<u32> {
     match model {
         "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1" | "claude-sonnet-5-5"
@@ -595,11 +604,7 @@ impl ClaudeBuilder {
             thinking: if self.thinking_explicit || self.thinking_disabled || self.effort.is_some() {
                 effort_thinking(self.effort)
             } else {
-                self.claude
-                    .model
-                    .parse::<ModelSelection>()
-                    .map_err(unsupported)?
-                    .default_thinking()
+                claude_selection(&self.claude.model).default_thinking()
             },
             service_tier: nanocode_agent_core::ServiceTier::from_fast_mode(self.fast_mode),
         })
@@ -761,11 +766,7 @@ impl ClaudeBuilder {
     }
 
     pub fn thinking(mut self, thinking: Thinking) -> Result<Self> {
-        let model: ModelSelection = self.claude.model.parse().map_err(unsupported)?;
-        if model.family() != HarnessFamily::Claude {
-            return Err(unsupported("Claude builder requires a Claude model"));
-        }
-        model
+        claude_selection(&self.claude.model)
             .capabilities(ModelTransport::Native)
             .check_thinking(thinking)?;
         self.thinking_explicit = true;
@@ -2818,7 +2819,7 @@ impl AgentFactory for ClaudeNativeFactory {
         let state = self.owner();
         Box::pin(async move {
             let state = state?;
-            let model: ModelSelection = state.model().parse().map_err(unsupported)?;
+            let model = claude_selection(&state.model());
             let thinking = state.selected_thinking(&model);
             Ok((model, thinking))
         })
@@ -2862,16 +2863,8 @@ impl AgentFactory for ClaudeNativeFactory {
                 return Agent::persist_created(recipe.host_context(host_context).build()).await;
             }
 
-            let (model, thinking) = match state.model().parse::<ModelSelection>() {
-                Ok(model) => {
-                    let thinking = state.selected_thinking(&model);
-                    (model, thinking)
-                }
-                Err(_) => {
-                    let model = HarnessFamily::Claude.default_model();
-                    (model.clone(), model.default_thinking())
-                }
-            };
+            let model = claude_selection(&state.model());
+            let thinking = state.selected_thinking(&model);
             let options = options.resolve(model, thinking)?;
             let selected = options.selected_harness_model().expect("resolved model");
             if selected.family() != HarnessFamily::Claude {
@@ -6648,7 +6641,7 @@ impl LifecycleBackend for Driver {
                 return Ok(());
             };
             let snapshot = state.latest_boundary().await?;
-            let model: ModelSelection = state.model().parse().map_err(unsupported)?;
+            let model = claude_selection(&state.model());
             policy
                 .initial_checkpoint(
                     serde_json::to_value(&snapshot).map_err(provider_error)?,
@@ -6949,8 +6942,7 @@ impl LifecycleBackend for Driver {
                 return Err(NanocodeError::AgentStopped);
             }
 
-            let model: ModelSelection = state.model().parse().map_err(unsupported)?;
-            model
+            claude_selection(&state.model())
                 .capabilities(ModelTransport::Native)
                 .check_thinking(thinking)?;
             state.effort.set(thinking_effort(thinking));

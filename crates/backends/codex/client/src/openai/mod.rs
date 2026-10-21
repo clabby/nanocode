@@ -161,7 +161,6 @@ fn validate_responses_gateway(
             detail: "Responses gateways require API-key authentication",
         });
     }
-    #[cfg(not(target_family = "wasm"))]
     if config.chat_gateway.is_some() {
         return Err(OpenAiError::InvalidConfiguration {
             detail: "choose either a Chat Completions gateway or a Responses gateway",
@@ -273,7 +272,6 @@ pub fn validate(config: &ModelConfig) -> Result<(), OpenAiError> {
     if let Some(gateway) = config.responses_gateway.as_deref() {
         validate_responses_gateway(config, gateway)?;
     }
-    #[cfg(not(target_family = "wasm"))]
     if let Some(gateway) = config.chat_gateway.as_deref() {
         if !gateway.api_base_url_is_allowed(&config.api_base_url) {
             return Err(OpenAiError::InvalidConfiguration {
@@ -287,7 +285,7 @@ pub fn validate(config: &ModelConfig) -> Result<(), OpenAiError> {
         }
         if !gateway.wire_model_is_valid() {
             return Err(OpenAiError::InvalidConfiguration {
-                detail: "the gateway model ID must be an OpenRouter vendor/model slug",
+                detail: gateway.wire_model_rule(),
             });
         }
         if config.auth.mode() != OpenAiAuthMode::ApiKey {

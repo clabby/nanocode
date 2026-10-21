@@ -1,5 +1,4 @@
 mod api_error;
-#[cfg(not(target_family = "wasm"))]
 pub(crate) mod chat;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod connector;
@@ -28,7 +27,6 @@ use std::{fmt, str::FromStr};
 pub use crate::client::tower::attempt::{
     TransportStats, TransportStatsDelta, TransportStatsSnapshot,
 };
-#[cfg(not(target_family = "wasm"))]
 pub use chat::{ChatGateway, DEFAULT_STALL_TIMEOUT, OPENROUTER_API_BASE_URL};
 #[cfg(not(target_family = "wasm"))]
 pub use crypto::install_default_rustls_crypto_provider;

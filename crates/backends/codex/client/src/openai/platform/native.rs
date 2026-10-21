@@ -34,11 +34,6 @@ impl FactoryPlatform {
         if config.host_transport.is_none() {
             return Ok(());
         }
-        if config.chat_gateway.is_some() {
-            return Err(OpenAiError::InvalidConfiguration {
-                detail: "choose either a Chat Completions gateway or a Responses host transport",
-            });
-        }
         if !matches!(config.responses_transport, ResponsesTransport::Https) {
             return Err(OpenAiError::InvalidConfiguration {
                 detail: "native Responses host transports serve HTTPS; select the HTTPS Responses transport",
