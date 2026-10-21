@@ -374,6 +374,8 @@ pub enum RemoteFrame {
         runtime_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_frame_bytes: Option<usize>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resumable: bool,
     },
     Request {
         id: u64,
@@ -382,6 +384,8 @@ pub enum RemoteFrame {
         max_frame_bytes: Option<usize>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         compact: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resumable: bool,
     },
     Reply {
         id: u64,
@@ -417,6 +421,12 @@ pub enum RemoteFrame {
     CallbackResult {
         id: u64,
         result: Result<Value, String>,
+    },
+    Ack {
+        ids: Vec<u64>,
+    },
+    Resume {
+        pending: Vec<u64>,
     },
 }
 
@@ -462,17 +472,28 @@ pub const NO_CATALOG: &str = "runner did not publish a code mode catalog";
 
 pub const HAND_REPLACED: &str = "another hand attached under this name";
 
+pub const HAND_RESTARTED: &str = "the hand reconnected as a new runtime, so it no longer has this connection's cells; dispatched operations have unknown outcomes and were not retried";
+
+pub const NOT_RECEIVED: &str =
+    "the hand never received this operation before its connection dropped; it was not dispatched";
+
 pub struct RemoteCatalog {
     pub definitions: Vec<ToolDefinition>,
     pub name: Option<String>,
     pub workspace: Option<String>,
     pub runtime_id: Option<String>,
     pub max_frame_bytes: Option<usize>,
+    pub resumable: bool,
 }
 
 impl RemoteCatalog {
     pub fn decode(text: &str, max_frame_bytes: usize) -> Result<Self, CodeModeHostError> {
         Self::try_from(RemoteFrame::decode(text, max_frame_bytes)?)
+    }
+
+    #[must_use]
+    pub fn resumes(&self) -> Option<&str> {
+        self.runtime_id.as_deref().filter(|_| self.resumable)
     }
 }
 
@@ -487,12 +508,14 @@ impl TryFrom<RemoteFrame> for RemoteCatalog {
                 workspace,
                 runtime_id,
                 max_frame_bytes,
+                resumable,
             } => Ok(Self {
                 definitions,
                 name,
                 workspace,
                 runtime_id,
                 max_frame_bytes,
+                resumable,
             }),
             _ => Err(CodeModeHostError::new(NO_CATALOG)),
         }

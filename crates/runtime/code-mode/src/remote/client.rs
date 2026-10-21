@@ -21,8 +21,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    ReceivedCalls, RemoteCodeModeHost, RemoteContext, RemoteFrame as Frame, RemoteOperation,
-    RemoteTransport, output_to_wire,
+    HAND_RESTARTED, ReceivedCalls, RemoteCodeModeHost, RemoteContext, RemoteFrame as Frame,
+    RemoteOperation, RemoteTransport, output_to_wire,
 };
 use crate::{
     Tool, ToolDefinition, ToolInput,
@@ -48,6 +48,9 @@ pub trait RemoteLink: Send + Sync + 'static {
     fn close<'a>(&'a self, reason: &'a str) -> HostFuture<'a, ()>;
     fn changed(&self) {}
     fn max_frame_bytes(&self) -> Option<usize> {
+        None
+    }
+    fn resumes(&self) -> Option<String> {
         None
     }
 }
@@ -105,6 +108,7 @@ struct Client {
     failure: Atom<Option<String>>,
     hands: Atom<Option<Arc<dyn HandCalls>>>,
     max_frame_bytes: Option<usize>,
+    resumes: Option<String>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -172,6 +176,15 @@ impl RemoteClient {
         let (outgoing, frames) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel();
         let max_frame_bytes = link.max_frame_bytes();
+        let resumes = link.resumes();
+        if resumes.is_some() {
+            let _ = outgoing.send((
+                Frame::Resume {
+                    pending: Vec::new(),
+                },
+                RemoteDelivery::Immediate,
+            ));
+        }
         let client = Arc::new(Client {
             outgoing,
             pending: Atom::default(),
@@ -183,6 +196,7 @@ impl RemoteClient {
             failure: Atom::default(),
             hands: Atom::default(),
             max_frame_bytes,
+            resumes,
             _stop: stop,
         });
         let driver = Box::pin(drive(Arc::downgrade(&client), link, frames, stopped));
@@ -244,6 +258,25 @@ impl Client {
                 if let Some(waiter) = self.pending.read(|pending| pending.get(&id).cloned()) {
                     let _ = waiter.replies.send(frame);
                 }
+            }
+            Frame::Catalog {
+                runtime_id,
+                resumable,
+                ..
+            } => {
+                if !resumable || runtime_id.is_none() || runtime_id != self.resumes {
+                    return Err(error(HAND_RESTARTED));
+                }
+                let pending = self.pending.read(|pending| {
+                    pending
+                        .iter()
+                        .filter(|(_, waiter)| waiter.written.load(Ordering::SeqCst))
+                        .map(|(id, _)| *id)
+                        .collect()
+                });
+                self.outgoing
+                    .send((Frame::Resume { pending }, RemoteDelivery::Immediate))
+                    .map_err(error)?;
             }
             Frame::CallbackCancel { id } => {
                 if let Some((_, abort)) = self.running.update(|running| running.remove(&id)) {
@@ -433,6 +466,7 @@ impl Client {
             operation,
             max_frame_bytes: self.max_frame_bytes,
             compact: true,
+            resumable: self.resumes.is_some(),
         }
     }
 
@@ -545,12 +579,23 @@ async fn drive(
                         let Some(client) = client.upgrade() else {
                             return Poll::Ready(Ok(()));
                         };
+                        let mut acks = Vec::new();
                         for frame in received {
+                            if client.resumes.is_some()
+                                && let Frame::Reply { id, .. } = &frame
+                            {
+                                acks.push(*id);
+                            }
                             match client.receive(frame) {
                                 Ok(Some(callback)) => callbacks.push(callback),
                                 Ok(None) => {}
                                 Err(issue) => return Poll::Ready(Err(issue)),
                             }
+                        }
+                        if !acks.is_empty() {
+                            let _ = client
+                                .outgoing
+                                .send((Frame::Ack { ids: acks }, RemoteDelivery::Immediate));
                         }
                         link.changed();
                         receiving = link.receive();

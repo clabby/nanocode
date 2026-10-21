@@ -36,9 +36,11 @@ pub use nanocode_code_mode::Tool;
 
 pub use nanocode_code_mode::embedded::{
     CodeModeExecution, CodeModeHost, CodeModeHostError, CodeModeObserver, CodeModeUpdate,
+    HostFuture,
 };
 pub use nanocode_code_mode::remote::{
-    CodeModeExecutors, ExecutorSelection, RemoteCodeModeHost, RemoteTransport,
+    CodeModeExecutors, ExecutorSelection, RemoteCatalog, RemoteClient, RemoteCodeModeHost,
+    RemoteContext, RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation, RemoteTransport,
 };
 pub use nanocode_code_mode::tool;
 pub use nanocode_tool_runtime::{FunctionHandler, FunctionTool, Tools};

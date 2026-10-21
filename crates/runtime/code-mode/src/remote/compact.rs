@@ -110,6 +110,11 @@ impl SentCalls {
 
     #[must_use]
     pub fn execution(&self, execution: CodeModeExecution) -> Value {
+        self.encode(&execution)
+    }
+
+    #[must_use]
+    pub fn encode(&self, execution: &CodeModeExecution) -> Value {
         let calls = execution
             .nested_calls
             .iter()

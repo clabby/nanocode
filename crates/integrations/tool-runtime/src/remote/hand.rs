@@ -7,7 +7,8 @@ use std::{
 use tokio::net::TcpListener;
 
 use super::native::{
-    Dial, ExecutorOptions, SocketPolicy, dial, error, serve, serve_stream, validate_policy,
+    Dial, Executor, ExecutorOptions, SocketPolicy, dial, error, serve, serve_stream,
+    validate_policy,
 };
 use crate::embedded::CodeModeHostError;
 
@@ -135,6 +136,7 @@ impl Hand {
                     let target = crate::attachment::AttachmentTarget::new(endpoint, self.token)
                         .map_err(error)?;
                     let mut backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
+                    let mut executor = Executor::new(directory, self.tools, options);
                     loop {
                         let endpoint = target.endpoint().to_string();
                         events(HandEvent::Connecting {
@@ -144,15 +146,7 @@ impl Hand {
                             Ok(socket) => {
                                 events(HandEvent::Connected { endpoint });
                                 let started = Instant::now();
-                                match serve(
-                                    socket,
-                                    directory.clone(),
-                                    self.tools.clone(),
-                                    policy,
-                                    options.clone(),
-                                )
-                                .await
-                                {
+                                match serve(socket, &mut executor, policy).await {
                                     Ok(()) => events(HandEvent::Disconnected {
                                         reason: "the brain closed the connection".into(),
                                     }),
@@ -160,10 +154,12 @@ impl Hand {
                                         if issue.message()
                                             == nanocode_tool_host::attachment::ATTACHMENT_REVOKED_REASON =>
                                     {
+                                        executor.reset().await;
                                         events(HandEvent::Revoked);
                                         return Ok(());
                                     }
                                     Err(issue) if issue.message() == super::HAND_REPLACED => {
+                                        executor.reset().await;
                                         events(HandEvent::Replaced);
                                         return Ok(());
                                     }
@@ -175,7 +171,10 @@ impl Hand {
                                     backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
                                 }
                             }
-                            Err(Dial::Rejected(issue)) => return Err(issue),
+                            Err(Dial::Rejected(issue)) => {
+                                executor.reset().await;
+                                return Err(issue);
+                            }
                             Err(Dial::Failed(issue)) => events(HandEvent::Disconnected {
                                 reason: issue.to_string(),
                             }),
