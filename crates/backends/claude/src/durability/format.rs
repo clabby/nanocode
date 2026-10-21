@@ -14,21 +14,72 @@ use serde_json::Value;
 pub struct ClaudeCheckpointFormat;
 
 #[derive(Deserialize)]
-struct PagedSnapshot {
+struct PagedConversation {
+    version: u32,
     messages: Sequence,
+    #[serde(default)]
+    code_calls: Option<Sequence>,
+    #[serde(default)]
+    admitted_tool_ids: Vec<String>,
+    #[serde(default)]
+    unadmitted_tool_ids: HashSet<String>,
+}
+
+impl PagedConversation {
+    async fn restore(
+        self,
+        reader: PayloadReader<'_>,
+        conversation: &mut serde_json::Map<String, Value>,
+        read: &mut HashSet<String>,
+    ) -> Result<()> {
+        let messages: Vec<Value> = load_sequence(reader, self.messages, read).await?;
+        if let Some(code_calls) = self.code_calls {
+            let rounds = load_sequence(reader, code_calls, read).await?;
+            conversation.insert("code_calls".into(), Value::Array(rounds));
+        }
+        if self.version >= 3 {
+            let mut admitted = self.admitted_tool_ids;
+            admitted.extend(
+                messages
+                    .iter()
+                    .filter_map(|message| message["content"].as_array())
+                    .flatten()
+                    .filter(|block| block["type"] == "tool_use")
+                    .filter_map(|block| block["id"].as_str())
+                    .filter(|id| !self.unadmitted_tool_ids.contains(*id))
+                    .map(str::to_owned),
+            );
+            conversation.insert(
+                "admitted_tool_ids".into(),
+                Value::Array(admitted.into_iter().map(Value::String).collect()),
+            );
+        }
+        conversation.insert("messages".into(), Value::Array(messages));
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct PagedSnapshot {
+    #[serde(flatten)]
+    conversation: PagedConversation,
     snapshot: Value,
 }
 
 #[derive(Deserialize)]
 struct PagedCursor {
-    messages: Sequence,
+    #[serde(flatten)]
+    conversation: PagedConversation,
     pending: Sequence,
     template: EncodedPayload,
     cursor: Value,
 }
 
 fn paged(value: &Value) -> bool {
-    value.get("version").and_then(Value::as_u64) == Some(2)
+    value
+        .get("version")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version == 2 || version == 3)
 }
 
 fn object<'a>(
@@ -55,9 +106,11 @@ pub(super) async fn hydrate_snapshot(
         return Ok(stored);
     }
     let paged: PagedSnapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
-    let messages = load_sequence(reader, paged.messages, read).await?;
     let mut snapshot = paged.snapshot;
-    insert(&mut snapshot, "/conversation", "messages", messages)?;
+    paged
+        .conversation
+        .restore(reader, object(&mut snapshot, "/conversation")?, read)
+        .await?;
     Ok(snapshot)
 }
 
@@ -67,15 +120,61 @@ pub(super) async fn hydrate_cursor(reader: PayloadReader<'_>, stored: Value) -> 
     }
     let paged: PagedCursor = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
     let read = &mut HashSet::new();
-    let messages = load_sequence(reader, paged.messages, read).await?;
     let pending = load_sequence(reader, paged.pending, read).await?;
     let prompt: serde_json::Map<String, Value> =
         reader.load_payload(paged.template).await?.decode()?;
     let mut cursor = paged.cursor;
-    insert(&mut cursor, "/snapshot/conversation", "messages", messages)?;
+    paged
+        .conversation
+        .restore(reader, object(&mut cursor, "/snapshot/conversation")?, read)
+        .await?;
     insert(&mut cursor, "", "pending", pending)?;
     object(&mut cursor, "/template")?.extend(prompt);
     Ok(cursor)
+}
+
+async fn record(reader: PayloadReader<'_>, key: &str) -> Result<Value> {
+    reader
+        .load_payload(EncodedPayload::by_key(key))
+        .await?
+        .decode()
+}
+
+pub(super) async fn hydrate_receipt(
+    reader: PayloadReader<'_>,
+    mut receipt: Value,
+) -> Result<Value> {
+    let Some(Value::String(key)) = receipt
+        .as_object_mut()
+        .and_then(|fields| fields.remove("content_record"))
+    else {
+        return Ok(receipt);
+    };
+    let message = record(reader, &key).await?;
+    let content = message.get("content").cloned().ok_or_else(|| {
+        Error::InvalidState(format!("Claude message record {key} has no content"))
+    })?;
+    object(&mut receipt, "")?.insert("content".into(), content);
+    Ok(receipt)
+}
+
+pub(super) async fn hydrate_output(reader: PayloadReader<'_>, mut output: Value) -> Result<Value> {
+    let Some(Value::String(key)) = output
+        .as_object_mut()
+        .and_then(|fields| fields.remove("final_record"))
+    else {
+        return Ok(output);
+    };
+    let message = record(reader, &key).await?;
+    let text = message["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    object(&mut output, "")?.insert("final_message".into(), Value::String(text));
+    Ok(output)
 }
 
 impl CheckpointFormat for ClaudeCheckpointFormat {

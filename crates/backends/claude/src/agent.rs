@@ -2412,7 +2412,7 @@ struct Conversation {
     recovery_notices: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    code_calls: Vec<Value>,
+    code_calls: Vec<history::CodeRound>,
 
     #[serde(default, skip_serializing_if = "is_zero")]
     code_calls_omitted_rounds: u64,
@@ -2441,8 +2441,8 @@ impl Conversation {
         if omitted > 0 {
             round["omitted_calls"] = json!(omitted);
         }
-        self.code_calls.push(round);
-        let size = |round: &Value| bounded_json_len(round, usize::MAX);
+        self.code_calls.push(round.into());
+        let size = |round: &history::CodeRound| bounded_json_len(round, usize::MAX);
         let mut total = self.code_calls.iter().map(size).sum::<usize>();
         while self.code_calls.len() > Self::CODE_CALL_ROUNDS
             || (total > Self::CODE_CALL_BYTES && !self.code_calls.is_empty())
@@ -4692,18 +4692,14 @@ impl State {
                 },
             );
             let error = match result {
-                Ok(response) => {
+                Ok(mut response) => {
                     telemetry::complete_attempt(&attempt_span);
                     if let Some(effect) = active_effect {
+                        let completion =
+                            effect.model_completion(&mut response, self.pages_messages())?;
                         match journal.as_deref_mut() {
-                            Some(journal) => journal.complete(effect.completion(&response)?),
-                            None => {
-                                effect
-                                    .complete(
-                                        serde_json::to_value(&response).map_err(provider_error)?,
-                                    )
-                                    .await?;
-                            }
+                            Some(journal) => journal.complete(completion),
+                            None => self.policy_writes(effect, vec![completion]).await?,
                         }
                     }
                     completed(

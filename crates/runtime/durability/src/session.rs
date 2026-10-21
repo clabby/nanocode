@@ -269,6 +269,7 @@ enum Command {
         caller: Caller,
         operation_id: String,
         continuation: EncodedPayload,
+        deferred: bool,
         result: oneshot::Sender<Result<()>>,
     },
     RecoverFailure {
@@ -670,17 +671,23 @@ impl Driver {
                 caller,
                 operation_id,
                 continuation,
+                deferred,
                 result,
             } => {
                 let outcome = async {
                     self.authorize(&caller)?;
                     self.require_claimed(&caller, &operation_id)?;
                     self.require_running(&operation_id)?;
-                    self.apply(Transition::ExecutionAdvanced {
+                    let transition = Transition::ExecutionAdvanced {
                         operation_id,
                         continuation,
-                    })
-                    .await
+                    };
+                    if deferred {
+                        let revision = self.state.revision();
+                        self.state.apply_within(revision, transition)
+                    } else {
+                        self.apply(transition).await
+                    }
                 }
                 .await;
                 drop(result.send(outcome));
@@ -3108,11 +3115,29 @@ impl DurableOwner {
     }
 
     pub async fn advance(&self, operation_id: String, continuation: EncodedPayload) -> Result<()> {
+        self.send_advance(operation_id, continuation, false).await
+    }
+
+    pub async fn advance_deferred(
+        &self,
+        operation_id: String,
+        continuation: EncodedPayload,
+    ) -> Result<()> {
+        self.send_advance(operation_id, continuation, true).await
+    }
+
+    async fn send_advance(
+        &self,
+        operation_id: String,
+        continuation: EncodedPayload,
+        deferred: bool,
+    ) -> Result<()> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::Advance {
             caller: self.caller()?,
             operation_id,
             continuation,
+            deferred,
             result,
         })
         .await?;
@@ -3366,8 +3391,13 @@ impl DurableOwner {
         step_id: String,
         output: &T,
     ) -> Result<()> {
-        self.send_completion(operation_id, step_id, output, false)
-            .await
+        self.send_completion(
+            operation_id,
+            step_id,
+            EncodedPayload::encode(output)?,
+            false,
+        )
+        .await
     }
 
     pub async fn complete_step_deferred<T: Serialize + ?Sized>(
@@ -3376,15 +3406,25 @@ impl DurableOwner {
         step_id: String,
         output: &T,
     ) -> Result<()> {
+        self.send_completion(operation_id, step_id, EncodedPayload::encode(output)?, true)
+            .await
+    }
+
+    pub async fn complete_step_deferred_encoded(
+        &self,
+        operation_id: String,
+        step_id: String,
+        output: EncodedPayload,
+    ) -> Result<()> {
         self.send_completion(operation_id, step_id, output, true)
             .await
     }
 
-    async fn send_completion<T: Serialize + ?Sized>(
+    async fn send_completion(
         &self,
         operation_id: String,
         step_id: String,
-        output: &T,
+        output: EncodedPayload,
         deferred: bool,
     ) -> Result<()> {
         let (result, receiver) = oneshot::channel();
@@ -3392,7 +3432,7 @@ impl DurableOwner {
             caller: self.caller()?,
             operation_id,
             step_id,
-            output: EncodedPayload::encode(output)?,
+            output,
             deferred,
             result,
         })

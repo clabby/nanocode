@@ -26,6 +26,7 @@ struct CurrentExecution {
     reasoning_mode: String,
     model_id_prefix: Option<String>,
     store_responses: bool,
+    #[serde(with = "stored_stats")]
     stats: RunStats,
     #[serde(default)]
     operation_started_at: Option<Duration>,
@@ -36,6 +37,58 @@ struct CurrentExecution {
     context_window_tokens: u64,
     force_compaction: bool,
     tool_call_indices: HashMap<Box<str>, u32>,
+}
+
+mod stored_stats {
+    use serde::{Deserialize as _, Deserializer, Serialize as _, Serializer, de, ser};
+    use serde_json::Value;
+
+    use super::RunStats;
+
+    pub(super) fn serialize<S: Serializer>(
+        stats: &RunStats,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(stats).map_err(ser::Error::custom)?;
+        prune(&mut value);
+        value.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<RunStats, D::Error> {
+        let mut stats = serde_json::to_value(RunStats::default()).map_err(de::Error::custom)?;
+        merge(&mut stats, Value::deserialize(deserializer)?);
+        serde_json::from_value(stats).map_err(de::Error::custom)
+    }
+
+    fn prune(value: &mut Value) -> bool {
+        match value {
+            Value::Null => true,
+            Value::Number(number) => number.as_f64() == Some(0.0),
+            Value::Object(fields) => {
+                fields.retain(|_, field| !prune(field));
+                fields.is_empty()
+            }
+            Value::Bool(_) | Value::String(_) | Value::Array(_) => false,
+        }
+    }
+
+    fn merge(base: &mut Value, overlay: Value) {
+        match (base, overlay) {
+            (Value::Object(base), Value::Object(overlay)) => {
+                for (key, value) in overlay {
+                    match base.get_mut(&key) {
+                        Some(field) => merge(field, value),
+                        None => {
+                            base.insert(key, value);
+                        }
+                    }
+                }
+            }
+            (base, overlay) => *base = overlay,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -270,6 +323,16 @@ impl ModelRun {
             force_compaction: self.force_compaction,
             tool_call_indices: self.tool_call_indices.clone(),
         };
+        if phase == ExecutionPhase::PrepareTurn && next_step.is_none() {
+            steps
+                .advance_deferred(
+                    &saved,
+                    session.conversation.shared_history(),
+                    session.factory.profile().shared_prefix(),
+                )
+                .await?;
+            return Ok(None);
+        }
         steps
             .advance(
                 &saved,

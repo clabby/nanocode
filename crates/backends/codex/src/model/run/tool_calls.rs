@@ -475,6 +475,7 @@ impl ModelRun {
 
         let instruction_revision = self.instruction_revision;
         let execution_steps = self.execution_steps.clone();
+        let solo = prepared.len() == 1;
         let mut executions = prepared
             .into_iter()
             .map(|(call, active)| {
@@ -544,8 +545,12 @@ impl ModelRun {
                             if persist_result {
                                 completed.work_duration_ns =
                                     Self::completed_tool_work_duration(&active);
-                                if let Some(steps) = &execution_steps {
-                                    steps.complete(&step_id, &completed).await?;
+                                match &execution_steps {
+                                    Some(steps) if solo => {
+                                        steps.complete_deferred(&step_id, &completed).await?;
+                                    }
+                                    Some(steps) => steps.complete(&step_id, &completed).await?,
+                                    None => {}
                                 }
                             }
                             Self::emit_completed_tool_result(&events, &completed)?;

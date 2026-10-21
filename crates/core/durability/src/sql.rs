@@ -44,21 +44,42 @@ pub trait Sql {
     ) -> StoreFuture<'a, Result<Vec<Vec<SqlRow>>, StoreError>>;
 }
 
-const SCHEMA: [&str; 3] = [
+const SCHEMA: [&str; 4] = [
     "CREATE TABLE IF NOT EXISTS states (id TEXT PRIMARY KEY, revision TEXT NOT NULL, payload TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, owner TEXT NOT NULL, fence TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS records (state_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (state_id, key)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS blobs (id INTEGER PRIMARY KEY, state_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL)",
 ];
 const PEEK: &str = "SELECT revision, payload FROM states WHERE id = ?1";
 const OWNER: &str = "SELECT owner, fence FROM owners WHERE id = ?1";
 const HEAD: &str = "SELECT owners.owner, owners.fence, COALESCE(states.revision, '0') FROM owners LEFT JOIN states ON states.id = owners.id WHERE owners.id = ?1";
-const RECORD: &str = "SELECT value FROM records WHERE state_id = ?1 AND key = ?2";
-const RECORDS: &str = "SELECT records.value FROM json_each(?2) AS keys LEFT JOIN records ON records.state_id = ?1 AND records.key = keys.value ORDER BY keys.key";
+const RECORDS: &str = "SELECT COALESCE(blobs.value, records.value) FROM json_each(?2) AS keys LEFT JOIN blobs ON blobs.id = CAST(json_extract(keys.value, '$[0]') AS INTEGER) AND blobs.state_id = ?1 AND blobs.key = json_extract(keys.value, '$[1]') LEFT JOIN records ON blobs.id IS NULL AND records.state_id = ?1 AND records.key = json_extract(keys.value, '$[1]') ORDER BY keys.key";
 const STATES: &str = "SELECT id FROM states ORDER BY rowid DESC LIMIT CAST(?1 AS INTEGER)";
-const RECORD_KEYS: &str = "SELECT key FROM records WHERE state_id = ?1";
+const RECORD_KEYS: &str =
+    "SELECT key FROM blobs WHERE state_id = ?1 UNION SELECT key FROM records WHERE state_id = ?1";
 const ACQUIRE: &str = "INSERT INTO owners VALUES (?1, ?2, '1') ON CONFLICT (id) DO UPDATE SET owner = excluded.owner, fence = CAST(CAST(fence AS INTEGER) + 1 AS TEXT) WHERE CAST(fence AS INTEGER) < 9223372036854775807 RETURNING fence";
-const INSERT_RECORD: &str = "INSERT INTO records SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 ON CONFLICT DO NOTHING";
-const REPLACE: &str = "INSERT INTO states SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload RETURNING revision";
+const INSERT_RECORD: &str = "INSERT INTO blobs SELECT CAST(?7 AS INTEGER), ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 ON CONFLICT DO NOTHING";
+const REPLACE: &str = "INSERT INTO states SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM owners WHERE id = ?1 AND owner = ?4 AND fence = ?5) AND COALESCE((SELECT revision FROM states WHERE id = ?1), '0') = ?6 AND NOT EXISTS (SELECT 1 FROM json_each(?7) AS staged LEFT JOIN blobs ON blobs.id = CAST(json_extract(staged.value, '$[0]') AS INTEGER) WHERE blobs.state_id IS NOT ?1 OR blobs.key IS NOT json_extract(staged.value, '$[1]')) ON CONFLICT (id) DO UPDATE SET revision = excluded.revision, payload = excluded.payload RETURNING revision";
+
+fn row_id(state_id: &str, key: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(state_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(key.as_bytes());
+    let mut id = [0; 8];
+    hasher.finalize_xof().fill(&mut id);
+    i64::from_be_bytes(id).to_string()
+}
+
+fn located(state_id: &str, keys: &[String]) -> Result<String, StoreError> {
+    serde_json::to_string(
+        &keys
+            .iter()
+            .map(|key| [row_id(state_id, key), key.clone()])
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| StoreError::Backend(format!("record keys: {error}")))
+}
 
 const fn statement<'a>(sql: &'static str, params: Vec<&'a str>) -> SqlStatement<'a> {
     SqlStatement { sql, params }
@@ -114,6 +135,8 @@ struct Counters {
     fence: String,
     expected: String,
     revision: String,
+    ids: Vec<String>,
+    staged: String,
 }
 
 impl Replacement<'_> {
@@ -121,16 +144,24 @@ impl Replacement<'_> {
         let revision = self.expected_revision.checked_add(1).ok_or_else(|| {
             StoreError::NotCommitted("SQL durability revision overflow".to_owned())
         })?;
+        let keys = self
+            .records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect::<Vec<_>>();
         Ok(Counters {
             fence: self.owner.fence().to_string(),
             expected: self.expected_revision.to_string(),
             revision: revision.to_string(),
+            ids: keys.iter().map(|key| row_id(self.state_id, key)).collect(),
+            staged: located(self.state_id, &keys)
+                .map_err(|error| StoreError::NotCommitted(error.to_string()))?,
         })
     }
 
     fn statements<'a>(&'a self, counters: &'a Counters, statements: &mut Vec<SqlStatement<'a>>) {
         let owner = self.owner.owner_id().as_str();
-        statements.extend(self.records.iter().map(|record| {
+        statements.extend(self.records.iter().zip(&counters.ids).map(|(record, id)| {
             statement(
                 INSERT_RECORD,
                 vec![
@@ -140,6 +171,7 @@ impl Replacement<'_> {
                     owner,
                     &counters.fence,
                     &counters.expected,
+                    id,
                 ],
             )
         }));
@@ -152,6 +184,7 @@ impl Replacement<'_> {
                 owner,
                 &counters.fence,
                 &counters.expected,
+                &counters.staged,
             ],
         ));
         statements.push(statement(HEAD, vec![self.state_id]));
@@ -246,12 +279,11 @@ impl<H: Sql + ?Sized> SqlStore<H> {
     }
 
     async fn record(&mut self, state_id: &str, key: &str) -> Result<Option<String>, StoreError> {
-        let rows = self
-            .query("read_record", RECORD, vec![state_id, key])
-            .await?;
-        single(&rows)?
-            .map(|row| text(row, 0).map(str::to_owned))
-            .transpose()
+        Ok(self
+            .records(state_id, std::slice::from_ref(&key.to_owned()))
+            .await?
+            .pop()
+            .flatten())
     }
 
     async fn records(
@@ -262,8 +294,7 @@ impl<H: Sql + ?Sized> SqlStore<H> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let encoded = serde_json::to_string(keys)
-            .map_err(|error| StoreError::Backend(format!("record keys: {error}")))?;
+        let encoded = located(state_id, keys)?;
         let rows = self
             .query("read_records", RECORDS, vec![state_id, &encoded])
             .await?;

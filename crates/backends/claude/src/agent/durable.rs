@@ -1,5 +1,8 @@
 use super::*;
-use crate::execution::{BeginRequest, EncodedState, JournalWrite, Settlement};
+use crate::{
+    MessageResponse,
+    execution::{BeginRequest, EncodedState, JournalWrite, Settlement},
+};
 use nanocode_durability::{EncodedPayload, Sequence};
 use serde_json::value::RawValue;
 
@@ -225,6 +228,42 @@ impl Effect<'_> {
         Ok(JournalWrite::Complete {
             step_id: self.step.clone(),
             output: serde_json::value::to_raw_value(output).map_err(provider_error)?,
+            records: Vec::new(),
+        })
+    }
+
+    pub(super) fn model_completion(
+        &self,
+        response: &mut MessageResponse,
+        paged: bool,
+    ) -> Result<JournalWrite> {
+        #[derive(Serialize)]
+        struct Receipt<'a> {
+            content_record: EncodedPayload,
+            #[serde(flatten)]
+            response: &'a MessageResponse,
+        }
+        if !paged {
+            return self.completion(response);
+        }
+        let message = Message {
+            role: Role::Assistant,
+            content: std::mem::take(&mut response.content),
+        };
+        let record =
+            serde_json::to_string(&message).map(|json| EncodedPayload::from_json(json.into()));
+        let output = record.as_ref().map_err(provider_error).and_then(|record| {
+            serde_json::value::to_raw_value(&Receipt {
+                content_record: record.reference(),
+                response,
+            })
+            .map_err(provider_error)
+        });
+        response.content = message.content;
+        Ok(JournalWrite::Complete {
+            step_id: self.step.clone(),
+            output: output?,
+            records: vec![record.map_err(provider_error)?],
         })
     }
 }
@@ -494,7 +533,7 @@ impl State {
         self.policy.is_some() && cursor.operation.is_some()
     }
 
-    fn pages_messages(&self) -> bool {
+    pub(super) fn pages_messages(&self) -> bool {
         self.policy
             .as_ref()
             .is_some_and(|policy| policy.pages_messages())
@@ -603,12 +642,13 @@ impl State {
         *conversation = snapshot.conversation;
         let checkpoint = checkpoint?;
         let settlement = match result {
-            Ok(result) => Settlement::Complete(
-                serde_json::value::to_raw_value(
-                    &json!({"final_message": result.final_message(), "usage":result.usage()}),
-                )
-                .map_err(provider_error)?,
-            ),
+            Ok(result) => Settlement::Complete(turn_output(
+                result,
+                conversation
+                    .messages
+                    .last()
+                    .filter(|_| policy.pages_messages()),
+            )?),
             Err(NanocodeError::TurnCancelled) => Settlement::Cancel,
             Err(NanocodeError::Response(error)) if error.retryable() => {
                 Settlement::FailAttempt(error.to_string())
@@ -776,7 +816,11 @@ impl State {
         }
         Ok((result, deferred))
     }
-    async fn policy_writes(&self, effect: &Effect<'_>, writes: Vec<JournalWrite>) -> Result<()> {
+    pub(super) async fn policy_writes(
+        &self,
+        effect: &Effect<'_>,
+        writes: Vec<JournalWrite>,
+    ) -> Result<()> {
         effect
             .policy
             .commit_writes(effect.operation.to_owned(), writes, None)
@@ -785,23 +829,87 @@ impl State {
     }
 }
 
-const PAGED_VERSION: u32 = 2;
+const PAGED_VERSION: u32 = 3;
+
+#[derive(Serialize)]
+struct PagedConversation<'a> {
+    messages: Sequence,
+    code_calls: Sequence,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    admitted_tool_ids: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unadmitted_tool_ids: Vec<&'a str>,
+}
 
 #[derive(Serialize)]
 struct PagedSnapshot<'a> {
     provider: &'a str,
     version: u32,
-    messages: Sequence,
+    #[serde(flatten)]
+    conversation: PagedConversation<'a>,
     snapshot: &'a RawValue,
 }
 
 #[derive(Serialize)]
 struct PagedCursor<'a> {
     version: u32,
-    messages: Sequence,
+    #[serde(flatten)]
+    conversation: PagedConversation<'a>,
     pending: Sequence,
     template: EncodedPayload,
     cursor: &'a RawValue,
+}
+
+struct Detached {
+    messages: Vec<HistoryMessage>,
+    code_calls: Vec<history::CodeRound>,
+    admitted_tool_ids: HashSet<String>,
+}
+
+impl Detached {
+    fn take(conversation: &mut Conversation) -> Self {
+        Self {
+            messages: std::mem::take(&mut conversation.messages),
+            code_calls: std::mem::take(&mut conversation.code_calls),
+            admitted_tool_ids: std::mem::take(&mut conversation.admitted_tool_ids),
+        }
+    }
+
+    fn restore(self, conversation: &mut Conversation) {
+        conversation.messages = self.messages;
+        conversation.code_calls = self.code_calls;
+        conversation.admitted_tool_ids = self.admitted_tool_ids;
+    }
+
+    fn page(&self, records: &mut Vec<EncodedPayload>) -> Result<PagedConversation<'_>> {
+        let listed = self
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut admitted_tool_ids = self
+            .admitted_tool_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !listed.contains(id))
+            .collect::<Vec<_>>();
+        admitted_tool_ids.sort_unstable();
+        let mut unadmitted_tool_ids = listed
+            .into_iter()
+            .filter(|id| !self.admitted_tool_ids.contains(*id))
+            .collect::<Vec<_>>();
+        unadmitted_tool_ids.sort_unstable();
+        Ok(PagedConversation {
+            messages: page(&self.messages, HistoryMessage::record, records)?,
+            code_calls: page(&self.code_calls, history::CodeRound::record, records)?,
+            admitted_tool_ids,
+            unadmitted_tool_ids,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -812,10 +920,14 @@ struct TemplatePrompt<'a> {
     tools: &'a [ClaudeToolSpec],
 }
 
-fn page(messages: &[HistoryMessage], records: &mut Vec<EncodedPayload>) -> Result<Sequence> {
-    let items = messages
+fn page<T>(
+    items: &[T],
+    record: fn(&T) -> serde_json::Result<EncodedPayload>,
+    records: &mut Vec<EncodedPayload>,
+) -> Result<Sequence> {
+    let items = items
         .iter()
-        .map(HistoryMessage::record)
+        .map(record)
         .collect::<serde_json::Result<Vec<_>>>()
         .map_err(provider_error)?;
     let (sequence, pages) = nanocode_durability::seal_sequence(&items).map_err(provider_error)?;
@@ -838,20 +950,20 @@ fn encode_snapshot(snapshot: &mut Snapshot, paged: bool) -> Result<EncodedState>
             })
             .map_err(provider_error);
     }
-    let messages = std::mem::take(&mut snapshot.conversation.messages);
-    let encoded = paged_snapshot(snapshot, &messages);
-    snapshot.conversation.messages = messages;
+    let detached = Detached::take(&mut snapshot.conversation);
+    let encoded = paged_snapshot(snapshot, &detached);
+    detached.restore(&mut snapshot.conversation);
     encoded
 }
 
-fn paged_snapshot(snapshot: &Snapshot, messages: &[HistoryMessage]) -> Result<EncodedState> {
+fn paged_snapshot(snapshot: &Snapshot, detached: &Detached) -> Result<EncodedState> {
     let mut records = Vec::new();
-    let messages = page(messages, &mut records)?;
+    let conversation = detached.page(&mut records)?;
     let inner = serde_json::value::to_raw_value(snapshot).map_err(provider_error)?;
     let json = serde_json::value::to_raw_value(&PagedSnapshot {
         provider: &snapshot.provider,
         version: PAGED_VERSION,
-        messages,
+        conversation,
         snapshot: &inner,
     })
     .map_err(provider_error)?;
@@ -860,18 +972,18 @@ fn paged_snapshot(snapshot: &Snapshot, messages: &[HistoryMessage]) -> Result<En
 
 fn paged_cursor(
     cursor: &Cursor,
-    messages: &[HistoryMessage],
+    detached: &Detached,
     pending: &[HistoryMessage],
     prompt: &TemplatePrompt<'_>,
 ) -> Result<EncodedState> {
     let mut records = Vec::new();
-    let messages = page(messages, &mut records)?;
-    let pending = page(pending, &mut records)?;
+    let conversation = detached.page(&mut records)?;
+    let pending = page(pending, HistoryMessage::record, &mut records)?;
     let template = EncodedPayload::encode(prompt).map_err(provider_error)?;
     let inner = serde_json::value::to_raw_value(cursor).map_err(provider_error)?;
     let json = serde_json::value::to_raw_value(&PagedCursor {
         version: PAGED_VERSION,
-        messages,
+        conversation,
         pending,
         template: template.reference(),
         cursor: &inner,
@@ -883,7 +995,7 @@ fn paged_cursor(
 
 fn encode_cursor(cursor: &mut Cursor, paged: bool) -> Result<EncodedState> {
     if paged {
-        let messages = std::mem::take(&mut cursor.snapshot.conversation.messages);
+        let detached = Detached::take(&mut cursor.snapshot.conversation);
         let pending = std::mem::take(&mut cursor.pending);
         let system = cursor.template.system.take();
         let tools = std::mem::take(&mut cursor.template.tools);
@@ -891,8 +1003,8 @@ fn encode_cursor(cursor: &mut Cursor, paged: bool) -> Result<EncodedState> {
             system: system.as_ref(),
             tools: &tools,
         };
-        let encoded = paged_cursor(cursor, &messages, &pending, &prompt);
-        cursor.snapshot.conversation.messages = messages;
+        let encoded = paged_cursor(cursor, &detached, &pending, &prompt);
+        detached.restore(&mut cursor.snapshot.conversation);
         cursor.pending = pending;
         cursor.template.system = system;
         cursor.template.tools = tools;
@@ -926,6 +1038,39 @@ fn encode_cursor(cursor: &mut Cursor, paged: bool) -> Result<EncodedState> {
             records: Vec::new(),
         })
         .map_err(provider_error)
+}
+
+fn turn_output(result: &TurnResult, last: Option<&HistoryMessage>) -> Result<Box<RawValue>> {
+    let final_message = result.final_message();
+    let record = last
+        .filter(|message| {
+            message.role == Role::Assistant
+                && !final_message.is_empty()
+                && text_of(message) == final_message
+        })
+        .map(HistoryMessage::record)
+        .transpose()
+        .map_err(provider_error)?;
+    match record {
+        Some(record) => serde_json::value::to_raw_value(
+            &json!({"final_record": record.key(), "usage": result.usage()}),
+        ),
+        None => serde_json::value::to_raw_value(
+            &json!({"final_message": final_message, "usage": result.usage()}),
+        ),
+    }
+    .map_err(provider_error)
+}
+
+fn text_of(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(super) fn replay(operation: String, output: Value) -> Result<TurnResult> {

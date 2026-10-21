@@ -15,7 +15,7 @@ use nanocode_durability::{
     InitialAcquisition, InitialSettings, JournalClaim, JournalSeed, OperationStatus, OwnerWrite,
     SessionRecord, SharedStore, WriteOutcome, agent_error,
 };
-use serde_json::value::RawValue;
+use serde_json::{Value, value::RawValue};
 
 use crate::{
     CodexBuilder,
@@ -214,14 +214,26 @@ impl DurableExecution {
     }
 }
 
-fn step_admission(kind: &str, step: BeginStep) -> AgentResult<ExecutionStepAdmission> {
+async fn step_admission(
+    owner: &DurableOwner,
+    kind: &str,
+    step: BeginStep,
+) -> AgentResult<ExecutionStepAdmission> {
     match step {
         BeginStep::Execute => Ok(ExecutionStepAdmission::Execute),
         BeginStep::Interrupted if kind == "tool_call" => Ok(ExecutionStepAdmission::Interrupted),
         BeginStep::Interrupted => Ok(ExecutionStepAdmission::Execute),
-        BeginStep::Replay(output) => Ok(ExecutionStepAdmission::Replay(
-            output.json().map_err(agent_error)?.to_owned(),
-        )),
+        BeginStep::Replay(output) => {
+            let json = output.json().map_err(agent_error)?.to_owned();
+            let json = if kind == "model_call" {
+                context::restore_receipt(owner.into(), json)
+                    .await
+                    .map_err(agent_error)?
+            } else {
+                json
+            };
+            Ok(ExecutionStepAdmission::Replay(json))
+        }
     }
 }
 
@@ -313,7 +325,7 @@ impl ExecutionPolicy for DurableExecution {
             let input = raw(input_json)?;
             let owner = &self.owner;
             let admission = owner
-                .admit_typed::<_, context::Snapshot, ExecutionOutput>(operation_id, &input)
+                .admit_typed::<_, context::Snapshot, Value>(operation_id, &input)
                 .await
                 .map_err(agent_error)?;
             map_admission(owner, admission).await
@@ -329,7 +341,7 @@ impl ExecutionPolicy for DurableExecution {
             let input = raw(input_json)?;
             let admission = self
                 .owner
-                .admit_automatic_typed::<_, context::Snapshot, ExecutionOutput>(
+                .admit_automatic_typed::<_, context::Snapshot, Value>(
                     candidate_operation_id,
                     &input,
                 )
@@ -556,7 +568,7 @@ impl ExecutionPolicy for DurableExecution {
                 .begin_step(operation_id, step_id, kind.clone(), &input)
                 .await
                 .map_err(agent_error)?;
-            step_admission(&kind, step)
+            step_admission(&self.owner, &kind, step).await
         })
     }
 
@@ -608,7 +620,9 @@ impl ExecutionPolicy for DurableExecution {
                 return Ok(None);
             };
             match outcomes.into_iter().last() {
-                Some(WriteOutcome::Began(step)) => step_admission(&kind, step).map(Some),
+                Some(WriteOutcome::Began(step)) => {
+                    step_admission(&self.owner, &kind, step).await.map(Some)
+                }
                 _ => Err(NanocodeError::InvalidExecutionPolicy(
                     "fused durable write did not report the begun step".into(),
                 )),
@@ -638,9 +652,48 @@ impl ExecutionPolicy for DurableExecution {
         output_json: String,
     ) -> ExecutionFuture<'a, AgentResult<()>> {
         Box::pin(async move {
+            let output = context::prepare_receipt(&output_json).map_err(agent_error)?;
+            self.owner
+                .complete_step_deferred_encoded(operation_id, step_id, output)
+                .await
+                .map_err(agent_error)
+        })
+    }
+
+    fn complete_step_deferred<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        output_json: String,
+    ) -> ExecutionFuture<'a, AgentResult<()>> {
+        Box::pin(async move {
             let output = raw(output_json)?;
             self.owner
                 .complete_step_deferred(operation_id, step_id, &output)
+                .await
+                .map_err(agent_error)
+        })
+    }
+
+    fn advance_history_deferred<'a>(
+        &'a self,
+        operation_id: String,
+        state_json: String,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+    ) -> ExecutionFuture<'a, AgentResult<()>> {
+        Box::pin(async move {
+            let mut cache = self.continuation_cache.take().unwrap_or_default();
+            let prepared = context::prepare_cached_continuation(
+                state_json,
+                &history,
+                &prefix,
+                &mut cache,
+                &self.context_records.load(),
+            );
+            drop(self.continuation_cache.put(cache));
+            self.owner
+                .advance_deferred(operation_id, prepared.map_err(agent_error)?.payload)
                 .await
                 .map_err(agent_error)
         })
@@ -653,9 +706,11 @@ impl ExecutionPolicy for DurableExecution {
         output: ExecutionOutput,
     ) -> ExecutionFuture<'a, AgentResult<()>> {
         Box::pin(async move {
-            let prepared = self.prepare_snapshot(snapshot)?;
+            let (prepared, output) =
+                context::prepare_completion(snapshot, &output, &self.context_records.load())
+                    .map_err(agent_error)?;
             self.owner
-                .complete(operation_id, prepared.payload, &output)
+                .complete(operation_id, prepared.payload, &*output)
                 .await
                 .map_err(agent_error)?;
             self.remember(prepared.keys)
@@ -1169,6 +1224,35 @@ impl ExecutionPolicy for LazyExecution {
         })
     }
 
+    fn complete_step_deferred<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        output_json: String,
+    ) -> ExecutionFuture<'a, AgentResult<()>> {
+        Box::pin(async move {
+            self.get()
+                .await?
+                .complete_step_deferred(operation_id, step_id, output_json)
+                .await
+        })
+    }
+
+    fn advance_history_deferred<'a>(
+        &'a self,
+        operation_id: String,
+        state_json: String,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+    ) -> ExecutionFuture<'a, AgentResult<()>> {
+        Box::pin(async move {
+            self.get()
+                .await?
+                .advance_history_deferred(operation_id, state_json, history, prefix)
+                .await
+        })
+    }
+
     fn complete<'a>(
         &'a self,
         operation_id: String,
@@ -1203,7 +1287,7 @@ impl ExecutionPolicy for LazyExecution {
 
 async fn map_admission(
     owner: &DurableOwner,
-    admission: Admission<context::Snapshot, ExecutionOutput>,
+    admission: Admission<context::Snapshot, Value>,
 ) -> AgentResult<ExecutionAdmission> {
     Ok(match admission {
         Admission::Accepted => ExecutionAdmission::Execute,
@@ -1212,7 +1296,9 @@ async fn map_admission(
             snapshot: context::restore_snapshot(owner.into(), checkpoint)
                 .await
                 .map_err(agent_error)?,
-            output,
+            output: context::restore_output(owner.into(), output)
+                .await
+                .map_err(agent_error)?,
         },
         Admission::Failed { checkpoint, error } => ExecutionAdmission::Failed {
             snapshot: context::restore_snapshot(owner.into(), checkpoint)

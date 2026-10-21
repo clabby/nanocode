@@ -41,6 +41,7 @@ pub struct GenerationOutput {
 
     pub time_to_first_output_ns: Option<u64>,
 
+    #[serde(default)]
     pub pipeline_stats: ResponsePipelineStats,
 
     #[serde(default)]

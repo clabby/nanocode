@@ -608,7 +608,9 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
             let admission = match admission {
                 Admission::Completed { checkpoint, output } => ClaudeAdmission::Completed {
                     checkpoint: hydrate(reader, checkpoint).await?,
-                    output,
+                    output: format::hydrate_output(reader, output)
+                        .await
+                        .map_err(agent_error)?,
                 },
                 Admission::Failed { checkpoint, error } => ClaudeAdmission::Failed {
                     checkpoint: hydrate(reader, checkpoint).await?,
@@ -751,7 +753,7 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 .owner
                 .begin_step(id, step_id, kind.clone(), &*input)
                 .await;
-            admitted_step(begun, &kind)
+            self.admitted(begun, &kind).await
         })
     }
 
@@ -831,7 +833,7 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 }
                 Err(error) => Err(error),
             };
-            admitted_step(begun, &begin.kind).map(Some)
+            self.admitted(begun, &begin.kind).await.map(Some)
         })
     }
 
@@ -856,7 +858,7 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 .owner
                 .begin_step(id, step_id, kind.clone(), &input)
                 .await;
-            admitted_step(begun, &kind)
+            self.admitted(begun, &kind).await
         })
     }
 
@@ -1000,19 +1002,39 @@ fn owner_write(write: &JournalWrite) -> OwnerWrite {
             continuation: EncodedPayload::from_json(Arc::from(state.json.get()))
                 .with_payloads(state.records.clone()),
         },
-        JournalWrite::Complete { step_id, output } => OwnerWrite::CompleteStep {
+        JournalWrite::Complete {
+            step_id,
+            output,
+            records,
+        } => OwnerWrite::CompleteStep {
             step_id: step_id.clone(),
-            output: EncodedPayload::from_json(Arc::from(output.get())),
+            output: EncodedPayload::from_json(Arc::from(output.get()))
+                .with_payloads(records.clone()),
         },
     }
 }
 
-fn admitted_step(begun: nanocode_durability::Result<BeginStep>, kind: &str) -> AgentResult<Step> {
-    match begun.map_err(agent_error)? {
-        BeginStep::Execute => Ok(Step::Execute),
-        BeginStep::Interrupted if kind == "tool" => Ok(Step::Interrupted),
-        BeginStep::Interrupted => Ok(Step::Execute),
-        BeginStep::Replay(value) => Ok(Step::Replay(value.decode().map_err(agent_error)?)),
+impl ClaudeExecution {
+    async fn admitted(
+        &self,
+        begun: nanocode_durability::Result<BeginStep>,
+        kind: &str,
+    ) -> AgentResult<Step> {
+        match begun.map_err(agent_error)? {
+            BeginStep::Execute => Ok(Step::Execute),
+            BeginStep::Interrupted if kind == "tool" => Ok(Step::Interrupted),
+            BeginStep::Interrupted => Ok(Step::Execute),
+            BeginStep::Replay(value) if kind == "model" || kind == "model_call" => {
+                format::hydrate_receipt(
+                    PayloadReader::from(&self.owner),
+                    value.decode().map_err(agent_error)?,
+                )
+                .await
+                .map(Step::Replay)
+                .map_err(agent_error)
+            }
+            BeginStep::Replay(value) => Ok(Step::Replay(value.decode().map_err(agent_error)?)),
+        }
     }
 }
 

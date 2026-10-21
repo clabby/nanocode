@@ -140,6 +140,59 @@ impl WireMessage for HistoryMessage {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct CodeRound(Arc<Round>);
+
+struct Round {
+    value: serde_json::Value,
+    record: OnceLock<EncodedPayload>,
+}
+
+impl CodeRound {
+    pub(super) fn record(&self) -> serde_json::Result<EncodedPayload> {
+        if let Some(record) = self.0.record.get() {
+            return Ok(record.clone());
+        }
+        let record = EncodedPayload::from_json(serde_json::to_string(&self.0.value)?.into());
+        Ok(self.0.record.get_or_init(|| record).clone())
+    }
+}
+
+impl From<serde_json::Value> for CodeRound {
+    fn from(value: serde_json::Value) -> Self {
+        Self(Arc::new(Round {
+            value,
+            record: OnceLock::new(),
+        }))
+    }
+}
+
+impl Deref for CodeRound {
+    type Target = serde_json::Value;
+
+    fn deref(&self) -> &serde_json::Value {
+        &self.0.value
+    }
+}
+
+impl PartialEq for CodeRound {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0.value == other.0.value
+    }
+}
+
+impl Serialize for CodeRound {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CodeRound {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde_json::Value::deserialize(deserializer).map(Self::from)
+    }
+}
+
 pub(super) fn strip_thinking(messages: &mut Vec<HistoryMessage>) {
     messages.retain_mut(|message| {
         if message.content.iter().any(|block| {

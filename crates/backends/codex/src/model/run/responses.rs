@@ -27,8 +27,6 @@ impl Serialize for RecordedModelResult {
             usage: Option<&'a Usage>,
             time_to_first_event_ns: u64,
             time_to_first_output_ns: Option<u64>,
-            pipeline_stats: &'a ResponsePipelineStats,
-            timing: &'a ResponseTiming,
         }
 
         #[derive(Serialize)]
@@ -52,8 +50,6 @@ impl Serialize for RecordedModelResult {
                 usage: response.usage.as_ref(),
                 time_to_first_event_ns: response.time_to_first_event_ns,
                 time_to_first_output_ns: response.time_to_first_output_ns,
-                pipeline_stats: &response.pipeline_stats,
-                timing: &response.timing,
             },
             attempt: self.attempt,
             connection_generation: self.connection_generation,

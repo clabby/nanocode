@@ -42,6 +42,7 @@ pub enum JournalWrite {
     Complete {
         step_id: String,
         output: Box<RawValue>,
+        records: Vec<nanocode_durability::EncodedPayload>,
     },
 }
 
@@ -184,7 +185,9 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
                     JournalWrite::Advance(state) => {
                         self.advance_encoded(id.clone(), state.json).await?;
                     }
-                    JournalWrite::Complete { step_id, output } => {
+                    JournalWrite::Complete {
+                        step_id, output, ..
+                    } => {
                         let output = serde_json::from_str(output.get())
                             .map_err(crate::agent::provider_error)?;
                         self.complete_step(id.clone(), step_id, output).await?;

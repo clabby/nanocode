@@ -311,6 +311,31 @@ pub trait ExecutionPolicy: Send + Sync {
         self.complete_step(operation_id, step_id, output_json)
     }
 
+    #[doc(hidden)]
+    fn complete_step_deferred<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        output_json: String,
+    ) -> ExecutionFuture<'a, Result<()>> {
+        self.complete_step(operation_id, step_id, output_json)
+    }
+
+    #[doc(hidden)]
+    fn advance_history_deferred<'a>(
+        &'a self,
+        operation_id: String,
+        state_json: String,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+    ) -> ExecutionFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.advance_history(operation_id, state_json, history, prefix, None)
+                .await
+                .map(drop)
+        })
+    }
+
     fn complete<'a>(
         &'a self,
         operation_id: String,
@@ -553,6 +578,31 @@ pub trait ExecutionPolicy: Send + Sync {
         output_json: String,
     ) -> ExecutionFuture<'a, Result<()>> {
         self.complete_step(operation_id, step_id, output_json)
+    }
+
+    #[doc(hidden)]
+    fn complete_step_deferred<'a>(
+        &'a self,
+        operation_id: String,
+        step_id: String,
+        output_json: String,
+    ) -> ExecutionFuture<'a, Result<()>> {
+        self.complete_step(operation_id, step_id, output_json)
+    }
+
+    #[doc(hidden)]
+    fn advance_history_deferred<'a>(
+        &'a self,
+        operation_id: String,
+        state_json: String,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+    ) -> ExecutionFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.advance_history(operation_id, state_json, history, prefix, None)
+                .await
+                .map(drop)
+        })
     }
 
     fn complete<'a>(
@@ -1226,6 +1276,27 @@ impl ExecutionSteps {
     ) -> Result<()> {
         self.policy
             .complete_step(self.operation_id.clone(), step_id.into(), encode(output)?)
+            .await
+    }
+
+    pub(crate) async fn complete_deferred<O: Serialize + ?Sized>(
+        &self,
+        step_id: impl Into<String>,
+        output: &O,
+    ) -> Result<()> {
+        self.policy
+            .complete_step_deferred(self.operation_id.clone(), step_id.into(), encode(output)?)
+            .await
+    }
+
+    pub(crate) async fn advance_deferred<T: Serialize>(
+        &self,
+        state: &T,
+        history: ResponseHistory,
+        prefix: Arc<[ResponseItem]>,
+    ) -> Result<()> {
+        self.policy
+            .advance_history_deferred(self.operation_id.clone(), encode(state)?, history, prefix)
             .await
     }
 
