@@ -437,6 +437,24 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         Ok(Some((record, dequeued)))
     }
 
+    pub async fn steer(&self, id: &str, prompt: Prompt) -> Result<bool, InboxError> {
+        let live = self.shared.state.read(|state| {
+            state
+                .requests
+                .values()
+                .find(|request| request.running && request.inbox)
+                .and_then(|request| request.control.clone())
+        });
+        let Some(control) = live else {
+            return Ok(false);
+        };
+        match control.steer_with_id(id.to_owned(), prompt).await {
+            Ok(()) => Ok(true),
+            Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn settle(&self) -> Result<bool, InboxError> {
         self.events.drained().await.map_err(InboxError::Events)?;
         if !self.idle() {
