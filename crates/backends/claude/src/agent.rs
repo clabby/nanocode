@@ -4632,7 +4632,7 @@ impl State {
                                         },
                                         None,
                                     );
-                                    published_text = true;
+                                    published_text |= kind == AgentEventKind::AssistantDelta;
                                     pipeline.display_delta_emit_ns = pipeline
                                         .display_delta_emit_ns
                                         .saturating_add(telemetry::elapsed_ns(emit_started));

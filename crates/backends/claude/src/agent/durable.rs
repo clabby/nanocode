@@ -609,7 +609,7 @@ impl State {
                 .map_err(provider_error)?,
             ),
             Err(NanocodeError::TurnCancelled) => Settlement::Cancel,
-            Err(NanocodeError::Response(error)) if self.code_only && error.retryable() => {
+            Err(NanocodeError::Response(error)) if error.retryable() => {
                 Settlement::FailAttempt(error.to_string())
             }
             Err(error) => Settlement::Fail(error.to_string()),
