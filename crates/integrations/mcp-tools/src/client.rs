@@ -18,7 +18,7 @@ use nanocode_mcp_http::{
     streamable_http::{self, HttpAuth},
 };
 
-use super::config::{McpPaymentProvider, McpServer, McpTransport};
+use super::config::{McpPaymentManagement, McpPaymentProvider, McpServer, McpTransport};
 use super::pagination::collect_paginated;
 use super::stdio;
 
@@ -59,7 +59,14 @@ impl ClientInner {
             }
             _ => return first.map_err(|error| error.to_string()),
         };
-        let Some(pending) = payment.prepare(payment_required).await? else {
+        let management = ToolManagement {
+            session: &self.session,
+            params: params.clone(),
+        };
+        let Some(pending) = payment
+            .prepare_with_management(payment_required, &management)
+            .await?
+        else {
             return first.map_err(|error| error.to_string());
         };
 
@@ -157,6 +164,32 @@ impl ClientInner {
 
 fn payment_required_result(result: &CallToolResult) -> Option<&Value> {
     result.meta.as_ref()?.get(MCP_PAYMENT_REQUIRED_META_KEY)
+}
+
+struct ToolManagement<'a> {
+    session: &'a Session,
+    params: CallToolParams,
+}
+
+#[async_trait::async_trait]
+impl McpPaymentManagement for ToolManagement<'_> {
+    async fn send(&self, credential: Value) -> Result<Option<Value>, String> {
+        let mut params = self.params.clone();
+        params.insert_meta(MCP_CREDENTIAL_META_KEY, credential);
+        let result = self
+            .session
+            .call_tool(&params)
+            .await
+            .map_err(|error| error.to_string())?;
+        if payment_required_result(&result).is_some() {
+            return Err("the MCP server rejected the payment management credential".to_owned());
+        }
+        Ok(result
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(MCP_RECEIPT_META_KEY))
+            .cloned())
+    }
 }
 
 pub(crate) struct ConnectedServer {

@@ -59,6 +59,20 @@ pub trait McpPaymentProvider: Send + Sync {
         &self,
         payment_required: &Value,
     ) -> Result<Option<Box<dyn McpPendingPayment>>, String>;
+
+    async fn prepare_with_management(
+        &self,
+        payment_required: &Value,
+        management: &dyn McpPaymentManagement,
+    ) -> Result<Option<Box<dyn McpPendingPayment>>, String> {
+        let _ = management;
+        self.prepare(payment_required).await
+    }
+}
+
+#[async_trait]
+pub trait McpPaymentManagement: Send + Sync {
+    async fn send(&self, credential: Value) -> Result<Option<Value>, String>;
 }
 
 #[async_trait]

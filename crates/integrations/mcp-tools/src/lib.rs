@@ -31,7 +31,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{Instrument, info_span};
 
-pub use config::{McpPaymentProvider, McpPendingPayment, McpServer, McpToolExposure};
+pub use config::{
+    McpPaymentManagement, McpPaymentProvider, McpPendingPayment, McpServer, McpToolExposure,
+};
 pub use nanocode_mcp_http::oauth::{McpOAuthCredentials, McpOAuthRefreshGuard, McpOAuthStore};
 
 const MAX_TOOL_SEARCH_SOURCE_DESCRIPTION_BYTES: usize = 4 * 1024;
