@@ -204,28 +204,23 @@ impl ToolRegistry {
         if let Some(arguments_content) = &arguments_content {
             record_tool_content(&span, "tool.arguments", arguments_content);
         }
-        let (input, hand) = match take_hand(input) {
-            Ok(split) => split,
-            Err(output) => return output,
+        let (input, hand) = match &self.hand_calls {
+            Some(calls) => match take_hand(input) {
+                Ok((input, hand)) => (
+                    input,
+                    hand.filter(|hand| !calls.here(hand)).zip(Some(calls)),
+                ),
+                Err(output) => return output,
+            },
+            None => (input, None),
         };
-        if let Some(hand) = hand.filter(|hand| {
-            self.hand_calls
-                .as_ref()
-                .is_none_or(|calls| !calls.here(hand))
-        }) {
+        if let Some((hand, calls)) = hand {
             span.record("tool.hand", hand.as_str());
             let started_at = std::time::Instant::now();
-            let execution = match &self.hand_calls {
-                Some(calls) => {
-                    calls
-                        .call(&hand, name, input, context)
-                        .instrument(span.clone())
-                        .await
-                }
-                None => ToolOutput::error(format!(
-                    "hand `{hand}` is not reachable because this session has no hands; nothing was dispatched"
-                )),
-            };
+            let execution = calls
+                .call(&hand, name, input, context)
+                .instrument(span.clone())
+                .await;
             let output_content = trace_content
                 .then(|| serde_json::to_string(&execution.output).ok())
                 .flatten();
