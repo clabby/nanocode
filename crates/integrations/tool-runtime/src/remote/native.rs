@@ -218,7 +218,9 @@ pub(super) async fn dial(
     .map_err(|issue| Dial::Failed(error(issue)))?
     .map(|(socket, _)| socket)
     .map_err(|issue| match issue {
-        tungstenite::Error::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
+        tungstenite::Error::Http(response)
+            if matches!(response.status().as_u16(), 401 | 403 | 410) =>
+        {
             Dial::Rejected(error(format!(
                 "brain rejected the runner credential with HTTP {}",
                 response.status()
@@ -620,6 +622,9 @@ impl RemoteTransport for SocketTransport {
 }
 
 const BRAIN_DISCONNECTED: &str = "the hand is not connected to its brain";
+
+const CALL_CANCELLED: &str =
+    "the call's session was cancelled while it ran; its outcome is unknown and it was not retried";
 
 const CALLBACK_DROPPED: &str = "the hand's connection to its brain dropped while the callback ran; its outcome is unknown and it was not retried";
 
@@ -1207,6 +1212,7 @@ pub(super) struct Executor {
     finished: mpsc::UnboundedSender<Done>,
     results: mpsc::UnboundedReceiver<Done>,
     running: HashMap<u64, Running>,
+    calls: HashMap<String, CancellationToken>,
     retained: HashMap<u64, String>,
     connection: u64,
     resumable: bool,
@@ -1242,6 +1248,7 @@ impl Executor {
             finished,
             results,
             running: HashMap::new(),
+            calls: HashMap::new(),
             retained: HashMap::new(),
             connection: 0,
             resumable: false,
@@ -1277,6 +1284,7 @@ impl Executor {
         }
         while self.results.try_recv().is_ok() {}
         self.running.clear();
+        self.calls.clear();
         self.retained.clear();
         self.resumable = false;
     }
@@ -1402,6 +1410,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     }
                                 }
                             }
+                            if matches!(&operation, RemoteOperation::Cancel { .. } | RemoteOperation::CancelTurn { .. })
+                                && let Some(calls) = executor.calls.remove(&session_id)
+                            {
+                                calls.cancel();
+                            }
+                            let cancelled = executor.calls.entry(session_id.clone()).or_default().clone();
                             if let RemoteOperation::Execute { hand: Some(hand), .. } = &operation {
                                 executor.callbacks.name.set(Some(hand.clone()));
                             }
@@ -1459,8 +1473,10 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                         },
                                         RemoteOperation::Call { name, input, context } => {
                                             let owned = context.owned();
-                                            let output = runtime.execute_nested_tool(&name, input, owned.as_context()).await;
-                                            output_to_wire(output, compact).map(Some)
+                                            tokio::select! {
+                                                output = runtime.execute_nested_tool(&name, input, owned.as_context()) => output_to_wire(output, compact).map(Some),
+                                                () = cancelled.cancelled() => Err(error(CALL_CANCELLED)),
+                                            }
                                         },
                                         RemoteOperation::Cancel { .. } => { runtime.control().cancel_with_updates(&mut observer).await; catalog.finish_turn(None); Ok(None) },
                                         RemoteOperation::CancelTurn { .. } => { runtime.control().cancel_turn_with_updates(&mut observer).await; catalog.finish_turn(Some(turn)); Ok(None) },
