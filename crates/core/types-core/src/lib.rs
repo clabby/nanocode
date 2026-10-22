@@ -30,6 +30,54 @@ pub enum Model {
 
     #[serde(rename = "mimo-v2.6-pro", alias = "mimo")]
     Mimo,
+
+    #[serde(untagged)]
+    Custom(CustomModel),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustomModel(&'static str);
+
+impl CustomModel {
+    #[must_use]
+    pub fn new(id: &str) -> Self {
+        static INTERNED: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::BTreeSet<&'static str>>,
+        > = std::sync::OnceLock::new();
+        let mut interned = INTERNED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = interned.get(id) {
+            return Self(existing);
+        }
+        let leaked: &'static str = Box::leak(id.to_owned().into_boxed_str());
+        interned.insert(leaked);
+        Self(leaked)
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl Serialize for CustomModel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CustomModel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+        if id.trim().is_empty() {
+            return Err(serde::de::Error::custom(
+                "model identities must not be empty",
+            ));
+        }
+        Ok(Self::new(&id))
+    }
 }
 
 impl Model {
@@ -38,7 +86,7 @@ impl Model {
     #[must_use]
     pub const fn default_thinking(self) -> Thinking {
         match self {
-            Self::Astra | Self::Glm53 | Self::Kimi | Self::Mimo => Thinking::Low,
+            Self::Astra | Self::Glm53 | Self::Kimi | Self::Mimo | Self::Custom(_) => Thinking::Low,
             Self::Sol | Self::Luna => Thinking::Medium,
         }
     }
@@ -52,7 +100,13 @@ impl Model {
             Self::Glm53 => "@cf/zai-org/glm-5.3",
             Self::Kimi => "kimi-k3",
             Self::Mimo => "mimo-v2.6-pro",
+            Self::Custom(model) => model.as_str(),
         }
+    }
+
+    #[must_use]
+    pub const fn is_custom(self) -> bool {
+        matches!(self, Self::Custom(_))
     }
 
     #[must_use]
@@ -62,7 +116,7 @@ impl Model {
             Self::Glm53 | Self::Mimo => {
                 matches!(thinking, Thinking::Low | Thinking::Medium | Thinking::High)
             }
-            Self::Luna => true,
+            Self::Luna | Self::Custom(_) => true,
             Self::Astra | Self::Sol => !matches!(thinking, Thinking::None),
         }
     }
@@ -76,7 +130,10 @@ impl Model {
     pub const fn supports_reasoning_mode(self, mode: ReasoningMode) -> bool {
         !matches!(
             (self, mode),
-            (Self::Glm53 | Self::Kimi | Self::Mimo, ReasoningMode::Pro)
+            (
+                Self::Glm53 | Self::Kimi | Self::Mimo | Self::Custom(_),
+                ReasoningMode::Pro
+            )
         )
     }
 
@@ -97,21 +154,29 @@ impl fmt::Display for Model {
     }
 }
 
+impl Model {
+    #[must_use]
+    pub fn known(value: &str) -> Option<Self> {
+        match value {
+            "gpt-6.1-sol" | "sol" => Some(Self::Sol),
+            "gpt-6-luna" | "luna" => Some(Self::Luna),
+            "gpt-6-astra" | "astra" => Some(Self::Astra),
+            "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Some(Self::Glm53),
+            "kimi-k3" | "kimi" => Some(Self::Kimi),
+            "mimo-v2.6-pro" | "mimo" => Some(Self::Mimo),
+            _ => None,
+        }
+    }
+}
+
 impl FromStr for Model {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "gpt-6.1-sol" | "sol" => Ok(Self::Sol),
-            "gpt-6-luna" | "luna" => Ok(Self::Luna),
-            "gpt-6-astra" | "astra" => Ok(Self::Astra),
-            "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Ok(Self::Glm53),
-            "kimi-k3" | "kimi" => Ok(Self::Kimi),
-            "mimo-v2.6-pro" | "mimo" => Ok(Self::Mimo),
-            _ => Err(format!(
-                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, or mimo-v2.6-pro"
-            )),
+        if value.trim().is_empty() {
+            return Err("model identities must not be empty".to_owned());
         }
+        Ok(Self::known(value).unwrap_or_else(|| Self::Custom(CustomModel::new(value))))
     }
 }
 

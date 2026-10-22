@@ -495,6 +495,7 @@ fn display_name(model: &ModelSelection) -> &'static str {
         (Some(Model::Glm53), _) => "GLM-5.3",
         (Some(Model::Kimi), _) => "Kimi K3",
         (Some(Model::Mimo), _) => "MiMo V2.6 Pro",
+        (Some(Model::Custom(model)), _) => model.as_str(),
         (_, Some(ClaudeModel::Opus55)) => "Claude Opus 5.5",
         (_, Some(ClaudeModel::Sonnet55)) => "Claude Sonnet 5.5",
         (_, Some(ClaudeModel::Haiku55)) => "Claude Haiku 5.5",
@@ -544,10 +545,16 @@ impl fmt::Display for ModelSelection {
 impl FromStr for ModelSelection {
     type Err = &'static str;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some(model) = Model::known(value) {
+            return Ok(Self::Codex(model));
+        }
+        if let Ok(model) = value.parse::<ClaudeModel>() {
+            return Ok(Self::Claude(model));
+        }
         value
             .parse::<Model>()
             .map(Self::Codex)
-            .or_else(|_| value.parse::<ClaudeModel>().map(Self::Claude))
+            .map_err(|_| "model identities must not be empty")
     }
 }
 

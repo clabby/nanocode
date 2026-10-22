@@ -164,7 +164,7 @@ impl ChatGateway {
     pub const fn serves(model: Model) -> bool {
         matches!(
             model,
-            Model::Glm53 | Model::Astra | Model::Kimi | Model::Mimo
+            Model::Glm53 | Model::Astra | Model::Kimi | Model::Mimo | Model::Custom(_)
         )
     }
 
@@ -172,7 +172,7 @@ impl ChatGateway {
     pub const fn serves_model(&self, model: Model) -> bool {
         match self.provider {
             Provider::OpenRouter => Self::serves(model),
-            Provider::WorkersAi => matches!(model, Model::Glm53),
+            Provider::WorkersAi => matches!(model, Model::Glm53 | Model::Custom(_)),
         }
     }
 
@@ -193,6 +193,7 @@ impl ChatGateway {
             (Provider::OpenRouter, Model::Kimi) => "moonshotai/kimi-k3",
             (Provider::OpenRouter, Model::Mimo) => "xiaomi/mimo-v2.6-pro",
             (Provider::OpenRouter, Model::Astra) => "openai/gpt-6-astra",
+            (_, Model::Custom(model)) => model.as_str(),
             (Provider::OpenRouter, _) => "z-ai/glm-5.3",
             (Provider::WorkersAi, _) => "@cf/zai-org/glm-5.3",
         }

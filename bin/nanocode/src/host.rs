@@ -517,7 +517,7 @@ impl Host {
 
 pub fn parse_model(value: &str) -> Result<ModelSelection> {
     let value = value.trim();
-    if let Ok(model) = value.parse::<Model>() {
+    if let Some(model) = Model::known(value) {
         return Ok(ModelSelection::Codex(model));
     }
     if let Ok(model) = value.parse::<ClaudeModel>() {

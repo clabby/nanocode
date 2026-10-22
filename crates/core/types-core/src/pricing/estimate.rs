@@ -120,6 +120,12 @@ const MIMO_STANDARD: TokenRates = TokenRates {
     cache_write_input: 435,
     output: 870,
 };
+const UNPRICED: TokenRates = TokenRates {
+    input: 0,
+    cached_input: 0,
+    cache_write_input: 0,
+    output: 0,
+};
 const LONG_CONTEXT_THRESHOLD: u64 = 272_000;
 
 #[derive(Clone, Copy)]
@@ -139,6 +145,7 @@ impl TokenRates {
             (Model::Glm53, _, _) => GLM53_STANDARD,
             (Model::Kimi, _, _) => KIMI_STANDARD,
             (Model::Mimo, _, _) => MIMO_STANDARD,
+            (Model::Custom(_), _, _) => UNPRICED,
             (Model::Sol, Standard, false) => SOL_STANDARD,
             (Model::Sol, Priority | Fast, false) => SOL_PRIORITY,
             (Model::Sol, Ultrafast, false) => SOL_ULTRAFAST,

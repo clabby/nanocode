@@ -89,7 +89,10 @@ impl<F> OpenAiBuilder<F> {
     pub fn model(mut self, model: Model) -> Self {
         self.config.retarget(model);
 
-        if matches!(model, Model::Glm53 | Model::Kimi | Model::Mimo) {
+        if matches!(
+            model,
+            Model::Glm53 | Model::Kimi | Model::Mimo | Model::Custom(_)
+        ) {
             self.config.responses_transport = ResponsesTransport::Https;
             self.config.responses_history = ResponsesHistory::FullReplay;
             self.config.store_responses = false;

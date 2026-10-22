@@ -102,12 +102,14 @@ impl ModelConfig {
     pub fn base_system_prompt(&self) -> Cow<'_, str> {
         let base = self.system_prompt.as_deref().unwrap_or(match self.model {
             Model::Astra => ASTRA_SYSTEM_PROMPT,
-            Model::Glm53 | Model::Kimi | Model::Mimo => GLM_SYSTEM_PROMPT,
+            Model::Glm53 | Model::Kimi | Model::Mimo | Model::Custom(_) => GLM_SYSTEM_PROMPT,
             Model::Sol => SOL_SYSTEM_PROMPT,
             Model::Luna => LUNA_SYSTEM_PROMPT,
             _ => ASTRA_SYSTEM_PROMPT,
         });
-        if self.system_prompt.is_none() && matches!(self.model, Model::Kimi | Model::Mimo) {
+        if self.system_prompt.is_none()
+            && matches!(self.model, Model::Kimi | Model::Mimo | Model::Custom(_))
+        {
             Cow::Owned(base.replacen(
                 "powered by Z.ai GLM-5.3",
                 &format!("powered by {}", self.model.as_str()),
