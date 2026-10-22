@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use serde_json::Value;
-
 use nanocode_tools::ToolOutputContent;
+use serde_json::{Map, Value, json};
 
 use crate::{
     Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, embedded::HostFuture,
@@ -57,9 +56,14 @@ impl FunctionTool {
     }
 
     fn output(&self, output: Value) -> ToolOutput {
+        if !self.content_results {
+            return match output {
+                Value::String(output) => ToolOutput::text(output),
+                output => ToolOutput::from_json(output, true),
+            };
+        }
         match output {
-            Value::String(output) => ToolOutput::text(output),
-            Value::Object(mut fields) if self.content_results && fields.contains_key("content") => {
+            Value::Object(mut fields) if fields.contains_key("content") => {
                 let structured = fields.remove("structured_result");
                 let content = fields.remove("content").unwrap_or_default();
                 if let Some(field) = fields.keys().next() {
@@ -68,32 +72,90 @@ impl FunctionTool {
                         self.name
                     ));
                 }
-                match (
-                    serde_json::from_value::<Vec<ToolOutputContent>>(content),
-                    structured,
-                ) {
-                    (Ok(content), Some(structured)) => {
-                        ToolOutput::content(content).with_structured_result(structured)
+                match serde_json::from_value::<Vec<ToolOutputContent>>(content) {
+                    Ok(content) => {
+                        let result = call_tool_result(&content, structured);
+                        ToolOutput::content(content).with_structured_result(result)
                     }
-                    (Ok(content), None) => ToolOutput::content(content),
-                    (Err(error), _) => ToolOutput::error(format!(
+                    Err(error) => ToolOutput::error(format!(
                         "{} returned an invalid content result: {error}",
                         self.name
                     )),
                 }
             }
-            output => ToolOutput::from_json(output, true),
+            Value::String(text) => {
+                let result = call_tool_result(
+                    &[ToolOutputContent::InputText { text: text.clone() }],
+                    None,
+                );
+                ToolOutput::text(text).with_structured_result(result)
+            }
+            output => {
+                let result = call_tool_result(
+                    &[ToolOutputContent::InputText {
+                        text: output.to_string(),
+                    }],
+                    Some(output.clone()),
+                );
+                ToolOutput::from_json(output, true).with_structured_result(result)
+            }
         }
+    }
+}
+
+fn call_tool_result(content: &[ToolOutputContent], structured: Option<Value>) -> Value {
+    let blocks = content
+        .iter()
+        .filter_map(|item| match item {
+            ToolOutputContent::InputText { text } => Some(json!({"type": "text", "text": text})),
+            ToolOutputContent::InputImage { image_url, .. } => Some(media_block("image", image_url)),
+            ToolOutputContent::InputAudio { audio_url } => Some(media_block("audio", audio_url)),
+            ToolOutputContent::InputImageFile { file_id, detail } => {
+                Some(json!({"type": "input_image", "file_id": file_id, "detail": detail}))
+            }
+            ToolOutputContent::EncryptedContent { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let mut result = Map::new();
+    result.insert("content".to_owned(), Value::Array(blocks));
+    if let Some(structured) = structured {
+        result.insert("structuredContent".to_owned(), structured);
+    }
+    Value::Object(result)
+}
+
+fn media_block(kind: &str, url: &str) -> Value {
+    let encoded = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(','))
+        .and_then(|(header, data)| Some((header.strip_suffix(";base64")?, data)));
+    match encoded {
+        Some((mime_type, data)) => json!({"type": kind, "data": data, "mimeType": mime_type}),
+        None => json!({"type": "text", "text": url}),
     }
 }
 
 impl Tool for FunctionTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
+        let definition = ToolDefinition::function(
             self.name.as_str(),
             self.description.as_str(),
             self.parameters.clone(),
-        )
+        );
+        if !self.content_results {
+            return definition;
+        }
+        definition.with_output_schema(json!({
+            "type": "object",
+            "properties": {
+                "content": {"type": "array", "items": {"type": "object"}},
+                "structuredContent": {},
+                "isError": {"type": "boolean"},
+                "_meta": {"type": "object"}
+            },
+            "required": ["content"],
+            "additionalProperties": false
+        }))
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
