@@ -8,8 +8,8 @@ use nanocode_agent_core::{
     Agent, AgentEvents, AgentHandle, AgentSessionContext, Capabilities, CostStatus,
     EstimatedUsdCost, ForkPoint, ForkRequest, HarnessFamily, Lineage, ModelSelection,
     ModelTransport, Mutability, NanocodeError, Origin, Persistence, ReportedCost,
-    ReportedTurnUsage, Result, ServiceTier, SessionCheckpoint, SpawnOptions, Thinking, TurnResult,
-    TurnUsage, UsdAmount,
+    ReportedTurnUsage, Result, ServiceTier, SessionCheckpoint, SpawnOptions, SteerReceiptStatus,
+    Thinking, TurnResult, TurnUsage, UsdAmount,
     backend::{
         AgentFactory, BackendFuture, BackendPrompt, BackendPromptRoute, BackendRuntime,
         BackendTurn, BackendTurnKey, BuilderBackend, LifecycleBackend, TurnBoundary,
@@ -560,7 +560,7 @@ fn model_max_tokens(model: &str) -> Option<u32> {
     }
 }
 
-fn default_context_window_tokens(model: &str) -> u64 {
+pub fn default_context_window_tokens(model: &str) -> u64 {
     match model {
         "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1" | "claude-sonnet-5-5"
         | "claude-haiku-5-5" | "claude-sonnet-5" => 1_000_000,
@@ -3877,6 +3877,7 @@ struct ResponseOutcome {
     replayed: bool,
 }
 struct ResponseContext<'a> {
+    origin: Option<Arc<str>>,
     disable_tools: bool,
     force_text: bool,
     container: Option<&'a str>,
@@ -4336,9 +4337,12 @@ impl State {
         context: ResponseContext<'_>,
     ) -> std::result::Result<ResponseOutcome, ResponseFailure> {
         let template = context.template;
-        let mut outcome = self
-            .observed_response(messages, tools, cancel, events, index, context)
-            .await;
+        let origin = context.origin.clone();
+        let mut outcome = nanocode_http::layer::origin::scope(
+            origin,
+            self.observed_response(messages, tools, cancel, events, index, context),
+        )
+        .await;
         if let Ok(outcome) = &mut outcome {
             outcome.message.usage.estimated_cost =
                 self.estimate_cost(template, &outcome.message.usage);
@@ -5233,6 +5237,7 @@ impl State {
                     None,
                     0,
                     ResponseContext {
+                        origin: cursor.host_context(self),
                         disable_tools: true,
                         force_text,
                         container: context.container.as_deref(),
@@ -5540,7 +5545,7 @@ impl State {
                 .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
             call_id: id.to_owned(),
             instruction_revision: cursor.instruction_revision,
-            host_context: self.host_context.clone(),
+            host_context: cursor.host_context(self),
             progress: None,
         };
 
@@ -5998,6 +6003,7 @@ impl State {
                     Some(&request.events),
                     index,
                     ResponseContext {
+                        origin: cursor.host_context(self),
                         disable_tools: false,
                         force_text: false,
                         container: conversation.container.as_deref(),
@@ -6232,7 +6238,7 @@ impl State {
                 self.flush_journal(journal).await?;
             }
             if !text.is_empty() {
-                self.emit(&request.events,AgentEventKind::AssistantMessage,json!({"model_call_index":index,"item_id":response.id,"phase":null,"text":text,"citations":citations}));
+                self.emit(&request.events,AgentEventKind::AssistantMessage,json!({"model_call_index":index.saturating_add(1),"item_id":response.id,"phase":null,"text":text,"citations":citations}));
             }
 
             let committed = std::mem::take(&mut conversation.messages);
@@ -6968,6 +6974,21 @@ impl LifecycleBackend for Driver {
         prompt: Prompt,
     ) -> BackendFuture<Result<()>> {
         self.steer_input(key, Some(id), prompt)
+    }
+    fn steer_receipt(
+        &self,
+        id: String,
+        prompt: Prompt,
+    ) -> BackendFuture<Result<SteerReceiptStatus>> {
+        let policy = self.state.policy.clone();
+        Box::pin(async move {
+            let Some(policy) = policy else {
+                return Ok(SteerReceiptStatus::Unknown);
+            };
+            policy
+                .steer_receipt(id, serde_json::to_string(&prompt).map_err(provider_error)?)
+                .await
+        })
     }
     fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
         let state = self.state.clone();

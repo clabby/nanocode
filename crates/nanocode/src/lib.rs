@@ -6,8 +6,8 @@ pub use nanocode_agent::{
     AgentEvents, AgentSessionContext, Capabilities, ClaudeModel, CostStatus, EstimatedUsdCost,
     ExecutionPolicyDisposition, ForkPoint, ForkRequest, HarnessFamily, Lineage, ModelCapabilities,
     ModelTransport, Mutability, NanocodeError, Origin, Persistence, PromptRequest, PromptRoute,
-    ReportedTurnUsage, ServiceTier, SessionCheckpoint, SessionInfo, SideAnswer, Turn, TurnControl,
-    TurnResult, TurnUsage, UsdAmount, WeakAgent,
+    ReportedTurnUsage, ServiceTier, SessionCheckpoint, SessionInfo, SideAnswer, SteerReceiptStatus,
+    Turn, TurnControl, TurnResult, TurnUsage, UsdAmount, WeakAgent,
 };
 pub use nanocode_agent::{
     BackendId, BackendKind, BackendRegistration as Backend, BackendRequest, ModelSelection,
@@ -39,9 +39,9 @@ pub use nanocode_code_mode::embedded::{
     HostFuture,
 };
 pub use nanocode_code_mode::remote::{
-    CodeModeExecutors, ExecutorSelection, RemoteCatalog, RemoteClient, RemoteCodeModeHost,
-    RemoteContext, RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation, RemoteTransport,
-    ResumedReply,
+    CodeModeExecutors, ExecutorSelection, HandToolSelection, RemoteCatalog, RemoteClient,
+    RemoteCodeModeHost, RemoteContext, RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation,
+    RemoteTransport, ResumedReply,
 };
 pub use nanocode_code_mode::tool;
 pub use nanocode_tool_runtime::{FunctionHandler, FunctionTool, Tools};
@@ -102,9 +102,9 @@ pub use nanocode_agent::{
 
 pub mod session_host {
     pub use nanocode_agent::{
-        Driven, ImportedTurn, InboxError, InboxHost, LogEntry, LogPage, LoggedEvent, SessionLog,
-        Started, Submission, Submitted, TurnInbox, TurnRecord, TurnRetry, TurnState,
-        submission_digest,
+        Driven, ImportedTurn, InboxError, InboxHost, LogEntry, LogPage, LoggedEvent, MovedQueued,
+        Replaced, SessionLog, Started, Submission, Submitted, TurnInbox, TurnRecord, TurnRetry,
+        TurnState, submission_digest,
     };
 }
 

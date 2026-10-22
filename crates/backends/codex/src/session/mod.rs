@@ -84,6 +84,7 @@ pub(crate) struct CommittedSession {
 
     thinking: crate::Thinking,
     service_tier: crate::ServiceTier,
+    reasoning_mode: crate::ReasoningMode,
 }
 
 impl CommittedSession {
@@ -92,6 +93,7 @@ impl CommittedSession {
         selected_model: Model,
         thinking: crate::Thinking,
         service_tier: crate::ServiceTier,
+        reasoning_mode: crate::ReasoningMode,
         model: ModelCheckpoint,
     ) -> Self {
         Self {
@@ -101,6 +103,7 @@ impl CommittedSession {
             retained_snapshot: None,
             thinking,
             service_tier,
+            reasoning_mode,
         }
     }
 
@@ -126,6 +129,7 @@ impl CommittedSession {
             let mut snapshot = snapshot.clone();
             snapshot.thinking = Some(self.thinking);
             snapshot.service_tier = Some(self.service_tier);
+            snapshot.reasoning_mode = Some(self.reasoning_mode);
             return snapshot;
         }
         SessionSnapshot {
@@ -144,6 +148,7 @@ impl CommittedSession {
             reasoning: self.model.reasoning().clone(),
             thinking: Some(self.thinking),
             service_tier: Some(self.service_tier),
+            reasoning_mode: Some(self.reasoning_mode),
         }
     }
 }
@@ -184,6 +189,9 @@ pub struct SessionSnapshot {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     service_tier: Option<crate::ServiceTier>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_mode: Option<crate::ReasoningMode>,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -351,6 +359,11 @@ impl SessionSnapshot {
     #[must_use]
     pub const fn service_tier(&self) -> Option<crate::ServiceTier> {
         self.service_tier
+    }
+
+    #[must_use]
+    pub const fn reasoning_mode(&self) -> Option<crate::ReasoningMode> {
+        self.reasoning_mode
     }
 
     #[must_use]

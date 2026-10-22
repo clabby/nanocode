@@ -201,6 +201,7 @@ impl State {
                 None,
                 0,
                 ResponseContext {
+                    origin: self.host_context.clone(),
                     disable_tools: false,
                     force_text: false,
                     container: None,

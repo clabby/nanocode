@@ -238,6 +238,15 @@ impl LifecycleBackend for LocalLifecycle {
         })
     }
 
+    fn steer_receipt(
+        &self,
+        id: String,
+        prompt: Prompt,
+    ) -> BackendFuture<Result<SteerReceiptStatus>> {
+        let execution = self.execution.clone();
+        Box::pin(async move { execution.steer_receipt(id, &prompt).await })
+    }
+
     fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();
