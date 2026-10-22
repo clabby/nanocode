@@ -13,7 +13,7 @@ use nanocode_agent_core::backend::{BackendFuture, ChildJournal, ChildJournalStor
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    EncodedPayload, OwnedState, OwnerId, OwnerToken, StateStore, StoreError,
+    EncodedPayload, OperationStatus, OwnedState, OwnerId, OwnerToken, StateStore, StoreError,
     shared_store::SharedStore,
 };
 
@@ -222,6 +222,29 @@ impl ChildJournalStore for SharedJournal {
                 id.to_owned(),
                 input.decode().map_err(std::io::Error::other)?,
             )))
+        })
+    }
+
+    fn cancelled_turns(
+        &self,
+        session_id: String,
+        operation_ids: Vec<String>,
+    ) -> BackendFuture<std::io::Result<Vec<String>>> {
+        let mut store = self.store.clone();
+        Box::pin(async move {
+            let stored = store
+                .peek(&session_id)
+                .await
+                .map_err(std::io::Error::other)?;
+            let state = crate::session::reduce_peeked(stored).map_err(std::io::Error::other)?;
+            Ok(operation_ids
+                .into_iter()
+                .filter(|id| {
+                    state.operation(id).is_some_and(|operation| {
+                        matches!(operation.status, OperationStatus::Cancelled { .. })
+                    })
+                })
+                .collect())
         })
     }
 

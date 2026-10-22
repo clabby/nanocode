@@ -1,6 +1,8 @@
 mod image_validation;
 pub use image_validation::valid_tool_image_data_url;
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{
     Value,
@@ -96,6 +98,11 @@ pub struct ToolOutput {
     pub metadata: Option<Box<RawValue>>,
     structured_result: Option<Value>,
     process_trace: Option<ToolProcessTrace>,
+    receipts: Vec<Arc<dyn ToolReceipt>>,
+}
+
+pub trait ToolReceipt: Send + Sync {
+    fn carried_by(&self, call_id: Option<&str>);
 }
 
 #[doc(hidden)]
@@ -141,6 +148,7 @@ impl ToolOutput {
             metadata: None,
             structured_result: None,
             process_trace: None,
+            receipts: Vec::new(),
         }
     }
 
@@ -152,6 +160,7 @@ impl ToolOutput {
             metadata: None,
             structured_result: None,
             process_trace: None,
+            receipts: Vec::new(),
         }
     }
 
@@ -172,6 +181,7 @@ impl ToolOutput {
                 metadata: None,
                 structured_result: Some(output),
                 process_trace: None,
+                receipts: Vec::new(),
             },
             Err(error) => Self::error(format!("failed to encode tool result: {error}")),
         }
@@ -185,6 +195,7 @@ impl ToolOutput {
             metadata: None,
             structured_result: None,
             process_trace: None,
+            receipts: Vec::new(),
         }
     }
 
@@ -243,6 +254,16 @@ impl ToolOutput {
         self
     }
 
+    #[must_use]
+    pub fn with_receipt(mut self, receipt: Arc<dyn ToolReceipt>) -> Self {
+        self.receipts.push(receipt);
+        self
+    }
+
+    pub fn take_receipts(&mut self) -> Vec<Arc<dyn ToolReceipt>> {
+        std::mem::take(&mut self.receipts)
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub const fn process_trace(&self) -> Option<&ToolProcessTrace> {
@@ -274,6 +295,7 @@ impl ToolOutput {
                 .map(|value| serde_json::from_str(value.get()))
                 .transpose()?,
             process_trace: wire.process_trace.map(Into::into),
+            receipts: Vec::new(),
         })
     }
 }

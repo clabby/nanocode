@@ -421,6 +421,9 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         }
         let _busy = Busy(&self.busy);
         let root = self.session_id();
+        if let Some(control) = self.runtime.subagents() {
+            control.await_restored(&self.agent, root).await;
+        }
         if let Some(first) = self.runtime.pending_turns(root).await?.into_iter().next() {
             return match self.shared.log.turn(&first).await? {
                 Some(record) if !record.state.is_terminal() => self.run(&first, true).await,
