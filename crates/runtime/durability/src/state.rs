@@ -91,6 +91,11 @@ impl DurableState {
         self.journal.checkpoint_payload(self.session.as_ref())
     }
 
+    pub(crate) const fn receipts_complete(&self) -> bool {
+        self.journal.receipts_loaded()
+            && matches!(&self.session, Some(session) if !session.history_pruned)
+    }
+
     pub(crate) fn seal_receipts(&mut self) -> Result<()> {
         self.journal.seal_receipts()
     }
