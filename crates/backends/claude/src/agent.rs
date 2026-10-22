@@ -560,7 +560,7 @@ fn model_max_tokens(model: &str) -> Option<u32> {
     }
 }
 
-fn default_context_window_tokens(model: &str) -> u64 {
+pub fn default_context_window_tokens(model: &str) -> u64 {
     match model {
         "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1" | "claude-sonnet-5-5"
         | "claude-haiku-5-5" | "claude-sonnet-5" => 1_000_000,
