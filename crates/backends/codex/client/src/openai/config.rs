@@ -183,7 +183,7 @@ impl ModelConfig {
             context_window_tokens: CONTEXT_WINDOW_TOKENS,
             responses_transport: ResponsesTransport::default(),
             websocket_warmup: false,
-            raw_api_events: true,
+            raw_api_events: false,
             responses_history: ResponsesHistory::default(),
             store_responses: false,
             strict_json_schema: None,
