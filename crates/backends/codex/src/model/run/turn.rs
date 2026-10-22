@@ -1095,6 +1095,7 @@ impl ModelRun {
                 RunSteered {
                     steer_index: self.stats.steers,
                     instruction_bytes,
+                    message_id: steer.message_id.as_deref(),
                 },
             )?;
         }

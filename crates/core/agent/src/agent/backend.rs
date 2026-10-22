@@ -146,6 +146,14 @@ pub trait ChildJournalStore: Send + Sync + 'static {
         Box::pin(async { Ok(None) })
     }
 
+    fn cancelled_turns(
+        &self,
+        _session_id: String,
+        _operation_ids: Vec<String>,
+    ) -> BackendFuture<std::io::Result<Vec<String>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn load(&self) -> BackendFuture<std::io::Result<Option<String>>>;
 
     fn save(&self, payload: String, records: Vec<Arc<str>>) -> BackendFuture<std::io::Result<()>>;

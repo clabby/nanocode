@@ -24,6 +24,14 @@ pub trait SubagentStore: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    fn cancelled_turns<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _operation_ids: Vec<String>,
+    ) -> SubagentStoreFuture<'a, std::io::Result<Vec<String>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn load<'a>(
         &'a self,
         root_session_id: &'a str,
@@ -382,6 +390,12 @@ struct AgentRecord {
     settled_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "AgentUsage::is_empty")]
     usage: AgentUsage,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    completion_attempt: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    completion_parked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancelled_revision: Option<u64>,
 }
 
 fn encode_agent(
@@ -411,6 +425,9 @@ fn encode_agent(
         pending_completion: agent.pending_completion,
         settled_revision: agent.settled_revision,
         usage: agent.usage,
+        completion_attempt: agent.completion_attempt,
+        completion_parked: agent.completion_parked,
+        cancelled_revision: agent.cancelled_revision,
     })?;
     records.push((Arc::clone(&key), json));
     Ok(key)
@@ -457,6 +474,9 @@ pub(super) async fn load_agent(
         pending_completion: record.pending_completion,
         settled_revision: record.settled_revision,
         usage: record.usage,
+        completion_attempt: record.completion_attempt,
+        completion_parked: record.completion_parked,
+        cancelled_revision: record.cancelled_revision,
     };
     agent.expand();
     Ok(agent)
@@ -632,6 +652,15 @@ pub(super) struct PersistedAgent {
 
     #[serde(default, skip_serializing_if = "AgentUsage::is_empty")]
     pub(super) usage: AgentUsage,
+
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) completion_attempt: u32,
+
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) completion_parked: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cancelled_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -895,6 +924,14 @@ impl SubagentStore for JournalStore {
         self.0.pending_turn(session_id.to_owned())
     }
 
+    fn cancelled_turns<'a>(
+        &'a self,
+        session_id: &'a str,
+        operation_ids: Vec<String>,
+    ) -> SubagentStoreFuture<'a, std::io::Result<Vec<String>>> {
+        self.0.cancelled_turns(session_id.to_owned(), operation_ids)
+    }
+
     fn load<'a>(
         &'a self,
         _root_session_id: &'a str,
@@ -1002,6 +1039,9 @@ pub(super) fn persist_agent(
         pending_completion: session.pending_completion,
         settled_revision: session.settled_revision,
         usage: session.usage.clone(),
+        completion_attempt: session.completion_attempt,
+        completion_parked: session.completion_parked,
+        cancelled_revision: session.cancelled_revision,
     })
 }
 
@@ -1012,6 +1052,19 @@ impl PersistedAgent {
         {
             self.last_output = Some(output.clone());
         }
+    }
+
+    const fn running(&self) -> bool {
+        !matches!(self.status, AgentStatus::Closing | AgentStatus::Closed)
+            && (self.turn_in_flight
+                || matches!(self.status, AgentStatus::Running | AgentStatus::Pending)
+                || (matches!(self.status, AgentStatus::Interrupted) && self.resume_attempts > 0))
+    }
+
+    pub(super) fn unmarked_spawning_turn(&self) -> Option<&str> {
+        (self.descriptor.parent.is_none() && self.cancelled_revision.is_none() && self.running())
+            .then_some(self.host_context.as_deref())
+            .flatten()
     }
 
     pub(super) async fn hydrate(
@@ -1106,10 +1159,7 @@ pub(super) fn restored_session(
     let journaled = snapshot.is_none() && agent.checkpoint_ref.is_some();
     let recoverable = snapshot.is_some() || journaled;
     let terminal = matches!(agent.status, AgentStatus::Closing | AgentStatus::Closed);
-    let running = !terminal
-        && (agent.turn_in_flight
-            || matches!(agent.status, AgentStatus::Running | AgentStatus::Pending)
-            || (matches!(agent.status, AgentStatus::Interrupted) && agent.resume_attempts > 0));
+    let running = agent.running();
 
     let accepted = running.then_some(agent.accepted_output).flatten();
     let in_flight = running && accepted.is_none();
@@ -1168,13 +1218,16 @@ pub(super) fn restored_session(
     } else {
         settled_revision
     };
-    session.pending_completion = if !root_child {
-        None
-    } else if completed_by_acceptance {
-        Some(accepted_revision)
-    } else {
-        pending_completion
-    };
+    if root_child {
+        session.cancelled_revision = agent.cancelled_revision;
+        if completed_by_acceptance {
+            session.settle_completion(accepted_revision);
+        } else if pending_completion.is_some() {
+            session.pending_completion = pending_completion;
+            session.completion_attempt = agent.completion_attempt;
+            session.completion_parked = agent.completion_parked;
+        }
+    }
     session.journaled_runtime = journaled;
 
     if in_flight {
