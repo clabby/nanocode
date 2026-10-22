@@ -182,6 +182,8 @@ pub trait CodeModeHost: Send + Sync + 'static {
 
     fn route_hands(&self, _name: &str, _hands: std::sync::Arc<dyn HandCalls>) {}
 
+    fn bind_session(&self, _session_id: &str, _backend: &str) {}
+
     fn link_session(&self, _session_id: &str, _root_session_id: &str) {}
 
     fn begin_turn(&self, _session_id: &str) {}
@@ -290,6 +292,9 @@ impl<T: CodeModeHost + ?Sized> CodeModeHost for std::sync::Arc<T> {
     }
     fn route_hands(&self, name: &str, hands: std::sync::Arc<dyn HandCalls>) {
         (**self).route_hands(name, hands);
+    }
+    fn bind_session(&self, session_id: &str, backend: &str) {
+        (**self).bind_session(session_id, backend);
     }
     fn link_session(&self, session_id: &str, root_session_id: &str) {
         (**self).link_session(session_id, root_session_id);
