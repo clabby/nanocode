@@ -1561,6 +1561,7 @@ dependencies = [
  "nanocode-durability",
  "nanocode-home",
  "nanocode-platform",
+ "nanocode-process-contracts",
  "nanocode-store-jsonl",
  "nanocode-subagents",
  "nanocode-tool-runtime",

@@ -24,7 +24,8 @@ impl Default for UpdatePlanTool {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
 impl Tool for UpdatePlanTool {
     fn definition(&self) -> ToolDefinition {
         StandardTool::UpdatePlan.definition()

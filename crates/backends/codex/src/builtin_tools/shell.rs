@@ -21,7 +21,8 @@ impl ExecCommandHandler {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
 impl Tool for ExecCommandHandler {
     fn definition(&self) -> ToolDefinition {
         StandardTool::ExecCommand.definition()
@@ -57,7 +58,8 @@ impl WriteStdinHandler {
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
 impl Tool for WriteStdinHandler {
     fn definition(&self) -> ToolDefinition {
         StandardTool::WriteStdin.definition()

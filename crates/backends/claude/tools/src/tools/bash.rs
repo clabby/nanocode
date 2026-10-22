@@ -50,11 +50,17 @@ pub struct BashResult {
     pub truncated: bool,
 }
 
+#[cfg(not(target_family = "wasm"))]
+pub trait BashFuture<T>: Future<Output = T> + Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T, F: Future<Output = T> + Send> BashFuture<T> for F {}
+#[cfg(target_family = "wasm")]
+pub trait BashFuture<T>: Future<Output = T> {}
+#[cfg(target_family = "wasm")]
+impl<T, F: Future<Output = T>> BashFuture<T> for F {}
+
 pub trait SandboxBashExecutor: Send + Sync {
-    fn execute(
-        &self,
-        request: BashRequest,
-    ) -> impl std::future::Future<Output = Result<BashResult, String>> + Send;
+    fn execute(&self, request: BashRequest) -> impl BashFuture<Result<BashResult, String>>;
 }
 
 pub enum BashExecution {
@@ -72,7 +78,7 @@ pub trait BashExecutor: Send + Sync {
         &self,
         request: BashRequest,
         background: bool,
-    ) -> impl std::future::Future<Output = Result<BashExecution, String>> + Send {
+    ) -> impl BashFuture<Result<BashExecution, String>> {
         async move {
             if background {
                 return Err("this executor does not support background commands".into());
@@ -81,10 +87,7 @@ pub trait BashExecutor: Send + Sync {
         }
     }
 
-    fn execute(
-        &self,
-        request: BashRequest,
-    ) -> impl std::future::Future<Output = Result<BashResult, String>> + Send;
+    fn execute(&self, request: BashRequest) -> impl BashFuture<Result<BashResult, String>>;
 }
 
 impl<E: SandboxBashExecutor> BashExecutor for E {

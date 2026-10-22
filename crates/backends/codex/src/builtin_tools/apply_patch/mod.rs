@@ -3,12 +3,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-#[cfg(not(target_family = "wasm"))]
+use nanocode_process_contracts::FileHost;
 use nanocode_tools::ToolDefinition;
-#[cfg(not(target_family = "wasm"))]
 use serde_json::json;
 
-#[cfg(not(target_family = "wasm"))]
 use super::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 mod parser;
@@ -48,6 +46,74 @@ impl Tool for ApplyPatchHandler {
                 Err(error) => ToolOutput::error(format!("apply_patch task failed: {error}")),
             },
         )
+    }
+}
+
+pub(crate) struct HostApplyPatchHandler {
+    workspace: PathBuf,
+    files: std::sync::Arc<dyn FileHost>,
+}
+
+impl HostApplyPatchHandler {
+    pub(crate) const fn new(workspace: PathBuf, files: std::sync::Arc<dyn FileHost>) -> Self {
+        Self { workspace, files }
+    }
+
+    async fn apply(&self, patch: &str) -> Result<String, String> {
+        let hunks = parse(patch)?;
+        validate_unique_targets(&hunks, |path| {
+            normalize_path(&resolve(&self.workspace, path))
+        })?;
+        let mut initial_files = HashMap::new();
+        for path in required_files_from_hunks(&hunks) {
+            let source = resolve(&self.workspace, &path);
+            let contents = self
+                .files
+                .read(&source)
+                .await
+                .and_then(|contents| contents.ok_or_else(|| "No such file or directory".into()))
+                .map_err(|error| {
+                    format!(
+                        "Failed to read file to update {}: {error}",
+                        source.display()
+                    )
+                })?;
+            initial_files.insert(path, contents);
+        }
+        let plan = plan_hunks(hunks, &initial_files)?;
+        for operation in plan.operations() {
+            match operation {
+                PatchOperation::Write { path, contents } => {
+                    let target = resolve(&self.workspace, path);
+                    self.files.write(&target, contents).await.map_err(|error| {
+                        format!("Failed to write file {}: {error}", target.display())
+                    })?;
+                }
+                PatchOperation::Delete { path } => {
+                    let target = resolve(&self.workspace, path);
+                    self.files.remove(&target).await.map_err(|error| {
+                        format!("Failed to delete file {}: {error}", target.display())
+                    })?;
+                }
+            }
+        }
+        Ok(plan.summary().to_owned())
+    }
+}
+
+#[cfg_attr(not(target_family = "wasm"), async_trait::async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait::async_trait(?Send))]
+impl Tool for HostApplyPatchHandler {
+    fn definition(&self) -> ToolDefinition {
+        StandardTool::ApplyPatch.definition()
+    }
+
+    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let input = input.into_freeform()?;
+        Ok(match self.apply(&input).await {
+            Ok(output) => ToolOutput::text(output).with_structured_result(json!({})),
+            Err(error) => ToolOutput::error(format!("apply_patch verification failed: {error}")),
+        })
     }
 }
 
@@ -237,7 +303,6 @@ fn parse(patch: &str) -> Result<Vec<Hunk>, String> {
     Ok(hunks.into_iter().map(normalize_hunk_paths).collect())
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn validate_unique_targets(
     hunks: &[Hunk],
     mut resolve: impl FnMut(&Path) -> PathBuf,
@@ -381,7 +446,6 @@ fn apply_chunks(original: &str, chunks: &[UpdateFileChunk], path: &Path) -> Resu
     Ok(original_lines.join("\n"))
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn resolve(workspace: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_owned()

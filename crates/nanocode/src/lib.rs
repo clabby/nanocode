@@ -13,6 +13,7 @@ pub use nanocode_agent::{
     BackendId, BackendKind, BackendRegistration as Backend, BackendRequest, ModelSelection,
 };
 pub use nanocode_platform as platform;
+pub use nanocode_process_contracts as process;
 
 pub use nanocode_agent::HarnessRequest;
 pub use nanocode_backend_claude::ClaudeHarness;
