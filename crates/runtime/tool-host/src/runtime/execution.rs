@@ -725,7 +725,10 @@ impl NativeToolRuntime {
     > {
         Box::pin(async move {
             let Some(executors) = &self.executors else {
-                return Ok(self.code_mode.wait_with_updates(input, observer).await);
+                return Ok(self
+                    .code_mode
+                    .wait_with_updates(input, context, observer)
+                    .await);
             };
             let session_id = context.session_id();
             self.track(session_id);
@@ -737,7 +740,7 @@ impl NativeToolRuntime {
                 let execution = match &place {
                     None => {
                         self.code_mode
-                            .wait_with_updates(input, &mut *observer)
+                            .wait_with_updates(input, context, &mut *observer)
                             .await
                     }
                     Some(name) => {

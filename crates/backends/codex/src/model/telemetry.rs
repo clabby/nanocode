@@ -367,9 +367,11 @@ pub(super) struct RunStarted<'a> {
 }
 
 #[derive(Serialize)]
-pub(super) struct RunSteered {
+pub(super) struct RunSteered<'a> {
     pub(super) steer_index: u32,
     pub(super) instruction_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) message_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]

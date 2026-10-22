@@ -30,7 +30,7 @@ pub use crate::embedded::{
 };
 pub use crate::{CodeModeToolObservation, CodeModeToolset};
 use nanocode_code_mode_engine::{EmbeddedHost as ExecutionWorker, RuntimeEvent};
-use nanocode_tool_contracts::ToolProcessTraceWire;
+use nanocode_tool_contracts::{ToolProcessTraceWire, ToolReceipt};
 pub use spec::{exec_spec, wait_spec};
 
 const INITIAL_YIELD: Duration = Duration::from_secs(10);
@@ -160,6 +160,7 @@ struct CellObservationState {
 
     replay: VecDeque<CellUpdate>,
     buffered: ObservationBuffer,
+    receipts: Vec<Arc<dyn ToolReceipt>>,
 }
 
 #[derive(Default)]
@@ -211,6 +212,7 @@ struct CompletedNestedCall {
     input: Arc<Value>,
     call: NestedToolCall,
     process_trace: Option<ToolProcessTraceWire>,
+    receipts: Vec<Arc<dyn ToolReceipt>>,
 }
 
 struct ObservedNestedCall {
@@ -218,6 +220,7 @@ struct ObservedNestedCall {
     call: NestedToolCall,
     process_trace: Option<ToolProcessTraceWire>,
     delivered: bool,
+    receipts: Vec<Arc<dyn ToolReceipt>>,
 }
 
 struct PendingCall {
@@ -258,6 +261,7 @@ impl Drop for PendingCallReceipts {
                     call,
                     process_trace: None,
                     delivered: false,
+                    receipts: Vec::new(),
                 }));
         }
     }
@@ -421,6 +425,7 @@ impl CodeModeRuntime {
             started_at,
             ObservationMode::YieldAfter(yield_after, preempt),
             Some(output_token_budget),
+            Some(&cell.origin_call_id),
             observer,
         )
         .await;
@@ -438,14 +443,15 @@ impl CodeModeRuntime {
         execution
     }
 
-    pub async fn wait(&self, input: &str, _context: ToolContext<'_>) -> CodeModeExecution {
-        self.wait_with_updates(input, &mut IgnoreCodeModeUpdates)
+    pub async fn wait(&self, input: &str, context: ToolContext<'_>) -> CodeModeExecution {
+        self.wait_with_updates(input, context, &mut IgnoreCodeModeUpdates)
             .await
     }
 
     pub async fn wait_with_updates(
         &self,
         input: &str,
+        context: ToolContext<'_>,
         observer: &mut dyn CodeModeObserver,
     ) -> CodeModeExecution {
         let started_at = Instant::now();
@@ -464,7 +470,7 @@ impl CodeModeRuntime {
             duration_ns = tracing::field::Empty,
         );
         let execution = self
-            .wait_inner(input, observer, started_at)
+            .wait_inner(input, context.call_id(), observer, started_at)
             .instrument(span.clone())
             .await;
         if let Some(cell) = &execution.cell {
@@ -477,6 +483,7 @@ impl CodeModeRuntime {
     async fn wait_inner(
         &self,
         input: &str,
+        call_id: &str,
         observer: &mut dyn CodeModeObserver,
         started_at: Instant,
     ) -> CodeModeExecution {
@@ -544,6 +551,7 @@ impl CodeModeRuntime {
                 started_at,
                 ObservationMode::Terminate,
                 output_token_budget,
+                Some(call_id),
                 observer,
             )
             .await;
@@ -564,6 +572,7 @@ impl CodeModeRuntime {
             started_at,
             ObservationMode::YieldAfter(yield_time, preempt),
             output_token_budget,
+            Some(call_id),
             observer,
         )
         .await;
@@ -887,6 +896,7 @@ impl LiveCell {
                 updates,
                 replay: VecDeque::new(),
                 buffered: ObservationBuffer::default(),
+                receipts: Vec::new(),
             })),
             lifecycle,
             terminate: Slot::new(Some(terminate)),
@@ -965,6 +975,7 @@ impl LiveCell {
             observation,
             Instant::now(),
             ObservationMode::Terminate,
+            None,
             None,
             observer,
         )
@@ -1106,10 +1117,37 @@ async fn relay_cell_updates(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn observe_cell(
     cell: &LiveCell,
     mut observation: Leased<CellObservationState>,
+    started_at: Instant,
+    mode: ObservationMode,
+    max_output_tokens: Option<usize>,
+    carrier: Option<&str>,
+    observer: &mut dyn CodeModeObserver,
+) -> (CodeModeExecution, bool) {
+    let (execution, running) = observe_updates(
+        cell,
+        &mut observation,
+        started_at,
+        mode,
+        max_output_tokens,
+        observer,
+    )
+    .await;
+    if !running && let Some(carrier) = carrier {
+        for receipt in observation.receipts.drain(..) {
+            receipt.carried_by(Some(carrier));
+        }
+    }
+    (execution, running)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn observe_updates(
+    cell: &LiveCell,
+    observation: &mut Leased<CellObservationState>,
     started_at: Instant,
     mode: ObservationMode,
     max_output_tokens: Option<usize>,
@@ -1202,10 +1240,11 @@ async fn observe_cell(
                     });
                 }
             }
-            Some(CellUpdate::NestedCall(call)) => {
+            Some(CellUpdate::NestedCall(mut call)) => {
                 if !call.delivered {
                     observer.update(CodeModeUpdate::NestedCallCompleted(&call.call));
                 }
+                observation.receipts.append(&mut call.receipts);
                 observation.buffered.nested_calls.push(call);
             }
             Some(CellUpdate::Notification {
@@ -1504,6 +1543,7 @@ impl EmbeddedHost {
             input,
             mut call,
             process_trace,
+            receipts,
         } = completed;
         let success = call.success;
 
@@ -1519,6 +1559,7 @@ impl EmbeddedHost {
                 call,
                 process_trace,
                 delivered: false,
+                receipts,
             }));
         self.worker
             .send_tool_result(cell_id, id, encoded, success)
@@ -1700,10 +1741,15 @@ async fn execute_nested_call(
     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let value = execution.take_structured_result();
     let process_trace = execution.process_trace().copied().map(Into::into);
+    let receipts = execution.take_receipts();
+    for receipt in &receipts {
+        receipt.carried_by(None);
+    }
     CompletedNestedCall {
         id,
         input,
         process_trace,
+        receipts,
         call: NestedToolCall {
             call_id,
             name,
