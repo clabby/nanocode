@@ -88,6 +88,10 @@ impl AgentEvents {
             .map(|event| self.received(event))
     }
 
+    pub fn try_recv(&mut self) -> Option<AgentEvent> {
+        self.try_recv_timed().map(|event| event.event)
+    }
+
     #[doc(hidden)]
     pub fn try_recv_timed(&mut self) -> Option<TimedAgentEvent> {
         let event = self.receiver.try_recv().ok();
