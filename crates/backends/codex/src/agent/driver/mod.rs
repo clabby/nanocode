@@ -46,6 +46,7 @@ impl AgentDriver {
                     thread_model,
                     default_thinking,
                     default_service_tier,
+                    self.spawner.config.reasoning_mode,
                     initial.checkpoint.clone(),
                 )
                 .with_retained_snapshot(self.spawner.restored_snapshot.take()),
@@ -106,6 +107,7 @@ impl AgentDriver {
                         thread_model,
                         default_thinking,
                         default_service_tier,
+                        self.spawner.config.reasoning_mode,
                         snapshot,
                     )));
                 }
@@ -337,7 +339,12 @@ impl AgentDriver {
                                 &mut model,
                                 &self.execution,
                                 Arc::clone(&self.spawner.lineage_id),
-                                (thread_model, default_thinking, default_service_tier),
+                                (
+                                    thread_model,
+                                    default_thinking,
+                                    default_service_tier,
+                                    self.spawner.config.reasoning_mode,
+                                ),
                                 text,
                                 self.workspace.as_deref(),
                             )
@@ -539,6 +546,7 @@ impl AgentDriver {
                                         thread_model,
                                         default_thinking,
                                         default_service_tier,
+                                        self.spawner.config.reasoning_mode,
                                         snapshot,
                                     ));
                                     match self.execution.commit_checkpoint(&checkpoint).await {
@@ -601,6 +609,7 @@ impl AgentDriver {
                                     thread_model,
                                     default_thinking,
                                     default_service_tier,
+                                    self.spawner.config.reasoning_mode,
                                     snapshot,
                                 ))
                             }),
@@ -1038,6 +1047,7 @@ impl AgentDriver {
                                     thread_model,
                                     default_thinking,
                                     default_service_tier,
+                                    self.spawner.config.reasoning_mode,
                                     checkpoint,
                                 ));
                                 let persisted = self
@@ -1059,6 +1069,7 @@ impl AgentDriver {
                                     thread_model,
                                     default_thinking,
                                     default_service_tier,
+                                    self.spawner.config.reasoning_mode,
                                     checkpoint,
                                 ));
                                 let execution_turn = execution_turn.interrupted();
@@ -1090,6 +1101,7 @@ impl AgentDriver {
                                     thread_model,
                                     default_thinking,
                                     default_service_tier,
+                                    self.spawner.config.reasoning_mode,
                                     checkpoint,
                                 ));
                                 let persisted = self
@@ -1384,6 +1396,7 @@ impl AgentDriver {
                                 thread_model,
                                 default_thinking,
                                 default_service_tier,
+                    self.spawner.config.reasoning_mode,
                                 snapshot,
                             )));
                         }
@@ -1720,6 +1733,7 @@ impl AgentDriver {
                                             thread_model,
                                             default_thinking,
                                             default_service_tier,
+                    self.spawner.config.reasoning_mode,
                                             snapshot,
                                         ))
                                     })
@@ -1749,6 +1763,7 @@ impl AgentDriver {
                                             thread_model,
                                             default_thinking,
                                             default_service_tier,
+                    self.spawner.config.reasoning_mode,
                                             snapshot,
                                         )));
                                 }
@@ -1802,6 +1817,7 @@ impl AgentDriver {
                                             thread_model,
                                             default_thinking,
                                             default_service_tier,
+                    self.spawner.config.reasoning_mode,
                                             checkpoint,
                                         ))
                                     })
@@ -1859,6 +1875,7 @@ impl AgentDriver {
                         thread_model,
                         default_thinking,
                         default_service_tier,
+                        self.spawner.config.reasoning_mode,
                         checkpoint,
                     ));
                     let execution_turn =
@@ -1904,6 +1921,7 @@ impl AgentDriver {
                         thread_model,
                         default_thinking,
                         default_service_tier,
+                        self.spawner.config.reasoning_mode,
                         checkpoint,
                     ));
                     let execution_turn = execution_turn.interrupted();
@@ -1936,6 +1954,7 @@ impl AgentDriver {
                         thread_model,
                         default_thinking,
                         default_service_tier,
+                        self.spawner.config.reasoning_mode,
                         checkpoint,
                     ));
                     match error.execution_policy_disposition() {
@@ -2199,7 +2218,12 @@ async fn commit_developer_message(
     model: &mut ModelRun,
     execution: &Execution,
     lineage_id: Arc<str>,
-    (model_name, thinking, service_tier): (Model, Thinking, ServiceTier),
+    (model_name, thinking, service_tier, reasoning_mode): (
+        Model,
+        Thinking,
+        ServiceTier,
+        ReasoningMode,
+    ),
     text: String,
     workspace: Option<&str>,
 ) -> Result<Option<Arc<CommittedSession>>> {
@@ -2209,6 +2233,7 @@ async fn commit_developer_message(
         model_name,
         thinking,
         service_tier,
+        reasoning_mode,
         snapshot,
     ));
     execution.commit_checkpoint(&checkpoint).await?;

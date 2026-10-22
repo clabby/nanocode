@@ -78,6 +78,14 @@ impl ChildState {
         super::spawn::validate_model_thinking(self.model, self.thinking)?;
         super::spawn::validate_model_reasoning_mode(self.model, self.reasoning_mode)?;
         if let Some(conversation) = &self.conversation {
+            if conversation
+                .reasoning_mode()
+                .is_some_and(|mode| mode != self.reasoning_mode)
+            {
+                return Err(NanocodeError::InvalidCheckpoint(
+                    "checkpoint reasoning mode does not match its conversation".into(),
+                ));
+            }
             conversation.clone().into_resume()?;
         }
         Ok(())
@@ -130,7 +138,7 @@ impl CodexCheckpointExt for SessionCheckpoint {
             session_id: session_id.into(),
             model: snapshot.model()?,
             thinking: snapshot.thinking().unwrap_or(thinking),
-            reasoning_mode: ReasoningMode::Standard,
+            reasoning_mode: snapshot.reasoning_mode().unwrap_or(ReasoningMode::Standard),
             service_tier: snapshot.service_tier().unwrap_or(ServiceTier::Standard),
             stateless_http: false,
             lineage,
