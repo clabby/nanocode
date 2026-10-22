@@ -32,6 +32,8 @@ pub struct Defaults<C, A> {
     computer_disabled: bool,
     #[cfg(not(target_family = "wasm"))]
     management_disabled: bool,
+    #[cfg(not(target_family = "wasm"))]
+    runners_disabled: bool,
     #[cfg(target_os = "macos")]
     machine_tools_disabled: bool,
     #[cfg(not(target_family = "wasm"))]
@@ -52,6 +54,8 @@ impl<C, A> Default for Defaults<C, A> {
             computer_disabled: false,
             #[cfg(not(target_family = "wasm"))]
             management_disabled: false,
+            #[cfg(not(target_family = "wasm"))]
+            runners_disabled: false,
             #[cfg(target_os = "macos")]
             machine_tools_disabled: false,
             #[cfg(not(target_family = "wasm"))]
@@ -70,6 +74,8 @@ pub struct Services {
     pool: RunnerPool,
     #[cfg(not(target_family = "wasm"))]
     agents: Arc<runners::RunnerAgents>,
+    #[cfg(not(target_family = "wasm"))]
+    runners_disabled: bool,
     #[cfg(not(target_family = "wasm"))]
     processes: nanocode_process::NativeProcessExecutors,
 }
@@ -157,6 +163,7 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
                 computer: (!self.computer_disabled).then(|| computer::cell(self.computer)),
                 pool,
                 agents,
+                runners_disabled: self.runners_disabled,
                 processes: nanocode_process::NativeProcessExecutors::with_environment(
                     self.tool_environment,
                 ),
@@ -193,6 +200,12 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> NativeDefaults for Defa
     }
     fn runner_management(&mut self, enabled: bool) {
         self.management_disabled = !enabled;
+    }
+    fn without_runners(&mut self) {
+        self.runners_disabled = true;
+        self.management_disabled = true;
+        self.runners.clear();
+        self.servers.clear();
     }
     fn runner(&mut self, runner: Runner) {
         self.runners.push(runner);
@@ -240,7 +253,11 @@ impl HostServices for Services {
             self.agents
                 .code_mode_host(handle.session_id(), tools.has_code_mode_host());
             if !tools.has_code_mode_host() {
-                let mut tools = tools.with_runner_pool(self.pool.clone());
+                let mut tools = if self.runners_disabled {
+                    tools
+                } else {
+                    tools.with_runner_pool(self.pool.clone())
+                };
                 if let Some(store) = store {
                     tools = tools.with_default_process_route_store(
                         process_routes::DurableProcessRoutes::new(store),
@@ -256,7 +273,7 @@ impl HostServices for Services {
 
     #[cfg(not(target_family = "wasm"))]
     fn runner_routing(&self) -> Option<nanocode_tool_host::attachment::RunnerRouting> {
-        Some(self.pool.clone().into())
+        (!self.runners_disabled).then(|| self.pool.clone().into())
     }
     #[cfg(not(target_family = "wasm"))]
     fn process_routes(

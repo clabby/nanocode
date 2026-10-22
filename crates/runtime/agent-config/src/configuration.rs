@@ -150,6 +150,7 @@ pub trait NativeDefaults: RuntimeDefaults {
     fn computer(&mut self, computer: Option<Self::Computer>);
     fn tool_environment(&mut self, environment: Vec<(std::ffi::OsString, std::ffi::OsString)>);
     fn runner_management(&mut self, enabled: bool);
+    fn without_runners(&mut self) {}
     fn runner(&mut self, runner: Self::Runner);
     fn runner_server(&mut self, config: Self::RunnerServerConfig);
 }

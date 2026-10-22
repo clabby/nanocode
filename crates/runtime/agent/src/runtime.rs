@@ -496,6 +496,11 @@ impl<B, D: NativeDefaults> RuntimeBuilder<B, D> {
         self
     }
     #[must_use]
+    pub fn without_runners(mut self) -> Self {
+        self.defaults.without_runners();
+        self
+    }
+    #[must_use]
     pub fn runner(mut self, runner: D::Runner) -> Self {
         self.defaults.runner(runner);
         self
