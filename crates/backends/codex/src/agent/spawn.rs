@@ -153,7 +153,11 @@ pub(super) fn spawn_agent_driver(
         spawner
             .tools
             .materialize(child_handle.clone())
-            .map(|tools| tools.for_session(&child_handle.session_environment()))
+            .map(|tools| {
+                tools
+                    .for_session(&child_handle.session_environment())
+                    .for_backend(child_handle.session_id(), "codex")
+            })
     })?;
 
     if tools.exposure() == nanocode_tool_host::ToolExposure::Hidden {

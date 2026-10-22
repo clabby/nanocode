@@ -2,7 +2,7 @@ mod client;
 mod compact;
 mod executors;
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use nanocode_sync::Atom;
 
@@ -103,6 +103,8 @@ pub enum RemoteOperation {
         local_tools: Vec<ToolDefinition>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hand: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_tools: Option<Vec<String>>,
     },
     Wait {
         input: String,
@@ -112,6 +114,8 @@ pub enum RemoteOperation {
         name: String,
         input: Value,
         context: RemoteContext,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected_tools: Option<Vec<String>>,
     },
     DetachTurn {
         session_id: String,
@@ -134,6 +138,10 @@ pub enum RemoteOperation {
 }
 
 pub trait RemoteTransport: Send + Sync + 'static {
+    fn supports_tool_selection(&self) -> bool {
+        false
+    }
+
     fn request<'a>(
         &'a self,
         operation: RemoteOperation,
@@ -150,10 +158,16 @@ pub trait RemoteTransport: Send + Sync + 'static {
     ) -> Result<(), CodeModeHostError>;
 }
 
+pub trait HandToolSelection: Send + Sync + 'static {
+    fn allows(&self, session_id: &str, backend: &str, name: &str) -> bool;
+}
+
 pub struct RemoteCodeModeHost {
     transport: Arc<dyn RemoteTransport>,
     definitions: Vec<ToolDefinition>,
     hand: Atom<Option<String>>,
+    selection: Option<Arc<dyn HandToolSelection>>,
+    backends: Atom<HashMap<String, String>>,
 }
 
 impl RemoteCodeModeHost {
@@ -162,7 +176,40 @@ impl RemoteCodeModeHost {
             transport: Arc::new(transport),
             definitions,
             hand: Atom::default(),
+            selection: None,
+            backends: Atom::default(),
         }
+    }
+
+    pub fn with_tool_selection(mut self, selection: Arc<dyn HandToolSelection>) -> Self {
+        self.selection = Some(selection);
+        self
+    }
+
+    fn selected_tools(&self, session_id: &str) -> Result<Option<Vec<String>>, CodeModeHostError> {
+        let Some(selection) = &self.selection else {
+            return Ok(None);
+        };
+        if !self.transport.supports_tool_selection() {
+            return Err(CodeModeHostError::unsent(
+                "this hand does not support tool selection; nothing was dispatched",
+            ));
+        }
+        let backend = self
+            .backends
+            .read(|backends| backends.get(session_id).cloned())
+            .ok_or_else(|| {
+                CodeModeHostError::unsent(
+                    "the session has no registered backend; nothing was dispatched",
+                )
+            })?;
+        Ok(Some(
+            self.definitions
+                .iter()
+                .filter(|definition| selection.allows(session_id, &backend, definition.name()))
+                .map(|definition| definition.name().to_owned())
+                .collect(),
+        ))
     }
 
     async fn run<'a>(
@@ -185,8 +232,23 @@ impl CodeModeHost for RemoteCodeModeHost {
     fn supports_cells(&self) -> bool {
         true
     }
-    fn tool_definitions(&self, _: &str) -> Result<Vec<ToolDefinition>, CodeModeHostError> {
-        Ok(self.definitions.clone())
+    fn bind_session(&self, session_id: &str, backend: &str) {
+        self.backends.update(|backends| {
+            backends.insert(session_id.into(), backend.into());
+        });
+    }
+    fn tool_definitions(&self, session_id: &str) -> Result<Vec<ToolDefinition>, CodeModeHostError> {
+        let selected = self.selected_tools(session_id)?;
+        Ok(self
+            .definitions
+            .iter()
+            .filter(|definition| {
+                selected
+                    .as_ref()
+                    .is_none_or(|names| names.iter().any(|name| name == definition.name()))
+            })
+            .cloned()
+            .collect())
     }
     fn execute<'a>(
         &'a self,
@@ -210,13 +272,17 @@ impl CodeModeHost for RemoteCodeModeHost {
         tools: Vec<Arc<dyn Tool>>,
         observer: Option<&'a mut dyn CodeModeObserver>,
     ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
-        let operation = RemoteOperation::Execute {
-            source: source.into(),
-            context: RemoteContext::from_context(context),
-            local_tools: tools.iter().map(|tool| tool.definition()).collect(),
-            hand: Option::clone(&self.hand.get()),
-        };
-        Box::pin(async move { self.run(operation, tools, observer).await })
+        Box::pin(async move {
+            let selected_tools = self.selected_tools(context.session_id())?;
+            let operation = RemoteOperation::Execute {
+                source: source.into(),
+                context: RemoteContext::from_context(context),
+                local_tools: tools.iter().map(|tool| tool.definition()).collect(),
+                hand: Option::clone(&self.hand.get()),
+                selected_tools,
+            };
+            self.run(operation, tools, observer).await
+        })
     }
     fn wait_with_updates<'a>(
         &'a self,
@@ -242,12 +308,24 @@ impl CodeModeHost for RemoteCodeModeHost {
         input: Value,
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
-        let operation = RemoteOperation::Call {
-            name: name.into(),
-            input,
-            context: RemoteContext::from_context(context),
-        };
-        Box::pin(async move { output_from_wire(self.transport.call(operation).await?) })
+        Box::pin(async move {
+            let selected_tools = self.selected_tools(context.session_id())?;
+            if selected_tools
+                .as_ref()
+                .is_some_and(|names| !names.iter().any(|allowed| allowed == name))
+            {
+                return Err(CodeModeHostError::unsent(format!(
+                    "hand tool `{name}` is not permitted for this session; nothing was dispatched"
+                )));
+            }
+            let operation = RemoteOperation::Call {
+                name: name.into(),
+                input,
+                context: RemoteContext::from_context(context),
+                selected_tools,
+            };
+            output_from_wire(self.transport.call(operation).await?)
+        })
     }
     fn route_hands(&self, name: &str, hands: Arc<dyn HandCalls>) {
         self.hand.set(Some(name.into()));
@@ -377,6 +455,8 @@ pub enum RemoteFrame {
         max_frame_bytes: Option<usize>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         resumable: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tool_selection: bool,
     },
     Request {
         id: u64,
@@ -485,6 +565,7 @@ pub struct RemoteCatalog {
     pub runtime_id: Option<String>,
     pub max_frame_bytes: Option<usize>,
     pub resumable: bool,
+    pub tool_selection: bool,
 }
 
 impl RemoteCatalog {
@@ -510,6 +591,7 @@ impl TryFrom<RemoteFrame> for RemoteCatalog {
                 runtime_id,
                 max_frame_bytes,
                 resumable,
+                tool_selection,
             } => Ok(Self {
                 definitions,
                 name,
@@ -517,6 +599,7 @@ impl TryFrom<RemoteFrame> for RemoteCatalog {
                 runtime_id,
                 max_frame_bytes,
                 resumable,
+                tool_selection,
             }),
             _ => Err(CodeModeHostError::new(NO_CATALOG)),
         }
