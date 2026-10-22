@@ -41,7 +41,7 @@ const TURN: Dialects = [
 ];
 const PENDING: Dialects = [
     "SELECT request_id, status, digest, prompt, hand, metadata, CAST(cancel_requested AS TEXT), note, CAST(first_seq AS TEXT), NULL, NULL, retry FROM turns WHERE scope = ?1 AND status IN ('queued', 'running') ORDER BY first_seq",
-    "SELECT request_id, status, digest, prompt, hand, metadata, CAST(cancel_requested AS TEXT), note, CAST(first_seq AS TEXT), NULL, NULL, retry FROM turns WHERE scope = $1::text AND status IN ('queued', 'running') ORDER BY first_seq",
+    "SELECT request_id, status, digest, prompt, hand, metadata, CAST(cancel_requested AS TEXT), note, CAST(first_seq AS TEXT), NULL, NULL, retry FROM turns WHERE scope = $1::text AND status IN ('queued', 'running') ORDER BY turns.first_seq",
 ];
 const UNFINISHED_EVENT: Dialects = [
     "INSERT INTO events (scope, request_id, body, created_at) SELECT ?1, ?2, ?3, CAST(?4 AS INTEGER) WHERE EXISTS (SELECT 1 FROM turns WHERE scope = ?1 AND request_id = ?2 AND status IN ('queued', 'running')) RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT)",
@@ -101,7 +101,7 @@ const APPEND_UNATTRIBUTED: Dialects = [
 ];
 const PAGE: Dialects = [
     "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body FROM events WHERE scope = ?1 AND seq > CAST(?2 AS INTEGER) ORDER BY seq LIMIT CAST(?3 AS INTEGER)",
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body FROM events WHERE scope = $1::text AND seq > CAST($2::text AS BIGINT) ORDER BY seq LIMIT CAST($3::text AS BIGINT)",
+    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body FROM events WHERE scope = $1::text AND seq > CAST($2::text AS BIGINT) ORDER BY events.seq LIMIT CAST($3::text AS BIGINT)",
 ];
 const TURN_PAGE: Dialects = [
     "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body FROM turns JOIN events ON events.seq > MAX(CAST(?3 AS INTEGER), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = ?1 AND turns.request_id = ?2 AND events.scope = ?1 AND events.request_id = ?2 ORDER BY events.seq LIMIT CAST(?4 AS INTEGER)",
