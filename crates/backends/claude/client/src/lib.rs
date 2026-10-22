@@ -6,7 +6,7 @@ compile_error!(
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::{Stream, StreamExt, stream};
-use nanocode_agent_types::UsdAmount;
+use nanocode_agent_types::{ClaudeTokens, EstimatedUsdCost, UsdAmount};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -900,12 +900,46 @@ pub struct Usage {
     pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
     #[serde(
         default,
         with = "nanocode_agent_types::usage::usd_number",
         skip_serializing_if = "Option::is_none"
     )]
     pub cost: Option<UsdAmount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<EstimatedUsdCost>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCreation {
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u64,
+}
+
+impl Usage {
+    #[must_use]
+    pub const fn tokens(&self, requested_ttl: Option<CacheTtl>) -> ClaudeTokens {
+        let (cache_write_5m_input_tokens, cache_write_1h_input_tokens) =
+            match (self.cache_creation, requested_ttl) {
+                (Some(created), _) => (
+                    created.ephemeral_5m_input_tokens,
+                    created.ephemeral_1h_input_tokens,
+                ),
+                (None, Some(CacheTtl::OneHour)) => (0, self.cache_creation_input_tokens),
+                (None, _) => (self.cache_creation_input_tokens, 0),
+            };
+        ClaudeTokens {
+            input_tokens: self.input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_write_5m_input_tokens,
+            cache_write_1h_input_tokens,
+            output_tokens: self.output_tokens,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

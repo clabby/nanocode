@@ -31,13 +31,15 @@ impl UsdAmount {
         self.nano_usd as f64 / NANO_USD_PER_USD as f64
     }
 
-    pub(super) const fn saturating_add(self, other: Self) -> Self {
+    #[must_use]
+    pub const fn saturating_add(self, other: Self) -> Self {
         Self {
             nano_usd: self.nano_usd.saturating_add(other.nano_usd),
         }
     }
 
-    pub(super) const fn saturating_mul(tokens: u64, nano_usd_per_token: u64) -> Self {
+    #[must_use]
+    pub const fn saturating_mul(tokens: u64, nano_usd_per_token: u64) -> Self {
         Self {
             nano_usd: tokens.saturating_mul(nano_usd_per_token),
         }

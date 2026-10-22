@@ -259,6 +259,27 @@ impl ReportedCost {
 
 impl EstimatedUsdCost {
     #[must_use]
+    pub const fn new(
+        input: UsdAmount,
+        cached_input: UsdAmount,
+        cache_write_input: UsdAmount,
+        output: UsdAmount,
+        service_tier: ServiceTier,
+    ) -> Self {
+        Self {
+            amount: input
+                .saturating_add(cached_input)
+                .saturating_add(cache_write_input)
+                .saturating_add(output),
+            input,
+            cached_input,
+            cache_write_input,
+            output,
+            service_tier,
+        }
+    }
+
+    #[must_use]
     pub const fn amount(&self) -> UsdAmount {
         self.amount
     }
@@ -357,17 +378,5 @@ pub fn estimate_tokens(
     let cache_write_input =
         UsdAmount::saturating_mul(cache_write_input_tokens, rates.cache_write_input);
     let output = UsdAmount::saturating_mul(output_tokens, rates.output);
-    let amount = input
-        .saturating_add(cached_input)
-        .saturating_add(cache_write_input)
-        .saturating_add(output);
-
-    EstimatedUsdCost {
-        amount,
-        input,
-        cached_input,
-        cache_write_input,
-        output,
-        service_tier,
-    }
+    EstimatedUsdCost::new(input, cached_input, cache_write_input, output, service_tier)
 }

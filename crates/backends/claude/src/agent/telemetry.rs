@@ -39,7 +39,9 @@ pub(super) fn turn_span(parent: &Span, labels: &TurnLabels<'_>) -> Span {
         usage.output_tokens = Empty,
         usage.reasoning_output_tokens = Empty,
         usage.total_tokens = Empty,
+        cost.usd = Empty,
         cost.status = Empty,
+        cost.service_tier = Empty,
         status = Empty,
     );
     if let Some(parent_session_id) = &labels.lineage.parent_session_id {
@@ -66,6 +68,10 @@ pub(super) fn finish_turn(span: &Span, result: &Result<TurnResult>) {
         );
         span.record("usage.total_tokens", usage.total_tokens());
         span.record("cost.status", usage.cost_status().as_str());
+        if let Some(cost) = usage.estimated_cost() {
+            span.record("cost.usd", cost.amount().decimal().as_str());
+            span.record("cost.service_tier", cost.service_tier().as_str());
+        }
     }
     finish(span, result.as_ref().err(), "agent turn failed");
 }

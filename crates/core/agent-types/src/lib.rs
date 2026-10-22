@@ -1,5 +1,6 @@
 pub mod error;
 pub mod harness;
+pub mod pricing;
 pub mod usage;
 
 pub use error::{
@@ -7,6 +8,7 @@ pub use error::{
     Result,
 };
 pub use harness::{ClaudeModel, HarnessFamily, ModelCapabilities, ModelSelection, ModelTransport};
+pub use pricing::ClaudeTokens;
 pub use usage::{
     AgentUsage, CostStatus, EstimatedUsdCost, ReportedTurnUsage, ServiceTier, TurnUsage, UsdAmount,
 };

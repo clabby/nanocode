@@ -1,7 +1,6 @@
 use super::{
-    Cancellation, ContentBlock, CostStatus, HistoryMessage, Message, MessagesRequest,
-    NanocodeError, ReportedTurnUsage, ResponseContext, Result, Role, State, TurnUsage,
-    provider_error,
+    Cancellation, ContentBlock, HistoryMessage, Message, MessagesRequest, NanocodeError,
+    ResponseContext, Result, Role, State, provider_error,
 };
 use crate::{FrozenWireProfile, ToolResultContent};
 use nanocode_agent_core::{
@@ -236,30 +235,9 @@ impl State {
                 },
             ));
         }
-        let usage = &response.usage;
         Ok(SideAnswer::new(
             text,
-            Some(TurnUsage::from_reported(ReportedTurnUsage {
-                input_tokens: usage
-                    .input_tokens
-                    .saturating_add(usage.cache_read_input_tokens)
-                    .saturating_add(usage.cache_creation_input_tokens),
-                cached_input_tokens: usage.cache_read_input_tokens,
-                cache_write_input_tokens: usage.cache_creation_input_tokens,
-                output_tokens: usage.output_tokens,
-                reasoning_output_tokens: 0,
-                total_tokens: usage
-                    .input_tokens
-                    .saturating_add(usage.cache_read_input_tokens)
-                    .saturating_add(usage.cache_creation_input_tokens)
-                    .saturating_add(usage.output_tokens),
-                estimated_cost: usage.cost.map(super::reported_cost),
-                cost_status: if usage.cost.is_some() {
-                    CostStatus::ReportedByProvider
-                } else {
-                    CostStatus::Other
-                },
-            })),
+            Some(super::turn_usage(&response.usage)),
         ))
     }
 }

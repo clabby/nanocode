@@ -116,16 +116,19 @@ fn bound_tool_result(content: ToolResultContent) -> ToolResultContent {
     }
 }
 
-const fn add_usage(total: &mut Usage, usage: &Usage) {
+fn add_usage(total: &mut Usage, usage: &Usage) {
     let first = total.input_tokens == 0
         && total.cache_read_input_tokens == 0
         && total.cache_creation_input_tokens == 0
         && total.output_tokens == 0;
     total.cost = match (total.cost, usage.cost) {
-        (Some(sum), Some(cost)) => Some(UsdAmount::from_nano_usd(
-            sum.nano_usd().saturating_add(cost.nano_usd()),
-        )),
+        (Some(sum), Some(cost)) => Some(sum.saturating_add(cost)),
         (None, cost) if first => cost,
+        _ => None,
+    };
+    total.estimated_cost = match (total.estimated_cost.take(), &usage.estimated_cost) {
+        (Some(sum), Some(cost)) => Some(sum.saturating_add(cost.clone())),
+        (None, cost) if first => cost.clone(),
         _ => None,
     };
     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
@@ -144,6 +147,28 @@ fn reported_cost(usd: UsdAmount) -> EstimatedUsdCost {
         input_usd: None,
     }
     .as_cost(ServiceTier::default())
+}
+
+fn turn_usage(usage: &Usage) -> TurnUsage {
+    let input_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_input_tokens)
+        .saturating_add(usage.cache_creation_input_tokens);
+    let (estimated_cost, cost_status) = match (usage.cost, &usage.estimated_cost) {
+        (Some(cost), _) => (Some(reported_cost(cost)), CostStatus::ReportedByProvider),
+        (None, Some(estimate)) => (Some(estimate.clone()), CostStatus::EstimatedFromUsage),
+        (None, None) => (None, CostStatus::Other),
+    };
+    TurnUsage::from_reported(ReportedTurnUsage {
+        input_tokens,
+        cached_input_tokens: usage.cache_read_input_tokens,
+        cache_write_input_tokens: usage.cache_creation_input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_output_tokens: 0,
+        total_tokens: input_tokens.saturating_add(usage.output_tokens),
+        estimated_cost,
+        cost_status,
+    })
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -4107,6 +4132,35 @@ impl State {
         *self.effort.get()
     }
 
+    fn cache_ttl(&self) -> Option<crate::CacheTtl> {
+        (self.cache_one_hour || (self.lineage.depth == 0 && self.client.uses_subscription()))
+            .then_some(crate::CacheTtl::OneHour)
+    }
+
+    fn estimate_cost(
+        &self,
+        template: Option<&MessagesRequest>,
+        usage: &crate::Usage,
+    ) -> Option<EstimatedUsdCost> {
+        let (model, speed, ttl) = template.map_or_else(
+            || (self.model(), self.speed(), self.cache_ttl()),
+            |template| {
+                (
+                    template.model.clone(),
+                    template.speed,
+                    template
+                        .cache_control
+                        .as_ref()
+                        .and_then(|control| control.ttl),
+                )
+            },
+        );
+        model
+            .parse::<nanocode_agent_core::ClaudeModel>()
+            .ok()?
+            .estimate_cost(usage.tokens(ttl), speed == Some(crate::Speed::Fast))
+    }
+
     fn speed(&self) -> Option<crate::Speed> {
         let supported = self
             .model()
@@ -4178,7 +4232,9 @@ impl State {
             }
             Err(_) => ("failed", AgentEventKind::RunFailed),
         };
-        self.emit(events,kind,json!({"status":status,"model":self.model(),"reasoning_mode":reasoning_mode,"effort":effort,"transport":"messages_sse","orchestration":"claude","duration_ms":ns/1_000_000,"duration_ns":ns,"estimated_cost":null,"cost_usd":null,"cost_status":"other"}));
+        let usage = result.as_ref().ok().and_then(TurnResult::usage);
+        let cost = usage.and_then(TurnUsage::estimated_cost);
+        self.emit(events,kind,json!({"status":status,"model":self.model(),"reasoning_mode":reasoning_mode,"effort":effort,"transport":"messages_sse","orchestration":"claude","duration_ms":ns/1_000_000,"duration_ns":ns,"estimated_cost":cost,"cost_usd":cost.map(|cost| cost.amount().as_f64()),"cost_status":usage.map_or(CostStatus::Other, TurnUsage::cost_status)}));
     }
     fn thinking(&self) -> Thinking {
         effort_thinking(self.effort())
@@ -4222,9 +4278,7 @@ impl State {
             }),
             cache_control: self.automatic_cache.then(|| crate::CacheControl {
                 kind: crate::CacheType::Ephemeral,
-                ttl: (self.cache_one_hour
-                    || (self.lineage.depth == 0 && self.client.uses_subscription()))
-                .then_some(crate::CacheTtl::OneHour),
+                ttl: self.cache_ttl(),
             }),
             output_config: self.effort().map(|effort| crate::OutputConfig { effort }),
             speed,
@@ -4244,6 +4298,25 @@ impl State {
         request
     }
     async fn response(
+        &self,
+        messages: &[HistoryMessage],
+        tools: Vec<ClaudeToolSpec>,
+        cancel: &Cancellation,
+        events: Option<&AgentEventPublisher>,
+        index: u32,
+        context: ResponseContext<'_>,
+    ) -> std::result::Result<ResponseOutcome, ResponseFailure> {
+        let template = context.template;
+        let mut outcome = self
+            .observed_response(messages, tools, cancel, events, index, context)
+            .await;
+        if let Ok(outcome) = &mut outcome {
+            outcome.message.usage.estimated_cost =
+                self.estimate_cost(template, &outcome.message.usage);
+        }
+        outcome
+    }
+    async fn observed_response(
         &self,
         messages: &[HistoryMessage],
         tools: Vec<ClaudeToolSpec>,
@@ -6498,27 +6571,7 @@ impl State {
             return Ok(TurnResult::from_backend(
                 request.request_id.clone(),
                 text,
-                Some(TurnUsage::from_reported(ReportedTurnUsage {
-                    input_tokens: usage
-                        .input_tokens
-                        .saturating_add(usage.cache_read_input_tokens)
-                        .saturating_add(usage.cache_creation_input_tokens),
-                    cached_input_tokens: usage.cache_read_input_tokens,
-                    cache_write_input_tokens: usage.cache_creation_input_tokens,
-                    output_tokens: usage.output_tokens,
-                    reasoning_output_tokens: 0,
-                    total_tokens: usage
-                        .input_tokens
-                        .saturating_add(usage.cache_read_input_tokens)
-                        .saturating_add(usage.cache_creation_input_tokens)
-                        .saturating_add(usage.output_tokens),
-                    estimated_cost: usage.cost.map(reported_cost),
-                    cost_status: if usage.cost.is_some() {
-                        CostStatus::ReportedByProvider
-                    } else {
-                        CostStatus::Other
-                    },
-                })),
+                Some(turn_usage(&usage)),
                 None,
             ));
         }
