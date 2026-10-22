@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use nanocode_tools::ToolOutputContent;
+
 use crate::{
-    Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolOutputContent, ToolResult,
-    embedded::HostFuture,
+    Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, embedded::HostFuture,
 };
 
 pub trait FunctionHandler: Send + Sync + 'static {
