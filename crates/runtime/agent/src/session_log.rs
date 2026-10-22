@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -172,6 +173,23 @@ const IMPORT_FINISH: Dialects = [
     "UPDATE turns SET last_seq = (SELECT MAX(seq) FROM events) WHERE scope = ?1 AND request_id = ?2 AND status IN ('completed', 'failed', 'cancelled') AND last_seq IS NULL",
     "UPDATE turns SET last_seq = (SELECT MAX(seq) FROM events WHERE scope = $1::text) WHERE scope = $1::text AND request_id = $2::text AND status IN ('completed', 'failed', 'cancelled') AND last_seq IS NULL",
 ];
+const IMPORT_EVENT: Dialects = [
+    "INSERT INTO events (seq, scope, request_id, body, created_at) SELECT CAST(?2 AS INTEGER), ?1, ?3, ?4, CAST(?5 AS INTEGER) WHERE (?6 = '0' OR EXISTS (SELECT 1 FROM events WHERE seq = CAST(?6 AS INTEGER) AND scope = ?1)) AND NOT EXISTS (SELECT 1 FROM events WHERE seq > CAST(?6 AS INTEGER) AND scope = ?1) ON CONFLICT DO NOTHING RETURNING CAST(seq AS TEXT)",
+    "INSERT INTO events (seq, scope, request_id, body, created_at) SELECT CAST($2::text AS BIGINT), $1::text, $3::text, $4::text, CAST($5::text AS BIGINT) WHERE ($6::text = '0' OR EXISTS (SELECT 1 FROM events WHERE seq = CAST($6::text AS BIGINT) AND scope = $1::text)) AND NOT EXISTS (SELECT 1 FROM events WHERE seq > CAST($6::text AS BIGINT) AND scope = $1::text) ON CONFLICT DO NOTHING RETURNING CAST(seq AS TEXT)",
+];
+const IMPORT_UNATTRIBUTED_EVENT: Dialects = [
+    "INSERT INTO events (seq, scope, request_id, body, created_at) SELECT CAST(?2 AS INTEGER), ?1, NULL, ?3, CAST(?4 AS INTEGER) WHERE (?5 = '0' OR EXISTS (SELECT 1 FROM events WHERE seq = CAST(?5 AS INTEGER) AND scope = ?1)) AND NOT EXISTS (SELECT 1 FROM events WHERE seq > CAST(?5 AS INTEGER) AND scope = ?1) ON CONFLICT DO NOTHING RETURNING CAST(seq AS TEXT)",
+    "INSERT INTO events (seq, scope, request_id, body, created_at) SELECT CAST($2::text AS BIGINT), $1::text, NULL, $3::text, CAST($4::text AS BIGINT) WHERE ($5::text = '0' OR EXISTS (SELECT 1 FROM events WHERE seq = CAST($5::text AS BIGINT) AND scope = $1::text)) AND NOT EXISTS (SELECT 1 FROM events WHERE seq > CAST($5::text AS BIGINT) AND scope = $1::text) ON CONFLICT DO NOTHING RETURNING CAST(seq AS TEXT)",
+];
+const ADVANCE_EVENT_SEQUENCE: &str = "SELECT CAST(setval(CAST(pg_get_serial_sequence('events', 'seq') AS regclass), MAX(seq)) AS TEXT) FROM events HAVING MAX(seq) > COALESCE(pg_sequence_last_value(CAST(pg_get_serial_sequence('events', 'seq') AS regclass)), 0)";
+const IMPORTED_RANGE: Dialects = [
+    "SELECT CAST(seq AS TEXT), scope, request_id, CAST(created_at AS TEXT), CASE WHEN scope = ?1 THEN body END FROM events WHERE seq > CAST(?2 AS INTEGER) AND seq <= CAST(?3 AS INTEGER)",
+    "SELECT CAST(seq AS TEXT), scope, request_id, CAST(created_at AS TEXT), CASE WHEN scope = $1::text THEN body END FROM events WHERE seq > CAST($2::text AS BIGINT) AND seq <= CAST($3::text AS BIGINT)",
+];
+const LAST_EVENT: Dialects = [
+    "SELECT CAST(seq AS TEXT) FROM events WHERE scope = ?1 ORDER BY events.seq DESC LIMIT 1",
+    "SELECT CAST(seq AS TEXT) FROM events WHERE scope = $1::text ORDER BY events.seq DESC LIMIT 1",
+];
 const VARINT_BYTES: usize = 9;
 const INTEGER_BYTES: usize = 8;
 const EVENT_TEXTS: usize = 3;
@@ -311,7 +329,7 @@ pub struct ImportedTurn {
     pub result: Option<Map<String, Value>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct LoggedEvent {
     pub seq: u64,
     pub request_id: Option<String>,
@@ -711,6 +729,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 APPEND,
                 IMPORT_RESULT,
                 REPLACE_QUEUED,
+                IMPORT_UNATTRIBUTED_EVENT,
             ]
             .iter()
             .any(|sql| stmt.sql == dialect.pick(sql))
@@ -718,7 +737,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 Some(2)
             } else if stmt.sql == dialect.pick(&APPEND_UNATTRIBUTED) {
                 Some(1)
-            } else if [NEW_TURN, NEW_PLACED_TURN]
+            } else if [NEW_TURN, NEW_PLACED_TURN, IMPORT_EVENT]
                 .iter()
                 .any(|sql| stmt.sql == dialect.pick(sql))
             {
@@ -778,6 +797,8 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 .any(|sql| stmt.sql == dialect.pick(sql))
             {
                 &[3]
+            } else if stmt.sql == dialect.pick(&IMPORTED_RANGE) {
+                &[4]
             } else {
                 &[]
             };
@@ -1615,6 +1636,163 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         Ok(rows.len())
     }
 
+    pub async fn import_events(
+        &self,
+        after: u64,
+        events: &[LoggedEvent],
+    ) -> Result<u64, StoreError> {
+        let Some(last) = events.last() else {
+            return Ok(after);
+        };
+        let mut previous = after;
+        for event in events {
+            if event.seq <= previous {
+                return Err(StoreError::NotCommitted(format!(
+                    "imported session log events must ascend after seq {previous}, but seq {} follows it",
+                    event.seq
+                )));
+            }
+            if !self.event_fits(event.request_id.as_deref(), event.event.get()) {
+                return Err(StoreError::NotCommitted(format!(
+                    "imported session log event {} does not fit the log's logical limit",
+                    event.seq
+                )));
+            }
+            previous = event.seq;
+        }
+        let dialect = self.host.dialect();
+        let (start, end) = (after.to_string(), last.seq.to_string());
+        let read = self
+            .transaction(
+                "import_events",
+                vec![
+                    statement(dialect, &LAST_EVENT, vec![&self.scope]),
+                    statement(dialect, &IMPORTED_RANGE, vec![&self.scope, &start, &end]),
+                ],
+            )
+            .await?;
+        let ends = single(&read[0])?
+            .map(|row| text(row, 0).and_then(counter))
+            .transpose()?
+            .unwrap_or(0);
+        if ends < after {
+            return Err(StoreError::NotCommitted(format!(
+                "session log {} ends at seq {ends}, before the seq {after} the imported events follow",
+                self.scope
+            )));
+        }
+        let held = read[1]
+            .iter()
+            .map(|row| Ok((counter(text(row, 0)?)?, row)))
+            .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
+        let imported: BTreeSet<_> = events.iter().map(|event| event.seq).collect();
+        if let Some(seq) = held
+            .iter()
+            .find(|(seq, row)| optional(row, 1) == Some(&self.scope) && !imported.contains(seq))
+            .map(|(seq, _)| seq)
+        {
+            return Err(StoreError::NotCommitted(format!(
+                "session log {} holds event {seq}, which the imported events after seq {after} do not",
+                self.scope
+            )));
+        }
+        for event in events {
+            let seq = event.seq;
+            match held.get(&seq) {
+                None if seq <= ends => {
+                    return Err(StoreError::NotCommitted(format!(
+                        "session log {} lacks imported event {seq} but holds later events",
+                        self.scope
+                    )));
+                }
+                None => {}
+                Some(row) if optional(row, 1) != Some(&self.scope) => {
+                    return Err(StoreError::NotCommitted(format!(
+                        "seq {seq} already belongs to session log {}",
+                        text(row, 1)?
+                    )));
+                }
+                Some(row)
+                    if optional(row, 2) != event.request_id.as_deref()
+                        || counter(text(row, 3)?)? != event.created_at
+                        || optional(row, 4) != Some(event.event.get()) =>
+                {
+                    return Err(StoreError::NotCommitted(format!(
+                        "session log {} already holds a different event at seq {seq}",
+                        self.scope
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        let fresh = &events[events.partition_point(|event| event.seq <= ends)..];
+        if fresh.is_empty() {
+            return Ok(last.seq);
+        }
+        let mut previous = ends;
+        let values: Vec<_> = fresh
+            .iter()
+            .map(|event| {
+                let value = (
+                    event.seq.to_string(),
+                    event.created_at.to_string(),
+                    previous.to_string(),
+                );
+                previous = event.seq;
+                value
+            })
+            .collect();
+        let mut statements: Vec<_> = fresh
+            .iter()
+            .zip(&values)
+            .map(
+                |(event, (seq, created, previous))| match event.request_id.as_deref() {
+                    Some(request_id) => statement(
+                        dialect,
+                        &IMPORT_EVENT,
+                        vec![
+                            &self.scope,
+                            seq,
+                            request_id,
+                            event.event.get(),
+                            created,
+                            previous,
+                        ],
+                    ),
+                    None => statement(
+                        dialect,
+                        &IMPORT_UNATTRIBUTED_EVENT,
+                        vec![&self.scope, seq, event.event.get(), created, previous],
+                    ),
+                },
+            )
+            .collect();
+        if dialect == SqlDialect::Postgres {
+            statements.push(SqlStatement {
+                sql: ADVANCE_EVENT_SEQUENCE,
+                params: Vec::new(),
+            });
+        }
+        let results = self.transaction("import_events", statements).await?;
+        for ((seq, _, _), rows) in values.iter().zip(&results) {
+            match single(rows)? {
+                Some(row) if text(row, 0)? == seq => {}
+                Some(row) => {
+                    return Err(invalid(format!(
+                        "imported event {seq} was stored as seq {}",
+                        text(row, 0)?
+                    )));
+                }
+                None => {
+                    return Err(StoreError::NotCommitted(format!(
+                        "session log {} changed while event {seq} was imported",
+                        self.scope
+                    )));
+                }
+            }
+        }
+        Ok(last.seq)
+    }
     fn batches(&self, rows: &[Imported<'_>]) -> Result<Vec<String>, StoreError> {
         let mut batches = Vec::new();
         let mut batch = String::from("[");
