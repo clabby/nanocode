@@ -28,7 +28,7 @@ use crate::{
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
     Rpc(RpcError),
-    Transport(String),
+    Transport(TransportError),
     Closed,
     Cancelled(Option<String>),
     InvalidResult { method: String, error: String },
@@ -53,6 +53,75 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportError {
+    message: String,
+    unsent: bool,
+    status: Option<u16>,
+}
+
+impl TransportError {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            unsent: false,
+            status: None,
+        }
+    }
+
+    #[must_use]
+    pub fn unsent(message: impl Into<String>) -> Self {
+        Self {
+            unsent: true,
+            ..Self::new(message)
+        }
+    }
+
+    #[must_use]
+    pub fn with_status(message: impl Into<String>, status: u16) -> Self {
+        Self {
+            status: Some(status),
+            ..Self::new(message)
+        }
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[must_use]
+    pub const fn is_unsent(&self) -> bool {
+        self.unsent
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> Option<u16> {
+        self.status
+    }
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TransportError {}
+
+impl From<String> for TransportError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for TransportError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
 
 const CLIENT_CANCELLED_REASON: &str = "request cancelled by client";
 

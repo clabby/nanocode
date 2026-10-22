@@ -1,5 +1,6 @@
 # Development
 
+- MCP transport failures are typed: `nanocode_mcp::Error::Transport` carries a `TransportError` whose `is_unsent()` says the request certainly never reached the server (a connect or request-builder error, a body that failed to encode, or an OAuth token that could not be obtained), and whose `status()` is the HTTP status of a non-2xx response that failed it without a JSON-RPC error body (401 and 403 challenges included, and 404 when an expired session could not be reopened, so the request was not resent). Anything else, such as a stream that broke after a 2xx, has neither and its outcome is unknown. `message()` and `Display` keep the earlier text. Hosts that record calls before sending, such as Pyramid, use these to report a call as not done instead of fencing it as unknown.
 - Do not add code comments, doc comments, or comment headers.
 - Do not create or edit README files. The user maintains them; put development guidance in AGENTS.md.
 - Do not add project Cargo features or `cfg(feature = ...)` branches. Use crate boundaries and native/WASM target gates.

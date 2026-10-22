@@ -4,7 +4,7 @@ use arc_swap::ArcSwap;
 use futures_util::StreamExt;
 use http::{HeaderName, HeaderValue, Method};
 use nanocode_mcp::{
-    Error as SessionError, Inbound, Message, Outgoing, RequestId,
+    Error as SessionError, Inbound, Message, Outgoing, RequestId, TransportError,
     protocol::{INITIALIZE, INITIALIZED},
     sse,
 };
@@ -69,13 +69,15 @@ struct Shared {
 
 enum PostError {
     SessionExpired,
-    Failed(String),
+    Failed(TransportError),
 }
 
-impl From<PostError> for String {
+const SESSION_EXPIRED: &str = "Session expired (HTTP 404)";
+
+impl From<PostError> for TransportError {
     fn from(error: PostError) -> Self {
         match error {
-            PostError::SessionExpired => "Session expired (HTTP 404)".to_owned(),
+            PostError::SessionExpired => Self::with_status(SESSION_EXPIRED, 404),
             PostError::Failed(error) => error,
         }
     }
@@ -147,7 +149,7 @@ async fn drive(shared: Arc<Shared>, mut outgoing: Outgoing) {
                     let state = shared.state();
                     if let Err(error) = shared.post(&message, &state).await {
                         tracing::error!(
-                            error = %String::from(error),
+                            error = %TransportError::from(error),
                             "failed to send MCP initialized notification"
                         );
                         shared.inbound.close();
@@ -190,24 +192,30 @@ fn is_mime(content_type: Option<&str>, mime: &str) -> bool {
     content_type.is_some_and(|content_type| content_type.as_bytes().starts_with(mime.as_bytes()))
 }
 
-fn client_error(error: &reqwest::Error) -> String {
-    format!("Client error: {}", crate::error_chain(error))
+fn client_error(error: &reqwest::Error) -> TransportError {
+    let message = format!("Client error: {}", crate::error_chain(error));
+    if error.is_connect() || error.is_builder() {
+        TransportError::unsent(message)
+    } else {
+        TransportError::new(message)
+    }
 }
 
-fn challenge_error(response: &reqwest::Response) -> Option<String> {
+fn challenge_error(response: &reqwest::Response) -> Option<TransportError> {
+    let status = response.status();
     let header = response.headers().get(WWW_AUTHENTICATE)?;
     let Ok(header) = header.to_str() else {
-        return Some(
-            "unexpected server response: invalid www-authenticate header value".to_owned(),
-        );
+        return Some(TransportError::with_status(
+            "unexpected server response: invalid www-authenticate header value",
+            status.as_u16(),
+        ));
     };
-    match response.status() {
-        StatusCode::UNAUTHORIZED => {
-            Some(format!("Auth required: authorization required: {header}"))
-        }
-        StatusCode::FORBIDDEN => Some(format!("Insufficient scope: insufficient scope: {header}")),
-        _ => None,
-    }
+    let message = match status {
+        StatusCode::UNAUTHORIZED => format!("Auth required: authorization required: {header}"),
+        StatusCode::FORBIDDEN => format!("Insufficient scope: insufficient scope: {header}"),
+        _ => return None,
+    };
+    Some(TransportError::with_status(message, status.as_u16()))
 }
 
 impl Shared {
@@ -219,11 +227,16 @@ impl Shared {
         &self,
         method: &Method,
         build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, String> {
+    ) -> Result<reqwest::Response, TransportError> {
         let token = match &self.auth {
             HttpAuth::None => None,
             HttpAuth::Bearer(token) => Some(token.clone()),
-            HttpAuth::OAuth(runtime) => Some(runtime.access_token().await?),
+            HttpAuth::OAuth(runtime) => Some(
+                runtime
+                    .access_token()
+                    .await
+                    .map_err(TransportError::unsent)?,
+            ),
         };
         let request = |token: Option<&str>| {
             let mut request = build(self.client.request(method.clone(), &self.url));
@@ -261,10 +274,10 @@ impl Shared {
     async fn post_initialize(
         &self,
         initialize: &Message,
-    ) -> Result<(Message, Option<Arc<str>>), String> {
+    ) -> Result<(Message, Option<Arc<str>>), TransportError> {
         let body = initialize
             .to_vec()
-            .map_err(|error| format!("Deserialize error: {error}"))?;
+            .map_err(|error| TransportError::unsent(format!("Deserialize error: {error}")))?;
         let response = self
             .send(&Method::POST, |request| {
                 request
@@ -278,7 +291,7 @@ impl Shared {
         }
         let status = response.status();
         if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
-            return Err("unexpected server response: expect initialized, accepted".to_owned());
+            return Err("unexpected server response: expect initialized, accepted".into());
         }
         let session_id = response
             .headers()
@@ -296,26 +309,28 @@ impl Shared {
                     session_id,
                 ));
             }
-            return Err(format!("unexpected server response: HTTP {status}: {body}"));
+            return Err(TransportError::with_status(
+                format!("unexpected server response: HTTP {status}: {body}"),
+                status.as_u16(),
+            ));
         }
         if is_mime(content_type.as_deref(), EVENT_STREAM_MIME_TYPE) {
             let mut response = response;
             let mut parser = sse::Parser::new(MAX_SSE_EVENT_BYTES);
             let mut events = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|error| format!("SSE error: {}", client_error(&error)))?
-            {
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                TransportError::new(format!("SSE error: {}", client_error(&error)))
+            })? {
                 parser
                     .feed(&chunk, &mut events)
-                    .map_err(|error| format!("SSE error: {error}"))?;
+                    .map_err(|error| TransportError::new(format!("SSE error: {error}")))?;
                 for event in events.drain(..) {
                     let Some(data) = event.data.filter(|data| !data.trim().is_empty()) else {
                         continue;
                     };
-                    let message = Message::from_slice(data.as_bytes())
-                        .map_err(|error| format!("Deserialize error: {error}"))?;
+                    let message = Message::from_slice(data.as_bytes()).map_err(|error| {
+                        TransportError::new(format!("Deserialize error: {error}"))
+                    })?;
                     if message.is_response() {
                         return Ok((message, session_id));
                     }
@@ -325,7 +340,7 @@ impl Shared {
                     );
                 }
             }
-            return Err("unexpected server response: empty sse stream".to_owned());
+            return Err("unexpected server response: empty sse stream".into());
         }
         if is_mime(content_type.as_deref(), JSON_MIME_TYPE) {
             let body = response
@@ -333,10 +348,12 @@ impl Shared {
                 .await
                 .map_err(|error| client_error(&error))?;
             let message = Message::from_slice(&body)
-                .map_err(|error| format!("Deserialize error: {error}"))?;
+                .map_err(|error| TransportError::new(format!("Deserialize error: {error}")))?;
             return Ok((message, session_id));
         }
-        Err(format!("Unexpected content type: {content_type:?}"))
+        Err(TransportError::new(format!(
+            "Unexpected content type: {content_type:?}"
+        )))
     }
 
     async fn dispatch(self: Arc<Self>, message: Message) {
@@ -349,18 +366,22 @@ impl Shared {
         }
     }
 
-    async fn post_with_recovery(self: &Arc<Self>, message: &Message) -> Result<(), String> {
+    async fn post_with_recovery(self: &Arc<Self>, message: &Message) -> Result<(), TransportError> {
         let state = self.state();
         match self.post(message, &state).await {
             Err(PostError::SessionExpired) if state.initialize.is_some() => {
                 tracing::info!(
                     "session expired (HTTP 404), attempting transparent re-initialization"
                 );
-                self.reinitialize(state.id.clone()).await?;
+                self.reinitialize(state.id.clone()).await.map_err(|error| {
+                    TransportError::with_status(format!("{SESSION_EXPIRED}: {error}"), 404)
+                })?;
                 let state = self.state();
-                self.post(message, &state).await.map_err(String::from)
+                self.post(message, &state)
+                    .await
+                    .map_err(TransportError::from)
             }
-            result => result.map_err(String::from),
+            result => result.map_err(TransportError::from),
         }
     }
 
@@ -377,9 +398,12 @@ impl Shared {
             return Ok(());
         }
         let Some(initialize) = state.initialize else {
-            return Err(String::from(PostError::SessionExpired));
+            return Err(SESSION_EXPIRED.to_owned());
         };
-        let (response, session_id) = self.post_initialize(&initialize).await?;
+        let (response, session_id) = self
+            .post_initialize(&initialize)
+            .await
+            .map_err(|error| error.to_string())?;
         if let Message::Error { error, .. } = &response {
             return Err(format!("MCP re-initialization failed: {error}"));
         }
@@ -390,7 +414,7 @@ impl Shared {
         };
         self.post(&Message::notification(INITIALIZED, None), &state)
             .await
-            .map_err(String::from)?;
+            .map_err(|error| TransportError::from(error).to_string())?;
         self.session.store(Arc::new(state));
         self.restart_listener();
         Ok(())
@@ -415,9 +439,11 @@ impl Shared {
         message: &Message,
         state: &SessionState,
     ) -> Result<(), PostError> {
-        let body = message
-            .to_vec()
-            .map_err(|error| PostError::Failed(format!("Deserialize error: {error}")))?;
+        let body = message.to_vec().map_err(|error| {
+            PostError::Failed(TransportError::unsent(format!(
+                "Deserialize error: {error}"
+            )))
+        })?;
         let session = Self::with_session(state);
         let response = self
             .send(&Method::POST, |request| {
@@ -463,8 +489,9 @@ impl Shared {
                     ),
                 }
             }
-            return Err(PostError::Failed(format!(
-                "unexpected server response: HTTP {status}: {body}"
+            return Err(PostError::Failed(TransportError::with_status(
+                format!("unexpected server response: HTTP {status}: {body}"),
+                status.as_u16(),
             )));
         }
         if is_mime(content_type.as_deref(), EVENT_STREAM_MIME_TYPE) {
@@ -483,9 +510,9 @@ impl Shared {
                         .deliver(with_request_id(reply, message.request_id()));
                     Ok(())
                 }
-                Err(error) if message.is_request() => {
-                    Err(PostError::Failed(format!("Deserialize error: {error}")))
-                }
+                Err(error) if message.is_request() => Err(PostError::Failed(TransportError::new(
+                    format!("Deserialize error: {error}"),
+                ))),
                 Err(error) => {
                     tracing::warn!(
                         "could not parse JSON response as a JSON-RPC message, treating as accepted: {error}"
@@ -495,9 +522,9 @@ impl Shared {
             };
         }
         tracing::error!("unexpected content type: {content_type:?}");
-        Err(PostError::Failed(format!(
+        Err(PostError::Failed(TransportError::new(format!(
             "Unexpected content type: {content_type:?}"
-        )))
+        ))))
     }
 
     async fn follow_response_stream(
@@ -516,13 +543,13 @@ impl Shared {
                 StreamEnd::Response => return Ok(()),
                 StreamEnd::Fatal(error) => {
                     tracing::warn!("fatal sse stream error: {error}");
-                    return Err(PostError::Failed(CLOSED_BEFORE_RESPONSE.to_owned()));
+                    return Err(PostError::Failed(CLOSED_BEFORE_RESPONSE.into()));
                 }
                 _ if cursor.last_event_id.is_none() => {
                     tracing::debug!(
                         "sse response ended before an event ID was received; cannot resume"
                     );
-                    return Err(PostError::Failed(CLOSED_BEFORE_RESPONSE.to_owned()));
+                    return Err(PostError::Failed(CLOSED_BEFORE_RESPONSE.into()));
                 }
                 StreamEnd::Closed => cursor.retry.take().unwrap_or(SSE_RETRY_BASE),
                 StreamEnd::Failed(error) => {
@@ -533,7 +560,7 @@ impl Shared {
             response = self
                 .reconnect(&mut cursor, wait, Some(id))
                 .await
-                .ok_or_else(|| PostError::Failed(CLOSED_BEFORE_RESPONSE.to_owned()))?;
+                .ok_or_else(|| PostError::Failed(CLOSED_BEFORE_RESPONSE.into()))?;
         }
     }
 
@@ -549,7 +576,7 @@ impl Shared {
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => return StreamEnd::Closed,
-                Err(error) => return StreamEnd::Failed(client_error(&error)),
+                Err(error) => return StreamEnd::Failed(client_error(&error).to_string()),
             };
             if let Err(error) = parser.feed(&chunk, &mut events) {
                 return StreamEnd::Fatal(error.to_string());
@@ -629,7 +656,8 @@ impl Shared {
                 }
                 request
             })
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Ok(None);
         }

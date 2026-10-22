@@ -10,4 +10,4 @@ pub use protocol::{
     LATEST_PROTOCOL_VERSION, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     ReadResourceResult, ServerCapabilities, Tool, ToolAnnotations,
 };
-pub use session::{Error, Inbound, Outgoing, Session};
+pub use session::{Error, Inbound, Outgoing, Session, TransportError};
