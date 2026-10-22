@@ -15,6 +15,100 @@ pub(crate) fn environment_section(workspace: &str) -> String {
     lines.join("\n")
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ClaudeEnvironment {
+    working_directory: Option<String>,
+    git_repository: Option<bool>,
+    platform: Option<String>,
+    shell: Option<String>,
+    os_version: Option<String>,
+    date: Option<String>,
+    project_instructions: Option<String>,
+}
+
+impl ClaudeEnvironment {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn working_directory(mut self, directory: impl Into<String>) -> Self {
+        self.working_directory = Some(directory.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn git_repository(mut self, repository: bool) -> Self {
+        self.git_repository = Some(repository);
+        self
+    }
+
+    #[must_use]
+    pub fn platform(mut self, platform: impl Into<String>) -> Self {
+        self.platform = Some(platform.into());
+        self
+    }
+
+    #[must_use]
+    pub fn shell(mut self, shell: impl Into<String>) -> Self {
+        self.shell = Some(shell.into());
+        self
+    }
+
+    #[must_use]
+    pub fn os_version(mut self, version: impl Into<String>) -> Self {
+        self.os_version = Some(version.into());
+        self
+    }
+
+    #[must_use]
+    pub fn date(mut self, date: impl Into<String>) -> Self {
+        self.date = Some(date.into());
+        self
+    }
+
+    #[must_use]
+    pub fn project_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.project_instructions = Some(instructions.into());
+        self
+    }
+
+    pub(crate) fn render(self) -> (String, Option<String>) {
+        let mut lines = vec![
+            "# Environment".to_owned(),
+            "You have been invoked in the following environment: ".to_owned(),
+        ];
+        if let Some(directory) = &self.working_directory {
+            lines.push(format!("Primary working directory: {directory}"));
+        }
+        if let Some(repository) = self.git_repository {
+            lines.push(format!("Is a git repository: {repository}"));
+        }
+        if let Some(platform) = &self.platform {
+            lines.push(format!("Platform: {platform}"));
+        }
+        if let Some(shell) = &self.shell {
+            lines.push(format!("Shell: {shell}"));
+        }
+        if let Some(version) = &self.os_version {
+            lines.push(format!("OS Version: {version}"));
+        }
+        lines.push(format!(
+            "Today's date: {}",
+            self.date.unwrap_or_else(current_date)
+        ));
+        let instructions = self.project_instructions.map(|text| {
+            let heading = self.working_directory.map_or_else(
+                || "# AGENTS.md instructions".to_owned(),
+                |directory| format!("# AGENTS.md instructions for {directory}"),
+            );
+            format!("{heading}\n\n<INSTRUCTIONS>\n{text}\n</INSTRUCTIONS>")
+        });
+        (lines.join("\n"), instructions)
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn project_instructions(workspace: &str) -> Option<String> {
     if workspace.is_empty() {

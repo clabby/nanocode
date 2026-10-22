@@ -9,6 +9,7 @@ pub mod __private {
 pub use nanocode_backend_claude_client::*;
 
 mod environment;
+pub use environment::ClaudeEnvironment;
 mod hooks;
 mod instructions;
 mod prompt;

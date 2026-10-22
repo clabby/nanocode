@@ -614,6 +614,7 @@ pub struct ClaudeBuilder {
     lineage: Option<Lineage>,
     conversation_id: Option<String>,
     system_context: Option<(String, Option<String>)>,
+    environment: Option<crate::ClaudeEnvironment>,
     #[cfg(not(target_family = "wasm"))]
     task_board: Option<Arc<crate::tools::tasks::ClaudeTasks>>,
     initial_developer_notices: Vec<(String, String)>,
@@ -678,6 +679,7 @@ impl ClaudeBuilder {
             lineage: None,
             conversation_id: None,
             system_context: None,
+            environment: None,
             #[cfg(not(target_family = "wasm"))]
             task_board: None,
             initial_developer_notices: Vec::new(),
@@ -961,6 +963,11 @@ impl ClaudeBuilder {
         F: Fn(&str) -> String + Send + Sync + 'static,
     {
         self.system_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    pub fn environment(mut self, environment: crate::ClaudeEnvironment) -> Self {
+        self.environment = Some(environment);
         self
     }
 
@@ -1554,10 +1561,13 @@ impl ClaudeBuilder {
                 .is_empty()
                 .then(|| crate::instructions::default_system_blocks(self.code_only))
         });
-        let (environment, project_instructions) = self.system_context.map_or_else(
-            || (std::sync::OnceLock::new(), std::sync::OnceLock::new()),
-            |(environment, instructions)| (environment.into(), instructions.into()),
-        );
+        let (environment, project_instructions) = self
+            .system_context
+            .or_else(|| self.environment.map(crate::ClaudeEnvironment::render))
+            .map_or_else(
+                || (std::sync::OnceLock::new(), std::sync::OnceLock::new()),
+                |(environment, instructions)| (environment.into(), instructions.into()),
+            );
         let state = Arc::new(State {
             subagent_type: self.subagent_type,
             subagent_type_resolver: self.subagent_type_resolver,
