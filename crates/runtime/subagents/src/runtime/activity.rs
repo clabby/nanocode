@@ -97,6 +97,7 @@ impl Registry {
             }
             if session.descriptor.parent.is_none()
                 && session.status.wakes_parent()
+                && !session.completion_parked
                 && let Some(revision) = session.pending_completion
             {
                 activity.pending_completions.push((id, revision));
