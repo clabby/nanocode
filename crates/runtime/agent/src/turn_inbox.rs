@@ -16,7 +16,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     Agent, AgentRuntime, DurableOutcome, EventSink, NanocodeError, PromptRequest, SessionEvent,
-    SessionEvents, TurnControl,
+    SessionEvents, SteerReceiptStatus, TurnControl,
     durability::{SessionRecord, SessionStore, Sql, StoreError},
     events::{
         AGENT_EVENT_PROTOCOL_VERSION, AcceptedInput, AgentEvent, AgentEventKind, AgentEventTiming,
@@ -82,6 +82,15 @@ pub enum Driven {
     Resumed(String),
     Waiting(String),
     Interrupted(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MovedQueued {
+    Moved,
+    NotQueued,
+    NotRunning,
+    Conflict,
+    Unknown,
 }
 
 #[derive(Clone, Default)]
@@ -486,13 +495,20 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         Ok(Some((record, dequeued)))
     }
 
-    pub async fn steer(&self, id: &str, prompt: Prompt) -> Result<bool, InboxError> {
+    pub async fn steer(
+        &self,
+        target: Option<&str>,
+        id: &str,
+        prompt: Prompt,
+    ) -> Result<bool, InboxError> {
         let live = self.shared.state.read(|state| {
-            state
-                .requests
-                .values()
-                .find(|request| request.running && request.inbox)
-                .and_then(|request| request.control.clone())
+            let steerable =
+                |request: &&Request| request.running && request.inbox && !request.cancelled;
+            match target {
+                Some(target) => state.requests.get(target).filter(steerable),
+                None => state.requests.values().find(steerable),
+            }
+            .and_then(|request| request.control.clone())
         });
         let Some(control) = live else {
             return Ok(false);
@@ -502,6 +518,46 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub async fn move_queued(
+        &self,
+        queued_id: &str,
+        target: Option<&str>,
+    ) -> Result<MovedQueued, InboxError> {
+        let Some(queued) = self.shared.log.turn(queued_id).await? else {
+            return Ok(MovedQueued::NotQueued);
+        };
+        let Some(prompt) = queued
+            .prompt
+            .clone()
+            .filter(|_| queued.state == TurnState::Queued)
+        else {
+            let steered = queued.report()?.get("steered") == Some(&Value::Bool(true));
+            return Ok(if steered {
+                MovedQueued::Moved
+            } else {
+                MovedQueued::NotQueued
+            });
+        };
+        match self
+            .agent
+            .steer_receipt(queued_id.to_owned(), prompt.clone())
+            .await?
+        {
+            SteerReceiptStatus::Accepted => {}
+            SteerReceiptStatus::Absent => {
+                if !self.steer(target, queued_id, prompt).await? {
+                    return Ok(MovedQueued::NotRunning);
+                }
+            }
+            SteerReceiptStatus::Different | SteerReceiptStatus::Withdrawn => {
+                return Ok(MovedQueued::Conflict);
+            }
+            SteerReceiptStatus::Unknown => return Ok(MovedQueued::Unknown),
+        }
+        self.withdraw_steered(&queued).await?;
+        Ok(MovedQueued::Moved)
     }
 
     pub async fn settle(&self) -> Result<bool, InboxError> {
@@ -531,7 +587,33 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             .map_err(InboxError::Events)
     }
 
+    async fn withdraw_steered(
+        &self,
+        queued: &TurnRecord,
+    ) -> Result<Option<TurnRecord>, InboxError> {
+        let Some((record, event)) = self
+            .shared
+            .log
+            .withdraw_steered(&queued.request_id, &queued.digest)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.publish(event).await?;
+        Ok(Some(record))
+    }
+
     async fn run(&self, id: &str, accepted: bool) -> Result<Driven, InboxError> {
+        if !accepted
+            && let Some(queued) = self.shared.log.turn(id).await?
+            && queued.state == TurnState::Queued
+            && let Some(prompt) = queued.prompt.clone()
+            && self.agent.steer_receipt(id.to_owned(), prompt).await?
+                == SteerReceiptStatus::Accepted
+            && let Some(record) = self.withdraw_steered(&queued).await?
+        {
+            return Ok(Driven::Finished(record));
+        }
         let Some(Started {
             previous,
             record,

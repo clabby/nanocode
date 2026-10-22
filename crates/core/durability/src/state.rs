@@ -423,6 +423,11 @@ impl JournalState {
     }
 
     #[must_use]
+    pub const fn receipts_loaded(&self) -> bool {
+        self.unloaded == 0
+    }
+
+    #[must_use]
     pub fn has_operations(&self) -> bool {
         !self.operations.is_empty() || !self.sealed.is_empty()
     }
