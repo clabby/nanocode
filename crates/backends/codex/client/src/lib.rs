@@ -85,6 +85,8 @@ pub(crate) use tower::{attempt, middleware, service, service_error, stream};
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use transport::connector;
 
+pub use client::session::compaction::auto_compact_token_limit;
+
 pub(crate) use transport::http;
 
 pub(crate) use transport::{socket, telemetry};
