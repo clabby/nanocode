@@ -39,6 +39,7 @@ impl Drop for SideQuestionLease {
 struct DeliveryCommand {
     message: AgentMessage,
     committed: Option<oneshot::Receiver<()>>,
+    restored: bool,
     response: oneshot::Sender<std::io::Result<MessageDisposition>>,
 }
 
@@ -181,22 +182,42 @@ impl HarnessHandle {
     ) -> std::io::Result<EnqueuedDelivery> {
         let (response, result) = oneshot::channel();
         let (committed, wait_for_commit) = oneshot::channel();
-        let command = DeliveryCommand {
+        self.send_delivery(DeliveryCommand {
             message,
             committed: Some(wait_for_commit),
+            restored: false,
             response,
-        };
+        })?;
+        Ok(EnqueuedDelivery {
+            committed,
+            response: result,
+        })
+    }
+
+    pub(super) async fn redeliver(
+        &self,
+        message: AgentMessage,
+    ) -> std::io::Result<MessageDisposition> {
+        let (response, result) = oneshot::channel();
+        self.send_delivery(DeliveryCommand {
+            message,
+            committed: None,
+            restored: true,
+            response,
+        })?;
+        result
+            .await
+            .map_err(|_| std::io::Error::other("subagent harness stopped before responding"))?
+    }
+
+    fn send_delivery(&self, command: DeliveryCommand) -> std::io::Result<()> {
         let sender = match command.message.priority {
             MessagePriority::Deferred => &self.deferred,
             MessagePriority::Urgent => &self.urgent,
         };
         sender
             .send(command)
-            .map_err(|_| std::io::Error::other("subagent harness is closed"))?;
-        Ok(EnqueuedDelivery {
-            committed,
-            response: result,
-        })
+            .map_err(|_| std::io::Error::other("subagent harness is closed"))
     }
 
     async fn request(
@@ -525,7 +546,9 @@ impl Harness {
         if !command.wait_for_commit().await {
             return;
         }
-        if let Some(registry) = self.registry.upgrade() {
+        if !command.restored
+            && let Some(registry) = self.registry.upgrade()
+        {
             registry
                 .message_rejected(&self.root_session_id, command.message.id)
                 .await;

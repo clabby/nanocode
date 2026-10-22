@@ -15,8 +15,10 @@ use super::{
 };
 use futures_util::future::join_all;
 use nanocode_agent_core::{
-    Agent, AgentEvents, AgentHandle, AgentUsage, ModelSelection, NanocodeError, ReasoningMode,
-    Result as AgentResult, SessionCheckpoint, Thinking, TurnResult, events::AgentEventKind,
+    Agent, AgentEvents, AgentHandle, AgentUsage, ExecutionPolicyDisposition, ModelSelection,
+    NanocodeError, PromptRoute, ReasoningMode, Result as AgentResult, SessionCheckpoint, Thinking,
+    TurnResult, WeakAgent,
+    events::{AgentEventKind, RunStatus},
 };
 use nanocode_platform::Instant;
 use nanocode_schema::Validator;
@@ -69,6 +71,10 @@ pub(super) struct ChildSession {
     pub(super) in_flight_omitted: u32,
 
     pub(super) pending_completion: Option<u64>,
+
+    pub(super) completion_attempt: u32,
+
+    pub(super) completion_parked: bool,
 
     pub(super) settled_revision: Option<u64>,
 
@@ -224,6 +230,8 @@ pub struct Registry {
 
     completion_retries: Atom<HashMap<(String, AgentId), (u32, bool)>>,
     completion_dispatch: Atom<HashMap<(String, AgentId), Sequencer>>,
+    completion_routes: Atom<HashMap<(String, AgentId), u64>>,
+    parked_watches: Atom<HashSet<String>>,
 
     parent_resolver: Atom<Option<ParentResolver>>,
 
@@ -264,6 +272,86 @@ pub fn completion_continuation_prompt(id: AgentId, status: &AgentStatus) -> Stri
 
 fn completion_retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(1000_u64 << attempt.clamp(1, 9)).min(Duration::from_secs(300))
+}
+
+enum NoticeOutcome {
+    Read,
+    Unread,
+    Pending,
+    Cancelled,
+    Stopped,
+}
+
+impl NoticeOutcome {
+    fn of_turn(result: AgentResult<TurnResult>) -> Self {
+        let Err(error) = result else {
+            return Self::Read;
+        };
+        match (&error, error.execution_policy_disposition()) {
+            (NanocodeError::TurnCancelled, _) => Self::Cancelled,
+            (NanocodeError::AgentStopped | NanocodeError::TurnStopped, _)
+            | (_, Some(ExecutionPolicyDisposition::Reopen)) => Self::Stopped,
+            (_, Some(ExecutionPolicyDisposition::Retry)) => Self::Pending,
+            _ => Self::Unread,
+        }
+    }
+
+    async fn of_steer(mut events: AgentEvents, request_id: &str) -> Self {
+        let mut carrier = None;
+        while let Some(event) = events.recv().await {
+            let steered = event.kind == AgentEventKind::RunSteered;
+            if !steered
+                && !matches!(
+                    event.kind,
+                    AgentEventKind::RunCompleted | AgentEventKind::RunFailed
+                )
+            {
+                continue;
+            }
+            let Ok(run) = event.decode_payload::<RootRunEvent>() else {
+                continue;
+            };
+            if steered {
+                if run.message_id.as_deref() == Some(request_id) {
+                    carrier = run.turn_id;
+                }
+                continue;
+            }
+            if carrier.is_some() && carrier != run.turn_id {
+                continue;
+            }
+            return match run.status {
+                Some(RunStatus::Completed) if carrier.is_some() => Self::Read,
+                Some(RunStatus::Cancelled) => Self::Cancelled,
+                _ => Self::Unread,
+            };
+        }
+        Self::Stopped
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RootRunEvent {
+    #[serde(default)]
+    turn_id: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    status: Option<RunStatus>,
+}
+
+impl RootRunEvent {
+    fn starts_user_turn(&self) -> bool {
+        self.kind.as_deref() == Some("prompt")
+            && self
+                .request_id
+                .as_deref()
+                .is_none_or(|id| !id.starts_with(crate::COMPLETION_REQUEST_PREFIX))
+    }
 }
 
 #[derive(Default)]
@@ -1436,6 +1524,8 @@ impl Registry {
             status_queues: Atom::default(),
             completion_retries: Atom::default(),
             completion_dispatch: Atom::default(),
+            completion_routes: Atom::default(),
+            parked_watches: Atom::default(),
             parent_resolver: Atom::default(),
             spawn_policy: Atom::default(),
         }
@@ -1552,6 +1642,7 @@ impl Registry {
                 .announce_restored_completions(&root, &completed)
                 .await;
             registry.changed();
+            let pending = registry.pending_messages(&root).await;
             for (id, result) in registry.resume_interrupted(&root).await {
                 if let Err(error) = result {
                     tracing::warn!(%id, %error, "could not resume restored subagent");
@@ -1566,6 +1657,7 @@ impl Registry {
                         .await;
                 }
             }
+            registry.redeliver_messages(&root, pending).await;
             let _ = ready.send(RestorationState::Ready);
         }));
     }
@@ -2672,8 +2764,8 @@ impl Registry {
             let settled = session.next_instruction_revision;
             session.settled_revision = Some(settled);
             let completion = session.descriptor.parent.is_none().then_some(settled);
-            if completion.is_some() {
-                session.pending_completion = completion;
+            if let Some(revision) = completion {
+                session.settle_completion(revision);
             }
             (session.status.clone(), completion)
         };
@@ -2952,7 +3044,7 @@ impl Registry {
                 .and_then(|scope| scope.sessions.get_mut(&id))
             {
                 Some(session) if session.pending_completion == Some(revision) => {
-                    session.pending_completion = None;
+                    session.clear_completion();
                     true
                 }
                 _ => false,
@@ -3147,6 +3239,8 @@ impl Registry {
                 in_flight_calls: Vec::new(),
                 in_flight_omitted: 0,
                 pending_completion: None,
+                completion_attempt: 0,
+                completion_parked: false,
                 settled_revision: None,
                 usage: AgentUsage::default(),
                 in_flight_progress: durable::OmittedProgress::default(),
@@ -3384,8 +3478,8 @@ impl Registry {
 
             let completion = (session.status.wakes_parent() && session.descriptor.parent.is_none())
                 .then_some(settled);
-            if completion.is_some() {
-                session.pending_completion = completion;
+            if let Some(revision) = completion {
+                session.settle_completion(revision);
             }
             (session.status.clone(), completion, harness)
         };
@@ -3587,11 +3681,26 @@ impl Registry {
                 .clone()
         });
         let _dispatch = dispatch.enter().await;
+        let key = (root_session_id.to_owned(), id);
         if self
-            .peek_completion(root_session_id, id, revision)
-            .await
-            .is_none()
+            .completion_routes
+            .read(|routes| routes.get(&key) == Some(&revision))
         {
+            return Ok(false);
+        }
+        let Some((_, _, _, parked)) = self.peek_completion(root_session_id, id, revision).await
+        else {
+            return Ok(false);
+        };
+        if parked
+            || self
+                .park_completion(root_session_id, id, revision, false)
+                .await
+        {
+            self.watch_for_user_turn(root_session_id, parent);
+            if !parked && self.store_for(root_session_id).is_some() {
+                self.persist_durably(root_session_id).await?;
+            }
             return Ok(false);
         }
         if self.store_for(root_session_id).is_some()
@@ -3600,38 +3709,58 @@ impl Registry {
             self.retry_completion(root_session_id, id, revision);
             return Err(error);
         }
-        let Some((status, session_id)) = self.peek_completion(root_session_id, id, revision).await
+        let Some((status, session_id, attempt, _)) =
+            self.peek_completion(root_session_id, id, revision).await
         else {
             return Ok(false);
         };
+        let request_id = match attempt {
+            0 => format!(
+                "{}{session_id}:{revision}",
+                crate::COMPLETION_REQUEST_PREFIX
+            ),
+            attempt => format!(
+                "{}{session_id}:{revision}:{attempt}",
+                crate::COMPLETION_REQUEST_PREFIX
+            ),
+        };
+        let events = parent.subscribe();
         match parent
             .route_prompt_request(
                 nanocode_agent_core::PromptRequest::new(completion_continuation_prompt(
                     id, &status,
                 ))
-                .request_id(format!(
-                    "{}{session_id}:{revision}",
-                    crate::COMPLETION_REQUEST_PREFIX
-                )),
+                .request_id(request_id.clone()),
             )
             .await
         {
-            Ok(_) => {
+            Ok(route) => {
                 self.wait_reported.update(|reported| {
                     reported.insert(
                         (root_session_id.to_owned(), id),
                         wait_mark(&status, revision),
                     );
                 });
-                self.acknowledge_completion(root_session_id, id, revision)
-                    .await;
-                if self.store_for(root_session_id).is_some()
-                    && let Err(error) = self.persist_durably(root_session_id).await
-                {
-                    self.restore_completion(root_session_id, id, revision).await;
-                    self.retry_completion(root_session_id, id, revision);
-                    return Err(error);
-                }
+                self.completion_routes.update(|routes| {
+                    routes.insert(key.clone(), revision);
+                });
+                let registry = Arc::downgrade(self);
+                let parent = parent.downgrade();
+                drop(platform::spawn(async move {
+                    let outcome = match route {
+                        PromptRoute::Started(turn) => {
+                            drop(events);
+                            NoticeOutcome::of_turn(turn.result().await)
+                        }
+                        PromptRoute::Steered => NoticeOutcome::of_steer(events, &request_id).await,
+                    };
+                    let Some(registry) = registry.upgrade() else {
+                        return;
+                    };
+                    registry
+                        .settle_notice(&key.0, id, revision, outcome, &parent)
+                        .await;
+                }));
                 Ok(true)
             }
             Err(error) => {
@@ -3651,7 +3780,7 @@ impl Registry {
         root_session_id: &str,
         id: AgentId,
         revision: u64,
-    ) -> Option<(AgentStatus, String)> {
+    ) -> Option<(AgentStatus, String, u32, bool)> {
         let state = self.state.acquire().await;
         state
             .scopes
@@ -3664,8 +3793,184 @@ impl Registry {
                 (
                     session.status.clone(),
                     session.descriptor.session_id.clone(),
+                    session.completion_attempt,
+                    session.completion_parked,
                 )
             })
+    }
+
+    async fn settle_notice(
+        self: &Arc<Self>,
+        root_session_id: &str,
+        id: AgentId,
+        revision: u64,
+        outcome: NoticeOutcome,
+        parent: &WeakAgent,
+    ) {
+        self.completion_routes.update(|routes| {
+            let key = (root_session_id.to_owned(), id);
+            if routes.get(&key) == Some(&revision) {
+                routes.remove(&key);
+            }
+        });
+        match outcome {
+            NoticeOutcome::Read => {
+                self.acknowledge_completion(root_session_id, id, revision)
+                    .await;
+                if self.store_for(root_session_id).is_some()
+                    && let Err(error) = self.persist_durably(root_session_id).await
+                {
+                    tracing::warn!(%error, %id, revision, "subagent completion acknowledgement was not journaled");
+                    self.restore_completion(root_session_id, id, revision).await;
+                    self.retry_completion(root_session_id, id, revision);
+                }
+            }
+            NoticeOutcome::Unread => {
+                self.next_completion_attempt(root_session_id, id, revision)
+                    .await;
+                self.retry_completion(root_session_id, id, revision);
+            }
+            NoticeOutcome::Pending => self.retry_completion(root_session_id, id, revision),
+            NoticeOutcome::Cancelled => {
+                if !self
+                    .park_completion(root_session_id, id, revision, true)
+                    .await
+                {
+                    return;
+                }
+                if let Some(parent) = parent.upgrade() {
+                    self.watch_for_user_turn(root_session_id, &parent);
+                }
+                if self.store_for(root_session_id).is_some()
+                    && let Err(error) = self.persist_durably(root_session_id).await
+                {
+                    tracing::warn!(%error, %id, revision, "parked subagent completion was not journaled");
+                }
+            }
+            NoticeOutcome::Stopped => {}
+        }
+    }
+
+    async fn next_completion_attempt(&self, root_session_id: &str, id: AgentId, revision: u64) {
+        let mut state = self.state.acquire().await;
+        if let Some(scope) = state.scopes.get_mut(root_session_id)
+            && scope
+                .sessions
+                .get(&id)
+                .is_some_and(|session| session.pending_completion == Some(revision))
+            && let Some(session) = scope.sessions.get_mut(&id)
+        {
+            session.completion_attempt = session.completion_attempt.saturating_add(1);
+        }
+    }
+
+    async fn park_completion(
+        &self,
+        root_session_id: &str,
+        id: AgentId,
+        revision: u64,
+        cancelled: bool,
+    ) -> bool {
+        let parked = {
+            let mut state = self.state.acquire().await;
+            let Some(scope) = state.scopes.get_mut(root_session_id) else {
+                return false;
+            };
+            let lineage = cancelled
+                || scope.sessions.values().any(|session| {
+                    session.completion_parked && session.pending_completion.is_some()
+                });
+            let pending = scope
+                .sessions
+                .get(&id)
+                .is_some_and(|session| session.pending_completion == Some(revision));
+            if lineage
+                && pending
+                && let Some(session) = scope.sessions.get_mut(&id)
+            {
+                session.completion_parked = true;
+                true
+            } else {
+                false
+            }
+        };
+        if parked {
+            self.completion_retries.update(|retries| {
+                retries.remove(&(root_session_id.to_owned(), id));
+            });
+            self.changed();
+        }
+        parked
+    }
+
+    fn watch_for_user_turn(self: &Arc<Self>, root_session_id: &str, parent: &Agent) {
+        let root = root_session_id.to_owned();
+        let watching = self.parked_watches.try_update(|watches| {
+            if watches.contains(&root) {
+                return None;
+            }
+            watches.insert(root.clone());
+            Some(())
+        });
+        if watching.is_none() {
+            return;
+        }
+        let mut events = parent.subscribe();
+        let registry = Arc::downgrade(self);
+        drop(platform::spawn(async move {
+            let started = loop {
+                let Some(event) = events.recv().await else {
+                    break false;
+                };
+                if event.kind == AgentEventKind::InputAccepted
+                    && event
+                        .decode_payload::<RootRunEvent>()
+                        .is_ok_and(|input| input.starts_user_turn())
+                {
+                    break true;
+                }
+            };
+            drop(events);
+            let Some(registry) = registry.upgrade() else {
+                return;
+            };
+            registry.parked_watches.update(|watches| {
+                watches.remove(&root);
+            });
+            if started {
+                registry.unpark_completions(&root).await;
+            }
+        }));
+    }
+
+    async fn unpark_completions(&self, root_session_id: &str) {
+        let unparked = {
+            let mut state = self.state.acquire().await;
+            let Some(scope) = state.scopes.get_mut(root_session_id) else {
+                return;
+            };
+            let ids = scope
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.completion_parked)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| {
+                    let session = scope.sessions.get_mut(&id)?;
+                    session.completion_parked = false;
+                    session.completion_attempt = session.completion_attempt.saturating_add(1);
+                    session.pending_completion.map(|revision| (id, revision))
+                })
+                .collect::<Vec<_>>()
+        };
+        if unparked.is_empty() {
+            return;
+        }
+        self.changed();
+        for (id, revision) in unparked {
+            self.schedule_parent_continuation(root_session_id, id, revision);
+        }
     }
 
     async fn restore_completion(&self, root_session_id: &str, id: AgentId, revision: u64) {
@@ -3694,7 +3999,12 @@ impl Registry {
                 .copied()
                 .filter(|id| {
                     scope.sessions.get_mut(id).is_some_and(|session| {
-                        session.status.wakes_parent() && session.pending_completion.take().is_some()
+                        let observed =
+                            session.status.wakes_parent() && session.pending_completion.is_some();
+                        if observed {
+                            session.clear_completion();
+                        }
+                        observed
                     })
                 })
                 .collect::<Vec<_>>()
@@ -3947,6 +4257,14 @@ impl Registry {
                     .acquire()
                     .await
                     .rollback_message(&prepared.root_session_id, prepared.message.id);
+                if self.store_for(&prepared.root_session_id).is_some()
+                    && let Err(persist) = self.persist_durably(&prepared.root_session_id).await
+                {
+                    return Err(std::io::Error::new(
+                        persist.kind(),
+                        format!("{error}; the refused message stays journaled: {persist}"),
+                    ));
+                }
                 return Err(error);
             }
         };
@@ -3960,6 +4278,60 @@ impl Registry {
             to_agent_id: prepared.message.to,
             disposition,
         })
+    }
+
+    async fn pending_messages(&self, root_session_id: &str) -> Vec<AgentMessage> {
+        self.state
+            .acquire()
+            .await
+            .scopes
+            .get(root_session_id)
+            .map(|scope| scope.messages.pending_messages())
+            .unwrap_or_default()
+    }
+
+    async fn redeliver_messages(
+        self: &Arc<Self>,
+        root_session_id: &str,
+        messages: Vec<AgentMessage>,
+    ) {
+        if messages.is_empty() {
+            return;
+        }
+        for message in messages {
+            let id = message.id;
+            if let Err(error) = self.redeliver_message(root_session_id, message).await {
+                self.message_failed(
+                    root_session_id,
+                    id,
+                    format!("message {id} could not be delivered after a runtime restart: {error}"),
+                )
+                .await;
+            }
+        }
+        if self.store_for(root_session_id).is_some()
+            && let Err(error) = self.persist_durably(root_session_id).await
+        {
+            tracing::warn!(%error, root_session_id, "redelivered subagent messages are not journaled yet");
+        }
+    }
+
+    async fn redeliver_message(
+        self: &Arc<Self>,
+        root_session_id: &str,
+        message: AgentMessage,
+    ) -> std::io::Result<MessageDisposition> {
+        let locks = self.session_locks(root_session_id).await;
+        let _residency_guard = locks.residency.enter().await;
+        let _message_guard = locks.message.enter().await;
+        self.rehydrate(root_session_id, message.to, MessagePurpose::Coordinate)
+            .await?;
+        let harness = self
+            .state
+            .acquire()
+            .await
+            .harness_in_scope(root_session_id, message.to)?;
+        harness.redeliver(message).await
     }
 
     pub(super) async fn message_admitted(
@@ -4666,12 +5038,26 @@ impl ChildSession {
             in_flight_calls: Vec::new(),
             in_flight_omitted: 0,
             pending_completion: None,
+            completion_attempt: 0,
+            completion_parked: false,
             settled_revision: None,
             usage: AgentUsage::default(),
             in_flight_progress: durable::OmittedProgress::default(),
             announce: true,
             journal_generation: 0,
         }
+    }
+
+    const fn settle_completion(&mut self, revision: u64) {
+        self.pending_completion = Some(revision);
+        self.completion_attempt = 0;
+        self.completion_parked = false;
+    }
+
+    const fn clear_completion(&mut self) {
+        self.pending_completion = None;
+        self.completion_attempt = 0;
+        self.completion_parked = false;
     }
 
     pub(super) fn summary(&self) -> AgentSummary {

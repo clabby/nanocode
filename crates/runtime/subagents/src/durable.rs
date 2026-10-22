@@ -382,6 +382,10 @@ struct AgentRecord {
     settled_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "AgentUsage::is_empty")]
     usage: AgentUsage,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    completion_attempt: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    completion_parked: bool,
 }
 
 fn encode_agent(
@@ -411,6 +415,8 @@ fn encode_agent(
         pending_completion: agent.pending_completion,
         settled_revision: agent.settled_revision,
         usage: agent.usage,
+        completion_attempt: agent.completion_attempt,
+        completion_parked: agent.completion_parked,
     })?;
     records.push((Arc::clone(&key), json));
     Ok(key)
@@ -457,6 +463,8 @@ pub(super) async fn load_agent(
         pending_completion: record.pending_completion,
         settled_revision: record.settled_revision,
         usage: record.usage,
+        completion_attempt: record.completion_attempt,
+        completion_parked: record.completion_parked,
     };
     agent.expand();
     Ok(agent)
@@ -632,6 +640,12 @@ pub(super) struct PersistedAgent {
 
     #[serde(default, skip_serializing_if = "AgentUsage::is_empty")]
     pub(super) usage: AgentUsage,
+
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) completion_attempt: u32,
+
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) completion_parked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1002,6 +1016,8 @@ pub(super) fn persist_agent(
         pending_completion: session.pending_completion,
         settled_revision: session.settled_revision,
         usage: session.usage.clone(),
+        completion_attempt: session.completion_attempt,
+        completion_parked: session.completion_parked,
     })
 }
 
@@ -1175,6 +1191,10 @@ pub(super) fn restored_session(
     } else {
         pending_completion
     };
+    if root_child && !completed_by_acceptance && session.pending_completion.is_some() {
+        session.completion_attempt = agent.completion_attempt;
+        session.completion_parked = agent.completion_parked;
+    }
     session.journaled_runtime = journaled;
 
     if in_flight {
