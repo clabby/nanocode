@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -7,19 +9,19 @@ pub(crate) const JSON_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 
 pub(crate) const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 
-#[derive(Debug, Default, Clone, Serialize)]
-pub(crate) struct ReceiptTiming {
-    pub(crate) scheduler_ms: f64,
-    pub(crate) execution_gate_ms: f64,
-    pub(crate) execution_ms: f64,
-    pub(crate) result_encode_ms: f64,
-    pub(crate) result_queue_ms: f64,
-    pub(crate) host_elapsed_ms: f64,
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReceiptTiming {
+    pub scheduler_ms: f64,
+    pub execution_gate_ms: f64,
+    pub execution_ms: f64,
+    pub result_encode_ms: f64,
+    pub result_queue_ms: f64,
+    pub host_elapsed_ms: f64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum DiagnosticStage {
+pub enum DiagnosticStage {
     Received,
     ExecutionStarted,
     ExecutionFinished,
@@ -27,7 +29,8 @@ pub(crate) enum DiagnosticStage {
 }
 
 impl DiagnosticStage {
-    pub(crate) const fn name(self) -> &'static str {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Received => "received",
             Self::ExecutionStarted => "execution_started",
@@ -37,58 +40,73 @@ impl DiagnosticStage {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStatus {
+    Running,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ExecutorFrame<'a> {
+pub enum RunnerFrame<'a> {
     Catalog {
-        capabilities: [&'static str; 1],
-        runtime_id: &'a str,
+        capabilities: Vec<Cow<'a, str>>,
+        runtime_id: Cow<'a, str>,
         command_recovery: bool,
         turn_lifecycle: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnostics: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        connection_id: Option<&'a str>,
-        tools: &'a Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        machines: Option<&'a [AttachmentMachine]>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        attachment_id: Option<&'a str>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_id: Option<Cow<'a, str>>,
+        tools: Cow<'a, Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machines: Option<Cow<'a, [AttachmentMachine]>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment_id: Option<Cow<'a, str>>,
     },
     Diagnostic {
-        call_id: &'a str,
+        call_id: Cow<'a, str>,
         stage: DiagnosticStage,
         elapsed_ms: f64,
     },
     Result {
-        call_id: &'a str,
-        outcome: &'a Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        timing: Option<&'a ReceiptTiming>,
+        call_id: Cow<'a, str>,
+        outcome: Cow<'a, Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timing: Option<ReceiptTiming>,
     },
     Status {
-        call_id: &'a str,
-        state: &'static str,
+        call_id: Cow<'a, str>,
+        state: CommandStatus,
     },
     Drain {},
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentCall {
+    pub session_id: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_turn_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub turn_id: Option<String>,
+    pub call_id: String,
+    pub model: String,
+    pub name: String,
+    pub input: Value,
+    pub output_token_budget: u64,
+    pub output_byte_budget: u64,
+    pub deadline_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum RemoteFrame {
+pub enum EndpointFrame {
     Ready {},
-    Call {
-        session_id: String,
-        #[serde(default, deserialize_with = "deserialize_turn_id")]
-        turn_id: Option<String>,
-        call_id: String,
-        model: String,
-        name: String,
-        input: Value,
-        output_token_budget: u64,
-        output_byte_budget: u64,
-        deadline_at: u64,
-    },
+    Call(AttachmentCall),
     TurnEnded {
         session_id: String,
         turn_id: String,
@@ -106,8 +124,9 @@ pub(crate) enum RemoteFrame {
     Draining {},
 }
 
-impl RemoteFrame {
-    pub(crate) const fn kind(&self) -> &'static str {
+impl EndpointFrame {
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
         match self {
             Self::Ready {} => "ready",
             Self::Call { .. } => "call",
@@ -119,7 +138,7 @@ impl RemoteFrame {
         }
     }
 
-    pub(crate) fn parse(text: &str) -> Result<Self, &'static str> {
+    pub fn parse(text: &str) -> Result<Self, &'static str> {
         let frame: Self = serde_json::from_str(text).map_err(|_| "invalid attachment frame")?;
         frame.validate()?;
         Ok(frame)
@@ -128,7 +147,7 @@ impl RemoteFrame {
     fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Ready {} | Self::Draining {} => Ok(()),
-            Self::Call {
+            Self::Call(AttachmentCall {
                 session_id,
                 turn_id,
                 call_id,
@@ -138,7 +157,7 @@ impl RemoteFrame {
                 output_token_budget,
                 output_byte_budget,
                 deadline_at,
-            } => {
+            }) => {
                 if !valid_identifier(session_id)
                     || turn_id
                         .as_ref()

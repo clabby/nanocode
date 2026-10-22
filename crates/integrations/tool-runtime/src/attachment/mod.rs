@@ -12,6 +12,9 @@ pub(crate) mod process_routes;
 mod protocol;
 pub(crate) use driver::{INITIAL_TRANSPORT_BACKOFF, STABLE_CONNECTION};
 pub(crate) use protocol::HEARTBEAT_INTERVAL;
+pub use protocol::{
+    AttachmentCall, CommandStatus, DiagnosticStage, EndpointFrame, ReceiptTiming, RunnerFrame,
+};
 
 pub(crate) fn reconnect_delay(backoff: &mut std::time::Duration) -> std::time::Duration {
     driver::Failure::Transport.delay(backoff, None)
@@ -40,7 +43,8 @@ const MAX_MACHINE_WORKSPACE_BYTES: usize = 1024;
 const MAX_MACHINE_CAPABILITIES: usize = 64;
 const MAX_MACHINE_CAPABILITY_BYTES: usize = 64;
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "MachineWire")]
 pub struct AttachmentMachine {
     id: Box<str>,
     name: Box<str>,
@@ -114,6 +118,11 @@ impl AttachmentMachine {
     }
 
     #[must_use]
+    pub const fn resources(&self) -> Option<&AttachmentResourceObservation> {
+        self.resources.as_ref()
+    }
+
+    #[must_use]
     pub const fn with_resources(mut self, resources: AttachmentResourceObservation) -> Self {
         self.resources = Some(resources);
         self
@@ -140,7 +149,29 @@ impl AttachmentMachine {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(serde::Deserialize)]
+struct MachineWire {
+    id: String,
+    name: String,
+    workspace: String,
+    capabilities: Vec<String>,
+    #[serde(default)]
+    resources: Option<AttachmentResourceObservation>,
+}
+
+impl TryFrom<MachineWire> for AttachmentMachine {
+    type Error = AttachmentError;
+
+    fn try_from(wire: MachineWire) -> Result<Self, Self::Error> {
+        let machine = Self::new(wire.id, wire.name, wire.workspace, wire.capabilities)?;
+        Ok(match wire.resources {
+            Some(resources) => machine.with_resources(resources),
+            None => machine,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttachmentResourceObservation {
     pub observed_at_ms: u64,
 

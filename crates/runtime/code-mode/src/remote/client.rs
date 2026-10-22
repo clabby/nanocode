@@ -21,8 +21,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    HAND_RESTARTED, ReceivedCalls, RemoteCodeModeHost, RemoteContext, RemoteFrame as Frame,
-    RemoteOperation, RemoteTransport, output_to_wire,
+    HAND_RESTARTED, NOT_RECEIVED, ReceivedCalls, RemoteCodeModeHost, RemoteContext,
+    RemoteFrame as Frame, RemoteOperation, RemoteTransport, output_to_wire,
 };
 use crate::{
     Tool, ToolDefinition, ToolInput,
@@ -31,6 +31,8 @@ use crate::{
 
 pub const PEER_CLOSED: &str = "runner disconnected";
 pub const LOCAL_CLOSED: &str = "remote connection closed";
+
+pub type ResumedReply = HostFuture<'static, Result<Option<Value>, CodeModeHostError>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoteDelivery {
@@ -124,6 +126,49 @@ fn error(value: impl std::fmt::Display) -> CodeModeHostError {
     CodeModeHostError::new(value.to_string())
 }
 
+fn replied(message: String) -> CodeModeHostError {
+    if message == NOT_RECEIVED {
+        CodeModeHostError::unsent(message)
+    } else {
+        CodeModeHostError::new(message)
+    }
+}
+
+struct Resumed {
+    client: Weak<Client>,
+    id: u64,
+}
+
+impl Drop for Resumed {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.upgrade() {
+            client.pending.update(|pending| {
+                pending.remove(&self.id);
+            });
+        }
+    }
+}
+
+fn resumed(
+    client: Weak<Client>,
+    id: u64,
+    mut replies: mpsc::UnboundedReceiver<Frame>,
+) -> ResumedReply {
+    Box::pin(async move {
+        let _resumed = Resumed { client, id };
+        while let Some(frame) = replies.recv().await {
+            match frame {
+                Frame::Reply { result, .. } => return result.map_err(replied),
+                Frame::Update { .. } => {}
+                _ => return Err(error("unexpected operation reply")),
+            }
+        }
+        Err(error(
+            "remote reply channel closed; operation outcome unknown",
+        ))
+    })
+}
+
 fn origin(call_id: &str) -> &str {
     call_id
         .rsplit_once("/code-")
@@ -173,21 +218,47 @@ impl RemoteClient {
         link: impl RemoteLink,
         operation_timeout: Option<Duration>,
     ) -> (Self, HostFuture<'static, String>) {
+        let (client, driver, _) = Self::resuming(link, operation_timeout, Vec::new());
+        (client, driver)
+    }
+
+    pub fn resuming(
+        link: impl RemoteLink,
+        operation_timeout: Option<Duration>,
+        pending: Vec<u64>,
+    ) -> (Self, HostFuture<'static, String>, Vec<(u64, ResumedReply)>) {
         let (outgoing, frames) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel();
         let max_frame_bytes = link.max_frame_bytes();
         let resumes = link.resumes();
+        let mut waiters = HashMap::new();
+        let mut receivers = Vec::new();
         if resumes.is_some() {
-            let _ = outgoing.send((
-                Frame::Resume {
-                    pending: Vec::new(),
-                },
-                RemoteDelivery::Immediate,
-            ));
+            for id in &pending {
+                let (replies, receiver) = mpsc::unbounded_channel();
+                waiters.insert(
+                    *id,
+                    Waiter {
+                        replies,
+                        written: Arc::new(AtomicBool::new(true)),
+                    },
+                );
+                receivers.push((*id, receiver));
+            }
+            let _ = outgoing.send((Frame::Resume { pending }, RemoteDelivery::Immediate));
+        } else {
+            for id in pending {
+                let (replies, receiver) = mpsc::unbounded_channel();
+                let _ = replies.send(Frame::Reply {
+                    id,
+                    result: Err(HAND_RESTARTED.to_owned()),
+                });
+                receivers.push((id, receiver));
+            }
         }
         let client = Arc::new(Client {
             outgoing,
-            pending: Atom::default(),
+            pending: Atom::new(waiters),
             callbacks: Atom::default(),
             running: Atom::default(),
             next: AtomicU64::new(nanocode_platform::uuid_v4().as_u64_pair().0 >> 12),
@@ -199,8 +270,12 @@ impl RemoteClient {
             resumes,
             _stop: stop,
         });
+        let resumed = receivers
+            .into_iter()
+            .map(|(id, receiver)| (id, resumed(Arc::downgrade(&client), id, receiver)))
+            .collect();
         let driver = Box::pin(drive(Arc::downgrade(&client), link, frames, stopped));
-        (Self { client }, driver)
+        (Self { client }, driver, resumed)
     }
 
     #[must_use]
@@ -722,7 +797,7 @@ impl RemoteTransport for RemoteClient {
                     match frame {
                         Frame::Reply { result, .. } => {
                             return result
-                                .map_err(error)?
+                                .map_err(replied)?
                                 .map(|mut value| {
                                     received.execution(&mut value)?;
                                     serde_json::from_value::<CodeModeExecution>(value)
@@ -807,7 +882,7 @@ impl RemoteTransport for RemoteClient {
                     match frame {
                         Frame::Reply { result, .. } => {
                             return result
-                                .map_err(error)?
+                                .map_err(replied)?
                                 .ok_or_else(|| error("hand omitted the tool result"));
                         }
                         Frame::Update { .. } => {}

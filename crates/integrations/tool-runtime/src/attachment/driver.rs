@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -20,7 +21,9 @@ use tokio_tungstenite::{
 use tracing::Instrument as _;
 use url::Url;
 
-use super::protocol::{self, DiagnosticStage, ExecutorFrame, ReceiptTiming, RemoteFrame};
+use super::protocol::{
+    self, AttachmentCall, CommandStatus, DiagnosticStage, EndpointFrame, ReceiptTiming, RunnerFrame,
+};
 use super::{
     AttachmentCallOutcome, AttachmentError, AttachmentEvent, AttachmentMetadata, AttachmentStatus,
 };
@@ -859,23 +862,23 @@ where
     let catalog_started = Instant::now();
     if let Err(error) = send(
         &mut socket,
-        &ExecutorFrame::Catalog {
-            capabilities: ["turn_metadata"],
-            runtime_id,
+        &RunnerFrame::Catalog {
+            capabilities: vec!["turn_metadata".into()],
+            runtime_id: runtime_id.into(),
             command_recovery: true,
             turn_lifecycle: true,
             diagnostics: Some(true),
-            connection_id: Some(connection_id),
-            tools: &config.tools,
+            connection_id: Some(connection_id.into()),
+            tools: Cow::Borrowed(&config.tools),
             machines: config
                 .metadata
                 .as_ref()
                 .and_then(AttachmentMetadata::attached_machine)
-                .map(std::slice::from_ref),
+                .map(|machine| Cow::Borrowed(std::slice::from_ref(machine))),
             attachment_id: config
                 .metadata
                 .as_ref()
-                .map(AttachmentMetadata::attachment_id),
+                .map(|metadata| metadata.attachment_id().into()),
         },
     )
     .await
@@ -885,7 +888,7 @@ where
     let catalog_sent = Instant::now();
     tracing::info!(target: "nanocode_code_mode::attachment", stage = "attachment.catalog_sent", duration_ms = catalog_sent.duration_since(catalog_started).as_secs_f64() * 1000.0, "attachment catalog sent");
     match next_handshake_frame(&mut socket, commands).await {
-        Ok(RemoteFrame::Ready {}) => {}
+        Ok(EndpointFrame::Ready {}) => {}
         Ok(frame) => {
             return reject(
                 &mut socket,
@@ -947,7 +950,7 @@ where
         tokio::select! {
             command = commands.recv(), if !detaching => {
                 match command { Some(Command::Detach) | None => {} }
-                if let Err(error) = send(&mut socket, &ExecutorFrame::Drain {}).await {
+                if let Err(error) = send(&mut socket, &RunnerFrame::Drain {}).await {
                     break ConnectionEnd::DetachFailed(error);
                 }
                 tracing::info!(target: "nanocode_code_mode::attachment", stage = "attachment.drain_requested", pending_calls = journal.values().filter(|call| call.task.is_some()).count(), pending_receipts = journal.values().filter(|call| call.receipt.is_some()).count(), reason_code = "detach_requested", "attachment drain requested");
@@ -1016,7 +1019,7 @@ where
                     Err(end) => break end,
                 };
                 match frame {
-                    RemoteFrame::Call { session_id, turn_id, call_id, model, name, input, output_token_budget, output_byte_budget, deadline_at } => {
+                    EndpointFrame::Call(AttachmentCall { session_id, turn_id, call_id, model, name, input, output_token_budget, output_byte_budget, deadline_at }) => {
                         let timing = CallClock::received();
                         if draining { break ConnectionEnd::Rejected("call received after drain barrier".into()); }
                         let identity = CallIdentity { session_id:session_id.clone().into(), turn_id:turn_id.clone().map(Into::into), call_id:call_id.clone().into(), model:model.clone().into(), name:name.clone().into(), input:input.clone(), output_token_budget, output_byte_budget, deadline_at };
@@ -1024,7 +1027,7 @@ where
                             if retained.identity != identity { break ConnectionEnd::Rejected("call identity conflicts with retained command".into()); }
                             let sent = if retained.receipt.is_some() {
                                 send_retained(&mut socket, retained, true).await
-                            } else { send(&mut socket, &ExecutorFrame::Status { call_id: &call_id, state: "running" }).await };
+                            } else { send(&mut socket, &RunnerFrame::Status { call_id: call_id.as_str().into(), state: CommandStatus::Running }).await };
                             if let Err(error) = sent { break ConnectionEnd::Failed(error); }
                             continue;
                         }
@@ -1057,14 +1060,14 @@ where
                         let task = start_call(runtime, active, identity.clone(), Arc::clone(&timing), tool_timeout, call_events, completed_tx.clone(), events);
                         journal.insert(call_id.into(), RetainedCall { identity, task: Some(task), timing, receipt: None });
                     }
-                    RemoteFrame::TurnEnded { session_id, turn_id, hook_event_name } => {
+                    EndpointFrame::TurnEnded { session_id, turn_id, hook_event_name } => {
 
                         if tokio::time::timeout(Duration::from_secs(5), runtime.end_turn(&session_id, &turn_id, &hook_event_name)).await.is_err() {
                             tracing::warn!(target: "nanocode_code_mode::attachment",
                                 "turn cleanup timed out; not retried");
                         }
                     }
-                    RemoteFrame::Cancel { call_id } => {
+                    EndpointFrame::Cancel { call_id } => {
                         tracing::info!(target: "nanocode_code_mode::attachment", stage = "attachment.call.cancel_received", transport_call_id = call_id.as_str(), pending_calls = journal.values().filter(|call| call.task.is_some()).count(), pending_receipts = journal.values().filter(|call| call.receipt.is_some()).count(), reason_code = "cancel_received", "attachment cancellation received");
                         if let Some(call) = journal.get_mut(call_id.as_str()) {
                             let replayed = call.receipt.is_some();
@@ -1083,28 +1086,28 @@ where
                                 && let Err(error) = send_retained(&mut socket, call, replayed).await { break ConnectionEnd::Failed(error); }
                         }
                     }
-                    RemoteFrame::Ack { call_id } => {
+                    EndpointFrame::Ack { call_id } => {
                         tracing::info!(target: "nanocode_code_mode::attachment", stage = "attachment.result_ack_received", transport_call_id = call_id.as_str(), pending_calls = journal.values().filter(|call| call.task.is_some()).count(), pending_receipts = journal.values().filter(|call| call.receipt.is_some()).count(), "attachment receipt acknowledgement received");
                         if journal.get(call_id.as_str()).is_some_and(|call| call.receipt.is_some()) {
                             journal.remove(call_id.as_str());
                         }
                     }
-                    RemoteFrame::Recover { call_ids } => {
+                    EndpointFrame::Recover { call_ids } => {
                         for call_id in call_ids {
                             let sent = match journal.get(call_id.as_str()) {
                                 Some(call) if call.receipt.is_some() => send_retained(&mut socket, call, true).await,
-                                Some(_) => send(&mut socket, &ExecutorFrame::Status { call_id: &call_id, state: "running" }).await,
-                                None => send(&mut socket, &ExecutorFrame::Status { call_id: &call_id, state: "missing" }).await,
+                                Some(_) => send(&mut socket, &RunnerFrame::Status { call_id: call_id.as_str().into(), state: CommandStatus::Running }).await,
+                                None => send(&mut socket, &RunnerFrame::Status { call_id: call_id.as_str().into(), state: CommandStatus::Missing }).await,
                             };
                             if let Err(error) = sent { return ConnectionEnd::Failed(error); }
                         }
                     }
-                    RemoteFrame::Draining {} => {
+                    EndpointFrame::Draining {} => {
                         if !detaching || draining { break ConnectionEnd::Rejected("unexpected draining acknowledgement".into()); }
                         tracing::info!(target: "nanocode_code_mode::attachment", stage = "attachment.draining", pending_calls = journal.values().filter(|call| call.task.is_some()).count(), pending_receipts = journal.values().filter(|call| call.receipt.is_some()).count(), "attachment drain barrier acknowledged");
                         draining = true;
                     }
-                    RemoteFrame::Ready {} => break ConnectionEnd::Rejected("unexpected ready".into()),
+                    EndpointFrame::Ready {} => break ConnectionEnd::Rejected("unexpected ready".into()),
                 }
             }
         }
@@ -1162,7 +1165,7 @@ where
 async fn next_handshake_frame<S>(
     socket: &mut tokio_tungstenite::WebSocketStream<S>,
     commands: &mut mpsc::Receiver<Command>,
-) -> Result<RemoteFrame, ConnectionEnd>
+) -> Result<EndpointFrame, ConnectionEnd>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1181,7 +1184,7 @@ where
 async fn incoming_frame<S>(
     socket: &mut tokio_tungstenite::WebSocketStream<S>,
     incoming: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
-) -> Result<Option<RemoteFrame>, ConnectionEnd>
+) -> Result<Option<EndpointFrame>, ConnectionEnd>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1189,7 +1192,7 @@ where
         tracing::info!(target: "nanocode_code_mode::attachment", stage = "attachment.socket.close_received", close_code = frame.as_ref().map(|frame| u16::from(frame.code)), reason_code = "remote_close", "attachment close received");
     }
     match incoming {
-        Some(Ok(Message::Text(text))) => RemoteFrame::parse(&text)
+        Some(Ok(Message::Text(text))) => EndpointFrame::parse(&text)
             .map(Some)
             .map_err(|reason| ConnectionEnd::Rejected(reason.into())),
         Some(Ok(Message::Ping(payload))) => {
@@ -1219,7 +1222,7 @@ where
 
 async fn next_frame<S>(
     socket: &mut tokio_tungstenite::WebSocketStream<S>,
-) -> Result<RemoteFrame, ConnectionEnd>
+) -> Result<EndpointFrame, ConnectionEnd>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1302,8 +1305,8 @@ where
         }
         feed(
             socket,
-            &ExecutorFrame::Diagnostic {
-                call_id,
+            &RunnerFrame::Diagnostic {
+                call_id: call_id.into(),
                 stage,
                 elapsed_ms,
             },
@@ -1376,9 +1379,9 @@ fn encode_result(
     let encode_started = Instant::now();
     let mut timing = clock.read(|clock| clock.snapshot(encode_started));
 
-    let mut text = serde_json::to_string(&ExecutorFrame::Result {
-        call_id,
-        outcome,
+    let mut text = serde_json::to_string(&RunnerFrame::Result {
+        call_id: call_id.into(),
+        outcome: Cow::Borrowed(outcome),
         timing: None,
     })
     .map_err(|error| AttachmentError::Transport(error.to_string().into()))?;

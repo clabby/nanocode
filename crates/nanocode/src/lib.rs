@@ -41,6 +41,7 @@ pub use nanocode_code_mode::embedded::{
 pub use nanocode_code_mode::remote::{
     CodeModeExecutors, ExecutorSelection, RemoteCatalog, RemoteClient, RemoteCodeModeHost,
     RemoteContext, RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation, RemoteTransport,
+    ResumedReply,
 };
 pub use nanocode_code_mode::tool;
 pub use nanocode_tool_runtime::{FunctionHandler, FunctionTool, Tools};

@@ -8,6 +8,7 @@ use nanocode_sync::Atom;
 
 pub use client::{
     LOCAL_CLOSED, PEER_CLOSED, RemoteActivity, RemoteClient, RemoteDelivery, RemoteLink,
+    ResumedReply,
 };
 pub use compact::{ReceivedCalls, SentCalls, output_from_wire, output_to_wire};
 pub use executors::{
