@@ -721,7 +721,10 @@ fn persistent_recipe(
                         checkpoint.lineage().clone(),
                     )
                 } else {
-                    let id = nanocode_platform::uuid_v7().to_string();
+                    let id = spec
+                        .session_id
+                        .take()
+                        .unwrap_or_else(|| nanocode_platform::uuid_v7().to_string());
                     let lineage = if let Some(parent) = &spec.parent {
                         let parent_lineage = match store.load(parent.session_id()).await {
                             Ok(stored) => stored.summary.record.lineage,
@@ -796,6 +799,7 @@ impl AgentRuntime {
             runtime: self,
             options: SpawnOptions::new(),
             settings: Settings::default(),
+            session_id: None,
         }
     }
 
@@ -868,6 +872,7 @@ impl AgentRuntime {
             checkpoint: Some(checkpoint),
 
             durable_state: None,
+            session_id: None,
         })
         .await
     }
@@ -962,6 +967,7 @@ impl AgentRuntime {
             host_context: None,
             checkpoint: None,
             durable_state: Some(durable_state),
+            session_id: None,
         };
         let (agent, events) = match opening {
             Some(_) => self.construct(spec).await?,
@@ -1074,6 +1080,7 @@ impl AgentRuntime {
                 host_context: None,
                 checkpoint: None,
                 durable_state,
+                session_id: None,
             })
             .await?;
         Ok((switched.with_transcript(transcript)?, events))
@@ -1120,6 +1127,7 @@ pub struct SpawnBuilder<'a, B = Unselected> {
     runtime: &'a AgentRuntime,
     options: SpawnOptions,
     settings: Settings,
+    session_id: Option<String>,
 }
 
 impl<B> SpawnBuilder<'_, B> {
@@ -1138,8 +1146,18 @@ impl<B> SpawnBuilder<'_, B> {
         self
     }
 
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
     pub async fn build(self) -> AgentResult {
         let runtime = &self.runtime.inner;
+        if self.session_id.is_some() && runtime.durability.is_none() {
+            return Err(NanocodeError::InvalidRequest(
+                "a spawned session ID names a durable session, and runtime durability is not configured".into(),
+            ));
+        }
         let resolved = runtime.harness.resolve_options(
             self.options,
             runtime.model.clone(),
@@ -1161,6 +1179,7 @@ impl<B> SpawnBuilder<'_, B> {
                 checkpoint: None,
 
                 durable_state: None,
+                session_id: self.session_id,
             })
             .await
     }
@@ -1173,6 +1192,7 @@ impl<'a> SpawnBuilder<'a, Unselected> {
             runtime: self.runtime,
             options: self.options.harness(B::backend_id().into()),
             settings: self.settings,
+            session_id: self.session_id,
         }
     }
 }
@@ -1244,6 +1264,7 @@ struct AgentSpec {
     checkpoint: Option<SessionCheckpoint>,
 
     durable_state: Option<crate::durability::DurableSession>,
+    session_id: Option<String>,
 }
 
 impl AgentSpec {
@@ -1260,6 +1281,7 @@ impl AgentSpec {
             checkpoint: request.checkpoint,
 
             durable_state: request.durable_state,
+            session_id: None,
         }
     }
 }
