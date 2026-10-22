@@ -87,10 +87,11 @@ impl ProjectHome {
         let mut files: Vec<InstructionFile> = Vec::new();
         let mut diagnostics = Vec::new();
         for directory in self.directories() {
-            let override_path = directory.join("AGENTS.override.md");
+            let [(first, first_kind), (second, second_kind)] = crate::PROJECT_INSTRUCTION_FILES;
+            let override_path = directory.join(first);
             let (path, kind) = match path_state(&override_path) {
-                Ok(PathState::File { .. }) => (override_path, InstructionKind::AgentsOverride),
-                _ => (directory.join("AGENTS.md"), InstructionKind::Agents),
+                Ok(PathState::File { .. }) => (override_path, first_kind),
+                _ => (directory.join(second), second_kind),
             };
             let canonical_path = match path_state(&path) {
                 Ok(PathState::File { canonical }) => canonical,

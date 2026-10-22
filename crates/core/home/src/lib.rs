@@ -1,6 +1,7 @@
 mod fs_util;
 mod instructions;
 mod project;
+mod scoped;
 mod session_environment;
 #[cfg(not(target_family = "wasm"))]
 pub mod shell;
@@ -19,6 +20,7 @@ pub use instructions::{
     PROJECT_DOC_SEPARATOR, combine_instructions, global_instructions,
 };
 pub use project::{InstructionFile, ProjectHome, ProjectInstructions};
+pub use scoped::{PROJECT_INSTRUCTION_FILES, instruction_candidates, instruction_scopes};
 pub use session_environment::SessionEnvironment;
 pub use skills::{SkillEntry, SkillRoot, SkillSet, resolve_skills};
 
