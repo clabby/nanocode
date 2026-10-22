@@ -301,7 +301,8 @@ impl Shared {
         let content_type = content_type(&response);
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            if is_mime(content_type.as_deref(), JSON_MIME_TYPE)
+            if !status.is_server_error()
+                && is_mime(content_type.as_deref(), JSON_MIME_TYPE)
                 && let Ok(message @ Message::Error { .. }) = Message::from_slice(body.as_bytes())
             {
                 return Ok((
@@ -477,7 +478,7 @@ impl Shared {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read response body>".to_owned());
-            if is_mime(content_type.as_deref(), JSON_MIME_TYPE) {
+            if !status.is_server_error() && is_mime(content_type.as_deref(), JSON_MIME_TYPE) {
                 match Message::from_slice(body.as_bytes()) {
                     Ok(error @ Message::Error { .. }) => {
                         self.inbound

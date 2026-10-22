@@ -14,6 +14,10 @@ pub trait FunctionHandler: Send + Sync + 'static {
         input: Value,
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<Value, String>>;
+
+    fn invalid_input(&self, _name: &str, _error: &str) -> Option<Result<Value, String>> {
+        None
+    }
 }
 
 pub struct FunctionTool {
@@ -84,10 +88,8 @@ impl FunctionTool {
                 }
             }
             Value::String(text) => {
-                let result = call_tool_result(
-                    &[ToolOutputContent::InputText { text: text.clone() }],
-                    None,
-                );
+                let result =
+                    call_tool_result(&[ToolOutputContent::InputText { text: text.clone() }], None);
                 ToolOutput::text(text).with_structured_result(result)
             }
             output => {
@@ -108,7 +110,9 @@ fn call_tool_result(content: &[ToolOutputContent], structured: Option<Value>) ->
         .iter()
         .filter_map(|item| match item {
             ToolOutputContent::InputText { text } => Some(json!({"type": "text", "text": text})),
-            ToolOutputContent::InputImage { image_url, .. } => Some(media_block("image", image_url)),
+            ToolOutputContent::InputImage { image_url, .. } => {
+                Some(media_block("image", image_url))
+            }
             ToolOutputContent::InputAudio { audio_url } => Some(media_block("audio", audio_url)),
             ToolOutputContent::InputImageFile { file_id, detail } => {
                 Some(json!({"type": "input_image", "file_id": file_id, "detail": detail}))
@@ -173,7 +177,16 @@ impl Tool for FunctionTool {
         Self: 'async_trait,
     {
         Box::pin(async move {
-            let input = input.decode_json()?;
+            let input = match input.decode_json() {
+                Ok(input) => input,
+                Err(error) => {
+                    return match self.handler.invalid_input(&self.name, &error.to_string()) {
+                        Some(Ok(output)) => Ok(self.output(output)),
+                        Some(Err(error)) => Ok(ToolOutput::error(error)),
+                        None => Err(error.into()),
+                    };
+                }
+            };
             Ok(match self.handler.call(&self.name, input, context).await {
                 Ok(output) => self.output(output),
                 Err(error) => ToolOutput::error(error),
