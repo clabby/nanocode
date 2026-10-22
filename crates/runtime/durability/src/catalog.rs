@@ -46,6 +46,20 @@ pub struct SessionRecord {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) event_preview: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) inherited: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) importing: Option<Importing>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Importing {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) preview: Option<String>,
+
+    pub(crate) next: Option<BranchCursor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +101,8 @@ impl SessionRecord {
             metadata: BTreeMap::new(),
             has_events: false,
             event_preview: None,
+            inherited: None,
+            importing: None,
         }
     }
 
@@ -140,6 +156,8 @@ impl SessionRecord {
             metadata: BTreeMap::new(),
             has_events: false,
             event_preview: None,
+            inherited: None,
+            importing: None,
         }
     }
 
@@ -151,6 +169,9 @@ impl SessionRecord {
     }
 
     pub(crate) fn merged(&self, next: Self) -> Self {
+        if self.importing.is_some() {
+            return next;
+        }
         let lineage = if next.lineage == Lineage::root(next.session_id.clone()) {
             self.lineage.clone()
         } else {
@@ -187,6 +208,8 @@ impl SessionRecord {
             },
             has_events: self.has_events || next.has_events,
             event_preview: self.event_preview.clone().or(next.event_preview),
+            inherited: next.inherited.or_else(|| self.inherited.clone()),
+            importing: None,
         }
     }
 
@@ -220,6 +243,8 @@ fn now_ms() -> u64 {
 pub use store::*;
 
 mod store {
+    mod transfer;
+
     use std::{
         collections::{BTreeMap, HashSet},
         path::PathBuf,
@@ -245,6 +270,7 @@ mod store {
     };
 
     pub use nanocode_agent_core::session::TranscriptItem;
+    pub use transfer::{BranchCursor, BranchExport, BranchImport, BranchPage};
 
     pub const LIST_LIMIT: usize = 1000;
 
@@ -857,70 +883,16 @@ mod store {
                         .into(),
                 ));
             }
-            let mut record = match state.session() {
-                Some(record) => record.clone(),
-                None => {
-                    let checkpoint =
-                        self.native_checkpoint(id, &state).await?.ok_or_else(|| {
-                            Error::InvalidState(
-                                "source session has no checkpoint to branch from".into(),
-                            )
-                        })?;
-                    self.infer_record(id, &checkpoint)?
+            let mut record = self.source_record(id, &state).await?;
+            let (selected, boundary) = match self.inherited_point(id, &state, &at).await? {
+                Some((selected, boundary)) => {
+                    (selected.map(|payload| (id.to_owned(), payload)), boundary)
                 }
+                None => (
+                    self.local_point(id, &state, &at)?,
+                    self.boundary(id, &state, &at).await?,
+                ),
             };
-            let selected = match &at {
-                BranchPoint::Latest => state
-                    .latest_checkpoint()
-                    .cloned()
-                    .map(|payload| (id.to_owned(), payload)),
-                BranchPoint::Through(turn) => {
-                    let operation = state.operation(turn).ok_or_else(unknown_turn)?;
-                    Some(
-                        settled_checkpoint(&operation.status)
-                            .cloned()
-                            .map(|payload| (id.to_owned(), payload))
-                            .ok_or_else(|| {
-                                Error::InvalidState(
-                                    "the selected turn has no settled checkpoint".into(),
-                                )
-                            })?,
-                    )
-                }
-                BranchPoint::Before(turn) => {
-                    let selected = state.operation(turn).ok_or_else(unknown_turn)?;
-                    let prior = state
-                        .operations()
-                        .values()
-                        .filter(|op| op.accepted_order() < selected.accepted_order())
-                        .max_by_key(|op| op.accepted_order());
-
-                    let complete_history = state
-                        .session()
-                        .map_or(selected.accepted_order() == 1, |record| {
-                            !record.history_pruned
-                        });
-                    match prior {
-                        None if complete_history => Self::start_checkpoint(id, &state)?,
-                        Some(prior) => Some(
-                            settled_checkpoint(&prior.status)
-                                .cloned()
-                                .map(|payload| (id.to_owned(), payload))
-                                .ok_or_else(|| {
-                                    Error::InvalidState(
-                                        "checkpoint before the selected turn is unavailable".into(),
-                                    )
-                                })?,
-                        ),
-                        None => {
-                            return Err(Error::InvalidState(
-                                "retained history before the selected turn was pruned".into(),
-                            ));
-                        }
-                    }
-                }
-            };
-            let boundary = self.boundary(id, &state, &at).await?;
             let branch_id = nanocode_platform::uuid_v7().to_string();
             let selected = match selected {
                 Some((holder, payload)) => Some(
@@ -956,6 +928,75 @@ mod store {
             self.publish(record.clone(), checkpoint, preview.clone())
                 .await?;
             Ok(SessionSummary { record, preview })
+        }
+
+        async fn source_record(&self, id: &str, state: &DurableState) -> Result<SessionRecord> {
+            if let Some(record) = state.session() {
+                return Ok(record.clone());
+            }
+            let checkpoint = self.native_checkpoint(id, state).await?.ok_or_else(|| {
+                Error::InvalidState("source session has no checkpoint to branch from".into())
+            })?;
+            self.infer_record(id, &checkpoint)
+        }
+
+        fn local_point(
+            &self,
+            id: &str,
+            state: &DurableState,
+            at: &BranchPoint,
+        ) -> Result<Option<(String, EncodedPayload)>> {
+            Ok(match at {
+                BranchPoint::Latest => state
+                    .latest_checkpoint()
+                    .cloned()
+                    .map(|payload| (id.to_owned(), payload)),
+                BranchPoint::Through(turn) => {
+                    let operation = state.operation(turn).ok_or_else(unknown_turn)?;
+                    Some(
+                        settled_checkpoint(&operation.status)
+                            .cloned()
+                            .map(|payload| (id.to_owned(), payload))
+                            .ok_or_else(|| {
+                                Error::InvalidState(
+                                    "the selected turn has no settled checkpoint".into(),
+                                )
+                            })?,
+                    )
+                }
+                BranchPoint::Before(turn) => {
+                    let selected = state.operation(turn).ok_or_else(unknown_turn)?;
+                    let prior = state
+                        .operations()
+                        .values()
+                        .filter(|op| op.accepted_order() < selected.accepted_order())
+                        .max_by_key(|op| op.accepted_order());
+
+                    let complete_history = state
+                        .session()
+                        .map_or(selected.accepted_order() == 1, |record| {
+                            !record.history_pruned
+                        });
+                    match prior {
+                        None if complete_history => Self::start_checkpoint(id, state)?,
+                        Some(prior) => Some(
+                            settled_checkpoint(&prior.status)
+                                .cloned()
+                                .map(|payload| (id.to_owned(), payload))
+                                .ok_or_else(|| {
+                                    Error::InvalidState(
+                                        "checkpoint before the selected turn is unavailable".into(),
+                                    )
+                                })?,
+                        ),
+                        None => {
+                            return Err(Error::InvalidState(
+                                "retained history before the selected turn was pruned".into(),
+                            ));
+                        }
+                    }
+                }
+            })
         }
 
         fn start_checkpoint(
@@ -1072,7 +1113,14 @@ mod store {
             if stored.payload.is_none() {
                 return Ok(None);
             }
-            reduce_peeked(stored).map(Some)
+            let state = reduce_peeked(stored)?;
+            if state
+                .session()
+                .is_some_and(|record| record.importing.is_some())
+            {
+                return Ok(None);
+            }
+            Ok(Some(state))
         }
 
         async fn require(&self, id: &str) -> Result<DurableState> {
@@ -1175,6 +1223,8 @@ mod store {
                 metadata: BTreeMap::new(),
                 has_events: false,
                 event_preview: None,
+                inherited: None,
+                importing: None,
             })
         }
 
