@@ -1563,6 +1563,7 @@ impl ClaudeBuilder {
         let round_boundary = Arc::new(round_boundary);
         let (runtime, events) = BackendRuntime::new(session_id.clone());
         let runtime = runtime.with_lineage(lineage.clone());
+        let session_events = runtime.events();
         let system_blocks = self.system_blocks.or_else(|| {
             self.system
                 .is_empty()
@@ -1576,6 +1577,7 @@ impl ClaudeBuilder {
                 |(environment, instructions)| (environment.into(), instructions.into()),
             );
         let state = Arc::new(State {
+            session_events,
             subagent_type: self.subagent_type,
             subagent_type_resolver: self.subagent_type_resolver,
             lifecycle_opened: Atom::default(),
@@ -3074,6 +3076,7 @@ struct State {
 
     waiters: Atom<std::collections::BTreeSet<u64>>,
     compaction_cancel: Atom<Option<Arc<Cancellation>>>,
+    session_events: AgentEventPublisher,
     #[cfg(not(target_family = "wasm"))]
     task_board: Option<Arc<crate::tools::tasks::ClaudeTasks>>,
     cancellations: Atom<HashMap<BackendTurnKey, Arc<Cancellation>>>,
@@ -4139,7 +4142,10 @@ impl State {
                 json!(events.turn_id().unwrap_or(events.request_id())),
             );
         }
-        let Ok(payload) = serde_json::value::to_raw_value(&payload) else {
+        Self::publish(events, kind, &payload);
+    }
+    fn publish(events: &AgentEventPublisher, kind: AgentEventKind, payload: &Value) {
+        let Ok(payload) = serde_json::value::to_raw_value(payload) else {
             return;
         };
         let _ = events.publish_next(kind, Arc::from(payload));
@@ -4188,6 +4194,19 @@ impl State {
         (supported && self.fast_mode.load(Ordering::SeqCst)).then_some(crate::Speed::Fast)
     }
 
+    fn compacted_payload(after_model_call_index: u32, started: Instant) -> Value {
+        json!({
+            "after_model_call_index": after_model_call_index,
+            "attempt": 1,
+            "connection_generation": 0,
+            "status": "completed",
+            "duration_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "time_to_first_event_ns": 0,
+            "time_to_first_output_ns": null,
+            "usage": null,
+        })
+    }
+
     fn emit_compacted(
         &self,
         events: &AgentEventPublisher,
@@ -4197,16 +4216,7 @@ impl State {
         self.emit(
             events,
             AgentEventKind::ModelCompactionCompleted,
-            json!({
-                "after_model_call_index": after_model_call_index,
-                "attempt": 1,
-                "connection_generation": 0,
-                "status": "completed",
-                "duration_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                "time_to_first_event_ns": 0,
-                "time_to_first_output_ns": null,
-                "usage": null,
-            }),
+            Self::compacted_payload(after_model_call_index, started),
         );
     }
     fn emit_run_started(&self, request: &BackendPrompt) -> (&'static str, String) {
@@ -7132,6 +7142,16 @@ impl LifecycleBackend for Driver {
                         )
                         .await?;
                     state.flush_journal(&mut journal).await?;
+                    let compaction_started = Instant::now();
+                    State::publish(
+                        &state.session_events,
+                        AgentEventKind::ModelCompactionStarted,
+                        &json!({
+                            "after_model_call_index": 0,
+                            "active_context_tokens": context.active_context_tokens,
+                            "auto_compact_token_limit": cursor.threshold,
+                        }),
+                    );
                     let result = state
                         .compact_locked(
                             &mut context,
@@ -7141,6 +7161,21 @@ impl LifecycleBackend for Driver {
                             "manual-compact",
                         )
                         .await;
+                    let (kind, payload) = match &result {
+                        Ok(_) => (
+                            AgentEventKind::ModelCompactionCompleted,
+                            State::compacted_payload(0, compaction_started),
+                        ),
+                        Err(error) => (
+                            AgentEventKind::ModelCompactionFailed,
+                            json!({
+                                "after_model_call_index": 0,
+                                "duration_ns": u64::try_from(compaction_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                                "error": error.to_string(),
+                            }),
+                        ),
+                    };
+                    State::publish(&state.session_events, kind, &payload);
                     state.publish_round_boundary(&context).await;
                     if let (Some(policy), Some(id)) = (&state.policy, operation) {
                         if result
