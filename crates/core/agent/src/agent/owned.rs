@@ -1,5 +1,6 @@
 use super::backend::{
-    BackendFuture, BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey, LifecycleBackend,
+    BackendFuture, BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey,
+    LifecycleBackend, SteerReceiptStatus,
 };
 use super::handle::{Interrupted, OwnershipProbe, Signal};
 use super::*;
@@ -384,6 +385,13 @@ impl LifecycleBackend for Owned {
     }
     fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
         self.0.backend().withdraw_steer(key, id)
+    }
+    fn steer_receipt(
+        &self,
+        id: String,
+        prompt: Prompt,
+    ) -> BackendFuture<Result<SteerReceiptStatus>> {
+        self.0.backend().steer_receipt(id, prompt)
     }
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>> {
         self.0.backend().cancel(key)

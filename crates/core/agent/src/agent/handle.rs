@@ -873,6 +873,14 @@ impl Agent {
         self.backend.cancel_active().await
     }
 
+    pub async fn steer_receipt(
+        &self,
+        id: String,
+        prompt: impl Into<Prompt>,
+    ) -> Result<SteerReceiptStatus> {
+        self.backend.steer_receipt(id, prompt.into()).await
+    }
+
     pub async fn set_thinking(&self, thinking: Thinking) -> Result<()> {
         self.backend.set_thinking(thinking).await
     }

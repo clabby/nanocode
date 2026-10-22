@@ -27,7 +27,7 @@ mod handle;
 mod owned;
 mod session_context;
 mod turn;
-pub use backend::BuilderBackend;
+pub use backend::{BuilderBackend, SteerReceiptStatus};
 pub use handle::{Agent, AgentHandle, WeakAgent, created, created_batch};
 pub use owned::{AgentOwner, adopt};
 pub use session_context::AgentSessionContext;

@@ -8,8 +8,8 @@ use nanocode_agent_core::{
     Agent, AgentEvents, AgentHandle, AgentSessionContext, Capabilities, CostStatus,
     EstimatedUsdCost, ForkPoint, ForkRequest, HarnessFamily, Lineage, ModelSelection,
     ModelTransport, Mutability, NanocodeError, Origin, Persistence, ReportedCost,
-    ReportedTurnUsage, Result, ServiceTier, SessionCheckpoint, SpawnOptions, Thinking, TurnResult,
-    TurnUsage, UsdAmount,
+    ReportedTurnUsage, Result, ServiceTier, SessionCheckpoint, SpawnOptions, SteerReceiptStatus,
+    Thinking, TurnResult, TurnUsage, UsdAmount,
     backend::{
         AgentFactory, BackendFuture, BackendPrompt, BackendPromptRoute, BackendRuntime,
         BackendTurn, BackendTurnKey, BuilderBackend, LifecycleBackend, TurnBoundary,
@@ -6958,6 +6958,21 @@ impl LifecycleBackend for Driver {
         prompt: Prompt,
     ) -> BackendFuture<Result<()>> {
         self.steer_input(key, Some(id), prompt)
+    }
+    fn steer_receipt(
+        &self,
+        id: String,
+        prompt: Prompt,
+    ) -> BackendFuture<Result<SteerReceiptStatus>> {
+        let policy = self.state.policy.clone();
+        Box::pin(async move {
+            let Some(policy) = policy else {
+                return Ok(SteerReceiptStatus::Unknown);
+            };
+            policy
+                .steer_receipt(id, serde_json::to_string(&prompt).map_err(provider_error)?)
+                .await
+        })
     }
     fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
         let state = self.state.clone();

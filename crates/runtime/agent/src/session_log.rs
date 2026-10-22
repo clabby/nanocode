@@ -11,7 +11,7 @@ use serde_json::{Map, Value, value::RawValue};
 
 use crate::{
     durability::{EncodedPayload, Sql, SqlDialect, SqlRow, SqlStatement, StoreError},
-    input::Prompt,
+    input::{Prompt, PromptInput, UserInput},
     turn_inbox::accepted_bytes,
 };
 
@@ -78,6 +78,26 @@ const REQUEST_CANCEL: Dialects = [
 const CANCEL_QUEUED: Dialects = [
     "UPDATE turns SET status = 'cancelled', prompt = NULL, note = NULL, retry = NULL, last_seq = (SELECT MAX(seq) FROM events) WHERE scope = ?1 AND request_id = ?2 AND status = 'queued'",
     "UPDATE turns SET status = 'cancelled', prompt = NULL, note = NULL, retry = NULL, last_seq = (SELECT MAX(seq) FROM events WHERE scope = $1::text) WHERE scope = $1::text AND request_id = $2::text AND status = 'queued'",
+];
+const EDIT_RECEIPT: Dialects = [
+    "SELECT json_extract(events.body, '$.digest') FROM turns JOIN events ON events.seq >= turns.first_seq WHERE turns.scope = ?1 AND turns.request_id = ?2 AND events.scope = ?1 AND events.request_id = ?2 AND json_extract(events.body, '$.type') = 'replaced' AND json_extract(events.body, '$.edit_id') = ?3 LIMIT 1",
+    "SELECT CAST(events.body AS json) ->> 'digest' FROM turns JOIN events ON events.seq >= turns.first_seq WHERE turns.scope = $1::text AND turns.request_id = $2::text AND events.scope = $1::text AND events.request_id = $2::text AND CAST(events.body AS json) ->> 'type' = 'replaced' AND CAST(events.body AS json) ->> 'edit_id' = $3::text LIMIT 1",
+];
+const REPLACE_QUEUED: Dialects = [
+    "UPDATE turns SET prompt = ?3, digest = ?4 WHERE scope = ?1 AND request_id = ?2 AND status = 'queued' AND digest = ?6 AND NOT EXISTS (SELECT 1 FROM events WHERE events.seq >= turns.first_seq AND events.scope = ?1 AND events.request_id = ?2 AND json_extract(events.body, '$.type') = 'replaced' AND json_extract(events.body, '$.edit_id') = ?5)",
+    "UPDATE turns SET prompt = $3::text, digest = $4::text WHERE scope = $1::text AND request_id = $2::text AND status = 'queued' AND digest = $6::text AND NOT EXISTS (SELECT 1 FROM events WHERE events.seq >= turns.first_seq AND events.scope = $1::text AND events.request_id = $2::text AND CAST(events.body AS json) ->> 'type' = 'replaced' AND CAST(events.body AS json) ->> 'edit_id' = $5::text)",
+];
+const REPLACED_EVENT: Dialects = [
+    "INSERT INTO events (scope, request_id, body, created_at) SELECT ?1, ?2, ?3, CAST(?4 AS INTEGER) FROM turns WHERE scope = ?1 AND request_id = ?2 AND status = 'queued' AND digest = ?5 AND NOT EXISTS (SELECT 1 FROM events WHERE events.seq >= turns.first_seq AND events.scope = ?1 AND events.request_id = ?2 AND json_extract(events.body, '$.type') = 'replaced' AND json_extract(events.body, '$.edit_id') = ?6) RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT)",
+    "INSERT INTO events (scope, request_id, body, created_at) SELECT $1::text, $2::text, $3::text, CAST($4::text AS BIGINT) FROM turns WHERE scope = $1::text AND request_id = $2::text AND status = 'queued' AND digest = $5::text AND NOT EXISTS (SELECT 1 FROM events WHERE events.seq >= turns.first_seq AND events.scope = $1::text AND events.request_id = $2::text AND CAST(events.body AS json) ->> 'type' = 'replaced' AND CAST(events.body AS json) ->> 'edit_id' = $6::text) RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT)",
+];
+const STEERED_EVENT: Dialects = [
+    "INSERT INTO events (scope, request_id, body, created_at) SELECT ?1, ?2, ?3, CAST(?4 AS INTEGER) WHERE EXISTS (SELECT 1 FROM turns WHERE scope = ?1 AND request_id = ?2 AND status = 'queued' AND digest = ?5) RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT)",
+    "INSERT INTO events (scope, request_id, body, created_at) SELECT $1::text, $2::text, $3::text, CAST($4::text AS BIGINT) WHERE EXISTS (SELECT 1 FROM turns WHERE scope = $1::text AND request_id = $2::text AND status = 'queued' AND digest = $5::text) RETURNING CAST(seq AS TEXT), CAST(created_at AS TEXT)",
+];
+const CANCEL_STEERED: Dialects = [
+    "UPDATE turns SET status = 'cancelled', prompt = NULL, note = NULL, retry = NULL, last_seq = (SELECT MAX(seq) FROM events) WHERE scope = ?1 AND request_id = ?2 AND status = 'queued' AND digest = ?3",
+    "UPDATE turns SET status = 'cancelled', prompt = NULL, note = NULL, retry = NULL, last_seq = (SELECT MAX(seq) FROM events WHERE scope = $1::text) WHERE scope = $1::text AND request_id = $2::text AND status = 'queued' AND digest = $3::text",
 ];
 const NOTE: Dialects = [
     "UPDATE turns SET note = ?3 WHERE scope = ?1 AND request_id = ?2 AND status = 'running'",
@@ -241,6 +261,14 @@ pub enum Submitted {
 }
 
 #[derive(Clone, Debug)]
+pub enum Replaced {
+    Applied(Option<LoggedEvent>),
+    NotQueued,
+    Conflict,
+    TooLarge { bytes: usize, limit: usize },
+}
+
+#[derive(Clone, Debug)]
 pub struct ImportedTurn {
     pub request_id: String,
     pub state: TurnState,
@@ -308,6 +336,15 @@ struct Outcome<'a> {
     status: &'static str,
     #[serde(flatten)]
     fields: &'a Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct Replacement<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    request_id: &'a str,
+    edit_id: &'a str,
+    digest: &'a str,
 }
 
 #[derive(Serialize)]
@@ -492,6 +529,41 @@ pub fn submission_digest(prompt: &Prompt, hand: Option<&str>) -> Result<String, 
     EncodedPayload::encode(&(prompt, hand))
         .map(|payload| payload.key().to_owned())
         .map_err(|error| StoreError::NotCommitted(format!("digest turn submission: {error}")))
+}
+
+fn edited(prompt: &Prompt, text: &str) -> Result<Prompt, StoreError> {
+    let mut prompt = prompt.clone();
+    prompt.instruction = match prompt.instruction {
+        PromptInput::Text(_) => PromptInput::Text(text.to_owned()),
+        PromptInput::Content(items) => {
+            let mut text = (!text.is_empty()).then(|| UserInput::Text {
+                text: text.to_owned(),
+            });
+            let mut edited: Vec<_> = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    UserInput::Text { .. } => text.take(),
+                    other => Some(other),
+                })
+                .collect();
+            edited.splice(0..0, text);
+            PromptInput::Content(edited)
+        }
+    };
+    prompt
+        .validate()
+        .map_err(|error| StoreError::NotCommitted(format!("edit a queued prompt: {error}")))?;
+    Ok(prompt)
+}
+
+fn edit_receipt(rows: &[SqlRow], edit: &str) -> Result<Option<Replaced>, StoreError> {
+    Ok(single(rows)?.map(|row| {
+        if optional(row, 0) == Some(edit) {
+            Replaced::Applied(None)
+        } else {
+            Replaced::Conflict
+        }
+    }))
 }
 
 pub struct SessionLog<H: ?Sized> {
@@ -841,6 +913,171 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             .map(|row| logged(row, request_id, raw(body)?))
             .transpose()?;
         Ok(Some((record(current)?, event)))
+    }
+
+    pub async fn replace_queued(
+        &self,
+        request_id: &str,
+        edit_id: &str,
+        text: &str,
+    ) -> Result<Replaced, StoreError> {
+        if edit_id.is_empty() {
+            return Err(StoreError::NotCommitted(
+                "an edit ID must not be empty".into(),
+            ));
+        }
+        let edit = submission_digest(&Prompt::new(text), None)?;
+        let body = serde_json::to_string(&Replacement {
+            kind: "replaced",
+            request_id,
+            edit_id,
+            digest: &edit,
+        })
+        .map_err(encoding)?;
+        let dialect = self.host.dialect();
+        let mut current = self.turn(request_id).await?;
+        loop {
+            let Some((turn, prompt)) = current.as_ref().and_then(|turn| {
+                turn.prompt
+                    .as_ref()
+                    .filter(|_| turn.state == TurnState::Queued)
+                    .map(|prompt| (turn, prompt))
+            }) else {
+                let results = self
+                    .transaction(
+                        "replace",
+                        vec![statement(
+                            dialect,
+                            &EDIT_RECEIPT,
+                            vec![&self.scope, request_id, edit_id],
+                        )],
+                    )
+                    .await?;
+                return Ok(edit_receipt(&results[0], &edit)?.unwrap_or(Replaced::NotQueued));
+            };
+            let prompt = edited(prompt, text)?;
+            let encoded = serde_json::to_string(&prompt).map_err(encoding)?;
+            let digest = submission_digest(&prompt, turn.hand.as_deref())?;
+            if let Some(limit) = self.limit {
+                let row = record_bytes(
+                    TURN_TEXTS,
+                    self.scope.len()
+                        + request_id.len()
+                        + digest.len()
+                        + TurnState::Running.as_str().len()
+                        + encoded.len()
+                        + turn.hand.as_deref().map_or(0, str::len)
+                        + turn.metadata.get().len(),
+                    TURN_INTEGERS,
+                );
+                let accepted = event_bytes(
+                    &self.scope,
+                    Some(request_id),
+                    accepted_bytes(request_id, &prompt.instruction).map_err(encoding)?,
+                );
+                let receipt = event_bytes(&self.scope, Some(request_id), body.len());
+                let bytes = row.max(accepted).max(receipt);
+                if bytes > limit {
+                    return Ok(Replaced::TooLarge { bytes, limit });
+                }
+            }
+            let created = now().to_string();
+            let results = self
+                .transaction(
+                    "replace",
+                    vec![
+                        statement(
+                            dialect,
+                            &EDIT_RECEIPT,
+                            vec![&self.scope, request_id, edit_id],
+                        ),
+                        statement(
+                            dialect,
+                            &REPLACE_QUEUED,
+                            vec![
+                                &self.scope,
+                                request_id,
+                                &encoded,
+                                &digest,
+                                edit_id,
+                                &turn.digest,
+                            ],
+                        ),
+                        statement(
+                            dialect,
+                            &REPLACED_EVENT,
+                            vec![&self.scope, request_id, &body, &created, &digest, edit_id],
+                        ),
+                        statement(dialect, &TURN, vec![&self.scope, request_id]),
+                    ],
+                )
+                .await?;
+            if let Some(receipt) = edit_receipt(&results[0], &edit)? {
+                return Ok(receipt);
+            }
+            if let Some(row) = single(&results[2])? {
+                return Ok(Replaced::Applied(Some(logged(
+                    row,
+                    request_id,
+                    raw(body)?,
+                )?)));
+            }
+            let next = single(&results[3])?.map(record).transpose()?;
+            if next
+                .as_ref()
+                .is_some_and(|next| next.state == TurnState::Queued && next.digest == turn.digest)
+            {
+                return Err(invalid(
+                    "a queued turn refused an edit of its current prompt",
+                ));
+            }
+            current = next;
+        }
+    }
+
+    pub async fn withdraw_steered(
+        &self,
+        request_id: &str,
+        digest: &str,
+    ) -> Result<Option<(TurnRecord, LoggedEvent)>, StoreError> {
+        let fields = Map::from_iter([
+            ("cancelled".to_owned(), Value::Bool(true)),
+            ("steered".to_owned(), Value::Bool(true)),
+        ]);
+        let body = serde_json::to_string(&Outcome {
+            kind: "result",
+            request_id,
+            status: TurnState::Cancelled.as_str(),
+            fields: &fields,
+        })
+        .map_err(encoding)?;
+        let created = now().to_string();
+        let dialect = self.host.dialect();
+        let results = self
+            .transaction(
+                "withdraw_steered",
+                vec![
+                    statement(
+                        dialect,
+                        &STEERED_EVENT,
+                        vec![&self.scope, request_id, &body, &created, digest],
+                    ),
+                    statement(
+                        dialect,
+                        &CANCEL_STEERED,
+                        vec![&self.scope, request_id, digest],
+                    ),
+                    statement(dialect, &TURN, vec![&self.scope, request_id]),
+                ],
+            )
+            .await?;
+        let (Some(row), Some(current)) = (single(&results[0])?, single(&results[2])?) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            record(current)?,
+            logged(row, request_id, raw(body)?)?,
+        )))
     }
 
     pub async fn retry(
