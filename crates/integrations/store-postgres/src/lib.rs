@@ -1,9 +1,10 @@
 #![cfg(not(target_family = "wasm"))]
 
-use tokio_postgres::Client;
+use tokio_postgres::{Client, types::ToSql};
 
 use nanocode_durability_core::{
-    OwnedState, OwnerId, OwnerToken, StateStore, StoreError, StoreFuture, StoredState,
+    OwnedState, OwnerId, OwnerToken, Sql, SqlDialect, SqlRow, SqlStatement, StateStore, StoreError,
+    StoreFuture, StoredState,
 };
 
 const POSTGRES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS nanocode_durable_records (
@@ -278,6 +279,60 @@ impl StateStore for PostgresStore {
                 .map(|row| row.get(0))
                 .collect())
         })
+    }
+}
+
+pub struct PostgresSql {
+    client: tokio::sync::Mutex<Client>,
+}
+
+impl PostgresSql {
+    #[must_use]
+    pub fn new(client: Client) -> Self {
+        Self {
+            client: tokio::sync::Mutex::new(client),
+        }
+    }
+}
+
+impl Sql for PostgresSql {
+    fn transaction<'a>(
+        &'a self,
+        _operation: &'static str,
+        statements: &'a [SqlStatement<'a>],
+    ) -> StoreFuture<'a, Result<Vec<Vec<SqlRow>>, StoreError>> {
+        Box::pin(async move {
+            let mut client = self.client.lock().await;
+            let transaction = client.transaction().await.map_err(backend)?;
+            let mut results = Vec::with_capacity(statements.len());
+            for statement in statements {
+                let params: Vec<&(dyn ToSql + Sync)> = statement
+                    .params
+                    .iter()
+                    .map(|param| param as &(dyn ToSql + Sync))
+                    .collect();
+                let rows = transaction
+                    .query(statement.sql, &params)
+                    .await
+                    .map_err(backend)?;
+                results.push(
+                    rows.iter()
+                        .map(|row| {
+                            (0..row.len())
+                                .map(|column| row.try_get::<_, Option<String>>(column))
+                                .collect::<Result<SqlRow, _>>()
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(backend)?,
+                );
+            }
+            transaction.commit().await.map_err(backend)?;
+            Ok(results)
+        })
+    }
+
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Postgres
     }
 }
 

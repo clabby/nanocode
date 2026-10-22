@@ -2137,6 +2137,7 @@ name = "nanocode-store-postgres"
 version = "0.6.7"
 dependencies = [
  "nanocode-durability-core",
+ "tokio",
  "tokio-postgres",
 ]
 
