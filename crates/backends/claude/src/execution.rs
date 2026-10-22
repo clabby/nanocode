@@ -1,4 +1,4 @@
-use nanocode_agent_core::{NanocodeError, Result, SessionInfo};
+use nanocode_agent_core::{NanocodeError, Result, SessionInfo, SteerReceiptStatus};
 use serde_json::{Value, value::RawValue};
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -100,6 +100,14 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         _input_json: String,
     ) -> PolicyFuture<'_, bool> {
         Box::pin(async { Ok(false) })
+    }
+
+    fn steer_receipt(
+        &self,
+        _message_id: String,
+        _input_json: String,
+    ) -> PolicyFuture<'_, SteerReceiptStatus> {
+        Box::pin(async { Ok(SteerReceiptStatus::Unknown) })
     }
 
     fn accept_steer(
