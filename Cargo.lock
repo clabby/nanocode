@@ -2006,6 +2006,7 @@ dependencies = [
  "nanocode-sync",
  "nanocode-tls",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

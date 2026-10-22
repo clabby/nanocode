@@ -7,7 +7,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::{Url, form_urlencoded};
@@ -114,6 +114,36 @@ impl AuthorizationMetadata {
                 Ok(())
             }
         }
+    }
+
+    #[must_use]
+    pub fn revocation_endpoint(&self) -> Option<&str> {
+        self.additional_fields
+            .get("revocation_endpoint")
+            .and_then(Value::as_str)
+    }
+
+    #[must_use]
+    pub fn token_endpoint_auth_methods(&self) -> Vec<&str> {
+        self.additional_fields
+            .get("token_endpoint_auth_methods_supported")
+            .and_then(Value::as_array)
+            .map_or_else(
+                || vec!["client_secret_basic"],
+                |methods| methods.iter().filter_map(Value::as_str).collect(),
+            )
+    }
+
+    #[must_use]
+    pub fn issues_refresh_tokens(&self) -> bool {
+        self.additional_fields
+            .get("grant_types_supported")
+            .and_then(Value::as_array)
+            .is_none_or(|grants| {
+                grants
+                    .iter()
+                    .any(|grant| grant.as_str() == Some("refresh_token"))
+            })
     }
 
     pub fn add_offline_access(&self, scopes: &mut Vec<String>) {
@@ -499,19 +529,12 @@ pub fn select_scopes(
     resource_scopes: &[String],
     metadata: &AuthorizationMetadata,
 ) -> Vec<String> {
-    let accumulated = challenge_scopes
-        .iter()
-        .chain(resource_scopes)
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut scopes = if accumulated.is_empty() {
-        metadata
-            .scopes_supported
-            .clone()
-            .filter(|scopes| !scopes.is_empty())
-            .unwrap_or_default()
+    let mut scopes = if !challenge_scopes.is_empty() {
+        dedup_scopes(challenge_scopes.iter().cloned())
+    } else if !resource_scopes.is_empty() {
+        dedup_scopes(resource_scopes.iter().cloned())
     } else {
-        dedup_scopes(accumulated)
+        metadata.scopes_supported.clone().unwrap_or_default()
     };
     metadata.add_offline_access(&mut scopes);
     scopes
@@ -551,6 +574,10 @@ pub struct AuthorizationUrl<'a> {
 
 impl AuthorizationUrl<'_> {
     pub fn build(&self) -> Result<Url, String> {
+        self.build_with(&[])
+    }
+
+    pub fn build_with(&self, params: &[(&str, &str)]) -> Result<Url, String> {
         let mut url = Url::parse(&self.metadata.authorization_endpoint)
             .map_err(|error| format!("OAuth error: Invalid authorization URL: {error}"))?;
         Url::parse(self.redirect_uri)
@@ -568,7 +595,12 @@ impl AuthorizationUrl<'_> {
             if !scopes.is_empty() {
                 query.append_pair("scope", &scopes);
             }
-            query.append_pair("resource", self.resource);
+            if !self.resource.is_empty() {
+                query.append_pair("resource", self.resource);
+            }
+            for (name, value) in params {
+                query.append_pair(name, value);
+            }
         }
         Ok(url)
     }
@@ -588,6 +620,44 @@ impl ClientAuthentication {
             client_id: client_id.into(),
             client_secret: None,
             secret_in_body: false,
+        }
+    }
+
+    pub fn with_method(
+        client_id: impl Into<String>,
+        client_secret: Option<String>,
+        method: &str,
+    ) -> Result<Self, String> {
+        let client_id = client_id.into();
+        let client_secret = client_secret.filter(|secret| !secret.is_empty());
+        let secret_in_body = match method {
+            "none" => return Ok(Self::public(client_id)),
+            "client_secret_basic" => false,
+            "client_secret_post" => true,
+            method => {
+                return Err(format!(
+                    "unsupported token endpoint authentication method `{method}`"
+                ));
+            }
+        };
+        if client_secret.is_none() {
+            return Err(format!(
+                "token endpoint authentication method `{method}` needs a client secret"
+            ));
+        }
+        Ok(Self {
+            client_id,
+            client_secret,
+            secret_in_body,
+        })
+    }
+
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match (&self.client_secret, self.secret_in_body) {
+            (None, _) => "none",
+            (Some(_), false) => "client_secret_basic",
+            (Some(_), true) => "client_secret_post",
         }
     }
 }
@@ -628,7 +698,9 @@ fn token_request(
     if let Some(redirect_uri) = redirect_uri {
         params.push(("redirect_uri", redirect_uri.to_owned()));
     }
-    params.push(("resource", resource.to_owned()));
+    if !resource.is_empty() {
+        params.push(("resource", resource.to_owned()));
+    }
     TokenRequest {
         body: form_urlencoded::Serializer::new(String::new())
             .extend_pairs(params)
@@ -677,16 +749,76 @@ pub fn refresh_token_request(
     )
 }
 
+#[must_use]
+pub fn revocation_request(
+    client: &ClientAuthentication,
+    token: &str,
+    token_type_hint: Option<&str>,
+) -> TokenRequest {
+    let mut params = vec![("token", token.to_owned())];
+    if let Some(hint) = token_type_hint {
+        params.push(("token_type_hint", hint.to_owned()));
+    }
+    token_request(params, &[], client, None, "")
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(from = "ReceivedTokenResponse")]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
-    #[serde(default)]
     pub expires_in: Option<u64>,
-    #[serde(default)]
     pub refresh_token: Option<String>,
-    #[serde(default)]
     pub scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReceivedTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    token_type: String,
+    #[serde(default, deserialize_with = "lifetime")]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    authed_user: Option<AuthedUser>,
+}
+
+#[derive(Deserialize)]
+struct AuthedUser {
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+impl From<ReceivedTokenResponse> for TokenResponse {
+    fn from(received: ReceivedTokenResponse) -> Self {
+        Self {
+            access_token: received.access_token,
+            token_type: received.token_type,
+            expires_in: received.expires_in,
+            refresh_token: received.refresh_token,
+            scope: received
+                .scope
+                .or_else(|| received.authed_user.and_then(|user| user.scope)),
+        }
+    }
+}
+
+fn lifetime<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Seconds {
+        Number(u64),
+        Text(String),
+    }
+    match Option::<Seconds>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Seconds::Number(seconds)) => Ok(Some(seconds)),
+        Some(Seconds::Text(seconds)) => seconds.parse().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 impl TokenResponse {
@@ -742,24 +874,54 @@ impl std::fmt::Display for TokenError {
     }
 }
 
+const REJECTED_ERRORS: &[&str] = &[
+    "invalid_grant",
+    "invalid_client",
+    "unauthorized_client",
+    "bad_refresh_token",
+];
+
+impl From<TokenErrorResponse> for TokenError {
+    fn from(error: TokenErrorResponse) -> Self {
+        if REJECTED_ERRORS.contains(&error.error.as_str()) {
+            Self::Rejected(error)
+        } else {
+            Self::Server(error)
+        }
+    }
+}
+
+fn error_response(status: u16, body: &[u8]) -> TokenError {
+    match serde_json::from_slice::<TokenErrorResponse>(body) {
+        Ok(error) => error.into(),
+        Err(_) if status == 401 => TokenError::Rejected(TokenErrorResponse {
+            error: "invalid_client".to_owned(),
+            error_description: Some("HTTP 401 without an OAuth error response".to_owned()),
+            error_uri: None,
+        }),
+        Err(_) if body.is_empty() => TokenError::Invalid(format!(
+            "Other error: server returned empty error response with HTTP {status}"
+        )),
+        Err(error) => TokenError::Invalid(format!(
+            "Failed to parse server response with HTTP {status}: {error}"
+        )),
+    }
+}
+
+pub fn parse_revocation_response(status: u16, body: &[u8]) -> Result<(), TokenError> {
+    if status == 200 {
+        return Ok(());
+    }
+    Err(error_response(status, body))
+}
+
 pub fn parse_token_response(
     status: u16,
     content_type: Option<&str>,
     body: &[u8],
 ) -> Result<TokenResponse, TokenError> {
     if status != 200 {
-        if body.is_empty() {
-            return Err(TokenError::Invalid(
-                "Other error: server returned empty error response".to_owned(),
-            ));
-        }
-        return match serde_json::from_slice::<TokenErrorResponse>(body) {
-            Ok(error) if error.error == "invalid_grant" => Err(TokenError::Rejected(error)),
-            Ok(error) => Err(TokenError::Server(error)),
-            Err(error) => Err(TokenError::Invalid(format!(
-                "Failed to parse server response: {error}"
-            ))),
-        };
+        return Err(error_response(status, body));
     }
     if let Some(content_type) = content_type
         && !content_type
@@ -774,6 +936,9 @@ pub fn parse_token_response(
         return Err(TokenError::Invalid(
             "Other error: server returned empty response body".to_owned(),
         ));
+    }
+    if let Ok(error) = serde_json::from_slice::<TokenErrorResponse>(body) {
+        return Err(error.into());
     }
     serde_json::from_slice(body)
         .map_err(|error| TokenError::Invalid(format!("Failed to parse server response: {error}")))
@@ -805,6 +970,29 @@ impl ClientRegistrationRequest {
             application_type: Some(APPLICATION_TYPE.to_owned()),
         }
     }
+
+    #[must_use]
+    pub fn web_client(
+        client_name: &str,
+        redirect_uri: &str,
+        scopes: &[String],
+        token_endpoint_auth_method: &str,
+        refresh_tokens: bool,
+    ) -> Self {
+        let mut grant_types = vec!["authorization_code".to_owned()];
+        if refresh_tokens {
+            grant_types.push("refresh_token".to_owned());
+        }
+        Self {
+            client_name: client_name.to_owned(),
+            redirect_uris: vec![redirect_uri.to_owned()],
+            grant_types,
+            token_endpoint_auth_method: token_endpoint_auth_method.to_owned(),
+            response_types: vec!["code".to_owned()],
+            scope: (!scopes.is_empty()).then(|| scopes.join(" ")),
+            application_type: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -812,6 +1000,8 @@ pub struct ClientRegistrationResponse {
     pub client_id: String,
     #[serde(default)]
     pub client_secret: Option<String>,
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

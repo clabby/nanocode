@@ -7,7 +7,7 @@ use std::{
 use arc_swap::ArcSwap;
 use nanocode_sync::SingleFlight;
 
-use nanocode_mcp::oauth::{ClientAuthentication, TokenError, TokenResponse};
+use nanocode_mcp::oauth::{TokenError, TokenResponse};
 use tokio::time::timeout;
 
 use super::{McpOAuthCredentials, OAuthRuntime, now_millis};
@@ -50,6 +50,10 @@ impl McpOAuthCredentials {
     fn from_refresh_response(client_id: String, response: &TokenResponse, previous: &Self) -> Self {
         let mut credentials =
             Self::from_token_response(client_id, response, previous.issuer.clone());
+        credentials
+            .client_secret
+            .clone_from(&previous.client_secret);
+        credentials.secret_in_body = previous.secret_in_body;
         if response.refresh_token.is_none() {
             credentials
                 .refresh_token
@@ -211,7 +215,7 @@ impl OAuthRuntime {
         let mut scopes = latest.scopes.clone();
         metadata.add_offline_access(&mut scopes);
         let request = nanocode_mcp::oauth::refresh_token_request(
-            &ClientAuthentication::public(latest.client_id.clone()),
+            &latest.client_authentication(),
             refresh_token,
             &scopes,
             self.base_url.as_str(),

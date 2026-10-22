@@ -13,6 +13,7 @@ use nanocode_mcp::oauth::{
     TokenResponse, WwwAuthenticate,
 };
 use reqwest::{StatusCode, Url};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -60,6 +61,8 @@ impl OAuthMetadataCache {
 #[derive(Clone, PartialEq, Eq)]
 pub struct McpOAuthCredentials {
     client_id: String,
+    client_secret: Option<String>,
+    secret_in_body: bool,
     access_token: String,
     refresh_token: Option<String>,
     issuer: Option<String>,
@@ -76,11 +79,30 @@ impl McpOAuthCredentials {
     pub fn new(client_id: impl Into<String>, access_token: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
+            client_secret: None,
+            secret_in_body: false,
             access_token: access_token.into(),
             refresh_token: None,
             issuer: None,
             expires_at_millis: None,
             scopes: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn client(mut self, client: ClientAuthentication) -> Self {
+        self.client_id = client.client_id;
+        self.client_secret = client.client_secret;
+        self.secret_in_body = client.secret_in_body;
+        self
+    }
+
+    #[must_use]
+    pub fn client_authentication(&self) -> ClientAuthentication {
+        ClientAuthentication {
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            secret_in_body: self.secret_in_body,
         }
     }
 
@@ -148,6 +170,8 @@ impl McpOAuthCredentials {
             .and_then(|expires_in| now_millis().checked_add(expires_in.checked_mul(1000)?));
         Self {
             client_id,
+            client_secret: None,
+            secret_in_body: false,
             access_token: response.access_token.clone(),
             refresh_token: response.refresh_token.clone(),
             issuer,
@@ -462,11 +486,74 @@ pub(crate) async fn discover(http: &reqwest::Client, base_url: &Url) -> Result<D
     Ok(discovery)
 }
 
+fn challenged_resource_metadata_url(
+    headers: &reqwest::header::HeaderMap,
+    base_url: &Url,
+    challenge_scopes: &mut Vec<String>,
+) -> Option<Url> {
+    for value in headers.get_all(reqwest::header::WWW_AUTHENTICATE) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        let challenge = WwwAuthenticate::parse(value, base_url);
+        if let Some(url) = challenge.resource_metadata_url.clone() {
+            let scopes = challenge.scopes();
+            if !scopes.is_empty() {
+                *challenge_scopes = scopes;
+            }
+            return Some(url);
+        }
+    }
+    None
+}
+
+async fn initialize_challenge(
+    http: &reqwest::Client,
+    base_url: &Url,
+    challenge_scopes: &mut Vec<String>,
+) -> Option<Url> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": DISCOVERY_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": OAUTH_CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")},
+        },
+    });
+    let response = http
+        .post(base_url.as_str())
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("MCP-Protocol-Version", DISCOVERY_PROTOCOL_VERSION)
+        .body(body.to_string())
+        .send()
+        .await
+        .inspect_err(|error| {
+            tracing::debug!(
+                "unauthenticated MCP initialize probe failed: {}",
+                crate::error_chain(error)
+            );
+        })
+        .ok()?;
+    if response.status() != StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    challenged_resource_metadata_url(response.headers(), base_url, challenge_scopes)
+}
+
 async fn discover_resource_metadata_url(
     http: &reqwest::Client,
     base_url: &Url,
     challenge_scopes: &mut Vec<String>,
 ) -> Result<Option<Url>, String> {
+    if let Some(url) = initialize_challenge(http, base_url, challenge_scopes).await {
+        return Ok(Some(url));
+    }
     let candidates = std::iter::once(base_url.clone()).chain(
         nanocode_mcp::oauth::protected_resource_metadata_urls(base_url),
     );
@@ -475,18 +562,10 @@ async fn discover_resource_metadata_url(
         match response.status {
             StatusCode::OK => return Ok(Some(candidate)),
             StatusCode::UNAUTHORIZED => {
-                for value in response.headers.get_all(reqwest::header::WWW_AUTHENTICATE) {
-                    let Ok(value) = value.to_str() else {
-                        continue;
-                    };
-                    let challenge = WwwAuthenticate::parse(value, base_url);
-                    if let Some(url) = challenge.resource_metadata_url.clone() {
-                        let scopes = challenge.scopes();
-                        if !scopes.is_empty() {
-                            *challenge_scopes = scopes;
-                        }
-                        return Ok(Some(url));
-                    }
+                if let Some(url) =
+                    challenged_resource_metadata_url(&response.headers, base_url, challenge_scopes)
+                {
+                    return Ok(Some(url));
                 }
             }
             status => {
@@ -578,11 +657,49 @@ async fn fetch_authorization_metadata(
     }
 }
 
-pub(crate) async fn token_endpoint_request(
+#[derive(Clone, Debug)]
+pub struct OAuthServer {
+    pub metadata: AuthorizationMetadata,
+    pub resource: Option<String>,
+    pub scopes: Vec<String>,
+}
+
+pub async fn discover_server(
+    http: &reqwest::Client,
+    server_url: &Url,
+) -> Result<OAuthServer, String> {
+    let Discovery {
+        metadata,
+        resource,
+        challenge_scopes,
+        resource_scopes,
+    } = discover(http, server_url).await?;
+    validate_authorization_server_endpoints(&metadata)?;
+    let scopes = nanocode_mcp::oauth::select_scopes(&challenge_scopes, &resource_scopes, &metadata);
+    Ok(OAuthServer {
+        metadata,
+        resource: Some(resource.unwrap_or_else(|| server_url.to_string())),
+        scopes,
+    })
+}
+
+pub async fn discover_issuer(http: &reqwest::Client, issuer: &Url) -> Result<OAuthServer, String> {
+    let metadata = discover_authorization_server(http, issuer)
+        .await?
+        .ok_or_else(|| format!("Metadata error: no authorization server metadata for {issuer}"))?;
+    validate_authorization_server_endpoints(&metadata)?;
+    Ok(OAuthServer {
+        metadata,
+        resource: None,
+        scopes: Vec::new(),
+    })
+}
+
+async fn send_token_endpoint_request(
     http: &reqwest::Client,
     endpoint: &str,
     request: TokenRequest,
-) -> Result<TokenResponse, TokenError> {
+) -> Result<(u16, Option<String>, Vec<u8>), TokenError> {
     let mut builder = http
         .post(endpoint)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -610,7 +727,119 @@ pub(crate) async fn token_endpoint_request(
     let body = read_limited(response)
         .await
         .map_err(|error| TokenError::Invalid(format!("Request failed: {error}")))?;
+    Ok((status, content_type, body))
+}
+
+pub async fn token_endpoint_request(
+    http: &reqwest::Client,
+    endpoint: &str,
+    request: TokenRequest,
+) -> Result<TokenResponse, TokenError> {
+    let (status, content_type, body) = send_token_endpoint_request(http, endpoint, request).await?;
     nanocode_mcp::oauth::parse_token_response(status, content_type.as_deref(), &body)
+}
+
+pub async fn revoke_token(
+    http: &reqwest::Client,
+    endpoint: &str,
+    request: TokenRequest,
+) -> Result<(), TokenError> {
+    let (status, _, body) = send_token_endpoint_request(http, endpoint, request).await?;
+    nanocode_mcp::oauth::parse_revocation_response(status, &body)
+}
+
+pub struct WebLogin<'a> {
+    pub server: &'a OAuthServer,
+    pub client_id: &'a str,
+    pub redirect_uri: &'a str,
+    pub scopes: &'a [String],
+    pub params: &'a [(&'a str, &'a str)],
+    pub state_prefix: &'a str,
+}
+
+pub struct StartedWebLogin {
+    pub authorization_url: String,
+    pub pending: PendingWebLogin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingWebLogin {
+    pub state: String,
+    pub code_verifier: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub token_endpoint: String,
+    pub resource: Option<String>,
+    pub issuer: Option<String>,
+    pub require_issuer: bool,
+}
+
+impl WebLogin<'_> {
+    pub fn start(&self) -> Result<StartedWebLogin, String> {
+        let metadata = &self.server.metadata;
+        metadata.validate_authorization_code_support()?;
+        let pkce = Pkce::from_random(&random_bytes::<PKCE_VERIFIER_BYTES>()?);
+        let state = format!(
+            "{}{}",
+            self.state_prefix,
+            nanocode_mcp::oauth::state_from_random(&random_bytes::<STATE_BYTES>()?)
+        );
+        let authorization_url = AuthorizationUrl {
+            metadata,
+            client_id: self.client_id,
+            redirect_uri: self.redirect_uri,
+            state: &state,
+            code_challenge: &pkce.challenge,
+            scopes: self.scopes,
+            resource: self.server.resource.as_deref().unwrap_or_default(),
+        }
+        .build_with(self.params)?
+        .to_string();
+        Ok(StartedWebLogin {
+            authorization_url,
+            pending: PendingWebLogin {
+                state,
+                code_verifier: pkce.verifier,
+                client_id: self.client_id.to_owned(),
+                redirect_uri: self.redirect_uri.to_owned(),
+                token_endpoint: metadata.token_endpoint.clone(),
+                resource: self.server.resource.clone(),
+                issuer: metadata.issuer.clone(),
+                require_issuer: metadata.requires_issuer_in_callback(),
+            },
+        })
+    }
+}
+
+impl PendingWebLogin {
+    pub async fn complete(
+        &self,
+        http: &reqwest::Client,
+        client: &ClientAuthentication,
+        callback: &AuthorizationCallback,
+    ) -> Result<TokenResponse, TokenError> {
+        if callback.state != self.state {
+            return Err(TokenError::Invalid(
+                "Internal error: Authorization state not found".to_owned(),
+            ));
+        }
+        if client.client_id != self.client_id {
+            return Err(TokenError::Invalid(
+                "OAuth client changed during authorization".to_owned(),
+            ));
+        }
+        callback
+            .validate_issuer(self.issuer.as_deref(), self.require_issuer)
+            .map_err(TokenError::Invalid)?;
+        let request = nanocode_mcp::oauth::authorization_code_request(
+            client,
+            &callback.code,
+            &self.code_verifier,
+            &self.redirect_uri,
+            self.resource.as_deref().unwrap_or_default(),
+        );
+        token_endpoint_request(http, &self.token_endpoint, request).await
+    }
 }
 
 fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
@@ -621,14 +850,8 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
 }
 
 pub(crate) struct LoginSession {
-    metadata: AuthorizationMetadata,
     client: ClientAuthentication,
-    state: String,
-    code_verifier: String,
-    resource: String,
-    redirect_uri: String,
-    expected_issuer: Option<String>,
-    require_issuer: bool,
+    pending: PendingWebLogin,
     authorization_url: String,
 }
 
@@ -647,36 +870,31 @@ impl LoginSession {
         } = discovery;
         let scopes =
             nanocode_mcp::oauth::select_scopes(&challenge_scopes, &resource_scopes, &metadata);
-        let client = register_client(http, &metadata, redirect_uri, &scopes)
+        let request =
+            ClientRegistrationRequest::public_client(OAUTH_CLIENT_NAME, redirect_uri, &scopes);
+        let client = register_client(http, &metadata, &request)
             .await
             .map_err(|error| {
                 format!("Registration failed: Dynamic registration failed: {error}")
             })?;
-        metadata.validate_authorization_code_support()?;
-        let pkce = Pkce::from_random(&random_bytes::<PKCE_VERIFIER_BYTES>()?);
-        let state = nanocode_mcp::oauth::state_from_random(&random_bytes::<STATE_BYTES>()?);
-        let resource = resource.unwrap_or_else(|| base_url.to_string());
-        let authorization_url = AuthorizationUrl {
-            metadata: &metadata,
+        let server = OAuthServer {
+            metadata,
+            resource: Some(resource.unwrap_or_else(|| base_url.to_string())),
+            scopes,
+        };
+        let started = WebLogin {
+            server: &server,
             client_id: &client.client_id,
             redirect_uri,
-            state: &state,
-            code_challenge: &pkce.challenge,
-            scopes: &scopes,
-            resource: &resource,
+            scopes: &server.scopes,
+            params: &[],
+            state_prefix: "",
         }
-        .build()?
-        .to_string();
+        .start()?;
         Ok(Self {
-            expected_issuer: metadata.issuer.clone(),
-            require_issuer: metadata.requires_issuer_in_callback(),
-            metadata,
             client,
-            state,
-            code_verifier: pkce.verifier,
-            resource,
-            redirect_uri: redirect_uri.to_owned(),
-            authorization_url,
+            pending: started.pending,
+            authorization_url: started.authorization_url,
         })
     }
 
@@ -687,36 +905,48 @@ impl LoginSession {
     ) -> Result<TokenResponse, String> {
         let callback = Url::parse(callback).map_err(|error| format!("URL parse error: {error}"))?;
         let callback = AuthorizationCallback::from_url(&callback)?;
-        if callback.state != self.state {
-            return Err("Internal error: Authorization state not found".to_owned());
-        }
-        callback.validate_issuer(self.expected_issuer.as_deref(), self.require_issuer)?;
-        let request = nanocode_mcp::oauth::authorization_code_request(
-            &self.client,
-            &callback.code,
-            &self.code_verifier,
-            &self.redirect_uri,
-            &self.resource,
-        );
-        token_endpoint_request(http, &self.metadata.token_endpoint, request)
+        self.pending
+            .complete(http, &self.client, &callback)
             .await
             .map_err(|error| format!("OAuth token exchange failed: {error}"))
     }
 }
 
+pub async fn register_web_client(
+    http: &reqwest::Client,
+    metadata: &AuthorizationMetadata,
+    client_name: &str,
+    redirect_uri: &str,
+    scopes: &[String],
+) -> Result<ClientAuthentication, String> {
+    let methods = metadata.token_endpoint_auth_methods();
+    let method = ["client_secret_basic", "client_secret_post", "none"]
+        .into_iter()
+        .find(|method| methods.contains(method))
+        .ok_or_else(|| {
+            "Registration failed: no supported token endpoint authentication method".to_owned()
+        })?;
+    let request = ClientRegistrationRequest::web_client(
+        client_name,
+        redirect_uri,
+        scopes,
+        method,
+        metadata.issues_refresh_tokens(),
+    );
+    register_client(http, metadata, &request).await
+}
+
 async fn register_client(
     http: &reqwest::Client,
     metadata: &AuthorizationMetadata,
-    redirect_uri: &str,
-    scopes: &[String],
+    request: &ClientRegistrationRequest,
 ) -> Result<ClientAuthentication, String> {
     let Some(endpoint) = metadata.registration_endpoint.as_deref() else {
         return Err("Registration failed: Dynamic client registration not supported".to_owned());
     };
     metadata.validate_authorization_code_support()?;
-    let request = ClientRegistrationRequest::public_client(OAUTH_CLIENT_NAME, redirect_uri, scopes);
     let body =
-        serde_json::to_vec(&request).map_err(|error| format!("Registration failed: {error}"))?;
+        serde_json::to_vec(request).map_err(|error| format!("Registration failed: {error}"))?;
     let response = http
         .post(endpoint)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -742,13 +972,22 @@ async fn register_client(
     }
     let registration = serde_json::from_slice::<ClientRegistrationResponse>(&body)
         .map_err(|error| format!("Registration failed: analyze response error: {error}"))?;
-    Ok(ClientAuthentication {
-        client_id: registration.client_id,
-        client_secret: registration
-            .client_secret
-            .filter(|secret| !secret.is_empty()),
-        secret_in_body: metadata.uses_client_secret_post(),
-    })
+    let client_secret = registration
+        .client_secret
+        .filter(|secret| !secret.is_empty());
+    match registration
+        .token_endpoint_auth_method
+        .as_deref()
+        .unwrap_or(&request.token_endpoint_auth_method)
+    {
+        "none" if client_secret.is_some() => Ok(ClientAuthentication {
+            client_id: registration.client_id,
+            client_secret,
+            secret_in_body: metadata.uses_client_secret_post(),
+        }),
+        method => ClientAuthentication::with_method(registration.client_id, client_secret, method)
+            .map_err(|error| format!("Registration failed: {error}")),
+    }
 }
 
 pub struct OAuthLoginFlow {
@@ -847,7 +1086,7 @@ async fn complete_login(
     );
     let callback = match tokio::time::timeout(
         LOGIN_TIMEOUT,
-        receive_callback(listener, &session.redirect_uri),
+        receive_callback(listener, &session.pending.redirect_uri),
     )
     .instrument(callback_span.clone())
     .await
@@ -897,7 +1136,8 @@ async fn complete_login(
         session.client.client_id.clone(),
         &response,
         authorization_issuer,
-    );
+    )
+    .client(session.client.clone());
     let save_span = info_span!(
         target: "nanocode_code_mode",
         "mcp.oauth.credentials_save",
