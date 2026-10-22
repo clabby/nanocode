@@ -504,8 +504,11 @@ impl AgentDriver {
                     result,
                 } = command
                 {
-                    default_service_tier = service_tier;
-                    drop(result.send(Ok(())));
+                    let outcome = crate::ModelSelection::Codex(thread_model)
+                        .capabilities(crate::ModelTransport::Native)
+                        .check_service_tier(service_tier)
+                        .map(|()| default_service_tier = service_tier);
+                    drop(result.send(outcome));
                     continue;
                 }
                 if let Command::Preconnect { result } = command {
