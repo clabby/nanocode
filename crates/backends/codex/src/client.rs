@@ -133,6 +133,12 @@ impl<F> OpenAiBuilder<F> {
     }
 
     #[must_use]
+    pub const fn tool_input_deltas(mut self, enabled: bool) -> Self {
+        self.config.tool_input_deltas = enabled;
+        self
+    }
+
+    #[must_use]
     pub const fn history(mut self, history: ResponsesHistory) -> Self {
         self.config.responses_history = history;
         self

@@ -38,10 +38,6 @@ pub trait InboxHost: Send + Sync + 'static {
 
     fn place(&self, _session_id: &str, _hand: Option<&str>) {}
 
-    fn streams_tool_input(&self) -> bool {
-        false
-    }
-
     fn idle(&self) -> bool {
         true
     }
@@ -254,18 +250,8 @@ impl<H: ?Sized> Shared<H> {
 struct LogSink<H: ?Sized>(Arc<Shared<H>>);
 
 impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
-    fn deliver(&self, mut events: Vec<SessionEvent>) -> HostFuture<'_, Result<(), String>> {
+    fn deliver(&self, events: Vec<SessionEvent>) -> HostFuture<'_, Result<(), String>> {
         Box::pin(async move {
-            if !self.0.host.streams_tool_input() {
-                events.retain(|event| {
-                    event
-                        .agent_event()
-                        .is_none_or(|event| event.kind != AgentEventKind::ToolInputDelta)
-                });
-                if events.is_empty() {
-                    return Ok(());
-                }
-            }
             let annotation = self.0.host.annotate();
             let unannotated = Map::new();
             let (entries, live): (Vec<_>, Vec<_>) = events

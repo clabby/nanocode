@@ -588,6 +588,7 @@ pub struct ClaudeBuilder {
     keep_thinking: bool,
     fast_mode: bool,
     message_diagnostics: bool,
+    tool_input_deltas: bool,
     context_window_tokens: u64,
     auto_compact_window_tokens: Option<u64>,
     system: String,
@@ -653,6 +654,7 @@ impl ClaudeBuilder {
             keep_thinking: true,
             fast_mode: false,
             message_diagnostics: false,
+            tool_input_deltas: false,
             context_window_tokens,
             auto_compact_window_tokens: None,
             system: String::new(),
@@ -912,6 +914,11 @@ impl ClaudeBuilder {
 
     pub const fn fast_mode(mut self, enabled: bool) -> Self {
         self.fast_mode = enabled;
+        self
+    }
+
+    pub const fn tool_input_deltas(mut self, enabled: bool) -> Self {
+        self.tool_input_deltas = enabled;
         self
     }
 
@@ -1583,6 +1590,7 @@ impl ClaudeBuilder {
             keep_thinking: self.keep_thinking,
             fast_mode: AtomicBool::new(self.fast_mode),
             message_diagnostics: self.message_diagnostics,
+            tool_input_deltas: self.tool_input_deltas,
             context_window_tokens: self.context_window_tokens,
             auto_compact_window_tokens: self.auto_compact_window_tokens,
             session_id,
@@ -3020,6 +3028,7 @@ struct State {
     keep_thinking: bool,
     fast_mode: AtomicBool,
     message_diagnostics: bool,
+    tool_input_deltas: bool,
     context_window_tokens: u64,
     auto_compact_window_tokens: Option<u64>,
     workspace: String,
@@ -4660,6 +4669,7 @@ impl State {
                                 index: block,
                                 content_block: ContentBlock::ToolUse { id, name, .. },
                             } = &event
+                                && self.tool_input_deltas
                             {
                                 tool_blocks.insert(*block, (id.clone(), name.clone()));
                             }

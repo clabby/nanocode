@@ -725,6 +725,9 @@ where
                     &mut assistant_items,
                 );
                 if let Some((tool, input)) = ToolStreamItem::of(&item) {
+                    if !observer.tool_input_deltas {
+                        continue;
+                    }
                     if !input.is_empty() {
                         emit_tool_input(
                             events,

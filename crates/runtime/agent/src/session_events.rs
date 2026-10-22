@@ -64,18 +64,6 @@ const fn is_delta(kind: AgentEventKind) -> bool {
 }
 
 impl SessionEvent {
-    #[must_use]
-    pub const fn agent_event(&self) -> Option<&AgentEvent> {
-        match self {
-            Self::Agent { event, .. }
-            | Self::Subagent(ScopedAgentUpdate {
-                update: AgentUpdate::Event { event, .. },
-                ..
-            }) => Some(event),
-            Self::Subagent(_) => None,
-        }
-    }
-
     const fn delta(&self) -> Option<&AgentEvent> {
         match self {
             Self::Agent { event, .. } if is_delta(event.kind) => Some(event),

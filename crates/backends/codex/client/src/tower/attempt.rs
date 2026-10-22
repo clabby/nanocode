@@ -53,6 +53,7 @@ impl ResponsesAttemptKind {
 pub(crate) struct ResponsesObserver {
     pub(crate) events: EventSink,
     pub(crate) raw_api_events: bool,
+    pub(crate) tool_input_deltas: bool,
     pub(crate) stats: Arc<TransportStats>,
     response_events: Option<mpsc::Sender<ResponseEvent>>,
 }
@@ -559,6 +560,7 @@ impl ResponsesAttemptFactory {
             observer: ResponsesObserver {
                 events,
                 raw_api_events: true,
+                tool_input_deltas: false,
                 stats,
                 response_events: None,
             },

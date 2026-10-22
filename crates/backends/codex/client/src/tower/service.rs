@@ -952,6 +952,7 @@ impl Service<ResponsesAttempt> for ResponsesService {
             .events
             .with_raw_api_events(self.config.raw_api_events);
         request.observer.raw_api_events = self.config.raw_api_events;
+        request.observer.tool_input_deltas = self.config.tool_input_deltas;
         let service = self.clone();
         let parent = tracing::Span::current();
         Box::pin(async move {
