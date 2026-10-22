@@ -35,6 +35,14 @@ pub enum HttpAuth {
     None,
     Bearer(String),
     OAuth(Arc<OAuthRuntime>),
+    Source(Arc<dyn BearerSource>),
+}
+
+#[async_trait::async_trait]
+pub trait BearerSource: Send + Sync {
+    async fn token(&self) -> Result<String, String>;
+
+    async fn rejected(&self, token: &str) -> Result<String, String>;
 }
 
 pub fn validate_custom_headers<'a>(
@@ -201,6 +209,11 @@ fn client_error(error: &reqwest::Error) -> TransportError {
     }
 }
 
+fn challenged(response: &reqwest::Response) -> bool {
+    response.status() == StatusCode::UNAUTHORIZED
+        && response.headers().contains_key(WWW_AUTHENTICATE)
+}
+
 fn challenge_error(response: &reqwest::Response) -> Option<TransportError> {
     let status = response.status();
     let header = response.headers().get(WWW_AUTHENTICATE)?;
@@ -237,6 +250,7 @@ impl Shared {
                     .await
                     .map_err(TransportError::unsent)?,
             ),
+            HttpAuth::Source(source) => Some(source.token().await.map_err(TransportError::unsent)?),
         };
         let request = |token: Option<&str>| {
             let mut request = build(self.client.request(method.clone(), &self.url));
@@ -250,22 +264,32 @@ impl Shared {
             .await
             .map(nanocode_http::decode_response)
             .map_err(|error| client_error(&error))?;
-        if response.status() == StatusCode::UNAUTHORIZED
-            && response.headers().contains_key(WWW_AUTHENTICATE)
-            && let (HttpAuth::OAuth(runtime), Some(sent)) = (&self.auth, token.as_deref())
-        {
-            match runtime.refresh_after_rejection(sent).await {
-                Ok(fresh) if fresh != sent => {
-                    return request(Some(&fresh))
-                        .send()
-                        .await
-                        .map(nanocode_http::decode_response)
-                        .map_err(|error| client_error(&error));
+        let Some(sent) = token.as_deref().filter(|_| challenged(&response)) else {
+            return Ok(response);
+        };
+        let fresh = match &self.auth {
+            HttpAuth::OAuth(runtime) => runtime.refresh_after_rejection(sent).await,
+            HttpAuth::Source(source) => source.rejected(sent).await,
+            HttpAuth::None | HttpAuth::Bearer(_) => return Ok(response),
+        };
+        match fresh {
+            Ok(fresh) if fresh != sent => {
+                let retried = request(Some(&fresh))
+                    .send()
+                    .await
+                    .map(nanocode_http::decode_response)
+                    .map_err(|error| client_error(&error))?;
+                if let HttpAuth::Source(source) = &self.auth
+                    && challenged(&retried)
+                    && let Err(error) = source.rejected(&fresh).await
+                {
+                    tracing::debug!("bearer source refused a rejected refreshed token: {error}");
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::debug!("token refresh after server rejection failed: {error}");
-                }
+                return Ok(retried);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("token refresh after server rejection failed: {error}");
             }
         }
         Ok(response)

@@ -15,9 +15,10 @@ use tracing::{Instrument, Span, info_span};
 use nanocode_mcp_http::{
     SecretSource, error_chain,
     oauth::{McpOAuthStore, OAuthMetadataCache, OAuthRuntime, transport_from_credentials},
-    streamable_http::{self, HttpAuth},
+    streamable_http::{self, BearerSource, HttpAuth},
 };
 
+use super::McpCallError;
 use super::config::{McpPaymentManagement, McpPaymentProvider, McpServer, McpTransport};
 use super::pagination::collect_paginated;
 use super::stdio;
@@ -40,24 +41,27 @@ const MCP_PAYMENT_REQUIRED_META_KEY: &str = "org.paymentauth/payment-required";
 const MCP_RECEIPT_META_KEY: &str = "org.paymentauth/receipt";
 
 impl ClientInner {
-    pub(crate) async fn call_tool(&self, params: CallToolParams) -> Result<CallToolResult, String> {
+    pub(crate) async fn call_tool(
+        &self,
+        params: CallToolParams,
+    ) -> Result<CallToolResult, McpCallError> {
         let first = self.session.call_tool(&params).await;
         let (payment_required, payment) = match (&first, &self.payment) {
             (Err(SessionError::Rpc(error)), Some(payment))
                 if error.code == MCP_PAYMENT_REQUIRED_CODE =>
             {
                 let Some(data) = error.data.as_ref() else {
-                    return first.map_err(|error| error.to_string());
+                    return first.map_err(McpCallError::Session);
                 };
                 (data, payment)
             }
             (Ok(result), Some(payment)) => {
                 let Some(data) = payment_required_result(result) else {
-                    return first.map_err(|error| error.to_string());
+                    return first.map_err(McpCallError::Session);
                 };
                 (data, payment)
             }
-            _ => return first.map_err(|error| error.to_string()),
+            _ => return first.map_err(McpCallError::Session),
         };
         let management = ToolManagement {
             session: &self.session,
@@ -65,16 +69,17 @@ impl ClientInner {
         };
         let Some(pending) = payment
             .prepare_with_management(payment_required, &management)
-            .await?
+            .await
+            .map_err(McpCallError::Payment)?
         else {
-            return first.map_err(|error| error.to_string());
+            return first.map_err(McpCallError::Session);
         };
 
         let mut paid = params;
         paid.insert_meta(MCP_CREDENTIAL_META_KEY, pending.credential().clone());
         match self.session.call_tool(&paid).await {
             Ok(result) if payment_required_result(&result).is_some() => {
-                pending.rollback().await?;
+                pending.rollback().await.map_err(McpCallError::Payment)?;
                 Ok(result)
             }
             Ok(result) => {
@@ -86,14 +91,14 @@ impl ClientInner {
                 {
                     pending.receipt(receipt);
                 }
-                pending.commit().await?;
+                pending.commit().await.map_err(McpCallError::Payment)?;
                 Ok(result)
             }
             Err(error @ SessionError::Rpc(_)) => {
-                pending.rollback().await?;
-                Err(error.to_string())
+                pending.rollback().await.map_err(McpCallError::Payment)?;
+                Err(McpCallError::Session(error))
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(McpCallError::Session(error)),
         }
     }
 
@@ -202,6 +207,7 @@ struct HttpConnect<'a> {
     server: &'a McpServer,
     url: &'a str,
     bearer: Option<&'a SecretSource>,
+    source: Option<Arc<dyn BearerSource>>,
     headers: &'a std::collections::BTreeMap<String, SecretSource>,
     oauth_store: Option<Arc<dyn McpOAuthStore>>,
     oauth_metadata: Arc<OAuthMetadataCache>,
@@ -230,6 +236,9 @@ pub(crate) async fn connect(
         McpTransport::Stdio { .. } => ("stdio", "none"),
         McpTransport::StreamableHttp { bearer, .. } if bearer.is_some() => {
             ("streamable_http", "bearer")
+        }
+        McpTransport::StreamableHttp { source, .. } if source.is_some() => {
+            ("streamable_http", "bearer_source")
         }
         McpTransport::StreamableHttp { .. } if oauth_store.is_some() => {
             ("streamable_http", "oauth_store")
@@ -280,6 +289,7 @@ pub(crate) async fn connect(
         McpTransport::StreamableHttp {
             url,
             bearer,
+            source,
             headers,
         } => {
             connect_http(HttpConnect {
@@ -287,6 +297,7 @@ pub(crate) async fn connect(
                 server,
                 url,
                 bearer: bearer.as_ref(),
+                source: source.clone(),
                 headers,
                 oauth_store,
                 oauth_metadata,
@@ -316,6 +327,7 @@ async fn connect_http(input: HttpConnect<'_>) -> Result<ConnectedServer, String>
         server,
         url,
         bearer,
+        source,
         headers,
         oauth_store,
         oauth_metadata,
@@ -343,6 +355,12 @@ async fn connect_http(input: HttpConnect<'_>) -> Result<ConnectedServer, String>
         }
         let session =
             connect_http_session(server, url, http_client, HttpAuth::Bearer(token), parent).await?;
+        return finish_startup(server, session, None, parent).await;
+    }
+    if let Some(source) = source {
+        let session =
+            connect_http_session(server, url, http_client, HttpAuth::Source(source), parent)
+                .await?;
         return finish_startup(server, session, None, parent).await;
     }
     if let Some(store) = oauth_store {

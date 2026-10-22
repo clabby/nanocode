@@ -199,7 +199,8 @@ impl McpHandle {
                 format!(
                     "MCP tool {name} timed out; outcome may be unknown, do not retry automatically"
                 )
-            })??;
+            })?
+            .map_err(|error| error.to_string())?;
         serde_json::to_value(result).map_err(|e| e.to_string())
     }
 

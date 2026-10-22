@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use nanocode_mcp_http::SecretSource;
+use nanocode_mcp_http::{SecretSource, streamable_http::BearerSource};
 use serde_json::Value;
 
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,6 +98,7 @@ pub(crate) enum McpTransport {
     StreamableHttp {
         url: String,
         bearer: Option<SecretSource>,
+        source: Option<Arc<dyn BearerSource>>,
         headers: BTreeMap<String, SecretSource>,
     },
 }
@@ -131,6 +132,7 @@ impl McpServer {
             transport: McpTransport::StreamableHttp {
                 url: url.into(),
                 bearer: None,
+                source: None,
                 headers: BTreeMap::new(),
             },
             description: None,
@@ -258,6 +260,15 @@ impl McpServer {
                 *bearer = Some(SecretSource::Environment(variable.into()));
             }
             McpTransport::Stdio { .. } => self.unsupported_option = Some("bearer_token_env"),
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn bearer_source(mut self, bearer_source: Arc<dyn BearerSource>) -> Self {
+        match &mut self.transport {
+            McpTransport::StreamableHttp { source, .. } => *source = Some(bearer_source),
+            McpTransport::Stdio { .. } => self.unsupported_option = Some("bearer_source"),
         }
         self
     }

@@ -35,6 +35,7 @@ pub use config::{
     McpPaymentManagement, McpPaymentProvider, McpPendingPayment, McpServer, McpToolExposure,
 };
 pub use nanocode_mcp_http::oauth::{McpOAuthCredentials, McpOAuthRefreshGuard, McpOAuthStore};
+pub use nanocode_mcp_http::streamable_http::BearerSource;
 
 const MAX_TOOL_SEARCH_SOURCE_DESCRIPTION_BYTES: usize = 4 * 1024;
 const CODEX_ENCRYPTED_CONTENT_META_KEY: &str = "codex/encryptedContent";
@@ -69,6 +70,7 @@ pub struct McpBuilder {
     servers: BTreeMap<String, McpServer>,
     oauth_store: Option<Arc<dyn McpOAuthStore>>,
     duplicate: Option<String>,
+    discovery_timeout: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -107,6 +109,21 @@ pub enum McpControlError {
 
     #[error("MCP OAuth login task stopped: {0}")]
     LoginTask(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum McpCallError {
+    #[error("{0}")]
+    Session(nanocode_mcp::Error),
+
+    #[error("{0}")]
+    Payment(String),
+
+    #[error("{0}")]
+    Auth(String),
+
+    #[error("exceeded {:.1} seconds", .0.as_secs_f64())]
+    Timeout(Duration),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,7 +187,62 @@ impl Mcp {
     }
 }
 
+impl Mcp {
+    pub fn prepared_servers(
+        &self,
+        max_timeout: Duration,
+    ) -> futures_util::future::BoxFuture<'_, BTreeMap<String, Result<Vec<PreparedMcpTool>, String>>>
+    {
+        Box::pin(async move {
+            DynamicToolProvider::start(self);
+            self.state
+                .server_entries()
+                .await
+                .into_iter()
+                .map(|(server, entries)| {
+                    let tools = entries.map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|entry| PreparedMcpTool {
+                                timeout: entry.timeout.min(max_timeout),
+                                entry,
+                            })
+                            .collect()
+                    });
+                    (server, tools)
+                })
+                .collect()
+        })
+    }
+}
+
 impl PreparedMcpTool {
+    pub fn server(&self) -> &str {
+        &self.entry.server_name
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.entry.read_only
+    }
+
+    pub fn call(
+        &self,
+        arguments: JsonObject,
+    ) -> futures_util::future::BoxFuture<'_, Result<CallToolResult, McpCallError>> {
+        Box::pin(async move {
+            self.entry
+                .client
+                .refresh_oauth()
+                .await
+                .map_err(McpCallError::Auth)?;
+            let params =
+                CallToolParams::new(self.entry.remote_name.clone()).with_arguments(arguments);
+            tokio::time::timeout(self.timeout, self.entry.client.call_tool(params))
+                .await
+                .map_err(|_| McpCallError::Timeout(self.timeout))?
+        })
+    }
+
     pub fn provider(&self) -> &str {
         self.entry.attached_provider()
     }
@@ -204,6 +276,12 @@ impl McpBuilder {
     #[must_use]
     pub fn oauth_store(mut self, store: Arc<dyn McpOAuthStore>) -> Self {
         self.oauth_store = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub const fn discovery_timeout(mut self, timeout: Duration) -> Self {
+        self.discovery_timeout = Some(timeout);
         self
     }
 
@@ -245,6 +323,7 @@ impl McpBuilder {
                 config: server,
             });
         }
+        let discovery_timeout = self.discovery_timeout.unwrap_or(discovery_timeout);
         let servers: Arc<[NamedServer]> = named.into();
         let state = Arc::new(ProviderState::new(
             servers.iter().map(|server| server.name.clone()),
@@ -392,8 +471,13 @@ impl McpHandle {
             config::McpTransport::StreamableHttp {
                 url,
                 bearer,
+                source,
                 headers,
-            } => (url.clone(), bearer.is_some(), headers.clone()),
+            } => (
+                url.clone(),
+                bearer.is_some() || source.is_some(),
+                headers.clone(),
+            ),
             config::McpTransport::Stdio { .. } => {
                 return Err(McpControlError::NotHttp(server_name.to_owned()));
             }
@@ -636,10 +720,10 @@ async fn execute_mcp_entry(
             span.record("status", "timeout");
             span.record("otel.status_code", "ERROR");
             return ToolOutput::error(format!(
-                "MCP tool {}/{} exceeded {:.1} seconds",
+                "MCP tool {}/{} {}",
                 entry.server_name,
                 entry.remote_name,
-                timeout.as_secs_f64()
+                McpCallError::Timeout(timeout)
             ));
         }
     };

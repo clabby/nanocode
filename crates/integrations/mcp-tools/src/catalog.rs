@@ -31,6 +31,7 @@ pub(crate) struct ToolEntry {
     namespace_description: String,
     pub definition: ToolDefinition,
     pub supports_parallel_tool_calls: bool,
+    pub read_only: bool,
     pub tool_exposure: McpToolExposure,
     pub search_text: String,
     pub client: Client,
@@ -379,6 +380,31 @@ impl ProviderState {
         self.entry(name)
     }
 
+    pub(crate) async fn server_entries(
+        &self,
+    ) -> BTreeMap<String, Result<Vec<Arc<ToolEntry>>, String>> {
+        self.wait_for_startup().await;
+        let catalog = self.catalog.get();
+        let mut servers = BTreeMap::new();
+        for server in catalog.clients.keys() {
+            servers.insert(server.clone(), Ok(Vec::new()));
+        }
+        for server in &catalog.pending_servers {
+            servers.insert(server.clone(), Err("MCP discovery timed out".to_owned()));
+        }
+        for (server, error) in &catalog.failures {
+            servers.insert(server.clone(), Err(error.clone()));
+        }
+        for entry in catalog.entries.values() {
+            if entry.tool_exposure.is_callable()
+                && let Some(Ok(entries)) = servers.get_mut(&entry.server_name)
+            {
+                entries.push(Arc::clone(entry));
+            }
+        }
+        servers
+    }
+
     pub(crate) async fn prepared_entries(&self) -> Result<Vec<Arc<ToolEntry>>, String> {
         self.wait_for_startup().await;
         let catalog = self.catalog.get();
@@ -573,6 +599,7 @@ impl ToolEntry {
             namespace_description,
             definition,
             supports_parallel_tool_calls,
+            read_only: tool.is_read_only(),
             tool_exposure: config.tool_exposure,
             search_text,
             client,
