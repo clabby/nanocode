@@ -237,6 +237,8 @@ struct EventChannel {
 struct OwnedDelta {
     model_call_index: u32,
     item_id: Option<String>,
+    call_id: Option<String>,
+    tool: Option<String>,
     phase: Option<MessagePhase>,
     text: String,
     model_elapsed_ns: Option<u64>,
@@ -247,6 +249,8 @@ impl OwnedDelta {
         Self {
             model_call_index: delta.model_call_index,
             item_id: delta.item_id.as_deref().map(str::to_owned),
+            call_id: delta.call_id.as_deref().map(str::to_owned),
+            tool: delta.tool.as_deref().map(str::to_owned),
             phase: delta.phase,
             text: delta.text.as_ref().to_owned(),
             model_elapsed_ns: delta.model_elapsed_ns,
@@ -257,6 +261,8 @@ impl OwnedDelta {
         TextDeltaRef {
             model_call_index: self.model_call_index,
             item_id: self.item_id.as_deref().map(Cow::Borrowed),
+            call_id: self.call_id.as_deref().map(Cow::Borrowed),
+            tool: self.tool.as_deref().map(Cow::Borrowed),
             phase: self.phase,
             text: Cow::Borrowed(&self.text),
             model_elapsed_ns: self.model_elapsed_ns,
@@ -319,6 +325,8 @@ struct DeltaKey {
 struct PendingDelta {
     key: Option<DeltaKey>,
     item_id: Option<String>,
+    call_id: Option<String>,
+    tool: Option<String>,
     text: String,
 }
 
@@ -335,6 +343,7 @@ impl PendingDelta {
                 && key.model_call_index == delta.model_call_index
                 && key.phase == delta.phase
         }) && self.item_id.as_deref() == delta.item_id.as_deref()
+            && self.call_id.as_deref() == delta.call_id.as_deref()
     }
 
     fn start(
@@ -354,6 +363,12 @@ impl PendingDelta {
         });
         if self.item_id.as_deref() != delta.item_id.as_deref() {
             self.item_id = delta.item_id.as_deref().map(str::to_owned);
+        }
+        if self.call_id.as_deref() != delta.call_id.as_deref() {
+            self.call_id = delta.call_id.as_deref().map(str::to_owned);
+        }
+        if self.tool.as_deref() != delta.tool.as_deref() {
+            self.tool = delta.tool.as_deref().map(str::to_owned);
         }
         self.text.clear();
         self.text.push_str(&delta.text);
@@ -727,6 +742,8 @@ impl EventChannel {
             &TextDeltaRef {
                 model_call_index: key.model_call_index,
                 item_id: pending.item_id.as_deref().map(Cow::Borrowed),
+                call_id: pending.call_id.as_deref().map(Cow::Borrowed),
+                tool: pending.tool.as_deref().map(Cow::Borrowed),
                 phase: key.phase,
                 text: Cow::Borrowed(&pending.text),
                 model_elapsed_ns: key.model_elapsed_ns,

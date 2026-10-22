@@ -60,6 +60,9 @@ pub enum AgentEventKind {
     #[serde(rename = "tool.notification")]
     ToolNotification,
 
+    #[serde(rename = "tool.input.delta")]
+    ToolInputDelta,
+
     #[serde(rename = "model.warmup.started")]
     ModelWarmupStarted,
 
@@ -171,6 +174,9 @@ impl AgentEvent {
             }
             AgentEventKind::ToolNotification => {
                 AgentEventData::Tool(ToolEvent::Notification(self.decode_payload()?))
+            }
+            AgentEventKind::ToolInputDelta => {
+                AgentEventData::Tool(ToolEvent::InputDelta(self.decode_payload()?))
             }
             AgentEventKind::ModelWarmupStarted => {
                 AgentEventData::Model(ModelEvent::WarmupStarted(self.decode_payload()?))

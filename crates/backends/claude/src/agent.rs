@@ -4617,6 +4617,7 @@ impl State {
                     tokio::pin!(cancelled);
                     let mut accumulator: Option<MessageAccumulator> = None;
                     let mut thinking_item: Option<(usize, String)> = None;
+                    let mut tool_blocks: HashMap<usize, (String, String)> = HashMap::new();
                     loop {
                         let receive_started = Instant::now();
                         let mut next = tokio::select! {
@@ -4645,6 +4646,13 @@ impl State {
                             if let StreamEvent::MessageStart { message } = &event {
                                 message_id = Some(message.id.clone());
                             }
+                            if let StreamEvent::ContentBlockStart {
+                                index: block,
+                                content_block: ContentBlock::ToolUse { id, name, .. },
+                            } = &event
+                            {
+                                tool_blocks.insert(*block, (id.clone(), name.clone()));
+                            }
                             let shown = match &event {
                                 StreamEvent::ContentBlockStart {
                                     index: block,
@@ -4664,6 +4672,14 @@ impl State {
                                 } if !thinking.is_empty() => {
                                     Some((AgentEventKind::ReasoningSummaryDelta, *block, thinking))
                                 }
+                                StreamEvent::ContentBlockDelta {
+                                    index: block,
+                                    delta: ContentDelta::InputJsonDelta { partial_json },
+                                } if !partial_json.is_empty()
+                                    && tool_blocks.contains_key(block) =>
+                                {
+                                    Some((AgentEventKind::ToolInputDelta, *block, partial_json))
+                                }
                                 _ => None,
                             };
                             if let Some((kind, block, text)) = shown {
@@ -4679,7 +4695,11 @@ impl State {
                                         thinking_item =
                                             Some((block, format!("{id}:thinking:{block}")));
                                     }
+                                    let tool = (kind == AgentEventKind::ToolInputDelta)
+                                        .then(|| tool_blocks.get(&block))
+                                        .flatten();
                                     let item_id = match (kind, &thinking_item) {
+                                        (AgentEventKind::ToolInputDelta, _) => None,
                                         (
                                             AgentEventKind::ReasoningSummaryDelta,
                                             Some((_, item)),
@@ -4692,6 +4712,12 @@ impl State {
                                         TextDeltaRef {
                                             model_call_index: index.saturating_add(1),
                                             item_id: item_id.map(std::borrow::Cow::Borrowed),
+                                            call_id: tool.map(|(id, _)| {
+                                                std::borrow::Cow::Borrowed(id.as_str())
+                                            }),
+                                            tool: tool.map(|(_, name)| {
+                                                std::borrow::Cow::Borrowed(name.as_str())
+                                            }),
                                             phase: None,
                                             text: std::borrow::Cow::Borrowed(text),
                                             model_elapsed_ns: Some(model_elapsed_ns),

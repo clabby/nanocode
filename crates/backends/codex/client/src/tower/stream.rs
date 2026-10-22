@@ -336,6 +336,11 @@ enum StreamEvent<'a> {
     ReasoningDelta {
         delta: Cow<'a, str>,
     },
+    ToolInputDelta {
+        output_index: Option<u32>,
+        item_id: Option<Cow<'a, str>>,
+        delta: Cow<'a, str>,
+    },
     ItemDone {
         output_index: Option<u32>,
         item: ResponseItem,
@@ -351,6 +356,7 @@ impl StreamEvent<'_> {
             self,
             Self::TextDelta { .. }
                 | Self::ReasoningDelta { .. }
+                | Self::ToolInputDelta { .. }
                 | Self::ItemAdded { .. }
                 | Self::ItemDone { .. }
         )
@@ -450,20 +456,38 @@ fn decode_wire_event(raw: &str, responses: bool) -> Result<DecodedEvent<'_>, ser
             });
             (StreamEvent::Completed(completed), response)
         }
+        "response.function_call_arguments.delta" => (
+            StreamEvent::ToolInputDelta {
+                output_index: optional(event.output_index)?,
+                item_id: optional::<Text<'_>>(event.item_id)?.map(|item| item.0),
+                delta: required::<Text<'_>>(event.delta, "delta")?.0,
+            },
+            None,
+        ),
         "response.custom_tool_call_input.delta" => {
             let delta = required::<Text<'_>>(event.delta, "delta")?.0;
-            let item_id = optional::<String>(event.item_id)?;
+            let item_id = optional::<Text<'_>>(event.item_id)?.map(|item| item.0);
             let call_id = optional::<String>(event.call_id)?;
             let response = responses
                 .then(|| {
                     Some(ResponseEvent::ToolCallInputDelta {
-                        item_id: item_id.or_else(|| call_id.clone())?,
+                        item_id: item_id
+                            .as_deref()
+                            .map(str::to_owned)
+                            .or_else(|| call_id.clone())?,
                         call_id,
-                        delta: delta.into_owned(),
+                        delta: delta.clone().into_owned(),
                     })
                 })
                 .flatten();
-            (StreamEvent::Other, response)
+            (
+                StreamEvent::ToolInputDelta {
+                    output_index: optional(event.output_index)?,
+                    item_id,
+                    delta,
+                },
+                response,
+            )
         }
         "response.reasoning_summary_text.done" => {
             let item_id = required::<String>(event.item_id, "item_id")?;
@@ -639,6 +663,7 @@ where
 {
     let mut done_items = Vec::with_capacity(2);
     let mut assistant_items = HashMap::new();
+    let mut tool_items = HashMap::new();
     let item_namespace = nanocode_platform::uuid_v4();
     let mut timing = StreamTiming::new(started_at, model_started_at);
     let context = EventContext {
@@ -699,6 +724,21 @@ where
                     &item_namespace,
                     &mut assistant_items,
                 );
+                if let Some((tool, input)) = ToolStreamItem::of(&item) {
+                    if !input.is_empty() {
+                        emit_tool_input(
+                            events,
+                            &mut timing,
+                            call_index,
+                            &tool,
+                            Cow::Borrowed(input),
+                            &received,
+                            published,
+                        )?;
+                    }
+                    tool_items.insert(output_index, tool);
+                    continue;
+                }
                 let ResponseItem::Message {
                     id,
                     role: MessageRole::Assistant,
@@ -731,6 +771,8 @@ where
                     TextDeltaRef {
                         model_call_index: call_index,
                         item_id: item.item_id.as_deref().map(Cow::Borrowed),
+                        call_id: None,
+                        tool: None,
                         phase: item.phase,
                         text: delta,
                         model_elapsed_ns: None,
@@ -747,6 +789,8 @@ where
                     TextDeltaRef {
                         model_call_index: call_index,
                         item_id: None,
+                        call_id: None,
+                        tool: None,
                         phase: None,
                         text: delta,
                         model_elapsed_ns: None,
@@ -754,6 +798,31 @@ where
                     &received,
                     published,
                 )?;
+            }
+            StreamEvent::ToolInputDelta {
+                output_index,
+                item_id,
+                delta,
+            } => {
+                let tool = output_index
+                    .and_then(|index| tool_items.get(&index))
+                    .or_else(|| {
+                        let item_id = item_id.as_deref()?;
+                        tool_items
+                            .values()
+                            .find(|tool| tool.item_id.as_deref() == Some(item_id))
+                    });
+                if let Some(tool) = tool {
+                    emit_tool_input(
+                        events,
+                        &mut timing,
+                        call_index,
+                        tool,
+                        delta,
+                        &received,
+                        published,
+                    )?;
+                }
             }
             StreamEvent::ItemDone {
                 output_index,
@@ -836,6 +905,83 @@ fn completed_output(
         return Ok(done_items);
     }
     serde_json::from_str(output.get()).map_err(invalid)
+}
+
+struct ToolStreamItem {
+    item_id: Option<String>,
+    call_id: String,
+    tool: String,
+}
+
+impl ToolStreamItem {
+    fn of(item: &ResponseItem) -> Option<(Self, &str)> {
+        let (id, call_id, name, namespace, input) = match item {
+            ResponseItem::FunctionCall {
+                id,
+                call_id,
+                name,
+                namespace,
+                arguments,
+                ..
+            } => (id, call_id, name, namespace, arguments),
+            ResponseItem::CustomToolCall {
+                id,
+                call_id,
+                name,
+                namespace,
+                input,
+                ..
+            } => (id, call_id, name, namespace, input),
+            _ => return None,
+        };
+        Some((
+            Self {
+                item_id: id.as_deref().map(str::to_owned),
+                call_id: call_id.to_string(),
+                tool: qualified_tool_name(name, namespace.as_deref()),
+            },
+            input,
+        ))
+    }
+}
+
+#[must_use]
+pub fn qualified_tool_name(name: &str, namespace: Option<&str>) -> String {
+    let Some(namespace) = namespace else {
+        return name.to_owned();
+    };
+    if namespace.ends_with('_') || name.starts_with('_') {
+        format!("{namespace}{name}")
+    } else {
+        format!("{namespace}__{name}")
+    }
+}
+
+fn emit_tool_input(
+    events: &EventSink,
+    timing: &mut StreamTiming,
+    call_index: u32,
+    tool: &ToolStreamItem,
+    text: Cow<'_, str>,
+    received: &ReceivedText,
+    published: Published,
+) -> Result<(), ResponsesServiceError> {
+    emit_display_delta(
+        events,
+        timing,
+        AgentEventKind::ToolInputDelta,
+        TextDeltaRef {
+            model_call_index: call_index,
+            item_id: None,
+            call_id: Some(Cow::Borrowed(&tool.call_id)),
+            tool: Some(Cow::Borrowed(&tool.tool)),
+            phase: None,
+            text,
+            model_elapsed_ns: None,
+        },
+        received,
+        published,
+    )
 }
 
 fn emit_display_delta(

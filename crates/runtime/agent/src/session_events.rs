@@ -19,7 +19,14 @@ use crate::{
     events::{AgentEvent, AgentEventKind, AgentEventTiming, monotonic_now_ns},
 };
 
-const MERGED_FIELDS: [&str; 4] = ["item_id", "turn_id", "model_call_index", "phase"];
+const MERGED_FIELDS: [&str; 6] = [
+    "item_id",
+    "call_id",
+    "tool",
+    "turn_id",
+    "model_call_index",
+    "phase",
+];
 
 pub enum SessionEvent {
     Agent {
@@ -50,11 +57,25 @@ struct Sources {
 const fn is_delta(kind: AgentEventKind) -> bool {
     matches!(
         kind,
-        AgentEventKind::AssistantDelta | AgentEventKind::ReasoningSummaryDelta
+        AgentEventKind::AssistantDelta
+            | AgentEventKind::ReasoningSummaryDelta
+            | AgentEventKind::ToolInputDelta
     )
 }
 
 impl SessionEvent {
+    #[must_use]
+    pub const fn agent_event(&self) -> Option<&AgentEvent> {
+        match self {
+            Self::Agent { event, .. }
+            | Self::Subagent(ScopedAgentUpdate {
+                update: AgentUpdate::Event { event, .. },
+                ..
+            }) => Some(event),
+            Self::Subagent(_) => None,
+        }
+    }
+
     const fn delta(&self) -> Option<&AgentEvent> {
         match self {
             Self::Agent { event, .. } if is_delta(event.kind) => Some(event),

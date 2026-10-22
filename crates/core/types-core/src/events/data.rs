@@ -115,6 +115,22 @@ pub struct TextDeltaRef<'a> {
     )]
     pub item_id: Option<Cow<'a, str>>,
 
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "borrowed_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub call_id: Option<Cow<'a, str>>,
+
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "borrowed_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tool: Option<Cow<'a, str>>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<MessagePhase>,
 
@@ -281,6 +297,8 @@ pub enum ToolEvent {
     Result(ToolResultEvent),
 
     Notification(ToolNotification),
+
+    InputDelta(ToolInputDelta),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -328,6 +346,17 @@ pub struct ToolResultEvent {
     pub structured_result: Value,
 
     pub metadata: Option<Box<RawValue>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ToolInputDelta {
+    pub model_call_index: u32,
+
+    pub call_id: String,
+
+    pub tool: String,
+
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

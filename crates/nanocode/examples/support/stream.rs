@@ -25,6 +25,9 @@ pub async fn prompt(
             result = &mut result => break result?,
         }
     };
+    while let Some(event) = events.try_recv() {
+        printer.event(&event)?;
+    }
     printer.finish(result.final_message())?;
     Ok(())
 }
