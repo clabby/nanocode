@@ -10,7 +10,7 @@ mod config;
 mod native;
 mod pagination;
 mod search;
-mod stdio;
+pub mod stdio;
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},

@@ -14,7 +14,7 @@ const MAX_MCP_STDIO_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MCP_STDIO_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
-pub(super) fn spawn(
+pub fn spawn(
     mut command: Command,
     outgoing: Outgoing,
     inbound: Inbound,
