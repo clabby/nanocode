@@ -3,7 +3,8 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::{
-    Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, embedded::HostFuture,
+    Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolOutputContent, ToolResult,
+    embedded::HostFuture,
 };
 
 pub trait FunctionHandler: Send + Sync + 'static {
@@ -21,6 +22,7 @@ pub struct FunctionTool {
     parameters: Value,
     handler: Arc<dyn FunctionHandler>,
     parallel: bool,
+    content_results: bool,
 }
 
 impl FunctionTool {
@@ -37,6 +39,7 @@ impl FunctionTool {
             parameters,
             handler,
             parallel: false,
+            content_results: false,
         }
     }
 
@@ -44,6 +47,42 @@ impl FunctionTool {
     pub const fn parallel_tool_calls(mut self, parallel: bool) -> Self {
         self.parallel = parallel;
         self
+    }
+
+    #[must_use]
+    pub const fn content_results(mut self, enabled: bool) -> Self {
+        self.content_results = enabled;
+        self
+    }
+
+    fn output(&self, output: Value) -> ToolOutput {
+        match output {
+            Value::String(output) => ToolOutput::text(output),
+            Value::Object(mut fields) if self.content_results && fields.contains_key("content") => {
+                let structured = fields.remove("structured_result");
+                let content = fields.remove("content").unwrap_or_default();
+                if let Some(field) = fields.keys().next() {
+                    return ToolOutput::error(format!(
+                        "{} returned a content result with the unknown field {field}",
+                        self.name
+                    ));
+                }
+                match (
+                    serde_json::from_value::<Vec<ToolOutputContent>>(content),
+                    structured,
+                ) {
+                    (Ok(content), Some(structured)) => {
+                        ToolOutput::content(content).with_structured_result(structured)
+                    }
+                    (Ok(content), None) => ToolOutput::content(content),
+                    (Err(error), _) => ToolOutput::error(format!(
+                        "{} returned an invalid content result: {error}",
+                        self.name
+                    )),
+                }
+            }
+            output => ToolOutput::from_json(output, true),
+        }
     }
 }
 
@@ -73,8 +112,7 @@ impl Tool for FunctionTool {
         Box::pin(async move {
             let input = input.decode_json()?;
             Ok(match self.handler.call(&self.name, input, context).await {
-                Ok(Value::String(output)) => ToolOutput::text(output),
-                Ok(output) => ToolOutput::from_json(output, true),
+                Ok(output) => self.output(output),
                 Err(error) => ToolOutput::error(error),
             })
         })
