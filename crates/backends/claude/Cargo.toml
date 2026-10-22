@@ -12,6 +12,7 @@ description = "Claude backend: agent driver, prompts, tools and durability over 
 [dependencies]
 nanocode-backend-claude-tools.workspace = true
 nanocode-backend-claude-client.workspace = true
+nanocode-http.workspace = true
 nanocode-process-contracts.workspace = true
 nanocode-agent-config.workspace = true
 nanocode-tool-contracts.workspace = true

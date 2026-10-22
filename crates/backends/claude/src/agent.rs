@@ -3899,6 +3899,7 @@ struct ResponseOutcome {
     replayed: bool,
 }
 struct ResponseContext<'a> {
+    origin: Option<Arc<str>>,
     disable_tools: bool,
     force_text: bool,
     container: Option<&'a str>,
@@ -4364,9 +4365,12 @@ impl State {
         context: ResponseContext<'_>,
     ) -> std::result::Result<ResponseOutcome, ResponseFailure> {
         let template = context.template;
-        let mut outcome = self
-            .observed_response(messages, tools, cancel, events, index, context)
-            .await;
+        let origin = context.origin.clone();
+        let mut outcome = nanocode_http::layer::origin::scope(
+            origin,
+            self.observed_response(messages, tools, cancel, events, index, context),
+        )
+        .await;
         if let Ok(outcome) = &mut outcome {
             outcome.message.usage.estimated_cost =
                 self.estimate_cost(template, &outcome.message.usage);
@@ -5268,6 +5272,7 @@ impl State {
                     None,
                     0,
                     ResponseContext {
+                        origin: cursor.host_context(self),
                         disable_tools: true,
                         force_text,
                         container: context.container.as_deref(),
@@ -5575,7 +5580,7 @@ impl State {
                 .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
             call_id: id.to_owned(),
             instruction_revision: cursor.instruction_revision,
-            host_context: self.host_context.clone(),
+            host_context: cursor.host_context(self),
             progress: None,
         };
 
@@ -6033,6 +6038,7 @@ impl State {
                     Some(&request.events),
                     index,
                     ResponseContext {
+                        origin: cursor.host_context(self),
                         disable_tools: false,
                         force_text: false,
                         container: conversation.container.as_deref(),
@@ -6267,7 +6273,7 @@ impl State {
                 self.flush_journal(journal).await?;
             }
             if !text.is_empty() {
-                self.emit(&request.events,AgentEventKind::AssistantMessage,json!({"model_call_index":index,"item_id":response.id,"phase":null,"text":text,"citations":citations}));
+                self.emit(&request.events,AgentEventKind::AssistantMessage,json!({"model_call_index":index.saturating_add(1),"item_id":response.id,"phase":null,"text":text,"citations":citations}));
             }
 
             let committed = std::mem::take(&mut conversation.messages);

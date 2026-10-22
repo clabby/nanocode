@@ -5486,6 +5486,13 @@ pub struct SubagentControl {
 }
 
 impl SubagentControl {
+    pub async fn completion_origin(&self, request_id: &str) -> Option<Arc<str>> {
+        let (session_id, _) = request_id
+            .strip_prefix(crate::COMPLETION_REQUEST_PREFIX)?
+            .split_once(':')?;
+        self.registry.host_context_for_session(session_id).await
+    }
+
     pub fn set_max_concurrency(&self, limit: usize) {
         self.registry.set_max_concurrency(limit);
     }

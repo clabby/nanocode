@@ -24,6 +24,7 @@ pub type HostFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub struct CodeModeHostError {
     message: Box<str>,
     unsent: bool,
+    refused: Box<[u64]>,
 }
 
 impl CodeModeHostError {
@@ -32,6 +33,7 @@ impl CodeModeHostError {
         Self {
             message: message.into().into_boxed_str(),
             unsent: false,
+            refused: Box::default(),
         }
     }
 
@@ -40,6 +42,16 @@ impl CodeModeHostError {
         Self {
             message: message.into().into_boxed_str(),
             unsent: true,
+            refused: Box::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn refused(message: impl Into<String>, ids: Vec<u64>) -> Self {
+        Self {
+            message: message.into().into_boxed_str(),
+            unsent: false,
+            refused: ids.into_boxed_slice(),
         }
     }
 
@@ -51,6 +63,11 @@ impl CodeModeHostError {
     #[must_use]
     pub const fn is_unsent(&self) -> bool {
         self.unsent
+    }
+
+    #[must_use]
+    pub fn refused_requests(&self) -> &[u64] {
+        &self.refused
     }
 }
 

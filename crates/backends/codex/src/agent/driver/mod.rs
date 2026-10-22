@@ -726,6 +726,13 @@ impl AgentDriver {
                             }
                             return;
                         }
+                        model.set_host_context(
+                            self.spawner
+                                .host_context
+                                .as_ref()
+                                .map(Arc::clone)
+                                .or_else(|| compaction_operation_id.as_deref().map(Arc::from)),
+                        );
                         let execution_steps = execution_turn.steps();
                         let mut compact_replaced = false;
                         let (cancel_compaction, mut cancel_compaction_rx) = oneshot::channel();
