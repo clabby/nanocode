@@ -514,6 +514,7 @@ impl Drop for ProcessGroupGuard {
 
 pub(super) fn sanitized_environment(
     overrides: &[(OsString, OsString)],
+    secret_overrides: &[(OsString, OsString)],
 ) -> (Vec<(OsString, OsString)>, Vec<String>) {
     let mut environment = Vec::new();
     let mut secrets = Vec::new();
@@ -536,6 +537,13 @@ pub(super) fn sanitized_environment(
         if is_sensitive_name(name)
             && let Some(value) = value.to_str().filter(|value| value.len() >= 8)
         {
+            secrets.push(value.to_owned());
+        }
+    }
+    for (name, value) in secret_overrides {
+        environment.retain(|(candidate, _)| candidate != name);
+        environment.push((name.clone(), value.clone()));
+        if let Some(value) = value.to_str().filter(|value| !value.is_empty()) {
             secrets.push(value.to_owned());
         }
     }

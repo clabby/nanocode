@@ -50,7 +50,7 @@ pub(crate) fn run_bash_with_environment<'call>(
                     .unwrap_or_default(),
             )
             .collect();
-        let (environment, _) = process::sanitized_environment(&overrides);
+        let (environment, _) = process::sanitized_environment(&overrides, &[]);
         let shell = selection::bash_shell().ok_or("Bash executable not found")?;
         let mut spawned = process::spawn(command, workspace, &shell, false, false, &environment)
             .map_err(|error| error.to_string())?;
