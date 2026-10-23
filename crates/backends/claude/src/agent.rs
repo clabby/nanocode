@@ -739,7 +739,11 @@ impl ClaudeBuilder {
         if let Some(snapshot) = &restored
             && (snapshot.effort.is_some() || snapshot.thinking_disabled || snapshot.fast_mode)
         {
-            if let Ok(model) = self.claude.model.parse::<ModelSelection>()
+            if let Ok(model) = self
+                .claude
+                .model
+                .parse::<nanocode_agent_core::ClaudeModel>()
+                .map(ModelSelection::Claude)
                 && (((snapshot.effort.is_some() || snapshot.thinking_disabled)
                     && !model.supports_thinking(effort_thinking(snapshot.effort)))
                     || (snapshot.fast_mode && !model.supports_fast_mode()))
@@ -1237,7 +1241,12 @@ impl ClaudeBuilder {
     }
 
     pub fn build(mut self) -> Result<(Agent, AgentEvents)> {
-        if let Ok(model) = self.claude.model.parse::<ModelSelection>() {
+        if let Ok(model) = self
+            .claude
+            .model
+            .parse::<nanocode_agent_core::ClaudeModel>()
+            .map(ModelSelection::Claude)
+        {
             model
                 .capabilities(ModelTransport::Native)
                 .check_fast_mode(self.fast_mode)?;
@@ -4212,8 +4221,8 @@ impl State {
     fn speed(&self) -> Option<crate::Speed> {
         let supported = self
             .model()
-            .parse::<ModelSelection>()
-            .is_ok_and(|model| model.supports_fast_mode());
+            .parse::<nanocode_agent_core::ClaudeModel>()
+            .is_ok_and(|model| ModelSelection::Claude(model).supports_fast_mode());
         (supported && self.fast_mode.load(Ordering::SeqCst)).then_some(crate::Speed::Fast)
     }
 
@@ -6760,7 +6769,11 @@ impl LifecycleBackend for Driver {
     fn capabilities(&self) -> Capabilities {
         let mut capabilities = CLAUDE_CAPABILITIES;
 
-        if let Ok(model) = self.state.model().parse::<ModelSelection>()
+        if let Ok(model) = self
+            .state
+            .model()
+            .parse::<nanocode_agent_core::ClaudeModel>()
+            .map(ModelSelection::Claude)
             && !model.capabilities(ModelTransport::Native).fast_mode()
         {
             capabilities.service_tier = Mutability::Fixed;
@@ -7123,7 +7136,11 @@ impl LifecycleBackend for Driver {
             if state.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
-            if let Ok(model) = state.model().parse::<ModelSelection>() {
+            if let Ok(model) = state
+                .model()
+                .parse::<nanocode_agent_core::ClaudeModel>()
+                .map(ModelSelection::Claude)
+            {
                 model
                     .capabilities(ModelTransport::Native)
                     .check_fast_mode(enabled)?;

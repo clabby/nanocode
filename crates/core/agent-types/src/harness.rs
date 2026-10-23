@@ -555,10 +555,10 @@ impl FromStr for ModelSelection {
         if let Ok(model) = value.parse::<ClaudeModel>() {
             return Ok(Self::Claude(model));
         }
-        value
-            .parse::<Model>()
-            .map(Self::Codex)
-            .map_err(|_| "model identities must not be empty")
+        if value.trim().is_empty() {
+            return Err("model identities must not be empty");
+        }
+        Ok(Self::new(HarnessFamily::Codex, value))
     }
 }
 
