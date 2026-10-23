@@ -1,0 +1,32 @@
+[package]
+autotests = false
+autobenches = false
+name = "nanocode-chatgpt-extension"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords = ["ai", "agents", "browser", "chrome", "native-messaging"]
+categories.workspace = true
+description = "Drive Chromium tabs through the official ChatGPT extension by proxying its native messaging host"
+include = ["src/**", "Cargo.toml"]
+
+[target.'cfg(unix)'.dependencies]
+getrandom.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false

@@ -1910,6 +1910,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-chatgpt-extension"
+version = "0.6.7"
+dependencies = [
+ "getrandom 0.4.3",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
 name = "nanocode-cli"
 version = "0.6.7"
 dependencies = [
