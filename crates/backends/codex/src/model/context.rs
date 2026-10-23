@@ -136,18 +136,18 @@ impl ContextSnapshot {
         execution_environment: Option<&ExecutionEnvironment>,
     ) -> Self {
         let detected;
-        let local_time = if let Some(configured) = execution_environment {
+        let environment = if let Some(configured) = execution_environment {
             configured
         } else {
             detected = detected_execution_environment();
             &detected
         };
         Self::capture_at(
-            cwd,
-            shell,
+            environment.working_directory.as_deref().unwrap_or(cwd),
+            environment.shell.as_deref().unwrap_or(shell),
             agents_md,
-            &local_time.current_date,
-            &local_time.timezone,
+            &environment.current_date(),
+            &environment.timezone,
         )
     }
 

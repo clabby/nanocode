@@ -197,6 +197,23 @@ impl<B, D: RuntimeDefaults> RuntimeBuilder<B, D> {
     settings_methods!();
 
     #[must_use]
+    pub fn model_instructions(
+        mut self,
+        model: ModelSelection,
+        instructions: impl Into<Arc<str>>,
+    ) -> Self {
+        let model = model
+            .as_codex()
+            .map(ModelSelection::Codex)
+            .or_else(|| model.as_claude().map(ModelSelection::Claude))
+            .unwrap_or(model);
+        let configured = &mut self.data.settings.model_instructions;
+        configured.retain(|(existing, _)| *existing != model);
+        configured.push((model, instructions.into()));
+        self
+    }
+
+    #[must_use]
     pub fn workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
         self.data.workspace = Some(workspace.into());
         self
@@ -554,7 +571,14 @@ fn backend_recipe(
     let workspace = workspace.clone();
     let defaults = runtime.clone();
     Arc::new(move |spec| {
-        let settings = spec.settings;
+        let mut settings = spec.settings;
+        if settings.instructions.is_none() {
+            settings.instructions = defaults
+                .model_instructions
+                .iter()
+                .find(|(model, _)| *model == spec.model)
+                .map(|(_, instructions)| Arc::clone(instructions));
+        }
         backend.build(RuntimeRequest {
             request: HarnessRequest {
                 model: spec.model,

@@ -10,7 +10,8 @@ use std::{
     time::Duration,
 };
 
-use nanocode_sync::{Atom, Slot};
+use nanocode_sync::{Atom, Inbox, Slot};
+use nanocode_tool_contracts::{ToolOutput, ToolReceipt};
 
 use futures_util::{
     FutureExt, StreamExt,
@@ -41,6 +42,10 @@ pub enum RemoteDelivery {
 }
 
 pub trait RemoteLink: Send + Sync + 'static {
+    fn supports_tool_selection(&self) -> bool {
+        false
+    }
+
     fn send(
         &self,
         frames: Vec<Frame>,
@@ -87,6 +92,14 @@ struct CallbackState {
     context: RemoteContext,
     generation: u64,
     observer: Arc<Observer>,
+    receipts: Arc<Inbox<Arc<dyn ToolReceipt>>>,
+}
+
+fn hold_receipts(output: &mut ToolOutput, receipts: &Inbox<Arc<dyn ToolReceipt>>) {
+    for receipt in output.take_receipts() {
+        receipt.carried_by(None);
+        receipts.push(receipt);
+    }
 }
 
 type Callbacks = HashMap<(String, String), CallbackState>;
@@ -111,6 +124,7 @@ struct Client {
     hands: Atom<Option<Arc<dyn HandCalls>>>,
     max_frame_bytes: Option<usize>,
     resumes: Option<String>,
+    tool_selection: bool,
     _stop: oneshot::Sender<()>,
 }
 
@@ -231,6 +245,7 @@ impl RemoteClient {
         let (stop, stopped) = oneshot::channel();
         let max_frame_bytes = link.max_frame_bytes();
         let resumes = link.resumes();
+        let tool_selection = link.supports_tool_selection();
         let mut waiters = HashMap::new();
         let mut receivers = Vec::new();
         if resumes.is_some() {
@@ -268,6 +283,7 @@ impl RemoteClient {
             hands: Atom::default(),
             max_frame_bytes,
             resumes,
+            tool_selection,
             _stop: stop,
         });
         let resumed = receivers
@@ -422,6 +438,7 @@ impl Client {
                         .find(|tool| tool.definition().name() == name)
                         .cloned(),
                     state.context.clone(),
+                    Arc::clone(&state.receipts),
                 )
             })
         });
@@ -442,7 +459,7 @@ impl Client {
             let execution = Abortable::new(
                 async move {
                     if let Some(hand) = hand {
-                        let (_, mut authoritative) = local.ok_or_else(|| {
+                        let (_, mut authoritative, receipts) = local.ok_or_else(|| {
                             error(format!(
                                 "brain callback origin for `{name}` on hand `{hand}` unavailable"
                             ))
@@ -452,10 +469,11 @@ impl Client {
                         })?;
                         authoritative.call_id = context.call_id;
                         let owned = authoritative.owned();
-                        let output = hands.call(&hand, &name, input, owned.as_context()).await;
+                        let mut output = hands.call(&hand, &name, input, owned.as_context()).await;
+                        hold_receipts(&mut output, &receipts);
                         return output_to_wire(output, compact);
                     }
-                    let Some((Some(tool), mut authoritative)) = local else {
+                    let Some((Some(tool), mut authoritative, receipts)) = local else {
                         return Err(error(format!("brain callback tool `{name}` unavailable")));
                     };
                     authoritative.call_id = context.call_id;
@@ -470,10 +488,11 @@ impl Client {
                     } else {
                         ToolInput::Function(serde_json::value::to_raw_value(&input).map_err(error)?)
                     };
-                    let output = tool
+                    let mut output = tool
                         .execute(input, owned.as_context())
                         .await
                         .map_err(error)?;
+                    hold_receipts(&mut output, &receipts);
                     output_to_wire(output, compact)
                 },
                 registration,
@@ -518,6 +537,21 @@ impl Client {
             let _ = waiter.replies.send(Frame::Reply {
                 id,
                 result: Err(result),
+            });
+        }
+    }
+
+    fn refuse(&self, ids: &[u64], message: &str) {
+        let refused = format!("{message}; the operation was not dispatched");
+        let waiters = self.pending.update(|pending| {
+            ids.iter()
+                .filter_map(|id| pending.remove(id).map(|waiter| (*id, waiter)))
+                .collect::<Vec<_>>()
+        });
+        for (id, waiter) in waiters {
+            let _ = waiter.replies.send(Frame::Reply {
+                id,
+                result: Err(refused.clone()),
             });
         }
     }
@@ -612,6 +646,23 @@ async fn drive(
                     match send.as_mut().poll(cx) {
                         Poll::Ready(Ok(())) => {
                             written(ids);
+                            sending = None;
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(issue))
+                            if !issue.refused_requests().is_empty()
+                                && issue.refused_requests().iter().all(|id| ids.contains(id)) =>
+                        {
+                            let refused = issue.refused_requests();
+                            let sent: Vec<u64> = ids
+                                .iter()
+                                .copied()
+                                .filter(|id| !refused.contains(id))
+                                .collect();
+                            written(&sent);
+                            if let Some(client) = client.upgrade() {
+                                client.refuse(refused, issue.message());
+                            }
                             sending = None;
                             progressed = true;
                         }
@@ -736,6 +787,9 @@ impl Drop for Pending {
 }
 
 impl RemoteTransport for RemoteClient {
+    fn supports_tool_selection(&self) -> bool {
+        self.client.tool_selection
+    }
     fn request<'a>(
         &'a self,
         operation: RemoteOperation,
@@ -750,6 +804,11 @@ impl RemoteTransport for RemoteClient {
                 _ => None,
             };
             let origin_call_id = executed.as_ref().map(|context| context.call_id.clone());
+            let carrier = match &operation {
+                RemoteOperation::Execute { context, .. }
+                | RemoteOperation::Wait { context, .. } => Some(context.call_id.clone()),
+                _ => None,
+            };
             let session_id = match &operation {
                 RemoteOperation::Execute { context, .. }
                 | RemoteOperation::Wait { context, .. } => Some(context.session_id.clone()),
@@ -771,6 +830,7 @@ impl RemoteTransport for RemoteClient {
                     context,
                     generation,
                     observer: Arc::default(),
+                    receipts: Arc::default(),
                 };
                 client.callbacks.modify(|callbacks| {
                     if callbacks.contains_key(&key) {
@@ -848,9 +908,13 @@ impl RemoteTransport for RemoteClient {
                 };
                 if let Some(origin) = completed {
                     let key = (session_id, origin);
-                    client.callbacks.update(|callbacks| {
-                        callbacks.remove(&key);
-                    });
+                    let removed = client.callbacks.update(|callbacks| callbacks.remove(&key));
+                    if let (Ok(Some(_)), Some(carrier), Some(state)) = (&result, &carrier, removed)
+                    {
+                        for receipt in state.receipts.drain() {
+                            receipt.carried_by(Some(carrier));
+                        }
+                    }
                 }
             }
             guard.complete = true;

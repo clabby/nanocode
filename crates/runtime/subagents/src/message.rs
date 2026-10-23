@@ -92,6 +92,16 @@ impl MessageThreads {
         })
     }
 
+    pub(super) fn pending_messages(&self) -> Vec<AgentMessage> {
+        let mut pending = self
+            .pending
+            .iter()
+            .filter_map(|id| self.message(*id))
+            .collect::<Vec<_>>();
+        pending.sort_by_key(|message| message.id);
+        pending
+    }
+
     pub(super) fn prepare(
         &mut self,
         from: MessageSender,

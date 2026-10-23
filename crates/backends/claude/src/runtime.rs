@@ -140,6 +140,11 @@ impl RuntimeBackend for ClaudeHarness {
             if let Some(instructions) = settings.instructions {
                 builder = builder.system(instructions.to_string());
             }
+            for (model, instructions) in &settings.model_instructions {
+                if model.family() == HarnessFamily::Claude {
+                    builder = builder.model_instructions(model.as_str(), Arc::clone(instructions));
+                }
+            }
             if let Some(configure) = configure {
                 builder = configure(builder)?.workspace(workspace.to_string_lossy().into_owned());
             }

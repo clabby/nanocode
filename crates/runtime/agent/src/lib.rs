@@ -16,7 +16,7 @@ pub use runtime::{
 };
 pub use session_events::{EventSink, SessionEvent, SessionEvents};
 pub use session_log::{
-    ImportedTurn, LogEntry, LogPage, LoggedEvent, SessionLog, Started, Submission, Submitted,
-    TurnRecord, TurnRetry, TurnState, submission_digest,
+    ImportedTurn, LogEntry, LogPage, LoggedEvent, Replaced, SessionLog, Started, Submission,
+    Submitted, TurnRecord, TurnRetry, TurnState, submission_digest,
 };
-pub use turn_inbox::{Driven, InboxError, InboxHost, TurnInbox};
+pub use turn_inbox::{Driven, InboxError, InboxHost, MovedQueued, TurnInbox};

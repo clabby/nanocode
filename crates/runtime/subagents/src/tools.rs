@@ -800,6 +800,7 @@ impl Tool for SpawnAgent {
             .registry
             .upgrade()
             .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
+        let lineage = Arc::clone(&registry);
         #[cfg(not(target_family = "wasm"))]
         let report = start_agent_with_host_context(
             &self.parent,
@@ -831,6 +832,9 @@ impl Tool for SpawnAgent {
                 .await
                 .map_err(|_| std::io::Error::other("subagent startup was cancelled"))??
         };
+        lineage
+            .spawned_in_turn(context.session_id(), report.agent_id)
+            .await;
         json_output(&report)
     }
 }
@@ -1259,12 +1263,21 @@ impl Tool for WaitAgent {
         let duration = timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_WAIT_TIMEOUT);
-        let (agents, delivered, timed_out) = registry
-            .wait(context.session_id(), &agent_ids, duration)
+        let (agents, delivered, timed_out, receipt) = registry
+            .wait(
+                context.session_id(),
+                context.call_id(),
+                &agent_ids,
+                duration,
+            )
             .await?;
-        json_output(&WaitReport {
+        let output = json_output(&WaitReport {
             agents: agent_reports(agents, &delivered)?,
             timed_out,
+        })?;
+        Ok(match receipt {
+            Some(receipt) => output.with_receipt(receipt),
+            None => output,
         })
     }
 }

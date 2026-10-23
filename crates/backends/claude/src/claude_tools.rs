@@ -31,6 +31,7 @@ pub(super) fn install(
     let tools = tools
         .clone()
         .for_session(&handle.session_environment())
+        .for_backend(handle.session_id(), "claude")
         .with_code_mode_policy(crate::code_mode_policy::claude_tool_policy());
     let runtime = Arc::new(ToolRuntime::new_with_tools(
         workspace.clone(),

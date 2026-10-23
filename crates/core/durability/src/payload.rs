@@ -183,6 +183,54 @@ impl EncodedPayload {
                 .is_some_and(|content| key_matches(key, content))
     }
 
+    pub fn is_key(value: &str) -> bool {
+        let hash = value.strip_prefix(KEY_PREFIX).unwrap_or(value);
+        hash.len() == HASH_HEX
+            && hash
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    pub fn verify_record(key: &str, value: &str) -> Result<()> {
+        let invalid = |detail: &str| Err(Error::InvalidState(format!("record {key} {detail}")));
+        if let Some(hash) = key.strip_prefix(KEY_PREFIX) {
+            let (content, limit) = match value.strip_prefix('=') {
+                Some(content) => (content, INLINE_BYTES),
+                None if value.starts_with(MANIFEST_PREFIX) || value.starts_with(TREE_PREFIX) => {
+                    check_hashes(&value[1..])?;
+                    (value, INLINE_BYTES)
+                }
+                None => return invalid("is neither an inline payload nor a chunk manifest"),
+            };
+            if content.len() >= limit {
+                return invalid("is larger than an inline payload or manifest can be");
+            }
+            if content_hash(content) != hash {
+                return invalid("does not hold the content its key names");
+            }
+            return Ok(());
+        }
+        if let Some(hash) = key.strip_prefix("c:") {
+            if value.len() > CHUNK_MAX + char::MAX_LEN_UTF8 - 1 {
+                return invalid("is larger than a payload chunk can be");
+            }
+            if content_hash(value) != hash {
+                return invalid("does not hold the content its key names");
+            }
+            return Ok(());
+        }
+        if !Self::is_key(key) {
+            return invalid("is not a content-addressed record");
+        }
+        match value.strip_prefix('=') {
+            Some(content) if sha256_key(content) == key => Ok(()),
+            Some(_) => invalid("does not hold the content its key names"),
+            None => invalid(
+                "is a chunked payload of an earlier build, whose parts cannot be verified on their own",
+            ),
+        }
+    }
+
     pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Self> {
         let json = serde_json::to_string(value).map_err(Error::InvalidPayload)?;
         Ok(Self::from_json(json.into()))

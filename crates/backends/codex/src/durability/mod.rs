@@ -9,7 +9,9 @@ use std::{
 use arc_swap::{ArcSwap, ArcSwapOption};
 use nanocode_sync::Slot;
 
-use nanocode_agent_core::{ExecutionPolicyDisposition, NanocodeError, Result as AgentResult};
+use nanocode_agent_core::{
+    ExecutionPolicyDisposition, NanocodeError, Result as AgentResult, SteerReceiptStatus,
+};
 use nanocode_durability::{
     Admission, BeginStep, Branches, DurableAgentExt, DurableOwner, DurableSession, EncodedPayload,
     InitialAcquisition, InitialSettings, JournalClaim, JournalSeed, OperationStatus, OwnerWrite,
@@ -420,6 +422,19 @@ impl ExecutionPolicy for DurableExecution {
         Box::pin(async move {
             self.owner
                 .identified_steer_accepted(message_id, &raw(input_json)?)
+                .await
+                .map_err(agent_error)
+        })
+    }
+
+    fn steer_receipt<'a>(
+        &'a self,
+        message_id: String,
+        input_json: String,
+    ) -> ExecutionFuture<'a, AgentResult<SteerReceiptStatus>> {
+        Box::pin(async move {
+            self.owner
+                .steer_receipt(message_id, &raw(input_json)?)
                 .await
                 .map_err(agent_error)
         })
@@ -1080,6 +1095,19 @@ impl ExecutionPolicy for LazyExecution {
             self.get()
                 .await?
                 .identified_steer_accepted(message_id, input_json)
+                .await
+        })
+    }
+
+    fn steer_receipt<'a>(
+        &'a self,
+        message_id: String,
+        input_json: String,
+    ) -> ExecutionFuture<'a, AgentResult<SteerReceiptStatus>> {
+        Box::pin(async move {
+            self.get()
+                .await?
+                .steer_receipt(message_id, input_json)
                 .await
         })
     }

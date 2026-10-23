@@ -43,6 +43,7 @@ struct State {
     executors: BTreeMap<Arc<str>, Arc<dyn CodeModeHost>>,
     selections: HashMap<Box<str>, ExecutorSelection>,
     roots: HashMap<Box<str>, Box<str>>,
+    backends: HashMap<Box<str>, Box<str>>,
     default: Option<Arc<str>>,
     sessions: HashMap<Box<str>, SessionPlaces>,
 }
@@ -279,6 +280,12 @@ impl CodeModeExecutors {
                 ));
             }
         };
+        if let Some(backend) = self
+            .state
+            .read(|state| state.backends.get(session_id).cloned())
+        {
+            host.bind_session(session_id, &backend);
+        }
         match host.call(name, input, context).await {
             Ok(output) => output,
             Err(error) => ToolOutput::error(format!("hand `{hand}`: {error}")),
@@ -327,7 +334,20 @@ impl CodeModeExecutors {
 
     #[must_use]
     pub fn placement(&self, session_id: &str) -> Placement {
-        self.state.read(|state| state.placement(session_id))
+        let (placement, backend) = self.state.read(|state| {
+            (
+                state.placement(session_id),
+                state.backends.get(session_id).cloned(),
+            )
+        });
+        if let Placement::Hand(HandRoute {
+            host: Some(host), ..
+        }) = &placement
+            && let Some(backend) = backend
+        {
+            host.bind_session(session_id, &backend);
+        }
+        placement
     }
 
     pub fn set_default(&self, name: Option<Arc<str>>) {
@@ -365,6 +385,7 @@ impl CodeModeExecutors {
         self.state.update(|state| {
             state.selections.remove(session_id);
             state.roots.remove(session_id);
+            state.backends.remove(session_id);
             state.sessions.remove(session_id);
         });
     }
@@ -597,6 +618,11 @@ impl CodeModeHost for CodeModeExecutors {
         Box::pin(self.wait_routed(input, context, observer))
     }
 
+    fn bind_session(&self, session_id: &str, backend: &str) {
+        self.state.update(|state| {
+            state.backends.insert(session_id.into(), backend.into());
+        });
+    }
     fn link_session(&self, session_id: &str, root_session_id: &str) {
         self.link(session_id, root_session_id);
     }
