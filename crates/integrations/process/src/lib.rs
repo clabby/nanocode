@@ -104,6 +104,7 @@ pub struct ShellSessions {
     default_shell: selection::Shell,
     environment: Arc<Vec<(OsString, OsString)>>,
     secrets: Option<SecretEnvironment>,
+    per_caller: bool,
 }
 
 impl ShellSessions {
@@ -116,7 +117,14 @@ impl ShellSessions {
             default_shell: selection::default_user_shell(),
             environment,
             secrets: None,
+            per_caller: false,
         }
+    }
+
+    #[must_use]
+    pub const fn per_caller(mut self) -> Self {
+        self.per_caller = true;
+        self
     }
 
     pub fn with_secrets(
@@ -175,7 +183,7 @@ impl ShellSessions {
                     );
                 }
             };
-            let session = match Session::new(session_id, spawned, secrets) {
+            let session = match Session::new(session_id, spawned, secrets, command.caller) {
                 Ok(session) => session,
                 Err(error) => {
                     return ExecCommandResult::failed(
@@ -249,6 +257,15 @@ impl ShellSessions {
                     ),
                 );
             };
+            if self.per_caller && session.caller != request.caller {
+                return ExecCommandResult::failed(
+                    started_at.elapsed(),
+                    format!(
+                        "write_stdin failed: process id {} belongs to another session",
+                        request.session_id
+                    ),
+                );
+            }
 
             if !request.chars.is_empty() && !session.tty && request.chars != "\u{3}" {
                 return ExecCommandResult::failed(
@@ -325,6 +342,7 @@ struct Session {
     tty: bool,
     process_group: process::SharedProcessGroup,
     owner: Actor<SessionState>,
+    caller: Option<String>,
     last_used: AtomicU64,
     busy: AtomicUsize,
     exited: Arc<AtomicBool>,
@@ -388,6 +406,7 @@ impl Session {
         id: i64,
         spawned: process::SpawnedProcess,
         secrets: Vec<String>,
+        caller: Option<String>,
     ) -> std::io::Result<Arc<Self>> {
         let tty = matches!(spawned.stdin.as_ref(), Some(process::ProcessStdin::Pty(_)));
         let (chunks, output) = mpsc::unbounded_channel();
@@ -416,6 +435,7 @@ impl Session {
             tty,
             process_group,
             owner,
+            caller,
             last_used: AtomicU64::new(0),
             busy: AtomicUsize::new(0),
             exited,

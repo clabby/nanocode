@@ -15,6 +15,7 @@ pub struct ExecCommand {
     pub tty: bool,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
+    pub caller: Option<String>,
 }
 
 impl ExecCommand {
@@ -35,7 +36,14 @@ impl ExecCommand {
             tty,
             yield_time_ms,
             max_output_tokens,
+            caller: None,
         }
+    }
+
+    #[must_use]
+    pub fn from_caller(mut self, caller: impl Into<String>) -> Self {
+        self.caller = Some(caller.into());
+        self
     }
 }
 
@@ -44,6 +52,7 @@ pub struct WriteStdin {
     pub chars: String,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
+    pub caller: Option<String>,
 }
 
 impl WriteStdin {
@@ -58,7 +67,14 @@ impl WriteStdin {
             chars,
             yield_time_ms,
             max_output_tokens,
+            caller: None,
         }
+    }
+
+    #[must_use]
+    pub fn from_caller(mut self, caller: impl Into<String>) -> Self {
+        self.caller = Some(caller.into());
+        self
     }
 }
 

@@ -32,7 +32,7 @@ impl Tool for ExecCommandHandler {
         true
     }
 
-    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let arguments = input.decode_json::<ExecCommandArguments>()?;
         let command = ExecCommand::new(
             arguments.cmd,
@@ -42,7 +42,8 @@ impl Tool for ExecCommandHandler {
             arguments.tty,
             arguments.yield_time_ms,
             arguments.max_output_tokens,
-        );
+        )
+        .from_caller(context.session_id());
         let result = self.sessions.execute(command, &self.workspace).await;
         Ok(shell_execution(&result))
     }
@@ -69,14 +70,15 @@ impl Tool for WriteStdinHandler {
         true
     }
 
-    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let arguments = input.decode_json::<WriteStdinArguments>()?;
         let request = WriteStdin::new(
             arguments.session_id,
             arguments.chars,
             arguments.yield_time_ms,
             arguments.max_output_tokens,
-        );
+        )
+        .from_caller(context.session_id());
         let result = self.sessions.write_stdin(request).await;
         Ok(shell_execution(&result))
     }
