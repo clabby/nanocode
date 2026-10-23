@@ -128,6 +128,11 @@ impl RuntimeBackend for CodexHarness {
             if let Some(instructions) = settings.instructions {
                 builder = builder.instructions(instructions);
             }
+            for (model, instructions) in &settings.model_instructions {
+                if let Some(model) = model.as_codex() {
+                    builder = builder.model_instructions(model, Arc::clone(instructions));
+                }
+            }
             if let Some(configure) = configure {
                 builder = configure(builder)?.workspace(workspace.to_path_buf());
             }

@@ -436,6 +436,9 @@ impl NativeToolRuntime {
     fn with_tools(mut self, tools: &Tools) -> Self {
         tools.start_providers();
         let registry = Arc::make_mut(&mut self.registry);
+        registry
+            .excluded_code_tools
+            .clone_from(&tools.excluded_code_tools);
         for policy in tools.code_mode_policies() {
             if !registry
                 .policies
@@ -725,7 +728,10 @@ impl NativeToolRuntime {
     > {
         Box::pin(async move {
             let Some(executors) = &self.executors else {
-                return Ok(self.code_mode.wait_with_updates(input, observer).await);
+                return Ok(self
+                    .code_mode
+                    .wait_with_updates(input, context, observer)
+                    .await);
             };
             let session_id = context.session_id();
             self.track(session_id);
@@ -737,7 +743,7 @@ impl NativeToolRuntime {
                 let execution = match &place {
                     None => {
                         self.code_mode
-                            .wait_with_updates(input, &mut *observer)
+                            .wait_with_updates(input, context, &mut *observer)
                             .await
                     }
                     Some(name) => {

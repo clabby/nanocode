@@ -153,6 +153,12 @@ pub(super) struct Cursor {
     pub(super) output_continuations: u32,
 }
 impl Cursor {
+    pub(super) fn host_context(&self, state: &State) -> Option<Arc<str>> {
+        state
+            .host_context
+            .clone()
+            .or_else(|| self.operation.as_deref().map(Arc::from))
+    }
     pub(super) fn effect<'a>(&'a self, state: &'a State, step: &str) -> Option<Effect<'a>> {
         Some(Effect {
             policy: state.policy.as_deref()?,

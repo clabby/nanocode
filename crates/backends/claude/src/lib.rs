@@ -24,7 +24,7 @@ mod agent;
 pub use agent::{
     Claude, ClaudeBuilder, ClaudeCheckpointView, ClaudeNestedToolUpdate, ClaudeToolInvocation,
     ClaudeToolProgress, ClaudeToolReply, ClaudeTools, decode_checkpoint, decode_session_checkpoint,
-    rewind_checkpoint, session_checkpoint,
+    default_context_window_tokens, rewind_checkpoint, session_checkpoint,
 };
 
 pub mod durability;

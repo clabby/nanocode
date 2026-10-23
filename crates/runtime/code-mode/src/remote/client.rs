@@ -11,6 +11,7 @@ use std::{
 };
 
 use nanocode_sync::{Atom, Slot};
+use nanocode_tool_contracts::{ToolOutput, ToolReceipt};
 
 use futures_util::{
     FutureExt, StreamExt,
@@ -41,6 +42,10 @@ pub enum RemoteDelivery {
 }
 
 pub trait RemoteLink: Send + Sync + 'static {
+    fn supports_tool_selection(&self) -> bool {
+        false
+    }
+
     fn send(
         &self,
         frames: Vec<Frame>,
@@ -91,6 +96,13 @@ struct CallbackState {
 
 type Callbacks = HashMap<(String, String), CallbackState>;
 
+/// Receipts of a cell's nested calls by callback origin, kept until the reply that returns the
+/// finished cell's output names its carrier. A runner may report the cell complete, ending its
+/// callback state, before that reply, so receipts live apart from it. Entries hold weak
+/// references because the subagent runtime holds every receipt whose result is still unsettled;
+/// entries whose receipts were all released are pruned as new receipts arrive.
+type Receipts = HashMap<(String, String), Vec<Weak<dyn ToolReceipt>>>;
+
 type Sending<'a> = (HostFuture<'a, Result<(), CodeModeHostError>>, Vec<u64>);
 
 #[derive(Clone)]
@@ -103,6 +115,7 @@ struct Client {
     outgoing: mpsc::UnboundedSender<(Frame, RemoteDelivery)>,
     pending: Atom<HashMap<u64, Waiter>>,
     callbacks: Atom<Callbacks>,
+    receipts: Atom<Receipts>,
     running: Atom<HashMap<u64, (String, AbortHandle)>>,
     next: AtomicU64,
     turns: Atom<HashMap<String, u64>>,
@@ -111,6 +124,7 @@ struct Client {
     hands: Atom<Option<Arc<dyn HandCalls>>>,
     max_frame_bytes: Option<usize>,
     resumes: Option<String>,
+    tool_selection: bool,
     _stop: oneshot::Sender<()>,
 }
 
@@ -231,6 +245,7 @@ impl RemoteClient {
         let (stop, stopped) = oneshot::channel();
         let max_frame_bytes = link.max_frame_bytes();
         let resumes = link.resumes();
+        let tool_selection = link.supports_tool_selection();
         let mut waiters = HashMap::new();
         let mut receivers = Vec::new();
         if resumes.is_some() {
@@ -260,6 +275,7 @@ impl RemoteClient {
             outgoing,
             pending: Atom::new(waiters),
             callbacks: Atom::default(),
+            receipts: Atom::default(),
             running: Atom::default(),
             next: AtomicU64::new(nanocode_platform::uuid_v4().as_u64_pair().0 >> 12),
             turns: Atom::default(),
@@ -268,6 +284,7 @@ impl RemoteClient {
             hands: Atom::default(),
             max_frame_bytes,
             resumes,
+            tool_selection,
             _stop: stop,
         });
         let resumed = receivers
@@ -303,6 +320,8 @@ impl Client {
         {
             self.callbacks
                 .update(|callbacks| callbacks.retain(|(session, _), _| session != session_id));
+            self.receipts
+                .update(|receipts| receipts.retain(|(session, _), _| session != session_id));
             self.turns.update(|turns| {
                 turns.remove(session_id);
             });
@@ -437,8 +456,14 @@ impl Client {
         });
         let outgoing = self.outgoing.clone();
         let client = Arc::downgrade(self);
+        let holder = Weak::clone(&client);
         let max_frame_bytes = self.max_frame_bytes;
         Box::pin(async move {
+            let hold = |output: &mut ToolOutput| {
+                if let Some(client) = holder.upgrade() {
+                    client.hold_receipts(&key, output);
+                }
+            };
             let execution = Abortable::new(
                 async move {
                     if let Some(hand) = hand {
@@ -452,7 +477,8 @@ impl Client {
                         })?;
                         authoritative.call_id = context.call_id;
                         let owned = authoritative.owned();
-                        let output = hands.call(&hand, &name, input, owned.as_context()).await;
+                        let mut output = hands.call(&hand, &name, input, owned.as_context()).await;
+                        hold(&mut output);
                         return output_to_wire(output, compact);
                     }
                     let Some((Some(tool), mut authoritative)) = local else {
@@ -470,10 +496,11 @@ impl Client {
                     } else {
                         ToolInput::Function(serde_json::value::to_raw_value(&input).map_err(error)?)
                     };
-                    let output = tool
+                    let mut output = tool
                         .execute(input, owned.as_context())
                         .await
                         .map_err(error)?;
+                    hold(&mut output);
                     output_to_wire(output, compact)
                 },
                 registration,
@@ -504,6 +531,7 @@ impl Client {
             abort.abort();
         }
         self.callbacks.set(HashMap::new());
+        self.receipts.set(HashMap::new());
         let uncertain = format!(
             "{message}; the dispatched operation has an unknown outcome and was not retried"
         );
@@ -522,6 +550,21 @@ impl Client {
         }
     }
 
+    fn refuse(&self, ids: &[u64], message: &str) {
+        let refused = format!("{message}; the operation was not dispatched");
+        let waiters = self.pending.update(|pending| {
+            ids.iter()
+                .filter_map(|id| pending.remove(id).map(|waiter| (*id, waiter)))
+                .collect::<Vec<_>>()
+        });
+        for (id, waiter) in waiters {
+            let _ = waiter.replies.send(Frame::Reply {
+                id,
+                result: Err(refused.clone()),
+            });
+        }
+    }
+
     fn written(&self, ids: &[u64]) {
         if ids.is_empty() {
             return;
@@ -532,6 +575,24 @@ impl Client {
                     waiter.written.store(true, Ordering::SeqCst);
                 }
             }
+        });
+    }
+
+    fn hold_receipts(&self, origin: &(String, String), output: &mut ToolOutput) {
+        let held = output.take_receipts();
+        if held.is_empty() {
+            return;
+        }
+        for receipt in &held {
+            receipt.carried_by(None);
+        }
+        self.receipts.update(|receipts| {
+            receipts
+                .retain(|_, receipts| receipts.iter().any(|receipt| receipt.strong_count() > 0));
+            receipts
+                .entry(origin.clone())
+                .or_default()
+                .extend(held.iter().map(Arc::downgrade));
         });
     }
 
@@ -612,6 +673,23 @@ async fn drive(
                     match send.as_mut().poll(cx) {
                         Poll::Ready(Ok(())) => {
                             written(ids);
+                            sending = None;
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(issue))
+                            if !issue.refused_requests().is_empty()
+                                && issue.refused_requests().iter().all(|id| ids.contains(id)) =>
+                        {
+                            let refused = issue.refused_requests();
+                            let sent: Vec<u64> = ids
+                                .iter()
+                                .copied()
+                                .filter(|id| !refused.contains(id))
+                                .collect();
+                            written(&sent);
+                            if let Some(client) = client.upgrade() {
+                                client.refuse(refused, issue.message());
+                            }
                             sending = None;
                             progressed = true;
                         }
@@ -736,6 +814,9 @@ impl Drop for Pending {
 }
 
 impl RemoteTransport for RemoteClient {
+    fn supports_tool_selection(&self) -> bool {
+        self.client.tool_selection
+    }
     fn request<'a>(
         &'a self,
         operation: RemoteOperation,
@@ -750,6 +831,11 @@ impl RemoteTransport for RemoteClient {
                 _ => None,
             };
             let origin_call_id = executed.as_ref().map(|context| context.call_id.clone());
+            let carrier = match &operation {
+                RemoteOperation::Execute { context, .. }
+                | RemoteOperation::Wait { context, .. } => Some(context.call_id.clone()),
+                _ => None,
+            };
             let session_id = match &operation {
                 RemoteOperation::Execute { context, .. }
                 | RemoteOperation::Wait { context, .. } => Some(context.session_id.clone()),
@@ -851,6 +937,15 @@ impl RemoteTransport for RemoteClient {
                     client.callbacks.update(|callbacks| {
                         callbacks.remove(&key);
                     });
+                    let held = client
+                        .receipts
+                        .update(|receipts| receipts.remove(&key))
+                        .unwrap_or_default();
+                    if let (Ok(Some(_)), Some(carrier)) = (&result, &carrier) {
+                        for receipt in held.iter().filter_map(Weak::upgrade) {
+                            receipt.carried_by(Some(carrier));
+                        }
+                    }
                 }
             }
             guard.complete = true;

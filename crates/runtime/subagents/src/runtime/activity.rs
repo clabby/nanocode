@@ -97,6 +97,7 @@ impl Registry {
             }
             if session.descriptor.parent.is_none()
                 && session.status.wakes_parent()
+                && !session.completion_parked
                 && let Some(revision) = session.pending_completion
             {
                 activity.pending_completions.push((id, revision));
@@ -130,6 +131,16 @@ impl Registry {
             ));
         }
         results
+    }
+
+    /// Waits until the root's subagent tree is restored and arms the root watch it needs, so the
+    /// next prompt the root accepts releases its parked completions.
+    pub async fn await_restored_root(self: &Arc<Self>, parent: &Agent, root_session_id: &str) {
+        if self.await_restored(root_session_id).await.is_ok()
+            && self.needs_root_watch(root_session_id).await
+        {
+            self.watch_root(root_session_id, parent);
+        }
     }
 
     pub async fn persist(&self, root_session_id: &str) -> std::io::Result<()> {
@@ -174,6 +185,15 @@ impl SubagentControl {
         self.registry
             .deliver_completions(parent, root_session_id)
             .await
+    }
+
+    /// Waits until a reopened root's subagent tree is restored. A host that prompts the root
+    /// without `TurnInbox::drive`, which waits itself, calls this first so the prompt releases
+    /// the root's parked completions.
+    pub async fn await_restored(&self, parent: &Agent, root_session_id: &str) {
+        self.registry
+            .await_restored_root(parent, root_session_id)
+            .await;
     }
 
     pub async fn persist(&self, root_session_id: &str) -> std::io::Result<()> {

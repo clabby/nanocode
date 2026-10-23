@@ -8,6 +8,8 @@ mod platform;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
+use nanocode_agent_core::SteerReceiptStatus;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -188,6 +190,14 @@ pub trait ExecutionPolicy: Send + Sync {
         _input_json: String,
     ) -> ExecutionFuture<'a, Result<bool>> {
         Box::pin(async { Ok(false) })
+    }
+
+    fn steer_receipt<'a>(
+        &'a self,
+        _message_id: String,
+        _input_json: String,
+    ) -> ExecutionFuture<'a, Result<SteerReceiptStatus>> {
+        Box::pin(async { Ok(SteerReceiptStatus::Unknown) })
     }
 
     fn accept_identified_steer<'a>(
@@ -457,6 +467,14 @@ pub trait ExecutionPolicy: Send + Sync {
         _input_json: String,
     ) -> ExecutionFuture<'a, Result<bool>> {
         Box::pin(async { Ok(false) })
+    }
+
+    fn steer_receipt<'a>(
+        &'a self,
+        _message_id: String,
+        _input_json: String,
+    ) -> ExecutionFuture<'a, Result<SteerReceiptStatus>> {
+        Box::pin(async { Ok(SteerReceiptStatus::Unknown) })
     }
 
     fn accept_identified_steer<'a>(
@@ -827,6 +845,17 @@ impl Execution {
         Ok(map_admission(
             policy.admit(operation_id.to_owned(), input).await?,
         ))
+    }
+
+    pub(crate) async fn steer_receipt<T: Serialize + ?Sized>(
+        &self,
+        message_id: String,
+        input: &T,
+    ) -> Result<SteerReceiptStatus> {
+        match &self.policy {
+            Some(policy) => policy.steer_receipt(message_id, encode(input)?).await,
+            None => Ok(SteerReceiptStatus::Unknown),
+        }
     }
 
     pub(crate) async fn identified_steer_accepted<T: Serialize + ?Sized>(

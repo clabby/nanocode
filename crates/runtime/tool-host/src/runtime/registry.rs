@@ -62,6 +62,7 @@ pub(crate) struct ToolRegistry {
     pub(super) policies: Vec<Arc<dyn crate::CodeModeToolPolicy>>,
     pub(super) hand_calls: Option<Arc<dyn crate::embedded::HandCalls>>,
     nested_gate: Arc<super::admission::AdmissionGate>,
+    pub(super) excluded_code_tools: HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -161,6 +162,11 @@ impl ToolRegistry {
         input: Value,
         context: ToolContext<'_>,
     ) -> ToolOutput {
+        if self.excluded_code_tools.contains(name) {
+            return ToolOutput::error(format!(
+                "hand tool `{name}` is not permitted for this session"
+            ));
+        }
         let trace_content = tracing::enabled!(
             target: "nanocode_code_mode",
             tracing::Level::INFO
@@ -376,6 +382,7 @@ impl ToolRegistry {
             policies: Vec::new(),
             hand_calls: None,
             nested_gate: Arc::default(),
+            excluded_code_tools: HashSet::new(),
         }
     }
 
@@ -454,7 +461,10 @@ impl ToolRegistry {
             self.definitions
                 .iter()
                 .zip(&self.exposures)
-                .filter(|(_, exposure)| exposure.is_available_in_code_mode())
+                .filter(|(definition, exposure)| {
+                    exposure.is_available_in_code_mode()
+                        && !self.excluded_code_tools.contains(definition.name())
+                })
                 .map(|(definition, _)| nested_definition(definition.clone())),
         )
     }
@@ -485,7 +495,8 @@ impl ToolRegistry {
                 self.providers
                     .iter()
                     .filter(|provider| provider.model_catalog_visible())
-                    .flat_map(|provider| provider.available_definitions()),
+                    .flat_map(|provider| provider.available_definitions())
+                    .filter(|definition| !self.excluded_code_tools.contains(definition.name())),
             ),
         )
     }
@@ -502,7 +513,10 @@ impl ToolRegistry {
                     .iter()
                     .flat_map(|provider| provider.available_definitions()),
             )
-            .filter(|definition| !host_owned_name(definition.name()))
+            .filter(|definition| {
+                !host_owned_name(definition.name())
+                    && !self.excluded_code_tools.contains(definition.name())
+            })
             .map(nested_definition);
         first_normalized_definitions(definitions)
     }

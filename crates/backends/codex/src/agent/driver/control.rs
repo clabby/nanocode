@@ -331,7 +331,8 @@ fn spawn_side_question(
     let config = Arc::clone(&spawner.config);
     let service = (spawner.service_factory)(Arc::clone(&config));
     let thread_id = session_id.to_owned();
-    let task = async move {
+    let host_context = spawner.host_context.as_ref().map(Arc::clone);
+    let task = crate::client::transport::layer::origin::scope(host_context, async move {
         let outcome = latest
             .model()
             .side_question(
@@ -345,7 +346,7 @@ fn spawn_side_question(
             )
             .await;
         drop(result.send(outcome));
-    };
+    });
     if let Err(error) = crate::agent::executor::spawn_driver(Box::pin(task)) {
         tracing::warn!(target: "nanocode", %error, "side question could not start");
     }

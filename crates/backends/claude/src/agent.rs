@@ -8,8 +8,8 @@ use nanocode_agent_core::{
     Agent, AgentEvents, AgentHandle, AgentSessionContext, Capabilities, CostStatus,
     EstimatedUsdCost, ForkPoint, ForkRequest, HarnessFamily, Lineage, ModelSelection,
     ModelTransport, Mutability, NanocodeError, Origin, Persistence, ReportedCost,
-    ReportedTurnUsage, Result, ServiceTier, SessionCheckpoint, SpawnOptions, Thinking, TurnResult,
-    TurnUsage, UsdAmount,
+    ReportedTurnUsage, Result, ServiceTier, SessionCheckpoint, SpawnOptions, SteerReceiptStatus,
+    Thinking, TurnResult, TurnUsage, UsdAmount,
     backend::{
         AgentFactory, BackendFuture, BackendPrompt, BackendPromptRoute, BackendRuntime,
         BackendTurn, BackendTurnKey, BuilderBackend, LifecycleBackend, TurnBoundary,
@@ -560,7 +560,7 @@ fn model_max_tokens(model: &str) -> Option<u32> {
     }
 }
 
-fn default_context_window_tokens(model: &str) -> u64 {
+pub fn default_context_window_tokens(model: &str) -> u64 {
     match model {
         "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1" | "claude-sonnet-5-5"
         | "claude-haiku-5-5" | "claude-sonnet-5" => 1_000_000,
@@ -593,6 +593,7 @@ pub struct ClaudeBuilder {
     auto_compact_window_tokens: Option<u64>,
     system: String,
     system_blocks: Option<Vec<Value>>,
+    model_systems: Vec<(String, Arc<str>)>,
     workspace: String,
     workspace_resolver: Option<WorkspaceResolver>,
     child_workspace_init: Option<ChildWorkspaceInit>,
@@ -659,6 +660,7 @@ impl ClaudeBuilder {
             auto_compact_window_tokens: None,
             system: String::new(),
             system_blocks: None,
+            model_systems: Vec::new(),
             workspace: String::new(),
             workspace_resolver: None,
             child_workspace_init: None,
@@ -940,6 +942,18 @@ impl ClaudeBuilder {
     pub fn system(mut self, system: impl Into<String>) -> Self {
         self.system = system.into();
         self.system_blocks = None;
+        self
+    }
+
+    pub fn model_instructions(
+        mut self,
+        model: impl Into<String>,
+        instructions: impl Into<Arc<str>>,
+    ) -> Self {
+        let model = model.into();
+        self.model_systems
+            .retain(|(existing, _)| *existing != model);
+        self.model_systems.push((model, instructions.into()));
         self
     }
 
@@ -1563,6 +1577,7 @@ impl ClaudeBuilder {
         let round_boundary = Arc::new(round_boundary);
         let (runtime, events) = BackendRuntime::new(session_id.clone());
         let runtime = runtime.with_lineage(lineage.clone());
+        let session_events = runtime.events();
         let system_blocks = self.system_blocks.or_else(|| {
             self.system
                 .is_empty()
@@ -1576,6 +1591,7 @@ impl ClaudeBuilder {
                 |(environment, instructions)| (environment.into(), instructions.into()),
             );
         let state = Arc::new(State {
+            session_events,
             subagent_type: self.subagent_type,
             subagent_type_resolver: self.subagent_type_resolver,
             lifecycle_opened: Atom::default(),
@@ -2917,6 +2933,14 @@ impl AgentFactory for ClaudeNativeFactory {
             }
             let mut recipe = recipe;
             recipe.claude.model = selected.as_str().into();
+            if let Some(system) = recipe
+                .model_systems
+                .iter()
+                .find(|(model, _)| model == selected.as_str())
+                .map(|(_, instructions)| instructions.to_string())
+            {
+                recipe = recipe.system(system);
+            }
 
             recipe.fast_mode =
                 state.fast_mode.load(Ordering::SeqCst) && selected.supports_fast_mode();
@@ -3074,6 +3098,7 @@ struct State {
 
     waiters: Atom<std::collections::BTreeSet<u64>>,
     compaction_cancel: Atom<Option<Arc<Cancellation>>>,
+    session_events: AgentEventPublisher,
     #[cfg(not(target_family = "wasm"))]
     task_board: Option<Arc<crate::tools::tasks::ClaudeTasks>>,
     cancellations: Atom<HashMap<BackendTurnKey, Arc<Cancellation>>>,
@@ -3874,6 +3899,7 @@ struct ResponseOutcome {
     replayed: bool,
 }
 struct ResponseContext<'a> {
+    origin: Option<Arc<str>>,
     disable_tools: bool,
     force_text: bool,
     container: Option<&'a str>,
@@ -4139,7 +4165,10 @@ impl State {
                 json!(events.turn_id().unwrap_or(events.request_id())),
             );
         }
-        let Ok(payload) = serde_json::value::to_raw_value(&payload) else {
+        Self::publish(events, kind, &payload);
+    }
+    fn publish(events: &AgentEventPublisher, kind: AgentEventKind, payload: &Value) {
+        let Ok(payload) = serde_json::value::to_raw_value(payload) else {
             return;
         };
         let _ = events.publish_next(kind, Arc::from(payload));
@@ -4188,6 +4217,19 @@ impl State {
         (supported && self.fast_mode.load(Ordering::SeqCst)).then_some(crate::Speed::Fast)
     }
 
+    fn compacted_payload(after_model_call_index: u32, started: Instant) -> Value {
+        json!({
+            "after_model_call_index": after_model_call_index,
+            "attempt": 1,
+            "connection_generation": 0,
+            "status": "completed",
+            "duration_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "time_to_first_event_ns": 0,
+            "time_to_first_output_ns": null,
+            "usage": null,
+        })
+    }
+
     fn emit_compacted(
         &self,
         events: &AgentEventPublisher,
@@ -4197,16 +4239,7 @@ impl State {
         self.emit(
             events,
             AgentEventKind::ModelCompactionCompleted,
-            json!({
-                "after_model_call_index": after_model_call_index,
-                "attempt": 1,
-                "connection_generation": 0,
-                "status": "completed",
-                "duration_ns": u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                "time_to_first_event_ns": 0,
-                "time_to_first_output_ns": null,
-                "usage": null,
-            }),
+            Self::compacted_payload(after_model_call_index, started),
         );
     }
     fn emit_run_started(&self, request: &BackendPrompt) -> (&'static str, String) {
@@ -4283,7 +4316,13 @@ impl State {
                         | nanocode_agent_core::ClaudeModel::Mythos51
                 )
             ))
-        .then(|| json!({"type":"adaptive","display":"summarized"}))
+        .then(|| {
+            json!({
+                "type":"adaptive",
+                "display":"summarized",
+                "block_binding":{"prefix_mismatch_behavior":"drop_block"},
+            })
+        })
     }
     fn request_template(&self, speed: Option<crate::Speed>) -> MessagesRequest {
         let thinking = self.thinking_config();
@@ -4326,9 +4365,12 @@ impl State {
         context: ResponseContext<'_>,
     ) -> std::result::Result<ResponseOutcome, ResponseFailure> {
         let template = context.template;
-        let mut outcome = self
-            .observed_response(messages, tools, cancel, events, index, context)
-            .await;
+        let origin = context.origin.clone();
+        let mut outcome = nanocode_http::layer::origin::scope(
+            origin,
+            self.observed_response(messages, tools, cancel, events, index, context),
+        )
+        .await;
         if let Ok(outcome) = &mut outcome {
             outcome.message.usage.estimated_cost =
                 self.estimate_cost(template, &outcome.message.usage);
@@ -4354,16 +4396,20 @@ impl State {
             .template
             .map_or_else(|| self.model(), |template| template.model.clone());
         let (reasoning_mode, effort) = self.run_labels();
-        self.emit(
-            events,
-            AgentEventKind::ModelCallStarted,
-            json!({
-                "call_index": call_index,
-                "model": model,
-                "reasoning_mode": reasoning_mode,
-                "effort": effort,
-            }),
+        let cache = context.template.map_or_else(
+            || self.automatic_cache.then(|| self.cache_ttl()),
+            |template| template.cache_control.as_ref().map(|control| control.ttl),
         );
+        let mut payload = json!({
+            "call_index": call_index,
+            "model": model,
+            "reasoning_mode": reasoning_mode,
+            "effort": effort,
+        });
+        if let Some(ttl) = cache {
+            payload["cache_ttl"] = json!(ttl.unwrap_or(crate::CacheTtl::FiveMinutes));
+        }
+        self.emit(events, AgentEventKind::ModelCallStarted, payload);
         let span = telemetry::model_call_span(
             &self.session_id,
             call_index,
@@ -5198,7 +5244,10 @@ impl State {
                     template.output_config = None;
                 }
                 RecoveryThinking::AdaptiveLow => {
-                    template.thinking = Some(json!({"type":"adaptive"}));
+                    template.thinking = Some(json!({
+                        "type":"adaptive",
+                        "block_binding":{"prefix_mismatch_behavior":"drop_block"},
+                    }));
                     template.output_config = Some(crate::OutputConfig {
                         effort: crate::Effort::Low,
                     });
@@ -5223,6 +5272,7 @@ impl State {
                     None,
                     0,
                     ResponseContext {
+                        origin: cursor.host_context(self),
                         disable_tools: true,
                         force_text,
                         container: context.container.as_deref(),
@@ -5530,7 +5580,7 @@ impl State {
                 .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
             call_id: id.to_owned(),
             instruction_revision: cursor.instruction_revision,
-            host_context: self.host_context.clone(),
+            host_context: cursor.host_context(self),
             progress: None,
         };
 
@@ -5988,6 +6038,7 @@ impl State {
                     Some(&request.events),
                     index,
                     ResponseContext {
+                        origin: cursor.host_context(self),
                         disable_tools: false,
                         force_text: false,
                         container: conversation.container.as_deref(),
@@ -6222,7 +6273,7 @@ impl State {
                 self.flush_journal(journal).await?;
             }
             if !text.is_empty() {
-                self.emit(&request.events,AgentEventKind::AssistantMessage,json!({"model_call_index":index,"item_id":response.id,"phase":null,"text":text,"citations":citations}));
+                self.emit(&request.events,AgentEventKind::AssistantMessage,json!({"model_call_index":index.saturating_add(1),"item_id":response.id,"phase":null,"text":text,"citations":citations}));
             }
 
             let committed = std::mem::take(&mut conversation.messages);
@@ -6959,6 +7010,21 @@ impl LifecycleBackend for Driver {
     ) -> BackendFuture<Result<()>> {
         self.steer_input(key, Some(id), prompt)
     }
+    fn steer_receipt(
+        &self,
+        id: String,
+        prompt: Prompt,
+    ) -> BackendFuture<Result<SteerReceiptStatus>> {
+        let policy = self.state.policy.clone();
+        Box::pin(async move {
+            let Some(policy) = policy else {
+                return Ok(SteerReceiptStatus::Unknown);
+            };
+            policy
+                .steer_receipt(id, serde_json::to_string(&prompt).map_err(provider_error)?)
+                .await
+        })
+    }
     fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
         let state = self.state.clone();
         Box::pin(async move {
@@ -7132,6 +7198,16 @@ impl LifecycleBackend for Driver {
                         )
                         .await?;
                     state.flush_journal(&mut journal).await?;
+                    let compaction_started = Instant::now();
+                    State::publish(
+                        &state.session_events,
+                        AgentEventKind::ModelCompactionStarted,
+                        &json!({
+                            "after_model_call_index": 0,
+                            "active_context_tokens": context.active_context_tokens,
+                            "auto_compact_token_limit": cursor.threshold,
+                        }),
+                    );
                     let result = state
                         .compact_locked(
                             &mut context,
@@ -7141,6 +7217,21 @@ impl LifecycleBackend for Driver {
                             "manual-compact",
                         )
                         .await;
+                    let (kind, payload) = match &result {
+                        Ok(_) => (
+                            AgentEventKind::ModelCompactionCompleted,
+                            State::compacted_payload(0, compaction_started),
+                        ),
+                        Err(error) => (
+                            AgentEventKind::ModelCompactionFailed,
+                            json!({
+                                "after_model_call_index": 0,
+                                "duration_ns": u64::try_from(compaction_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                                "error": error.to_string(),
+                            }),
+                        ),
+                    };
+                    State::publish(&state.session_events, kind, &payload);
                     state.publish_round_boundary(&context).await;
                     if let (Some(policy), Some(id)) = (&state.policy, operation) {
                         if result

@@ -94,6 +94,11 @@ impl ModelRun {
                 reasoning_mode: reasoning_mode.as_str(),
                 effort: thinking.as_str(),
                 previous_response_id,
+                prompt_cache_key: self
+                    .config
+                    .chat_gateway
+                    .is_none()
+                    .then(|| factory.profile().prompt_cache_key()),
             },
         )?;
         let request = factory

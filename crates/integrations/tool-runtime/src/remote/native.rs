@@ -435,6 +435,7 @@ impl SocketTransport {
             runtime_id,
             max_frame_bytes,
             resumable: _,
+            tool_selection,
         } = match catalog {
             Some(text) => RemoteCatalog::decode(&text, policy.max_frame_bytes)?,
             None => tokio::time::timeout(policy.request_timeout, read(&mut socket, &liveness))
@@ -472,6 +473,7 @@ impl SocketTransport {
                 liveness,
                 window: policy.request_timeout / 2,
                 stopped: shutdown.token.clone(),
+                tool_selection,
                 max_frame_bytes: max_frame_bytes.map_or(policy.max_frame_bytes, |peer| {
                     peer.min(policy.max_frame_bytes)
                 }),
@@ -509,6 +511,7 @@ struct SocketLink<S> {
     window: Duration,
     stopped: CancellationToken,
     max_frame_bytes: usize,
+    tool_selection: bool,
 }
 
 enum Received {
@@ -519,6 +522,9 @@ enum Received {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteLink for SocketLink<S> {
+    fn supports_tool_selection(&self) -> bool {
+        self.tool_selection
+    }
     fn send(
         &self,
         frames: Vec<Frame>,
@@ -595,6 +601,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> RemoteLink for SocketLi
 }
 
 impl RemoteTransport for SocketTransport {
+    fn supports_tool_selection(&self) -> bool {
+        self.client.supports_tool_selection()
+    }
     fn request<'a>(
         &'a self,
         operation: RemoteOperation,
@@ -940,6 +949,7 @@ struct CallbackOrigin {
 struct CallbackCatalogState {
     turn: u64,
     origins: Vec<CallbackOrigin>,
+    selected_tools: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -1361,6 +1371,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         runtime_id: executor.options.runtime_id.clone(),
         max_frame_bytes: Some(policy.max_frame_bytes),
         resumable: executor.options.runtime_id.is_some(),
+        tool_selection: !executor.tools.has_dynamic_providers(),
     };
     write(&mut socket, catalog.encode(policy.max_frame_bytes)?, policy).await?;
     let (sink, mut socket) = socket.split();
@@ -1396,19 +1407,32 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             executor.resumable |= resumable;
                             executor.running.insert(id, Running { resumable, connection });
                             let session_id = match &operation { RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } | RemoteOperation::Call { context, .. } => &context.session_id, RemoteOperation::Cancel { session_id } | RemoteOperation::CancelTurn { session_id } | RemoteOperation::DetachTurn { session_id } | RemoteOperation::BeginTurn { session_id } | RemoteOperation::Preempt { session_id } | RemoteOperation::SettlePreempt { session_id } => session_id }.clone();
+                            if matches!(&operation, RemoteOperation::Execute { selected_tools: Some(_), .. } | RemoteOperation::Call { selected_tools: Some(_), .. }) && executor.tools.has_dynamic_providers() {
+                                executor.finish(id, Err("hand tool selection is unavailable with dynamic hand providers; nothing was dispatched".into()));
+                                continue;
+                            }
                             if matches!(&operation, RemoteOperation::Execute { .. } | RemoteOperation::Call { .. }) && !executor.runtimes.contains_key(&session_id) {
                                 let catalog = CallbackCatalog {
                                     session_id: Arc::from(session_id.as_str()),
-                                    state: Arc::default(),
+                                    state: Arc::new(Atom::new(CallbackCatalogState { selected_tools: match &operation { RemoteOperation::Execute { selected_tools, .. } | RemoteOperation::Call { selected_tools, .. } => selected_tools.clone(), _ => None }, ..Default::default() })),
                                     bus: Arc::clone(&bus),
                                 };
-                                match executor.tools.clone().into_builder().provider(catalog.clone()).hand_calls(Arc::clone(&hands)).build() {
+                                let selected = catalog.state.read(|state| state.selected_tools.clone());
+                                let excluded = executor.definitions().await.into_iter().filter(|definition| selected.as_ref().is_some_and(|names| !names.iter().any(|name| name == definition.name()))).map(|definition| definition.name().to_owned()).collect::<Vec<_>>();
+                                match executor.tools.clone().excluding_code_tools(excluded).into_builder().provider(catalog.clone()).hand_calls(Arc::clone(&hands)).build() {
                                     Ok(selected) => { executor.runtimes.insert(session_id.clone(), (Arc::new(ToolRuntime::new_with_tools(executor.workspace.clone(), Vec::new(), &selected)), catalog)); },
                                     Err(issue) => {
                                         executor.finish(id, Err(issue.to_string()));
                                         continue;
                                     }
                                 }
+                            }
+                            if let RemoteOperation::Execute { selected_tools, .. } | RemoteOperation::Call { selected_tools, .. } = &operation
+                                && let Some((_, catalog)) = executor.runtimes.get(&session_id)
+                                && catalog.state.read(|state| &state.selected_tools != selected_tools)
+                            {
+                                executor.finish(id, Err("hand tool selection cannot change within a session".into()));
+                                continue;
                             }
                             if matches!(&operation, RemoteOperation::Cancel { .. } | RemoteOperation::CancelTurn { .. })
                                 && let Some(calls) = executor.calls.remove(&session_id)
@@ -1471,7 +1495,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                             full = resumable.then(|| SentCalls::new(compact).encode(&execution));
                                             Ok(Some(observer.calls.execution(execution)))
                                         },
-                                        RemoteOperation::Call { name, input, context } => {
+                                        RemoteOperation::Call { name, input, context, .. } => {
                                             let owned = context.owned();
                                             tokio::select! {
                                                 output = runtime.execute_nested_tool(&name, input, owned.as_context()) => output_to_wire(output, compact).map(Some),
