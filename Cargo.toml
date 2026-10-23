@@ -41,6 +41,7 @@ members = [
     "crates/integrations/mcp-tools",
     "crates/integrations/cua",
     "crates/integrations/chatgpt-extension",
+    "crates/integrations/sandbox",
     "crates/integrations/decisions",
     "crates/integrations/observability",
     "crates/integrations/store-postgres",
@@ -84,12 +85,14 @@ nanocode-tls = { version = "0.6.7", path = "crates/core/tls" }
 nanocode-types = { version = "0.6.7", path = "crates/core/types" }
 nanocode-cua = { version = "0.6.7", path = "crates/integrations/cua" }
 nanocode-chatgpt-extension = { version = "0.6.7", path = "crates/integrations/chatgpt-extension" }
+nanocode-sandbox = { version = "0.6.7", path = "crates/integrations/sandbox" }
 nanocode-decisions = { version = "0.6.7", path = "crates/integrations/decisions" }
 nanocode-tools = { version = "0.6.7", path = "crates/core/tools" }
 nanocode-tool-contracts = { version = "0.6.7", path = "crates/core/tool-contracts" }
 nanocode-store-jsonl = { version = "0.6.7", path = "crates/integrations/store-jsonl" }
 nanocode-store-sqlite = { version = "0.6.7", path = "crates/integrations/store-sqlite" }
 nanocode-store-postgres = { version = "0.6.7", path = "crates/integrations/store-postgres" }
+landlock = "0.4.4"
 libc = "0.2"
 base64 = "0.22.1"
 base64-simd = "0.8.0"
@@ -144,6 +147,7 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["m
 proc-macro-crate = "3"
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 rustix = { version = "1.1.4", features = ["thread"] }
 rustls-native-certs = "0.8.4"
@@ -153,6 +157,7 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 tokio-postgres = "0.7"
 rquickjs = "0.12.1"
 schemars = "0.8.22"
+seccompiler = "0.5.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 sha1 = "0.11.0"
