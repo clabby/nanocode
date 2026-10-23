@@ -53,7 +53,7 @@ pub(crate) struct ClientInner {
 }
 
 const MCP_CREDENTIAL_META_KEY: &str = "org.paymentauth/credential";
-const MCP_PAYMENT_REQUIRED_CODE: i64 = -32042;
+pub(crate) const MCP_PAYMENT_REQUIRED_CODE: i64 = -32042;
 const MCP_PAYMENT_REQUIRED_META_KEY: &str = "org.paymentauth/payment-required";
 const MCP_RECEIPT_META_KEY: &str = "org.paymentauth/receipt";
 
