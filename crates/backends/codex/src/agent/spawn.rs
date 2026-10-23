@@ -69,7 +69,9 @@ pub(super) fn build_agent(
                 "workspace no longer resolves to the stored location".to_owned(),
             ));
         }
-        if let Some(configured) = configured_workspace {
+        if let Some(configured) = configured_workspace
+            && context_source.execution_environment().is_none()
+        {
             let requested = context_source.resolve_workspace(Some(&configured))?;
             if requested != restored {
                 return Err(NanocodeError::WorkspaceChanged {
