@@ -71,22 +71,19 @@ impl LocalCells {
 
 struct LocalTools {
     tools: Vec<(Arc<dyn Tool>, ToolDefinition)>,
-    hidden: usize,
+    host: Vec<(Arc<dyn Tool>, ToolDefinition)>,
 }
 
 impl LocalTools {
     fn new(tools: Vec<Arc<dyn Tool>>, host_tools: &[Arc<dyn Tool>]) -> Self {
-        let listed = tools.len();
-        let tools = tools
-            .into_iter()
-            .chain(host_tools.iter().cloned())
-            .map(|tool| {
-                let definition = tool.definition();
-                (tool, definition)
-            })
-            .collect::<Vec<_>>();
-        let hidden = tools.len() - listed;
-        Self { tools, hidden }
+        let defined = |tool: Arc<dyn Tool>| {
+            let definition = tool.definition();
+            (tool, definition)
+        };
+        Self {
+            tools: tools.into_iter().map(defined).collect(),
+            host: host_tools.iter().cloned().map(defined).collect(),
+        }
     }
 }
 
@@ -108,7 +105,7 @@ fn identifier(name: &str) -> String {
 
 impl CodeModeToolset for LocalTools {
     fn nested_tool_metadata(&self) -> Vec<Value> {
-        self.tools[..self.tools.len() - self.hidden]
+        self.tools
             .iter()
             .filter_map(|(_, definition)| {
                 let kind = match definition {
@@ -135,55 +132,77 @@ impl CodeModeToolset for LocalTools {
         input: Value,
         context: ToolContext<'a>,
     ) -> HostFuture<'a, ToolOutput> {
-        Box::pin(async move {
-            let Some((tool, definition)) = self
-                .tools
-                .iter()
-                .rev()
-                .find(|(_, definition)| definition.name() == name)
-            else {
-                return ToolOutput::error(format!("unsupported nested tool call: {name}"));
-            };
-            let input = match definition {
-                ToolDefinition::Function { .. } if !input.is_object() => {
-                    return ToolOutput::error(format!(
-                        "nested function tool {name} requires an object argument"
-                    ));
+        execute(find(&self.tools, name), name, input, context)
+    }
+
+    fn execute_host_nested<'a>(
+        &'a self,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, ToolOutput> {
+        let found = find(&self.host, name).or_else(|| find(&self.tools, name));
+        execute(found, name, input, context)
+    }
+}
+
+fn find<'a>(
+    tools: &'a [(Arc<dyn Tool>, ToolDefinition)],
+    name: &str,
+) -> Option<&'a (Arc<dyn Tool>, ToolDefinition)> {
+    tools
+        .iter()
+        .rev()
+        .find(|(_, definition)| definition.name() == name)
+}
+
+fn execute<'a>(
+    found: Option<&'a (Arc<dyn Tool>, ToolDefinition)>,
+    name: &'a str,
+    input: Value,
+    context: ToolContext<'a>,
+) -> HostFuture<'a, ToolOutput> {
+    Box::pin(async move {
+        let Some((tool, definition)) = found else {
+            return ToolOutput::error(format!("unsupported nested tool call: {name}"));
+        };
+        let input = match definition {
+            ToolDefinition::Function { .. } if !input.is_object() => {
+                return ToolOutput::error(format!(
+                    "nested function tool {name} requires an object argument"
+                ));
+            }
+            ToolDefinition::Function { .. } => match to_raw_value(&input) {
+                Ok(input) => ToolInput::Function(input),
+                Err(error) => {
+                    return ToolOutput::error(format!("failed to encode {name} input: {error}"));
                 }
-                ToolDefinition::Function { .. } => match to_raw_value(&input) {
-                    Ok(input) => ToolInput::Function(input),
-                    Err(error) => {
-                        return ToolOutput::error(format!(
-                            "failed to encode {name} input: {error}"
-                        ));
-                    }
-                },
-                ToolDefinition::Custom { .. } => match &input {
-                    Value::String(input) => ToolInput::Freeform(input.clone()),
-                    Value::Object(fields) if fields.len() == 1 => {
-                        match fields.get("input").and_then(Value::as_str) {
-                            Some(input) => ToolInput::Freeform(input.to_owned()),
-                            None => {
-                                return ToolOutput::error(format!(
-                                    "nested freeform tool {name} requires a string argument or {{ input }}"
-                                ));
-                            }
+            },
+            ToolDefinition::Custom { .. } => match &input {
+                Value::String(input) => ToolInput::Freeform(input.clone()),
+                Value::Object(fields) if fields.len() == 1 => {
+                    match fields.get("input").and_then(Value::as_str) {
+                        Some(input) => ToolInput::Freeform(input.to_owned()),
+                        None => {
+                            return ToolOutput::error(format!(
+                                "nested freeform tool {name} requires a string argument or {{ input }}"
+                            ));
                         }
                     }
-                    _ => {
-                        return ToolOutput::error(format!(
-                            "nested freeform tool {name} requires a string argument or {{ input }}"
-                        ));
-                    }
-                },
-                _ => return ToolOutput::error(format!("unsupported nested tool call: {name}")),
-            };
-            match tool.execute(input, context).await {
-                Ok(output) => output,
-                Err(error) => ToolOutput::error(error.to_string()),
-            }
-        })
-    }
+                }
+                _ => {
+                    return ToolOutput::error(format!(
+                        "nested freeform tool {name} requires a string argument or {{ input }}"
+                    ));
+                }
+            },
+            _ => return ToolOutput::error(format!("unsupported nested tool call: {name}")),
+        };
+        match tool.execute(input, context).await {
+            Ok(output) => output,
+            Err(error) => ToolOutput::error(error.to_string()),
+        }
+    })
 }
 
 impl CodeModeHost for LocalCells {

@@ -740,13 +740,7 @@ mod store {
         }
 
         pub async fn prepare_session(&self, record: SessionRecord) -> Result<DurableSession> {
-            DurableSession::prepare_shared_described(
-                self.store.clone(),
-                record.session_id.clone(),
-                None,
-                Some(record),
-            )
-            .await
+            DurableSession::prepare_new(self.store.clone(), record)
         }
 
         pub async fn recovery_checkpoint(

@@ -512,6 +512,7 @@ struct Driver {
     terminal_receipt_limit: Option<usize>,
     owner: Option<OwnerToken>,
     pending_record: Option<crate::catalog::SessionRecord>,
+    create: bool,
     next_agent_generation: u64,
     active_agent_generation: Option<u64>,
     claimed: HashMap<String, Caller>,
@@ -1221,10 +1222,27 @@ impl Driver {
         journal: Option<crate::child_journal::Seed>,
     ) -> Result<bool> {
         let record = self.pending_record.clone();
+        let create = self.create && record.is_some();
+        if create
+            && reduce(self.store.peek(&self.state_id).await?)?
+                .session()
+                .is_some()
+        {
+            return Err(self.exists());
+        }
         let committed = Arc::new(AtomicBool::new(false));
         let staged = Arc::clone(&committed);
-        let update: crate::StoreUpdate =
-            Box::new(move |stored| update_session(stored, record, initial, checkpoint, &staged));
+        let existed = Arc::new(AtomicBool::new(false));
+        let found = Arc::clone(&existed);
+        let update: crate::StoreUpdate = Box::new(move |stored| {
+            if create && reduce(stored.clone()).is_ok_and(|state| state.session().is_some()) {
+                found.store(true, Ordering::Release);
+                return Err(StoreError::NotCommitted(
+                    "the session already exists".to_owned(),
+                ));
+            }
+            update_session(stored, record, initial, checkpoint, &staged)
+        });
         let acquired = match journal.filter(crate::child_journal::Seed::awaited) {
             Some(journal) => self
                 .store
@@ -1248,6 +1266,7 @@ impl Driver {
         };
         let acquired = match acquired {
             Ok(acquired) => acquired,
+            Err(_) if existed.load(Ordering::Acquire) => return Err(self.exists()),
             Err(error @ StoreError::NotCommitted(_)) => return Err(error.into()),
             Err(error) => {
                 self.poisoned = true;
@@ -1275,9 +1294,16 @@ impl Driver {
         }
         self.owner = Some(acquired.owner);
         self.pending_record = None;
+        self.create = false;
         self.state = state;
         self.next_event = None;
         Ok(committed.load(Ordering::Acquire))
+    }
+
+    fn exists(&self) -> Error {
+        Error::SessionExists {
+            session_id: self.state_id.to_string(),
+        }
     }
 
     async fn acquire_agent(
@@ -2450,6 +2476,20 @@ impl DurableSession {
         terminal_receipt_limit: Option<usize>,
         record: Option<crate::SessionRecord>,
     ) -> Result<Self> {
+        Self::prepare(store, state_id, terminal_receipt_limit, record, false)
+    }
+
+    pub(crate) fn prepare_new(store: SharedStore, record: crate::SessionRecord) -> Result<Self> {
+        Self::prepare(store, record.session_id.clone(), None, Some(record), true)
+    }
+
+    fn prepare(
+        store: SharedStore,
+        state_id: String,
+        terminal_receipt_limit: Option<usize>,
+        record: Option<crate::SessionRecord>,
+        create: bool,
+    ) -> Result<Self> {
         if state_id.trim().is_empty() {
             return Err(Error::InvalidState(
                 "state identity must not be empty".to_owned(),
@@ -2473,6 +2513,7 @@ impl DurableSession {
             terminal_receipt_limit,
             owner: None,
             pending_record: record,
+            create,
             next_agent_generation: 0,
             active_agent_generation: None,
             claimed: HashMap::new(),

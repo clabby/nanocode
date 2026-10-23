@@ -18,6 +18,15 @@ pub trait CodeModeToolset: Send + Sync {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, ToolOutput>;
 
+    fn execute_host_nested<'a>(
+        &'a self,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, ToolOutput> {
+        self.execute_nested(name, input, context)
+    }
+
     fn cell_observed(&self, _origin_call_id: &str, _observed: bool) {}
 
     fn append_observation_content(

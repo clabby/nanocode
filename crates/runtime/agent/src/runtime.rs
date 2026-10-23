@@ -1363,7 +1363,8 @@ fn attached(agent: Agent) -> (Agent, AgentEvents) {
 
 pub(crate) fn catalog_error(error: crate::durability::Error) -> NanocodeError {
     match error {
-        crate::durability::Error::SessionNotFound { .. } => {
+        crate::durability::Error::SessionNotFound { .. }
+        | crate::durability::Error::SessionExists { .. } => {
             NanocodeError::InvalidRequest(error.to_string())
         }
         error => NanocodeError::Backend {

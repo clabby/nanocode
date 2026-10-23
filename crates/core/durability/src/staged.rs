@@ -84,7 +84,6 @@ impl StagedWrites {
                 records.clear();
             }
         }
-        self.discard();
         Ok(())
     }
 

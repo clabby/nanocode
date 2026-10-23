@@ -53,7 +53,7 @@ impl Branches {
 pub fn agent_error(error: Error) -> NanocodeError {
     if matches!(
         error,
-        Error::SteerConflict { .. } | Error::SteerWithdrawn { .. }
+        Error::SteerConflict { .. } | Error::SteerWithdrawn { .. } | Error::SessionExists { .. }
     ) {
         return NanocodeError::InvalidRequest(error.to_string());
     }

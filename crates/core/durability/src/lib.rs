@@ -98,6 +98,9 @@ pub enum Error {
     #[error("unknown session `{session_id}`")]
     SessionNotFound { session_id: String },
 
+    #[error("session `{session_id}` already exists; open it instead")]
+    SessionExists { session_id: String },
+
     #[error("durability payload is invalid JSON: {0}")]
     InvalidPayload(#[from] serde_json::Error),
 }
