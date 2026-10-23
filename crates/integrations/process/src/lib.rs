@@ -20,7 +20,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use nanocode_sync::{Actor, Atom};
@@ -93,6 +93,16 @@ impl ForegroundExecutor for EnvironmentForeground {
 }
 
 type Sessions = Arc<Atom<HashMap<i64, Arc<Session>>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningProcess {
+    pub session_id: i64,
+    pub caller: Option<String>,
+    pub command: String,
+    pub workdir: PathBuf,
+    pub started_at: SystemTime,
+    pub in_call: bool,
+}
 
 pub type SecretEnvironment = Arc<dyn Fn() -> Vec<(OsString, OsString)> + Send + Sync>;
 
@@ -183,7 +193,13 @@ impl ShellSessions {
                     );
                 }
             };
-            let session = match Session::new(session_id, spawned, secrets, command.caller) {
+            let launch = Launch {
+                command: command.script.clone(),
+                workdir,
+                started_at: SystemTime::now(),
+                caller: command.caller,
+            };
+            let session = match Session::new(session_id, spawned, secrets, launch) {
                 Ok(session) => session,
                 Err(error) => {
                     return ExecCommandResult::failed(
@@ -257,7 +273,7 @@ impl ShellSessions {
                     ),
                 );
             };
-            if self.per_caller && session.caller != request.caller {
+            if self.per_caller && session.launch.caller != request.caller {
                 return ExecCommandResult::failed(
                     started_at.elapsed(),
                     format!(
@@ -318,6 +334,25 @@ impl ShellSessions {
         })
     }
 
+    pub fn running(&self) -> Vec<RunningProcess> {
+        let mut running = self.sessions.read(|sessions| {
+            sessions
+                .values()
+                .filter(|session| !session.exited.load(Ordering::SeqCst))
+                .map(|session| RunningProcess {
+                    session_id: session.id,
+                    caller: session.launch.caller.clone(),
+                    command: session.launch.command.clone(),
+                    workdir: session.launch.workdir.clone(),
+                    started_at: session.launch.started_at,
+                    in_call: session.busy.load(Ordering::SeqCst) > 0,
+                })
+                .collect::<Vec<_>>()
+        });
+        running.sort_unstable_by_key(|process| process.session_id);
+        running
+    }
+
     pub fn terminate_all<'call>(
         &'call self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'call>> {
@@ -337,12 +372,19 @@ impl ShellSessions {
     }
 }
 
+struct Launch {
+    command: String,
+    workdir: PathBuf,
+    started_at: SystemTime,
+    caller: Option<String>,
+}
+
 struct Session {
     id: i64,
     tty: bool,
     process_group: process::SharedProcessGroup,
     owner: Actor<SessionState>,
-    caller: Option<String>,
+    launch: Launch,
     last_used: AtomicU64,
     busy: AtomicUsize,
     exited: Arc<AtomicBool>,
@@ -406,7 +448,7 @@ impl Session {
         id: i64,
         spawned: process::SpawnedProcess,
         secrets: Vec<String>,
-        caller: Option<String>,
+        launch: Launch,
     ) -> std::io::Result<Arc<Self>> {
         let tty = matches!(spawned.stdin.as_ref(), Some(process::ProcessStdin::Pty(_)));
         let (chunks, output) = mpsc::unbounded_channel();
@@ -435,7 +477,7 @@ impl Session {
             tty,
             process_group,
             owner,
-            caller,
+            launch,
             last_used: AtomicU64::new(0),
             busy: AtomicUsize::new(0),
             exited,
