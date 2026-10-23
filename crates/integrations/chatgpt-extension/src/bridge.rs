@@ -1,4 +1,7 @@
-use crate::{EDGE_ORIGIN, Error, HOST_NAME, ORIGIN, browsers::browser_dirs, chatgpt_installed};
+use crate::{
+    EDGE_ORIGIN, Error, HOST_NAME, ORIGIN, browsers::browser_dirs, chatgpt_installed,
+    host::manifest_path,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -110,8 +113,7 @@ pub struct Guard<'a> {
 }
 
 pub fn host_path(root: &Path) -> PathBuf {
-    root.join("NativeMessagingHosts")
-        .join(format!("{HOST_NAME}.json"))
+    manifest_path(root, HOST_NAME)
 }
 
 fn random_hex() -> Result<String, Error> {

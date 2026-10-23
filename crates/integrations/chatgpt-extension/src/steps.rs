@@ -60,7 +60,7 @@ fn clipped(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
 
-pub fn snapshot(nodes: &[Value]) -> Snapshot {
+pub fn snapshot(nodes: &[Value], offset: usize) -> Snapshot {
     let by_id: HashMap<&str, &Value> = nodes
         .iter()
         .filter_map(|n| Some((n["nodeId"].as_str()?, n)))
@@ -127,6 +127,9 @@ pub fn snapshot(nodes: &[Value]) -> Snapshot {
         refs: HashMap<String, Reference>,
         length: usize,
         cut: bool,
+        offset: usize,
+        walked: usize,
+        numbered: usize,
     }
     fn visit(
         node: &Value,
@@ -190,7 +193,8 @@ pub fn snapshot(nodes: &[Value]) -> Snapshot {
                 if (actionable.contains(&role.as_str()) || focusable)
                     && let Some(dom) = node["backendDOMNodeId"].as_u64()
                 {
-                    let key = format!("e{}", walk.refs.len() + 1);
+                    walk.numbered += 1;
+                    let key = format!("e{}", walk.numbered);
                     line.push_str(&format!(" [ref={key}]"));
                     reference = Some((
                         key,
@@ -204,18 +208,29 @@ pub fn snapshot(nodes: &[Value]) -> Snapshot {
                         },
                     ));
                 }
+                let url = node["properties"]
+                    .as_array()
+                    .and_then(|p| p.iter().find(|p| p["name"] == "url"))
+                    .map(|p| ax_text(&p["value"]))
+                    .unwrap_or_default();
+                if !url.is_empty() {
+                    line.push_str(&format!(" [url={}]", clipped(&url, 500)));
+                }
                 let value = ax_text(&node["value"]);
-                if !value.is_empty() && value != name {
+                if !value.is_empty() && value != name && value != url {
                     line.push_str(&format!(": {}", json!(clipped(&value, 200))));
                 }
                 line
             };
-            if !line.is_empty() {
+            if !line.is_empty() && walk.walked < walk.offset {
+                walk.walked += 1;
+            } else if !line.is_empty() {
                 if walk.length + line.len() + 1 > 30000 {
                     walk.cut = true;
                     return;
                 }
                 walk.length += line.len() + 1;
+                walk.walked += 1;
                 walk.lines.push(std::mem::take(&mut line));
                 if let Some((key, target)) = reference {
                     walk.refs.insert(key, target);
@@ -253,6 +268,9 @@ pub fn snapshot(nodes: &[Value]) -> Snapshot {
         refs: HashMap::new(),
         length: 0,
         cut: false,
+        offset,
+        walked: 0,
+        numbered: 0,
     };
     for node in nodes {
         if node["nodeId"]
@@ -262,10 +280,24 @@ pub fn snapshot(nodes: &[Value]) -> Snapshot {
             visit(node, 0, &mut walk, &transparent, &actionable, &leaves);
         }
     }
-    if walk.cut {
-        walk.lines.push(
-            "… snapshot cut at 30000 characters; scroll, or open a more specific page.".into(),
+    if offset > 0 {
+        walk.lines.insert(
+            0,
+            if walk.walked < offset {
+                format!(
+                    "… offset {offset} is past the end: the snapshot has {} lines; offset 0 reads it from the top.",
+                    walk.walked
+                )
+            } else {
+                format!("… {offset} lines above (offset {offset}); offset 0 reads from the top.")
+            },
         );
+    }
+    if walk.cut {
+        walk.lines.push(format!(
+            "… snapshot cut at 30000 characters after line {0}; snapshot with offset {0} reads on, or open a more specific page.",
+            walk.walked
+        ));
     }
     Snapshot {
         text: walk.lines.join("\n"),
@@ -281,6 +313,7 @@ impl Tabs {
         turn: &str,
         tab: u64,
         screenshot: bool,
+        offset: usize,
     ) -> Result<Value, Error> {
         let current_url = ext.evaluate(session, turn, tab, "location.href")?;
         let title = ext.evaluate(session, turn, tab, "document.title")?;
@@ -289,6 +322,7 @@ impl Tabs {
             tree["nodes"]
                 .as_array()
                 .ok_or("extension returned no accessibility tree")?,
+            offset,
         );
         self.tabs.get_mut(&tab).ok_or("tab closed")?.refs = refs;
         let mut result = json!({"tab":tab,"url":current_url,"title":title,"snapshot":text});
@@ -559,7 +593,14 @@ impl Tabs {
             };
             Ok((
                 summary,
-                self.read(ext, &session_id, turn, tab, input["screenshot"] == true)?,
+                self.read(
+                    ext,
+                    &session_id,
+                    turn,
+                    tab,
+                    input["screenshot"] == true,
+                    usize::try_from(input["offset"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX),
+                )?,
             ))
         })();
         let _ = ext.rpc(
