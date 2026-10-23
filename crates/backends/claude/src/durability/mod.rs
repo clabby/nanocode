@@ -7,7 +7,8 @@ use std::{
 };
 
 use nanocode_agent_core::{
-    Agent, AgentEvents, BackendRequest, Result as AgentResult, backend::BackendFuture,
+    Agent, AgentEvents, BackendRequest, Result as AgentResult, SteerReceiptStatus,
+    backend::BackendFuture,
 };
 use nanocode_durability::{
     Admission, BeginStep, Branches, CheckpointFormat, DurableAgentExt, DurableBackendRegistration,
@@ -381,6 +382,19 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         })
     }
 
+    fn steer_receipt(
+        &self,
+        message_id: String,
+        input_json: String,
+    ) -> PolicyFuture<'_, SteerReceiptStatus> {
+        Box::pin(async move {
+            self.get()
+                .await?
+                .steer_receipt(message_id, input_json)
+                .await
+        })
+    }
+
     fn accept_steer(
         &self,
         id: String,
@@ -642,6 +656,22 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 })?;
             self.owner
                 .identified_steer_accepted(message_id, &input)
+                .await
+                .map_err(agent_error)
+        })
+    }
+
+    fn steer_receipt(
+        &self,
+        message_id: String,
+        input_json: String,
+    ) -> PolicyFuture<'_, SteerReceiptStatus> {
+        Box::pin(async move {
+            let input: Box<RawValue> = serde_json::from_str(&input_json).map_err(|error| {
+                nanocode_agent_core::NanocodeError::InvalidRequest(error.to_string())
+            })?;
+            self.owner
+                .steer_receipt(message_id, &input)
                 .await
                 .map_err(agent_error)
         })

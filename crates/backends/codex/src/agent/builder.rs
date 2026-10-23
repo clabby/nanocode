@@ -13,6 +13,7 @@ pub struct CodexBuilder<F = StandardServiceFactory> {
     pub(super) lineage: Option<Lineage>,
 
     pub(super) service_tier_explicit: bool,
+    pub(super) reasoning_mode_explicit: bool,
 
     pub(super) session_id_explicit: bool,
     pub(super) factory: F,
@@ -36,6 +37,7 @@ where
             resume: None,
             lineage: None,
             service_tier_explicit: false,
+            reasoning_mode_explicit: false,
             session_id_explicit: false,
             factory,
         }
@@ -191,6 +193,7 @@ impl<F> CodexBuilder<F> {
     #[must_use]
     pub const fn reasoning_mode(mut self, reasoning_mode: ReasoningMode) -> Self {
         self.config.reasoning_mode = reasoning_mode;
+        self.reasoning_mode_explicit = true;
         self
     }
 
@@ -286,6 +289,11 @@ impl<F> CodexBuilder<F> {
             && !self.service_tier_explicit
         {
             self.config.service_tier = service_tier;
+        }
+        if let Some(reasoning_mode) = snapshot.reasoning_mode()
+            && !self.reasoning_mode_explicit
+        {
+            self.config.reasoning_mode = reasoning_mode;
         }
         self.resume = Some(snapshot);
         self
@@ -421,12 +429,13 @@ fn validate_execution_environment(environment: Option<&ExecutionEnvironment>) ->
     let Some(environment) = environment else {
         return Ok(());
     };
-    if environment.current_date.trim().is_empty() {
+    let current_date = environment.current_date();
+    if current_date.trim().is_empty() {
         return Err(NanocodeError::InvalidRequest(
             "execution-environment current date must not be empty".to_owned(),
         ));
     }
-    if !is_iso_date(environment.current_date.trim()) {
+    if !is_iso_date(current_date.trim()) {
         return Err(NanocodeError::InvalidRequest(
             "execution-environment current date must use YYYY-MM-DD".to_owned(),
         ));
@@ -443,6 +452,24 @@ fn validate_execution_environment(environment: Option<&ExecutionEnvironment>) ->
     {
         return Err(NanocodeError::InvalidRequest(
             "execution-environment project instructions must not be empty".to_owned(),
+        ));
+    }
+    if environment
+        .working_directory
+        .as_deref()
+        .is_some_and(|directory| directory.trim().is_empty())
+    {
+        return Err(NanocodeError::InvalidRequest(
+            "execution-environment working directory must not be empty".to_owned(),
+        ));
+    }
+    if environment
+        .shell
+        .as_deref()
+        .is_some_and(|shell| shell.trim().is_empty())
+    {
+        return Err(NanocodeError::InvalidRequest(
+            "execution-environment shell must not be empty".to_owned(),
         ));
     }
     Ok(())

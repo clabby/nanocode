@@ -108,6 +108,8 @@ pub struct Tools {
     pub(crate) embedded_host: Option<Arc<dyn crate::embedded::CodeModeHost>>,
 
     pub(crate) embedded_session_id: Option<Arc<str>>,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) excluded_code_tools: HashSet<String>,
 
     code_mode_policies: Vec<Arc<dyn crate::CodeModeToolPolicy>>,
 }
@@ -157,6 +159,8 @@ impl Default for Tools {
             embedded_session_id: None,
 
             code_mode_policies: Vec::new(),
+            #[cfg(not(target_family = "wasm"))]
+            excluded_code_tools: HashSet::new(),
         }
     }
 }
@@ -383,6 +387,26 @@ impl Tools {
     }
 
     #[must_use]
+    pub fn for_backend(self, session_id: &str, backend: &str) -> Self {
+        if let Some(host) = &self.embedded_host {
+            host.bind_session(session_id, backend);
+        }
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(executors) = &self.code_mode_executors {
+            use crate::embedded::CodeModeHost;
+            executors.bind_session(session_id, backend);
+        }
+        self
+    }
+
+    #[must_use]
+    #[cfg(not(target_family = "wasm"))]
+    pub fn excluding_code_tools(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.excluded_code_tools.extend(names);
+        self
+    }
+
+    #[must_use]
     pub fn for_session(mut self, session: &crate::SessionEnvironment) -> Self {
         self.embedded_session_id = Some(Arc::from(session.session_id()));
         if let Some(host) = &self.embedded_host {
@@ -437,6 +461,12 @@ impl Tools {
 
     #[cfg(target_family = "wasm")]
     pub const fn start_providers(&self) {}
+
+    #[must_use]
+    #[cfg(not(target_family = "wasm"))]
+    pub fn has_dynamic_providers(&self) -> bool {
+        !self.providers.is_empty() || self.runner_pool.is_some()
+    }
 
     #[doc(hidden)]
     #[cfg(not(target_family = "wasm"))]

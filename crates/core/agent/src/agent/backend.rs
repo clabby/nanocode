@@ -283,6 +283,15 @@ fn unsupported<T: 'static>(capability: &'static str) -> BackendFuture<Result<T>>
     Box::pin(async move { Err(NanocodeError::UnsupportedCapability { capability }) })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SteerReceiptStatus {
+    Accepted,
+    Absent,
+    Different,
+    Withdrawn,
+    Unknown,
+}
+
 #[doc(hidden)]
 pub trait LifecycleBackend: Send + Sync + 'static {
     fn decode_durable_prompt(&self, input: serde_json::Value) -> Result<Prompt> {
@@ -315,6 +324,14 @@ pub trait LifecycleBackend: Send + Sync + 'static {
 
     fn withdraw_steer(&self, _key: BackendTurnKey, _id: String) -> BackendFuture<Result<bool>> {
         unsupported("identified_steering")
+    }
+
+    fn steer_receipt(
+        &self,
+        _id: String,
+        _prompt: Prompt,
+    ) -> BackendFuture<Result<SteerReceiptStatus>> {
+        Box::pin(async { Ok(SteerReceiptStatus::Unknown) })
     }
 
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>>;

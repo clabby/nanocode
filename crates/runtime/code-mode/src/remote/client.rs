@@ -41,6 +41,10 @@ pub enum RemoteDelivery {
 }
 
 pub trait RemoteLink: Send + Sync + 'static {
+    fn supports_tool_selection(&self) -> bool {
+        false
+    }
+
     fn send(
         &self,
         frames: Vec<Frame>,
@@ -111,6 +115,7 @@ struct Client {
     hands: Atom<Option<Arc<dyn HandCalls>>>,
     max_frame_bytes: Option<usize>,
     resumes: Option<String>,
+    tool_selection: bool,
     _stop: oneshot::Sender<()>,
 }
 
@@ -231,6 +236,7 @@ impl RemoteClient {
         let (stop, stopped) = oneshot::channel();
         let max_frame_bytes = link.max_frame_bytes();
         let resumes = link.resumes();
+        let tool_selection = link.supports_tool_selection();
         let mut waiters = HashMap::new();
         let mut receivers = Vec::new();
         if resumes.is_some() {
@@ -268,6 +274,7 @@ impl RemoteClient {
             hands: Atom::default(),
             max_frame_bytes,
             resumes,
+            tool_selection,
             _stop: stop,
         });
         let resumed = receivers
@@ -522,6 +529,21 @@ impl Client {
         }
     }
 
+    fn refuse(&self, ids: &[u64], message: &str) {
+        let refused = format!("{message}; the operation was not dispatched");
+        let waiters = self.pending.update(|pending| {
+            ids.iter()
+                .filter_map(|id| pending.remove(id).map(|waiter| (*id, waiter)))
+                .collect::<Vec<_>>()
+        });
+        for (id, waiter) in waiters {
+            let _ = waiter.replies.send(Frame::Reply {
+                id,
+                result: Err(refused.clone()),
+            });
+        }
+    }
+
     fn written(&self, ids: &[u64]) {
         if ids.is_empty() {
             return;
@@ -612,6 +634,23 @@ async fn drive(
                     match send.as_mut().poll(cx) {
                         Poll::Ready(Ok(())) => {
                             written(ids);
+                            sending = None;
+                            progressed = true;
+                        }
+                        Poll::Ready(Err(issue))
+                            if !issue.refused_requests().is_empty()
+                                && issue.refused_requests().iter().all(|id| ids.contains(id)) =>
+                        {
+                            let refused = issue.refused_requests();
+                            let sent: Vec<u64> = ids
+                                .iter()
+                                .copied()
+                                .filter(|id| !refused.contains(id))
+                                .collect();
+                            written(&sent);
+                            if let Some(client) = client.upgrade() {
+                                client.refuse(refused, issue.message());
+                            }
                             sending = None;
                             progressed = true;
                         }
@@ -736,6 +775,9 @@ impl Drop for Pending {
 }
 
 impl RemoteTransport for RemoteClient {
+    fn supports_tool_selection(&self) -> bool {
+        self.client.tool_selection
+    }
     fn request<'a>(
         &'a self,
         operation: RemoteOperation,

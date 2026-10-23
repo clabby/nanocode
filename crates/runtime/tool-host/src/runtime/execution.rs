@@ -436,6 +436,9 @@ impl NativeToolRuntime {
     fn with_tools(mut self, tools: &Tools) -> Self {
         tools.start_providers();
         let registry = Arc::make_mut(&mut self.registry);
+        registry
+            .excluded_code_tools
+            .clone_from(&tools.excluded_code_tools);
         for policy in tools.code_mode_policies() {
             if !registry
                 .policies

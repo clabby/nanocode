@@ -8,6 +8,7 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
+use nanocode_agent_core::backend::SteerReceiptStatus;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
@@ -337,6 +338,12 @@ enum Command {
         input: EncodedPayload,
         result: oneshot::Sender<Result<bool>>,
     },
+    SteerReceipt {
+        caller: Caller,
+        message_id: String,
+        input: EncodedPayload,
+        result: oneshot::Sender<Result<SteerReceiptStatus>>,
+    },
     RetainedSteers {
         caller: Caller,
         operation_id: String,
@@ -469,6 +476,7 @@ impl Command {
             Self::AdmitAutomatic { result, .. } => drop(result.send(Err(error))),
             Self::AcceptSteer { result, .. } => drop(result.send(Err(error))),
             Self::IdentifiedSteerAccepted { result, .. } => drop(result.send(Err(error))),
+            Self::SteerReceipt { result, .. } => drop(result.send(Err(error))),
             Self::RetainedSteers { result, .. } => drop(result.send(Err(error))),
             Self::BeginStep { result, .. } => drop(result.send(Err(error))),
             Self::CommitWrites { result, .. } => drop(result.send(Err(error))),
@@ -869,6 +877,38 @@ impl Driver {
                         }
                     }
                     Ok(accepted)
+                });
+                drop(result.send(outcome));
+            }
+            Command::SteerReceipt {
+                caller,
+                message_id,
+                input,
+                result,
+            } => {
+                let outcome = self.authorize(&caller).map(|()| {
+                    let receipts: Vec<_> = self
+                        .state
+                        .operations()
+                        .values()
+                        .filter_map(|operation| operation.steer_receipts.get(&message_id))
+                        .collect();
+                    if receipts
+                        .iter()
+                        .any(|receipt| !input.matches_key(&receipt.input_key))
+                    {
+                        SteerReceiptStatus::Different
+                    } else if receipts.iter().any(|receipt| !receipt.withdrawn) {
+                        SteerReceiptStatus::Accepted
+                    } else if !receipts.is_empty() {
+                        SteerReceiptStatus::Withdrawn
+                    } else if self.terminal_receipt_limit.is_none()
+                        && self.state.receipts_complete()
+                    {
+                        SteerReceiptStatus::Absent
+                    } else {
+                        SteerReceiptStatus::Unknown
+                    }
                 });
                 drop(result.send(outcome));
             }
@@ -3308,6 +3348,22 @@ impl DurableOwner {
     ) -> Result<bool> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::IdentifiedSteerAccepted {
+            caller: self.caller()?,
+            message_id,
+            input: EncodedPayload::encode(input)?,
+            result,
+        })
+        .await?;
+        receive(receiver).await
+    }
+
+    pub async fn steer_receipt<I: Serialize + ?Sized>(
+        &self,
+        message_id: String,
+        input: &I,
+    ) -> Result<SteerReceiptStatus> {
+        let (result, receiver) = oneshot::channel();
+        self.send(Command::SteerReceipt {
             caller: self.caller()?,
             message_id,
             input: EncodedPayload::encode(input)?,

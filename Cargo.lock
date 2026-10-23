@@ -1576,6 +1576,7 @@ name = "nanocode-agent"
 version = "0.6.7"
 dependencies = [
  "arc-swap",
+ "blake3",
  "futures-util",
  "nanocode-agent-config",
  "nanocode-agent-core",
@@ -1686,6 +1687,7 @@ dependencies = [
  "nanocode-code-mode",
  "nanocode-durability",
  "nanocode-home",
+ "nanocode-http",
  "nanocode-media",
  "nanocode-platform",
  "nanocode-process",
