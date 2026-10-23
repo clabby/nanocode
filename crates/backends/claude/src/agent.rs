@@ -4283,7 +4283,13 @@ impl State {
                         | nanocode_agent_core::ClaudeModel::Mythos51
                 )
             ))
-        .then(|| json!({"type":"adaptive","display":"summarized"}))
+        .then(|| {
+            json!({
+                "type":"adaptive",
+                "display":"summarized",
+                "block_binding":{"prefix_mismatch_behavior":"drop_block"},
+            })
+        })
     }
     fn request_template(&self, speed: Option<crate::Speed>) -> MessagesRequest {
         let thinking = self.thinking_config();
@@ -5198,7 +5204,10 @@ impl State {
                     template.output_config = None;
                 }
                 RecoveryThinking::AdaptiveLow => {
-                    template.thinking = Some(json!({"type":"adaptive"}));
+                    template.thinking = Some(json!({
+                        "type":"adaptive",
+                        "block_binding":{"prefix_mismatch_behavior":"drop_block"},
+                    }));
                     template.output_config = Some(crate::OutputConfig {
                         effort: crate::Effort::Low,
                     });
