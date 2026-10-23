@@ -94,6 +94,8 @@ impl ForegroundExecutor for EnvironmentForeground {
 
 type Sessions = Arc<Atom<HashMap<i64, Arc<Session>>>>;
 
+pub type SecretEnvironment = Arc<dyn Fn() -> Vec<(OsString, OsString)> + Send + Sync>;
+
 pub struct ShellSessions {
     terminations: AtomicU64,
     uses: AtomicU64,
@@ -101,6 +103,7 @@ pub struct ShellSessions {
     next_session_id: AtomicI64,
     default_shell: selection::Shell,
     environment: Arc<Vec<(OsString, OsString)>>,
+    secrets: Option<SecretEnvironment>,
 }
 
 impl ShellSessions {
@@ -112,6 +115,17 @@ impl ShellSessions {
             next_session_id: AtomicI64::new(1),
             default_shell: selection::default_user_shell(),
             environment,
+            secrets: None,
+        }
+    }
+
+    pub fn with_secrets(
+        environment: Arc<Vec<(OsString, OsString)>>,
+        secrets: SecretEnvironment,
+    ) -> Self {
+        Self {
+            secrets: Some(secrets),
+            ..Self::with_environment(environment)
         }
     }
 
@@ -133,7 +147,12 @@ impl ShellSessions {
                 || self.default_shell.clone(),
                 selection::get_shell_by_model_provided_path,
             );
-            let (environment, secrets) = process::sanitized_environment(&self.environment);
+            let host_secrets = self
+                .secrets
+                .as_ref()
+                .map_or_else(Vec::new, |secrets| secrets());
+            let (environment, secrets) =
+                process::sanitized_environment(&self.environment, &host_secrets);
 
             let terminations = self.terminations.load(Ordering::SeqCst);
             let spawned = match process::spawn(
