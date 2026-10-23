@@ -33,6 +33,7 @@ impl AgentTools {
 #[derive(Clone, Default)]
 pub struct Settings {
     pub instructions: Option<Arc<str>>,
+    pub model_instructions: Vec<(ModelSelection, Arc<str>)>,
     pub tools: Option<AgentTools>,
     #[cfg(not(target_family = "wasm"))]
     pub providers: Vec<Arc<dyn nanocode_tool_host::runtime::DynamicToolProvider>>,
@@ -42,6 +43,10 @@ impl Settings {
     pub fn or(self, fallback: &Self) -> Self {
         Self {
             instructions: self.instructions.or_else(|| fallback.instructions.clone()),
+            model_instructions: match self.model_instructions.is_empty() {
+                true => fallback.model_instructions.clone(),
+                false => self.model_instructions,
+            },
             tools: self.tools.or_else(|| fallback.tools.clone()),
             #[cfg(not(target_family = "wasm"))]
             providers: match self.providers.is_empty() {

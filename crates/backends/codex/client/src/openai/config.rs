@@ -69,6 +69,8 @@ pub struct ModelConfig {
 
     pub system_prompt: Option<Arc<str>>,
 
+    pub model_system_prompts: Vec<(Model, Arc<str>)>,
+
     pub additional_instructions: Option<Arc<str>>,
 }
 
@@ -200,6 +202,7 @@ impl ModelConfig {
             http_layer: None,
             responses_gateway: None,
             system_prompt: None,
+            model_system_prompts: Vec::new(),
             additional_instructions: None,
         }
     }

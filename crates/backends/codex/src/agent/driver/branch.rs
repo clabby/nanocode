@@ -177,6 +177,13 @@ impl BranchSpawner {
         ))?;
         let mut config = (*self.config).clone();
         config.retarget(model);
+        if let Some((_, instructions)) = config
+            .model_system_prompts
+            .iter()
+            .find(|(configured, _)| *configured == model)
+        {
+            config.system_prompt = Some(Arc::clone(instructions));
+        }
         config.thinking = thinking;
         config.reasoning_mode = reasoning_mode;
         config.service_tier = service_tier;
