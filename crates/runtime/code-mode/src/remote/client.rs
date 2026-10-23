@@ -173,7 +173,13 @@ fn resumed(
         let _resumed = Resumed { client, id };
         while let Some(frame) = replies.recv().await {
             match frame {
-                Frame::Reply { result, .. } => return result.map_err(replied),
+                Frame::Reply { result, .. } => {
+                    let mut value = result.map_err(replied)?;
+                    if let Some(value) = value.as_mut() {
+                        ReceivedCalls::default().execution(value)?;
+                    }
+                    return Ok(value);
+                }
                 Frame::Update { .. } => {}
                 _ => return Err(error("unexpected operation reply")),
             }
