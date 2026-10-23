@@ -721,6 +721,7 @@ impl<'a> ResponseCreate<'a> {
                     crate::client::Model::Sol
                         | crate::client::Model::Luna
                         | crate::client::Model::Astra
+                        | crate::client::Model::DaybreakBlue
                 ),
             },
             tool_choice: "auto",

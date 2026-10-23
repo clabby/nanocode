@@ -242,7 +242,10 @@ impl ModelSelection {
                     (
                         bits,
                         model.default_thinking(),
-                        matches!(model, Model::Astra | Model::Sol | Model::Luna),
+                        matches!(
+                            model,
+                            Model::Astra | Model::Sol | Model::Luna | Model::DaybreakBlue
+                        ),
                         matches!(transport, ModelTransport::Native)
                             && matches!(model, Model::Astra | Model::Sol),
                         model.supports_reasoning_mode(ReasoningMode::Pro),
@@ -495,6 +498,7 @@ fn display_name(model: &ModelSelection) -> &'static str {
         (Some(Model::Glm53), _) => "GLM-5.3",
         (Some(Model::Kimi), _) => "Kimi K3",
         (Some(Model::Mimo), _) => "MiMo V2.6 Pro",
+        (Some(Model::DaybreakBlue), _) => "GPT Daybreak Blue",
         (Some(Model::Custom(model)), _) => model.as_str(),
         (_, Some(ClaudeModel::Opus55)) => "Claude Opus 5.5",
         (_, Some(ClaudeModel::Sonnet55)) => "Claude Sonnet 5.5",

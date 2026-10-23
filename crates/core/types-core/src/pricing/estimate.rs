@@ -145,7 +145,7 @@ impl TokenRates {
             (Model::Glm53, _, _) => GLM53_STANDARD,
             (Model::Kimi, _, _) => KIMI_STANDARD,
             (Model::Mimo, _, _) => MIMO_STANDARD,
-            (Model::Custom(_), _, _) => UNPRICED,
+            (Model::Custom(_) | Model::DaybreakBlue, _, _) => UNPRICED,
             (Model::Sol, Standard, false) => SOL_STANDARD,
             (Model::Sol, Priority | Fast, false) => SOL_PRIORITY,
             (Model::Sol, Ultrafast, false) => SOL_ULTRAFAST,

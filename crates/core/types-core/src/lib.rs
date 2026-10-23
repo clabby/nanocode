@@ -31,6 +31,13 @@ pub enum Model {
     #[serde(rename = "mimo-v2.6-pro", alias = "mimo")]
     Mimo,
 
+    /// OpenAI's Daybreak Blue: reduced cyber refusals for defensive security
+    /// work, served by GPT-6 Sol, for accounts in OpenAI's Daybreak program.
+    /// Kept out of [`Model::ALL`]; hosts choose it, such as after a GPT model
+    /// refused a request under OpenAI's cyber policy.
+    #[serde(rename = "gpt-daybreak-blue-latest", alias = "daybreak-blue")]
+    DaybreakBlue,
+
     #[serde(untagged)]
     Custom(CustomModel),
 }
@@ -86,7 +93,12 @@ impl Model {
     #[must_use]
     pub const fn default_thinking(self) -> Thinking {
         match self {
-            Self::Astra | Self::Glm53 | Self::Kimi | Self::Mimo | Self::Custom(_) => Thinking::Low,
+            Self::Astra
+            | Self::DaybreakBlue
+            | Self::Glm53
+            | Self::Kimi
+            | Self::Mimo
+            | Self::Custom(_) => Thinking::Low,
             Self::Sol | Self::Luna => Thinking::Medium,
         }
     }
@@ -100,6 +112,7 @@ impl Model {
             Self::Glm53 => "@cf/zai-org/glm-5.3",
             Self::Kimi => "kimi-k3",
             Self::Mimo => "mimo-v2.6-pro",
+            Self::DaybreakBlue => "gpt-daybreak-blue-latest",
             Self::Custom(model) => model.as_str(),
         }
     }
@@ -117,13 +130,13 @@ impl Model {
                 matches!(thinking, Thinking::Low | Thinking::Medium | Thinking::High)
             }
             Self::Luna | Self::Custom(_) => true,
-            Self::Astra | Self::Sol => !matches!(thinking, Thinking::None),
+            Self::Astra | Self::Sol | Self::DaybreakBlue => !matches!(thinking, Thinking::None),
         }
     }
 
     #[must_use]
     pub const fn supports_reasoning_effort_updates(self) -> bool {
-        matches!(self, Self::Astra | Self::Sol)
+        matches!(self, Self::Astra | Self::Sol | Self::DaybreakBlue)
     }
 
     #[must_use]
@@ -164,6 +177,7 @@ impl Model {
             "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Some(Self::Glm53),
             "kimi-k3" | "kimi" => Some(Self::Kimi),
             "mimo-v2.6-pro" | "mimo" => Some(Self::Mimo),
+            "gpt-daybreak-blue-latest" | "daybreak-blue" => Some(Self::DaybreakBlue),
             _ => None,
         }
     }
@@ -685,5 +699,27 @@ impl<'de> Deserialize<'de> for UserInput {
             });
         }
         UserInputFields::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod daybreak_tests {
+    use super::{Model, Thinking};
+
+    #[test]
+    fn daybreak_blue_is_a_known_gpt_model() {
+        assert_eq!(
+            "gpt-daybreak-blue-latest".parse::<Model>(),
+            Ok(Model::DaybreakBlue)
+        );
+        assert_eq!("daybreak-blue".parse::<Model>(), Ok(Model::DaybreakBlue));
+        assert_eq!(Model::DaybreakBlue.as_str(), "gpt-daybreak-blue-latest");
+        assert_eq!(
+            serde_json::to_string(&Model::DaybreakBlue).ok().as_deref(),
+            Some("\"gpt-daybreak-blue-latest\"")
+        );
+        assert!(!Model::DaybreakBlue.supports_thinking(Thinking::None));
+        assert!(Model::DaybreakBlue.supports_thinking(Thinking::Max));
+        assert!(!Model::ALL.contains(&Model::DaybreakBlue));
     }
 }
