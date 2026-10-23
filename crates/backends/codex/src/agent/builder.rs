@@ -157,6 +157,14 @@ impl<F> CodexBuilder<F> {
     }
 
     #[must_use]
+    pub fn model_instructions(mut self, model: Model, instructions: impl Into<Arc<str>>) -> Self {
+        let configured = &mut self.config.model_system_prompts;
+        configured.retain(|(existing, _)| *existing != model);
+        configured.push((model, instructions.into()));
+        self
+    }
+
+    #[must_use]
     pub fn additional_instructions(mut self, instructions: impl Into<Arc<str>>) -> Self {
         self.config.additional_instructions = Some(instructions.into());
         self

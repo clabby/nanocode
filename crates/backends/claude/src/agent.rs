@@ -593,6 +593,7 @@ pub struct ClaudeBuilder {
     auto_compact_window_tokens: Option<u64>,
     system: String,
     system_blocks: Option<Vec<Value>>,
+    model_systems: Vec<(String, Arc<str>)>,
     workspace: String,
     workspace_resolver: Option<WorkspaceResolver>,
     child_workspace_init: Option<ChildWorkspaceInit>,
@@ -659,6 +660,7 @@ impl ClaudeBuilder {
             auto_compact_window_tokens: None,
             system: String::new(),
             system_blocks: None,
+            model_systems: Vec::new(),
             workspace: String::new(),
             workspace_resolver: None,
             child_workspace_init: None,
@@ -940,6 +942,18 @@ impl ClaudeBuilder {
     pub fn system(mut self, system: impl Into<String>) -> Self {
         self.system = system.into();
         self.system_blocks = None;
+        self
+    }
+
+    pub fn model_instructions(
+        mut self,
+        model: impl Into<String>,
+        instructions: impl Into<Arc<str>>,
+    ) -> Self {
+        let model = model.into();
+        self.model_systems
+            .retain(|(existing, _)| *existing != model);
+        self.model_systems.push((model, instructions.into()));
         self
     }
 
@@ -2917,6 +2931,14 @@ impl AgentFactory for ClaudeNativeFactory {
             }
             let mut recipe = recipe;
             recipe.claude.model = selected.as_str().into();
+            if let Some(system) = recipe
+                .model_systems
+                .iter()
+                .find(|(model, _)| model == selected.as_str())
+                .map(|(_, instructions)| instructions.to_string())
+            {
+                recipe = recipe.system(system);
+            }
 
             recipe.fast_mode =
                 state.fast_mode.load(Ordering::SeqCst) && selected.supports_fast_mode();
