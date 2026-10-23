@@ -174,8 +174,13 @@ pub fn effective_token_limit(requested: Option<usize>) -> usize {
 }
 
 pub fn redact_and_limit(mut output: String, secrets: &[String], limit: usize) -> (String, bool) {
+    let mut secrets = secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     for secret in secrets {
-        output = output.replace(secret, REDACTION);
+        output = output.replace(secret.as_str(), REDACTION);
     }
     if output.len() <= limit {
         return (output, false);
