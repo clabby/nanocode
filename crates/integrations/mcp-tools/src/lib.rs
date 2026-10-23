@@ -37,7 +37,9 @@ use std::{
 use async_trait::async_trait;
 use catalog::{ConnectedCatalog, ProviderState, ToolEntry};
 use nanocode_mcp::{
-    CallToolParams, CallToolResult, ContentBlock, ContentKind, protocol::JsonObject,
+    CallToolParams, CallToolResult, ContentBlock, ContentKind,
+    jsonrpc::{INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR},
+    protocol::JsonObject,
 };
 use nanocode_tools::ToolDefinition;
 use serde::Deserialize;
@@ -168,7 +170,17 @@ impl McpCallError {
     #[must_use]
     pub fn effect(&self) -> McpCallEffect {
         match self {
-            Self::Session(nanocode_mcp::Error::Rpc(error)) => {
+            Self::Session(nanocode_mcp::Error::Rpc(error))
+                if error.status().is_some()
+                    || matches!(
+                        error.code,
+                        PARSE_ERROR
+                            | INVALID_REQUEST
+                            | METHOD_NOT_FOUND
+                            | INVALID_PARAMS
+                            | client::MCP_PAYMENT_REQUIRED_CODE
+                    ) =>
+            {
                 McpCallEffect::Refused(Some(error.message.clone()))
             }
             Self::Session(nanocode_mcp::Error::Transport(error)) if error.is_unsent() => {
