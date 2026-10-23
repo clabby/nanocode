@@ -40,6 +40,10 @@ nanocode-store-jsonl.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 nix.workspace = true
 
+[features]
+default = ["local-cells"]
+local-cells = ["nanocode-code-mode/local-cells"]
+
 [lints]
 workspace = true
 
