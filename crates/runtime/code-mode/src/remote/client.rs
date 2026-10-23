@@ -124,6 +124,7 @@ struct Client {
     hands: Atom<Option<Arc<dyn HandCalls>>>,
     max_frame_bytes: Option<usize>,
     resumes: Option<String>,
+    settles: bool,
     tool_selection: bool,
     _stop: oneshot::Sender<()>,
 }
@@ -232,7 +233,7 @@ impl RemoteClient {
         link: impl RemoteLink,
         operation_timeout: Option<Duration>,
     ) -> (Self, HostFuture<'static, String>) {
-        let (client, driver, _) = Self::resuming(link, operation_timeout, Vec::new());
+        let (client, driver, _) = Self::open(link, operation_timeout, Vec::new(), false);
         (client, driver)
     }
 
@@ -240,6 +241,15 @@ impl RemoteClient {
         link: impl RemoteLink,
         operation_timeout: Option<Duration>,
         pending: Vec<u64>,
+    ) -> (Self, HostFuture<'static, String>, Vec<(u64, ResumedReply)>) {
+        Self::open(link, operation_timeout, pending, true)
+    }
+
+    fn open(
+        link: impl RemoteLink,
+        operation_timeout: Option<Duration>,
+        pending: Vec<u64>,
+        settles: bool,
     ) -> (Self, HostFuture<'static, String>, Vec<(u64, ResumedReply)>) {
         let (outgoing, frames) = mpsc::unbounded_channel();
         let (stop, stopped) = oneshot::channel();
@@ -284,6 +294,7 @@ impl RemoteClient {
             hands: Atom::default(),
             max_frame_bytes,
             resumes,
+            settles,
             tool_selection,
             _stop: stop,
         });
@@ -293,6 +304,13 @@ impl RemoteClient {
             .collect();
         let driver = Box::pin(drive(Arc::downgrade(&client), link, frames, stopped));
         (Self { client }, driver, resumed)
+    }
+
+    pub fn ack(&self, ids: Vec<u64>) -> Result<(), CodeModeHostError> {
+        self.client
+            .outgoing
+            .send((Frame::Ack { ids }, RemoteDelivery::Immediate))
+            .map_err(error)
     }
 
     #[must_use]
@@ -735,6 +753,7 @@ async fn drive(
                         let mut acks = Vec::new();
                         for frame in received {
                             if client.resumes.is_some()
+                                && !client.settles
                                 && let Frame::Reply { id, .. } = &frame
                             {
                                 acks.push(*id);
