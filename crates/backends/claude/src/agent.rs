@@ -4354,16 +4354,20 @@ impl State {
             .template
             .map_or_else(|| self.model(), |template| template.model.clone());
         let (reasoning_mode, effort) = self.run_labels();
-        self.emit(
-            events,
-            AgentEventKind::ModelCallStarted,
-            json!({
-                "call_index": call_index,
-                "model": model,
-                "reasoning_mode": reasoning_mode,
-                "effort": effort,
-            }),
+        let cache = context.template.map_or_else(
+            || self.automatic_cache.then(|| self.cache_ttl()),
+            |template| template.cache_control.as_ref().map(|control| control.ttl),
         );
+        let mut payload = json!({
+            "call_index": call_index,
+            "model": model,
+            "reasoning_mode": reasoning_mode,
+            "effort": effort,
+        });
+        if let Some(ttl) = cache {
+            payload["cache_ttl"] = json!(ttl.unwrap_or(crate::CacheTtl::FiveMinutes));
+        }
+        self.emit(events, AgentEventKind::ModelCallStarted, payload);
         let span = telemetry::model_call_span(
             &self.session_id,
             call_index,

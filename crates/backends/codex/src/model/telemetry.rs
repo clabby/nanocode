@@ -24,6 +24,8 @@ pub(super) struct ModelCallStarted<'a> {
     pub(super) effort: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) previous_response_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
