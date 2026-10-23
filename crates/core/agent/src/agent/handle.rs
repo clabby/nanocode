@@ -27,19 +27,36 @@ pub(super) type OwnershipProbe =
     Arc<dyn Fn() -> super::backend::BackendFuture<Result<bool>> + Send + Sync>;
 
 #[derive(Default)]
-pub(super) struct Interrupted(ArcSwapOption<Resumption>);
+pub(super) struct Interrupted {
+    turns: ArcSwapOption<Resumption>,
+    host_resumes: AtomicBool,
+}
 
 impl Interrupted {
     pub(super) fn replace(&self, turns: Vec<InterruptedTurn>) {
-        self.0
+        let turns = self.resumable(turns);
+        self.turns
             .store((!turns.is_empty()).then(|| Resumption::new(turns)));
     }
 
     pub(super) fn take_turns(&self) -> Vec<InterruptedTurn> {
-        self.0
+        self.turns
             .swap(None)
             .map(|resumption| resumption.turns.clone())
             .unwrap_or_default()
+    }
+
+    pub(super) fn resumable(&self, turns: Vec<InterruptedTurn>) -> Vec<InterruptedTurn> {
+        if self.host_resumes.load(Ordering::Acquire) {
+            Vec::new()
+        } else {
+            turns
+        }
+    }
+
+    fn leave_to_host(&self) {
+        self.host_resumes.store(true, Ordering::Release);
+        self.turns.store(None);
     }
 }
 
@@ -102,7 +119,7 @@ impl Drop for ResumptionClaim<'_> {
             .take()
             .unwrap_or_else(|| self.resumption.turns[self.resumed..].to_vec());
         let next = (!remaining.is_empty()).then(|| Resumption::new(remaining));
-        self.interrupted.0.rcu(|current| match current {
+        self.interrupted.turns.rcu(|current| match current {
             Some(current) if Arc::ptr_eq(current, &self.resumption) => next.clone(),
             other => other.clone(),
         });
@@ -576,10 +593,13 @@ impl Agent {
     #[doc(hidden)]
     #[must_use]
     pub fn with_interrupted_turns(self, turns: Vec<(String, serde_json::Value)>) -> Self {
-        if !turns.is_empty() {
-            self.interrupted.0.store(Some(Resumption::new(turns)));
-        }
+        self.interrupted.replace(turns);
         self
+    }
+
+    #[doc(hidden)]
+    pub fn leave_interrupted_turns_to_host(&self) {
+        self.interrupted.leave_to_host();
     }
 
     #[must_use]
@@ -595,7 +615,7 @@ impl Agent {
 
     async fn resume_interrupted(&self, request_id: Option<&str>) -> Result<()> {
         loop {
-            let Some(resumption) = self.interrupted.0.load_full() else {
+            let Some(resumption) = self.interrupted.turns.load_full() else {
                 return Ok(());
             };
             if resumption.claimed.swap(true, Ordering::AcqRel) {

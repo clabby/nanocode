@@ -16,8 +16,8 @@ use super::{
 use futures_util::future::join_all;
 use nanocode_agent_core::{
     Agent, AgentEvents, AgentHandle, AgentUsage, ExecutionPolicyDisposition, ModelSelection,
-    NanocodeError, PromptRoute, ReasoningMode, Result as AgentResult, SessionCheckpoint, Thinking,
-    TurnResult, WeakAgent,
+    NanocodeError, PromptRoute, ReasoningMode, Result as AgentResult, SessionCheckpoint,
+    SteerReceiptStatus, Thinking, TurnResult, WeakAgent,
     events::{AgentEventKind, RunStatus},
 };
 use nanocode_platform::Instant;
@@ -308,7 +308,12 @@ impl NoticeOutcome {
         }
     }
 
-    async fn of_steer(mut events: AgentEvents, request_id: &str) -> Self {
+    async fn of_steer(
+        mut events: AgentEvents,
+        request_id: &str,
+        prompt: String,
+        parent: &WeakAgent,
+    ) -> Self {
         let mut carrier = None;
         while let Some(event) = events.recv().await {
             let steered = event.kind == AgentEventKind::RunSteered;
@@ -334,6 +339,17 @@ impl NoticeOutcome {
             }
             return match run.status {
                 Some(RunStatus::Completed) if carrier.is_some() => Self::Read,
+                Some(RunStatus::Completed) => match parent.upgrade() {
+                    Some(parent)
+                        if matches!(
+                            parent.steer_receipt(request_id.to_owned(), prompt).await,
+                            Ok(SteerReceiptStatus::Accepted)
+                        ) =>
+                    {
+                        Self::Read
+                    }
+                    _ => Self::Unread,
+                },
                 Some(RunStatus::Cancelled) => Self::Cancelled,
                 _ => Self::Unread,
             };
@@ -3854,13 +3870,12 @@ impl Registry {
                 crate::COMPLETION_REQUEST_PREFIX
             ),
         };
+        let prompt = completion_continuation_prompt(id, &status);
         let events = parent.subscribe();
         match parent
             .route_prompt_request(
-                nanocode_agent_core::PromptRequest::new(completion_continuation_prompt(
-                    id, &status,
-                ))
-                .request_id(request_id.clone()),
+                nanocode_agent_core::PromptRequest::new(prompt.clone())
+                    .request_id(request_id.clone()),
             )
             .await
         {
@@ -3882,7 +3897,9 @@ impl Registry {
                             drop(events);
                             NoticeOutcome::of_turn(turn.result().await)
                         }
-                        PromptRoute::Steered => NoticeOutcome::of_steer(events, &request_id).await,
+                        PromptRoute::Steered => {
+                            NoticeOutcome::of_steer(events, &request_id, prompt, &parent).await
+                        }
                     };
                     let Some(registry) = registry.upgrade() else {
                         return;
