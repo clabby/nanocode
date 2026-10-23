@@ -843,7 +843,7 @@ async fn execute_mcp_entry(
     let success = !result.is_error();
     span.record("status", if success { "completed" } else { "failed" });
     span.record("otel.status_code", if success { "OK" } else { "ERROR" });
-    match tool_output_from_mcp_result(result, &entry.server_name, &entry.remote_name) {
+    match tool_output(result, &entry.server_name, &entry.remote_name) {
         Ok(output) => output,
         Err(error) => {
             span.record("status", "failed");
@@ -853,7 +853,7 @@ async fn execute_mcp_entry(
     }
 }
 
-fn tool_output_from_mcp_result(
+pub fn tool_output(
     result: CallToolResult,
     server_name: &str,
     remote_name: &str,
@@ -871,16 +871,16 @@ fn tool_output_from_mcp_result(
         let mut output = ToolOutput::content(direct_content.unwrap_or_default());
         output.success = success;
         output.with_structured_result(value)
+    } else if let Some(content) = direct_content {
+        let mut output = ToolOutput::content(content);
+        output.success = success;
+        output.with_structured_result(value)
     } else if let Some(structured_content) = result
         .structured_content
         .as_ref()
         .filter(|content| !content.is_null())
     {
         ToolOutput::from_json(structured_content.clone(), success).with_structured_result(value)
-    } else if let Some(content) = direct_content {
-        let mut output = ToolOutput::content(content);
-        output.success = success;
-        output.with_structured_result(value)
     } else {
         ToolOutput::from_json(serde_json::to_value(&result.content)?, success)
             .with_structured_result(value)
