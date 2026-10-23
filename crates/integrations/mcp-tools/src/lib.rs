@@ -156,6 +156,35 @@ pub enum McpCallError {
     Timeout(Duration),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpCallEffect {
+    Refused(Option<String>),
+    Unsent,
+    Unauthorized,
+    Unknown,
+}
+
+impl McpCallError {
+    #[must_use]
+    pub fn effect(&self) -> McpCallEffect {
+        match self {
+            Self::Session(nanocode_mcp::Error::Rpc(error)) => {
+                McpCallEffect::Refused(Some(error.message.clone()))
+            }
+            Self::Session(nanocode_mcp::Error::Transport(error)) if error.is_unsent() => {
+                McpCallEffect::Unsent
+            }
+            Self::Session(nanocode_mcp::Error::Transport(error)) => match error.status() {
+                Some(401) => McpCallEffect::Unauthorized,
+                Some(status @ 400..=499) => McpCallEffect::Refused(Some(format!("HTTP {status}"))),
+                _ => McpCallEffect::Unknown,
+            },
+            Self::Auth(_) => McpCallEffect::Refused(None),
+            _ => McpCallEffect::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum McpBuildError {
     #[error("at least one MCP server is required")]
