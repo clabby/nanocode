@@ -686,7 +686,11 @@ impl Shared {
                 .unwrap_or_else(|_| "<failed to read response body>".to_owned());
             if !status.is_server_error() && is_mime(content_type.as_deref(), JSON_MIME_TYPE) {
                 match Message::from_slice(body.as_bytes()) {
-                    Ok(error @ Message::Error { .. }) => {
+                    Ok(Message::Error { id, error }) => {
+                        let error = Message::Error {
+                            id,
+                            error: error.with_status(status.as_u16()),
+                        };
                         self.inbound
                             .deliver(with_request_id(error, message.request_id()));
                         return Ok(());

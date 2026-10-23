@@ -42,6 +42,8 @@ pub struct RpcError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+    #[serde(skip)]
+    status: Option<u16>,
 }
 
 impl RpcError {
@@ -51,7 +53,19 @@ impl RpcError {
             code,
             message: message.into(),
             data: None,
+            status: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_status(mut self, status: u16) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> Option<u16> {
+        self.status
     }
 }
 

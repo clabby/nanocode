@@ -13,7 +13,8 @@ use super::{
 use async_trait::async_trait;
 use futures_util::future::join_all;
 use nanocode_agent_core::{
-    AgentHandle, ForkRequest, HarnessFamily, ModelSelection, ReasoningMode, SpawnOptions, Thinking,
+    AgentHandle, ClaudeModel, ForkRequest, HarnessFamily, Model, ModelSelection, ReasoningMode,
+    SpawnOptions, Thinking,
 };
 use nanocode_tool_contracts::{
     Tool, ToolCollection, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult,
@@ -192,16 +193,16 @@ pub struct AgentStartReport {
 fn inferred_harness(parent: Option<HarnessFamily>, model: &str) -> std::io::Result<HarnessFamily> {
     let parent = parent
         .ok_or_else(|| std::io::Error::other("a model requires a backend selection or parent"))?;
-    let inherited = ModelSelection::new(parent.clone(), model);
-    if inherited.as_codex().is_some()
-        || inherited.as_claude().is_some()
-        || !HarnessFamily::builtin().contains(&parent)
-    {
+    if !HarnessFamily::builtin().contains(&parent) {
         return Ok(parent);
     }
-    Ok(model
-        .parse::<ModelSelection>()
-        .map_or(parent, |known| known.family()))
+    if Model::known(model).is_some() {
+        return Ok(HarnessFamily::Codex);
+    }
+    if model.parse::<ClaudeModel>().is_ok() {
+        return Ok(HarnessFamily::Claude);
+    }
+    Ok(parent)
 }
 
 async fn spawn_parent(
