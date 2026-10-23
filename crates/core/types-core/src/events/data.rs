@@ -418,6 +418,15 @@ pub struct ModelCallStarted {
     pub reasoning_mode: String,
 
     pub effort: String,
+
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+
+    #[serde(default)]
+    pub cache_ttl: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
