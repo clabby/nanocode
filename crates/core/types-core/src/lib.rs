@@ -42,18 +42,20 @@ impl CustomModel {
     #[must_use]
     pub fn new(id: &str) -> Self {
         static INTERNED: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::BTreeSet<&'static str>>,
+            nanocode_sync::Atom<std::collections::BTreeSet<&'static str>>,
         > = std::sync::OnceLock::new();
-        let mut interned = INTERNED
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = interned.get(id) {
+        let interned = INTERNED.get_or_init(Default::default);
+        if let Some(existing) = interned.read(|ids| ids.get(id).copied()) {
             return Self(existing);
         }
         let leaked: &'static str = Box::leak(id.to_owned().into_boxed_str());
-        interned.insert(leaked);
-        Self(leaked)
+        Self(interned.update(|ids| {
+            if let Some(existing) = ids.get(id) {
+                return *existing;
+            }
+            ids.insert(leaked);
+            leaked
+        }))
     }
 
     #[must_use]
