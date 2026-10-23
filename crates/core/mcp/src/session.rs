@@ -123,6 +123,10 @@ impl From<&str> for TransportError {
     }
 }
 
+fn unsent_closed() -> Error {
+    Error::Transport(TransportError::unsent("Transport closed"))
+}
+
 const CLIENT_CANCELLED_REASON: &str = "request cancelled by client";
 
 type Reply = oneshot::Sender<Result<Value, Error>>;
@@ -259,7 +263,7 @@ impl Session {
     pub async fn request_value(&self, method: &str, params: Option<Value>) -> Result<Value, Error> {
         let (reply, response) = oneshot::channel();
         if self.shared.is_closed() {
-            return Err(Error::Closed);
+            return Err(unsent_closed());
         }
         let id = RequestId::Number(i64::from(
             self.shared.next_id.fetch_add(1, Ordering::Relaxed),
@@ -272,7 +276,7 @@ impl Session {
         });
         if self.shared.is_closed() {
             drop(self.shared.take_pending(&id));
-            return Err(Error::Closed);
+            return Err(unsent_closed());
         }
         let mut guard = PendingGuard {
             shared: &self.shared,
@@ -282,7 +286,7 @@ impl Session {
         self.shared
             .outbound
             .unbounded_send(Message::request(id, method, params))
-            .map_err(|_| Error::Closed)?;
+            .map_err(|_| unsent_closed())?;
         let result = response.await.map_err(|_| Error::Closed)?;
         guard.id = None;
         result
@@ -293,9 +297,10 @@ impl Session {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let params = serde_json::to_value(params).map_err(|error| Error::InvalidResult {
-            method: method.to_owned(),
-            error: error.to_string(),
+        let params = serde_json::to_value(params).map_err(|error| {
+            Error::Transport(TransportError::unsent(format!(
+                "Serialize error for {method}: {error}"
+            )))
         })?;
         let result = self.request_value(method, Some(params)).await?;
         serde_json::from_value(result).map_err(|error| Error::InvalidResult {
