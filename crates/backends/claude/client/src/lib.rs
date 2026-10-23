@@ -34,6 +34,7 @@ pub const ANTHROPIC_SUBSCRIPTION_MESSAGES_URL: &str =
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const FIRST_PARTY_HOST: &str = "api.anthropic.com";
 const GZIP_MIN_BODY_BYTES: usize = 4096;
 const INVALID_JSON_MESSAGES: [&str; 2] = [
@@ -1405,6 +1406,10 @@ impl ClaudeClient {
                 .and_then(|thinking| thinking.get("display"))
                 .and_then(Value::as_str)
                 == Some("updates"),
+            thinking_binding: head
+                .thinking
+                .as_ref()
+                .is_some_and(|thinking| thinking.get("block_binding").is_some()),
             context_management: head.context_management.is_some(),
             speed: head.speed.is_some(),
         })
@@ -1422,6 +1427,7 @@ impl ClaudeClient {
             agent: false,
             thinking: false,
             thinking_updates: false,
+            thinking_binding: false,
             context_management: false,
             speed: false,
         }
@@ -1522,6 +1528,9 @@ impl ClaudeClient {
             const THINKING_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
             if wire.thinking_updates && !betas.contains(&THINKING_UPDATES_BETA) {
                 betas.push(THINKING_UPDATES_BETA);
+            }
+            if wire.thinking_binding && !betas.contains(&THINKING_BINDING_BETA) {
+                betas.push(THINKING_BINDING_BETA);
             }
             if wire.speed && !betas.contains(&FAST_MODE_BETA) {
                 betas.push(FAST_MODE_BETA);
@@ -1798,6 +1807,7 @@ pub struct PreparedWire {
     agent: bool,
     thinking: bool,
     thinking_updates: bool,
+    thinking_binding: bool,
     context_management: bool,
     speed: bool,
 }
