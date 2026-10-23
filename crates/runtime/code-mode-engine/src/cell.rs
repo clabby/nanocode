@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Duration
 use nanocode_platform::Instant;
 use rquickjs::{
     CatchResultExt, Coerced, Ctx, Exception, FromJs, Function, Persistent, Promise,
-    function::{Func, Rest},
+    function::{Func, Opt, Rest},
     promise::PromiseState,
 };
 use serde::Deserialize;
@@ -18,6 +18,7 @@ pub enum RuntimeEvent {
         id: u64,
         name: String,
         input: Value,
+        host: bool,
     },
     Notify {
         cell_id: u64,
@@ -192,7 +193,8 @@ pub(crate) fn install_native_functions<'js>(
             Func::from(
                 move |ctx: Ctx<'js>,
                       name: String,
-                      input_json: String|
+                      input_json: String,
+                      host: Opt<bool>|
                       -> rquickjs::Result<Promise<'js>> {
                     let input = serde_json::from_str(&input_json).map_err(|error| {
                         Exception::throw_type(&ctx, &format!("invalid tool input: {error}"))
@@ -213,6 +215,7 @@ pub(crate) fn install_native_functions<'js>(
                         id,
                         name,
                         input,
+                        host: host.0.unwrap_or(false),
                     });
                     Ok(promise)
                 },

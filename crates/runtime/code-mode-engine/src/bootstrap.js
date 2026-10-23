@@ -40,9 +40,9 @@
     const stored = new Map();
     const storedWrites = new Map();
     const declaredTools = Object.create(null);
-    const invokeTool = (name, input) => {
+    const invokeTool = (name, input, host = false) => {
       const encodedInput = input === undefined ? "null" : jsonStringify(input);
-      return nativeTool(name, encodedInput)
+      return nativeTool(name, encodedInput, host)
         .then(jsonParse, (payload) => Promise.reject(jsonParse(payload)));
     };
     for (const definition of definitions) {
@@ -124,7 +124,10 @@
     }
     try {
       const prelude = preludeSource
-        ? new Function("tools", "call", preludeSource)(tools, invokeTool) ?? {}
+        ? new Function("tools", "call", preludeSource)(
+          tools,
+          (name, input) => invokeTool(name, input, true),
+        ) ?? {}
         : {};
       const preludeNames = Object.keys(prelude);
       const script = new AsyncFunction(

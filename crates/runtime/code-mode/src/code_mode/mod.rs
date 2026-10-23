@@ -1496,7 +1496,7 @@ impl EmbeddedHost {
                     }
                     match event {
                         RuntimeEvent::ToolCall {
-                            id, name, input, ..
+                            id, name, input, host, ..
                         } => {
                             let nested_call_id = format!("{}/code-{id}", context.call_id);
                             let started = Instant::now();
@@ -1518,6 +1518,7 @@ impl EmbeddedHost {
                                 tools,
                                 id,
                                 name,
+                                host,
                                 input,
                                 context,
                                 actor_started_at,
@@ -1749,6 +1750,7 @@ async fn execute_nested_call(
     tools: &dyn CodeModeToolset,
     id: u64,
     name: String,
+    host: bool,
     input: Arc<Value>,
     context: &OwnedToolContext,
     cell_started_at: Instant,
@@ -1770,9 +1772,12 @@ async fn execute_nested_call(
     .with_instruction_revision(context.instruction_revision())
     .with_host_context(context.host_context())
     .with_turn_id(context.turn_id());
-    let mut execution = tools
-        .execute_nested(&name, Value::clone(&input), context)
-        .await;
+    let mut execution = if host {
+        tools.execute_host_nested(&name, Value::clone(&input), context)
+    } else {
+        tools.execute_nested(&name, Value::clone(&input), context)
+    }
+    .await;
     let duration_ns = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let value = execution.take_structured_result();
     let process_trace = execution.process_trace().copied().map(Into::into);
