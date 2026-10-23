@@ -861,21 +861,6 @@ fn spawn_agent_parameters_for(policy: &SpawnPolicy) -> Value {
         properties["model"]["enum"] = Value::Array(names);
         properties["harness"]["enum"] = Value::Array(families);
     }
-    if !policy.model_ladder.is_empty() {
-        let ladder = policy
-            .model_ladder
-            .iter()
-            .map(ModelSelection::as_str)
-            .collect::<Vec<_>>()
-            .join(" < ");
-        let description = format!(
-            "{} A child cannot rank above its spawning agent on this ladder: {ladder}.",
-            properties["model"]["description"]
-                .as_str()
-                .unwrap_or_default()
-        );
-        properties["model"]["description"] = json!(description);
-    }
     if policy.min_thinking.is_some() || policy.max_thinking.is_some() {
         let mut levels = policy
             .offered_thinking()

@@ -1,11 +1,10 @@
-use nanocode_agent_core::{Model, ModelSelection, ReasoningMode, Thinking};
+use nanocode_agent_core::{ModelSelection, ReasoningMode, Thinking};
 use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpawnPolicy {
     pub models: Option<Vec<ModelSelection>>,
-    pub model_ladder: Vec<ModelSelection>,
     pub min_thinking: Option<Thinking>,
     pub max_thinking: Option<Thinking>,
     pub bounded_by_parent_thinking: bool,
@@ -16,10 +15,6 @@ impl Default for SpawnPolicy {
     fn default() -> Self {
         Self {
             models: None,
-            model_ladder: [Model::Luna, Model::Sol, Model::Astra]
-                .into_iter()
-                .map(ModelSelection::Codex)
-                .collect(),
             min_thinking: Some(Thinking::Low),
             max_thinking: None,
             bounded_by_parent_thinking: true,
@@ -32,10 +27,6 @@ impl Default for SpawnPolicy {
 pub enum SpawnPolicyError {
     ModelNotOffered {
         requested: ModelSelection,
-    },
-    ModelExceedsParent {
-        requested: ModelSelection,
-        parent: ModelSelection,
     },
     ThinkingBelowMinimum {
         requested: Thinking,
@@ -71,12 +62,6 @@ impl fmt::Display for SpawnPolicyError {
                 "model {} ({}) is not offered to subagents",
                 requested.as_str(),
                 requested.family()
-            ),
-            Self::ModelExceedsParent { requested, parent } => write!(
-                formatter,
-                "model {} ranks above the spawning agent's model {}",
-                requested.as_str(),
-                parent.as_str()
             ),
             Self::ThinkingBelowMinimum { requested, minimum } => write!(
                 formatter,
@@ -127,7 +112,6 @@ pub(crate) struct SpawnParent {
 impl SpawnPolicy {
     pub const fn is_unrestricted(&self) -> bool {
         self.models.is_none()
-            && self.model_ladder.is_empty()
             && self.min_thinking.is_none()
             && self.max_thinking.is_none()
             && !self.bounded_by_parent_thinking
@@ -151,25 +135,12 @@ impl SpawnPolicy {
             .collect()
     }
 
-    pub fn admit_model(
-        &self,
-        parent: &ModelSelection,
-        model: &ModelSelection,
-    ) -> Result<(), SpawnPolicyError> {
+    pub fn admit_model(&self, model: &ModelSelection) -> Result<(), SpawnPolicyError> {
         if let Some(models) = &self.models
             && !models.contains(model)
         {
             return Err(SpawnPolicyError::ModelNotOffered {
                 requested: model.clone(),
-            });
-        }
-        if let (Some(parent_rank), Some(child_rank)) =
-            (self.ladder_rank(parent), self.ladder_rank(model))
-            && child_rank > parent_rank
-        {
-            return Err(SpawnPolicyError::ModelExceedsParent {
-                requested: model.clone(),
-                parent: parent.clone(),
             });
         }
         Ok(())
@@ -214,7 +185,7 @@ impl SpawnPolicy {
         thinking: Option<Thinking>,
     ) -> Result<(), SpawnPolicyError> {
         if let Some(model) = model {
-            self.admit_model(&parent.model, model)?;
+            self.admit_model(model)?;
         }
         if let Some(thinking) = thinking {
             let bound = if self.bounded_by_parent_thinking && parent.registered {
@@ -255,15 +226,6 @@ impl SpawnPolicy {
         Ok(())
     }
 
-    fn ladder_rank(&self, model: &ModelSelection) -> Option<usize> {
-        self.model_ladder.iter().position(|rung| {
-            rung == model
-                || rung
-                    .as_codex()
-                    .zip(model.as_codex())
-                    .is_some_and(|(rung, model)| rung == model)
-        })
-    }
 }
 
 impl crate::Registry {
