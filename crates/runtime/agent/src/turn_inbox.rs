@@ -376,6 +376,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         let subagents = runtime.take_subagent_updates();
         let stored = store.load(&session_id).await.map_err(catalog)?;
         let (agent, stream) = runtime.open_loaded(store, &stored).await?;
+        agent.leave_interrupted_turns_to_host();
         let shared = Arc::new(Shared {
             log,
             host,

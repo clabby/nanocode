@@ -196,7 +196,7 @@ impl Shared {
         spawn_detached(async move {
             let _ = previous.shutdown().await;
         });
-        let mut turns = agent.interrupted.take_turns();
+        let mut turns = self.interrupted.resumable(agent.interrupted.take_turns());
         let Some(retry) = retry else {
             self.interrupted.replace(turns);
             return Ok(backend);
