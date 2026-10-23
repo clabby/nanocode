@@ -1116,9 +1116,13 @@ impl Driver {
                 kinds,
                 result,
             } => {
-                let outcome = self.authorize(&caller).map(|()| {
-                    self.abandonable = kinds.into_iter().collect();
-                });
+                let outcome = match self.authorize(&caller) {
+                    Ok(()) => {
+                        self.abandonable = kinds.into_iter().collect();
+                        self.abandon_stale("").await
+                    }
+                    Err(error) => Err(error),
+                };
                 drop(result.send(outcome));
             }
             Command::Describe {
