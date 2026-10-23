@@ -1,6 +1,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![cfg_attr(target_family = "wasm", allow(clippy::module_name_repetitions))]
 
+#[cfg(any(not(target_family = "wasm"), feature = "local-cells"))]
 pub mod code_mode;
 
 #[path = "code_mode/description.rs"]
@@ -31,6 +32,16 @@ pub use contract::{
     Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolOutputBody, ToolOutputContent,
     ToolResult,
 };
+
+#[cfg(all(target_family = "wasm", not(feature = "local-cells")))]
+pub mod code_mode {
+    pub use crate::code_mode_spec::{exec_spec, wait_spec};
+    pub use crate::embedded::{
+        CodeModeCell, CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate,
+        NestedToolCall,
+    };
+    pub use crate::{CodeModeToolObservation, CodeModeToolset};
+}
 
 #[doc(hidden)]
 pub mod __private {
