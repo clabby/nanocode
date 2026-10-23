@@ -2,6 +2,7 @@
 
 mod bridge;
 mod browsers;
+mod host;
 mod native;
 mod proxy;
 mod steps;
@@ -11,6 +12,7 @@ pub use browsers::{
     browser_dirs, browser_for_bundle, chatgpt_installed, config_base, default_browser,
     default_from_handlers, extension_enabled, extension_on, profiles,
 };
+pub use host::{NativeHost, extension_origin, manifest_path};
 pub use native::{MAX_NATIVE, MAX_RESPONSE, read_body, standalone_reply, write_body};
 pub use proxy::Connection;
 pub use steps::{Reference, Snapshot, Tabs, snapshot};

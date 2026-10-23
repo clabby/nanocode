@@ -7,7 +7,7 @@ pub const MAX_RESPONSE: usize = 1024 * 1024;
 pub fn read_body(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut length = [0; 4];
     reader.read_exact(&mut length)?;
-    let size = u32::from_le_bytes(length) as usize;
+    let size = u32::from_ne_bytes(length) as usize;
     if size > MAX_NATIVE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -20,7 +20,7 @@ pub fn read_body(reader: &mut impl Read) -> io::Result<Vec<u8>> {
 }
 
 pub fn write_body(writer: &mut impl Write, body: &[u8]) -> io::Result<()> {
-    writer.write_all(&(body.len() as u32).to_le_bytes())?;
+    writer.write_all(&(body.len() as u32).to_ne_bytes())?;
     writer.write_all(body)?;
     writer.flush()
 }
