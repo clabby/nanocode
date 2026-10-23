@@ -40,6 +40,7 @@ members = [
     "crates/integrations/process",
     "crates/integrations/mcp-tools",
     "crates/integrations/cua",
+    "crates/integrations/chatgpt-extension",
     "crates/integrations/decisions",
     "crates/integrations/observability",
     "crates/integrations/store-postgres",
@@ -82,6 +83,7 @@ nanocode-audio = { version = "0.6.7", path = "crates/core/audio" }
 nanocode-tls = { version = "0.6.7", path = "crates/core/tls" }
 nanocode-types = { version = "0.6.7", path = "crates/core/types" }
 nanocode-cua = { version = "0.6.7", path = "crates/integrations/cua" }
+nanocode-chatgpt-extension = { version = "0.6.7", path = "crates/integrations/chatgpt-extension" }
 nanocode-decisions = { version = "0.6.7", path = "crates/integrations/decisions" }
 nanocode-tools = { version = "0.6.7", path = "crates/core/tools" }
 nanocode-tool-contracts = { version = "0.6.7", path = "crates/core/tool-contracts" }
