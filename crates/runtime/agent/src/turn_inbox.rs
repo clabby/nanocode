@@ -23,7 +23,7 @@ use crate::{
     },
     input::{Prompt, PromptInput},
     session_log::{LogEntry, LoggedEvent, SessionLog, Started, TurnRecord, TurnState},
-    stored_event::Stored,
+    stored_event::{EventForm, Stored},
 };
 
 pub trait InboxHost: Send + Sync + 'static {
@@ -134,6 +134,7 @@ struct Shared<H: ?Sized> {
     log: Arc<SessionLog<H>>,
     host: Arc<dyn InboxHost>,
     state: Atom<Requests>,
+    session_id: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -185,7 +186,10 @@ pub(crate) fn accepted_bytes(
         },
         received_ns: u64::MAX,
     };
-    let stored = serde_json::value::to_raw_value(&Stored(&event))?;
+    let stored = serde_json::value::to_raw_value(&Stored {
+        event: &event,
+        form: EventForm::Full,
+    })?;
     Ok(stored.get().len() - serde_json::to_vec(&empty)?.len() + serde_json::to_vec(input)?.len())
 }
 
@@ -232,6 +236,13 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
         Box::pin(async move {
             let annotation = self.0.host.annotate();
             let unannotated = Map::new();
+            let form = if self.0.log.compacts_events() {
+                EventForm::Compact {
+                    session_id: &self.0.session_id,
+                }
+            } else {
+                EventForm::Full
+            };
             let (entries, live): (Vec<_>, Vec<_>) = events
                 .iter()
                 .map(|event| {
@@ -248,7 +259,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
                             annotation: &unannotated,
                         })?;
                     }
-                    let stored = serde_json::value::to_raw_value(&Stored(event))?;
+                    let stored = serde_json::value::to_raw_value(&Stored { event, form })?;
                     Ok((
                         LogEntry {
                             request_id,
@@ -350,6 +361,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             log,
             host,
             state: Atom::default(),
+            session_id,
         });
         let (events, pump) =
             SessionEvents::start(stream, subagents, window, LogSink(Arc::clone(&shared)));
