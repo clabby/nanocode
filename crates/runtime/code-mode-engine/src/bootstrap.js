@@ -26,6 +26,37 @@
     return error.stack || label || String(error);
   }
 
+  function failureText(payload) {
+    if (typeof payload === "string") return payload;
+    if (payload === null || typeof payload !== "object") return payload === undefined ? "" : jsonStringify(payload);
+    if (Array.isArray(payload.content)) {
+      const texts = payload.content
+        .map((item) => typeof item?.text === "string" ? item.text : "")
+        .filter(Boolean);
+      if (texts.length) return texts.join("\n");
+    }
+    for (const key of ["message", "error", "detail"]) {
+      if (typeof payload[key] === "string" && payload[key]) return payload[key];
+    }
+    return jsonStringify(payload) ?? "";
+  }
+
+  function toolFailure(name, payload) {
+    if (payload instanceof Error) return payload;
+    const message = failureText(payload) || `tool ${name} failed`;
+    const error = new Error(message);
+    Object.defineProperty(error, "message", { value: message, enumerable: true, configurable: true, writable: true });
+    error.stack = `Error: ${message}`;
+    error.tool = name;
+    if (payload !== null && typeof payload === "object") {
+      for (const key of Object.keys(payload)) {
+        if (key !== "message" && key !== "name" && key !== "stack") error[key] = payload[key];
+      }
+      Object.defineProperty(error, "detail", { value: payload, configurable: true, writable: true });
+    }
+    return error;
+  }
+
   function storageKey(value, helper) {
     try {
       return `${value}`;
@@ -43,7 +74,7 @@
     const invokeTool = (name, input, host = false) => {
       const encodedInput = input === undefined ? "null" : jsonStringify(input);
       return nativeTool(name, encodedInput, host)
-        .then(jsonParse, (payload) => Promise.reject(jsonParse(payload)));
+        .then(jsonParse, (payload) => Promise.reject(toolFailure(name, jsonParse(payload))));
     };
     for (const definition of definitions) {
       declaredTools[definition.name] = (input) => invokeTool(
