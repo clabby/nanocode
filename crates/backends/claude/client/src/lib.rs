@@ -21,7 +21,7 @@ mod subscription_identity;
 pub mod subscription_wire;
 pub mod transport;
 pub use subscription_wire::SubscriptionIdentity;
-use transport::{HttpClient, HttpError, HttpResponse};
+use transport::{HttpClient, HttpError, HttpResponse, layer::retry};
 pub mod subscription;
 pub use auth::{ClaudeAccessToken, ClaudeTokenSource, RefreshingClaudeAuth};
 #[cfg(not(target_family = "wasm"))]
@@ -50,6 +50,8 @@ pub enum ClaudeError {
         body: String,
 
         retry_after: Option<Duration>,
+
+        should_retry: Option<bool>,
     },
     #[error("Messages transport: {0}")]
     Transport(#[from] HttpError),
@@ -69,7 +71,11 @@ impl ClaudeError {
     #[doc(hidden)]
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Http { status, .. } => *status == 429 || (500..600).contains(status),
+            Self::Http {
+                status,
+                should_retry,
+                ..
+            } => should_retry.unwrap_or_else(|| retry::retryable_status(*status)),
             Self::Transport(error) => transport::is_transient(error),
             Self::StreamError { kind, .. } => matches!(
                 kind.as_str(),
@@ -92,6 +98,9 @@ impl nanocode_agent_types::BackendFailure for ClaudeError {
 }
 
 fn retry_after(headers: &http::header::HeaderMap) -> Option<Duration> {
+    if let Some(delay) = retry::retry_after_ms(headers) {
+        return Some(delay);
+    }
     let value = headers
         .get(http::header::RETRY_AFTER)?
         .to_str()
@@ -1635,6 +1644,7 @@ impl ClaudeClient {
             if !response.status().is_success() {
                 let status = response.status().as_u16();
                 let retry_after = retry_after(response.headers());
+                let should_retry = retry::should_retry(response.headers());
                 let from_anthropic = response
                     .headers()
                     .get("request-id")
@@ -1661,6 +1671,7 @@ impl ClaudeClient {
                     status,
                     body,
                     retry_after,
+                    should_retry,
                 });
             }
             credentials.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
