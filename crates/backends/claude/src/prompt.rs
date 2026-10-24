@@ -21,10 +21,6 @@ const MAX_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FILENAME_BYTES: usize = 255;
 
-pub(crate) fn image_store_error(error: nanocode_durability::StoreError) -> NanocodeError {
-    nanocode_durability::agent_error(error.into())
-}
-
 fn invalid(message: impl Into<String>) -> NanocodeError {
     NanocodeError::InvalidRequest(message.into())
 }
@@ -346,7 +342,7 @@ pub(crate) async fn freeze(
     images
         .load_prompt(&mut prompt.instruction)
         .await
-        .map_err(image_store_error)?;
+        .map_err(nanocode_durability::agent_store_error)?;
     if let PromptInput::Content(items) = &mut prompt.instruction {
         if items.len() > 100 {
             return Err(invalid("Claude prompt exceeds 100 content items"));
@@ -403,7 +399,7 @@ pub(crate) async fn freeze(
                     let image_url = images
                         .store(&image_url)
                         .await
-                        .map_err(image_store_error)?
+                        .map_err(nanocode_durability::agent_store_error)?
                         .unwrap_or(image_url);
                     UserInput::Image { image_url, detail }
                 }

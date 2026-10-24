@@ -720,21 +720,18 @@ impl State {
                 discovered: HashSet<String>,
             }
             let mut receipt: Receipt = serde_json::from_value(value).map_err(recovery_error)?;
-            let ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                ..
-            } = &mut receipt.result
-            else {
-                return Err(recovery_error(
-                    "tool receipt does not match the admitted call",
-                ));
+            let content = match &mut receipt.result {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == id => content,
+                _ => {
+                    return Err(recovery_error(
+                        "tool receipt does not match the admitted call",
+                    ));
+                }
             };
-            if tool_use_id != id {
-                return Err(recovery_error(
-                    "tool receipt does not match the admitted call",
-                ));
-            }
             super::images::prepare_tool_images(
                 content,
                 crate::prompt::ImageResolution::of(&cursor.template.model),

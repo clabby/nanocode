@@ -55,7 +55,7 @@ async fn store_prompt_images(images: &ImageHistory, prompt: &mut Prompt) -> Resu
     images
         .store_prompt(&mut prompt.instruction)
         .await
-        .map_err(|error| nanocode_durability::agent_error(error.into()))
+        .map_err(nanocode_durability::agent_store_error)
 }
 
 const CODEX_CAPABILITIES: Capabilities = {

@@ -13,7 +13,7 @@ use serde_json::{Map, Value, value::RawValue};
 
 use crate::{
     durability::{
-        BlobKey, BlobStore, BlobUrl, EncodedPayload, Sql, SqlDialect, SqlRow, SqlStatement,
+        BlobKey, BlobUrl, EncodedPayload, SharedBlobStore, Sql, SqlDialect, SqlRow, SqlStatement,
         StoreError, get_blob,
     },
     input::{Prompt, PromptInput, UserInput},
@@ -625,7 +625,7 @@ struct Spill {
 }
 
 struct Blobs {
-    store: Arc<dyn BlobStore + Send + Sync>,
+    store: SharedBlobStore,
     threshold: usize,
 }
 
@@ -642,7 +642,7 @@ fn edit_receipt(rows: &[SqlRow], edit: &str) -> Result<Option<Replaced>, StoreEr
 pub struct SessionLog<H: ?Sized> {
     host: Arc<H>,
     scope: Arc<str>,
-    compact: bool,
+    pub(crate) compact: bool,
     ready: AtomicBool,
     limit: Option<usize>,
     physical_limit: Option<usize>,
@@ -668,10 +668,6 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         self
     }
 
-    pub(crate) const fn compacts_events(&self) -> bool {
-        self.compact
-    }
-
     #[must_use]
     pub const fn value_limit(mut self, bytes: usize) -> Self {
         self.physical_limit = Some(bytes);
@@ -685,7 +681,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
     }
 
     #[must_use]
-    pub fn blobs(mut self, store: Arc<dyn BlobStore + Send + Sync>, threshold: usize) -> Self {
+    pub fn blobs(mut self, store: SharedBlobStore, threshold: usize) -> Self {
         self.blobs = Some(Blobs { store, threshold });
         self
     }

@@ -291,7 +291,6 @@ enum NoticeOutcome {
     Undelivered,
     Pending,
     Cancelled,
-    Failed,
     Stopped,
 }
 
@@ -306,7 +305,7 @@ impl NoticeOutcome {
             | (_, Some(ExecutionPolicyDisposition::Reopen)) => Self::Stopped,
             (_, Some(ExecutionPolicyDisposition::Retry)) => Self::Pending,
             (NanocodeError::Response(failure), _) if failure.retryable() => Self::Pending,
-            _ => Self::Failed,
+            _ => Self::Cancelled,
         }
     }
 
@@ -3983,7 +3982,7 @@ impl Registry {
                 self.schedule_parent_continuation(root_session_id, id, revision);
             }
             NoticeOutcome::Pending => self.retry_completion(root_session_id, id, revision),
-            NoticeOutcome::Cancelled | NoticeOutcome::Failed => {
+            NoticeOutcome::Cancelled => {
                 if !self
                     .park_completion(root_session_id, id, revision, true)
                     .await

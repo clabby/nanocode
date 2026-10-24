@@ -5452,7 +5452,7 @@ impl State {
         self.images
             .store_prompt(&mut prompt.instruction)
             .await
-            .map_err(crate::prompt::image_store_error)
+            .map_err(nanocode_durability::agent_store_error)
     }
 
     async fn accept_steer(

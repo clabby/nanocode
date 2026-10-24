@@ -444,7 +444,7 @@ impl ModelRun {
                 .images
                 .prepare_user_input(&task.instruction)
                 .await
-                .map_err(image_store_error)?;
+                .map_err(nanocode_durability::agent_store_error)?;
             session
                 .conversation
                 .append(prompt_messages(task, user_content));
@@ -505,7 +505,7 @@ impl ModelRun {
             .images
             .prepare_user_input(&task.instruction)
             .await
-            .map_err(image_store_error)?;
+            .map_err(nanocode_durability::agent_store_error)?;
         session
             .conversation
             .append(prompt_messages(task, user_content));
@@ -559,7 +559,7 @@ impl ModelRun {
                 .images
                 .prepare_user_input(&task.instruction)
                 .await
-                .map_err(image_store_error)?;
+                .map_err(nanocode_durability::agent_store_error)?;
             let mut context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
             context.observe_host_instructions(&self.config.host_instructions());
             let context_snapshot = context.capture(
@@ -1106,7 +1106,7 @@ impl ModelRun {
                 .images
                 .prepare_user_input(&steer.prompt.instruction)
                 .await
-                .map_err(image_store_error)?;
+                .map_err(nanocode_durability::agent_store_error)?;
             conversation.append(prompt_messages(&steer.prompt, user_content));
             self.stats.steers += 1;
             self.events.emit(

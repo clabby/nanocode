@@ -23,7 +23,7 @@ use crate::{
     },
     input::{Prompt, PromptInput},
     session_log::{LogEntry, LoggedEvent, SessionLog, Started, TurnRecord, TurnState},
-    stored_event::{EventForm, Stored},
+    stored_event::Stored,
 };
 
 pub trait InboxHost: Send + Sync + 'static {
@@ -202,7 +202,7 @@ pub(crate) fn accepted_bytes(
     };
     let stored = serde_json::value::to_raw_value(&Stored {
         event: &event,
-        form: EventForm::Full,
+        compact: None,
     })?;
     Ok(stored.get().len() - serde_json::to_vec(&empty)?.len() + serde_json::to_vec(input)?.len())
 }
@@ -250,13 +250,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
         Box::pin(async move {
             let annotation = self.0.host.annotate();
             let unannotated = Map::new();
-            let form = if self.0.log.compacts_events() {
-                EventForm::Compact {
-                    session_id: &self.0.session_id,
-                }
-            } else {
-                EventForm::Full
-            };
+            let compact = self.0.log.compact.then_some(&*self.0.session_id);
             let (entries, live): (Vec<_>, Vec<_>) = events
                 .iter()
                 .map(|event| {
@@ -273,7 +267,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
                             annotation: &unannotated,
                         })?;
                     }
-                    let stored = serde_json::value::to_raw_value(&Stored { event, form })?;
+                    let stored = serde_json::value::to_raw_value(&Stored { event, compact })?;
                     Ok((
                         LogEntry {
                             request_id,

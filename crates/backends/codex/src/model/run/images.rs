@@ -2,23 +2,15 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::client::responses::FunctionOutputContent;
+use nanocode_durability::agent_store_error;
 
-pub(super) fn image_store_error(error: nanocode_durability::StoreError) -> NanocodeError {
-    nanocode_durability::agent_error(error.into())
-}
-
-enum Image<'a> {
-    Url(&'a str),
-    File(&'a str),
-}
-
-fn images(item: &ResponseItem) -> Vec<Image<'_>> {
+fn images(item: &ResponseItem) -> Vec<&str> {
     match item {
         ResponseItem::Message { content, .. } => content
             .iter()
             .filter_map(|part| match part {
-                ContentItem::InputImage { image_url, .. } => Some(Image::Url(image_url)),
-                ContentItem::InputImageFile { file_id, .. } => Some(Image::File(file_id)),
+                ContentItem::InputImage { image_url, .. } => Some(&**image_url),
+                ContentItem::InputImageFile { file_id, .. } => Some(&**file_id),
                 _ => None,
             })
             .collect(),
@@ -32,8 +24,8 @@ fn images(item: &ResponseItem) -> Vec<Image<'_>> {
         } => content
             .iter()
             .filter_map(|part| match part {
-                FunctionOutputContent::InputImage { image_url, .. } => Some(Image::Url(image_url)),
-                FunctionOutputContent::InputImageFile { file_id, .. } => Some(Image::File(file_id)),
+                FunctionOutputContent::InputImage { image_url, .. } => Some(&**image_url),
+                FunctionOutputContent::InputImageFile { file_id, .. } => Some(&**file_id),
                 _ => None,
             })
             .collect(),
@@ -46,13 +38,13 @@ enum Rewrite {
     Inline(Box<str>),
 }
 
-fn rewrite(item: &mut ResponseItem, mut replace: impl FnMut(Image<'_>) -> Option<Rewrite>) {
+fn rewrite(item: &mut ResponseItem, mut replace: impl FnMut(&str) -> Option<Rewrite>) {
     match item {
         ResponseItem::Message { content, .. } => {
             for part in content {
                 let replacement = match part {
-                    ContentItem::InputImage { image_url, .. } => replace(Image::Url(image_url)),
-                    ContentItem::InputImageFile { file_id, .. } => replace(Image::File(file_id)),
+                    ContentItem::InputImage { image_url, .. } => replace(image_url),
+                    ContentItem::InputImageFile { file_id, .. } => replace(file_id),
                     _ => continue,
                 };
                 match (replacement, part) {
@@ -76,12 +68,8 @@ fn rewrite(item: &mut ResponseItem, mut replace: impl FnMut(Image<'_>) -> Option
         } => {
             for part in content {
                 let replacement = match part {
-                    FunctionOutputContent::InputImage { image_url, .. } => {
-                        replace(Image::Url(image_url))
-                    }
-                    FunctionOutputContent::InputImageFile { file_id, .. } => {
-                        replace(Image::File(file_id))
-                    }
+                    FunctionOutputContent::InputImage { image_url, .. } => replace(image_url),
+                    FunctionOutputContent::InputImageFile { file_id, .. } => replace(file_id),
                     _ => continue,
                 };
                 match (replacement, part) {
@@ -126,12 +114,7 @@ pub(super) fn evict_images(limit: &ImageHistory, history: &RequestHistory) -> Re
         .map(|mut item| {
             rewrite(&mut item, |image| {
                 ordinal += 1;
-                (ordinal <= evicted).then(|| {
-                    Rewrite::Omit(limit.omitted(match image {
-                        Image::Url(url) => url,
-                        Image::File(file_id) => file_id,
-                    }))
-                })
+                (ordinal <= evicted).then(|| Rewrite::Omit(limit.omitted(image)))
             });
             item
         })
@@ -149,12 +132,11 @@ pub(super) async fn inline_images(
     let mut start = None;
     let mut loaded = HashMap::new();
     for (index, item) in full.iter().enumerate() {
-        for image in images(item) {
-            let Image::Url(url) = image else { continue };
+        for url in images(item) {
             if loaded.contains_key(url) {
                 continue;
             }
-            let Some(data) = limit.inline(url).await.map_err(image_store_error)? else {
+            let Some(data) = limit.inline(url).await.map_err(agent_store_error)? else {
                 continue;
             };
             start.get_or_insert(index);
@@ -168,9 +150,8 @@ pub(super) async fn inline_images(
         .iter_from(start)
         .cloned()
         .map(|mut item| {
-            rewrite(&mut item, |image| match image {
-                Image::Url(url) => loaded.get(url).cloned().map(Rewrite::Inline),
-                Image::File(_) => None,
+            rewrite(&mut item, |url| {
+                loaded.get(url).cloned().map(Rewrite::Inline)
             });
             item
         })

@@ -884,7 +884,7 @@ impl ModelRun {
             images
                 .prepare_output_images(&mut execution.output)
                 .await
-                .map_err(image_store_error)?;
+                .map_err(nanocode_durability::agent_store_error)?;
             let structured_result = execution.take_structured_result();
             if let Some(content) = serialize_trace_content(&execution.output) {
                 record_span_content(tool_span, "tool.output", &content);
@@ -1020,7 +1020,7 @@ impl ModelRun {
         images
             .prepare_output_images(&mut execution.output)
             .await
-            .map_err(image_store_error)?;
+            .map_err(nanocode_durability::agent_store_error)?;
         let structured_result = execution.output.structured_result();
         if let Some(content) = serialize_trace_content(&execution.output) {
             record_span_content(tool_span, "tool.output", &content);

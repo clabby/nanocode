@@ -50,6 +50,10 @@ impl Branches {
 }
 
 #[must_use]
+pub fn agent_store_error(error: StoreError) -> NanocodeError {
+    agent_error(error.into())
+}
+
 pub fn agent_error(error: Error) -> NanocodeError {
     if matches!(
         error,

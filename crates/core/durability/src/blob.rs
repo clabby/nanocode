@@ -65,11 +65,7 @@ pub trait BlobStore {
     fn get<'a>(&'a self, key: &'a BlobKey) -> StoreFuture<'a, Result<Option<Vec<u8>>, StoreError>>;
 }
 
-pub async fn put_blob(store: &dyn BlobStore, bytes: &[u8]) -> Result<BlobKey, StoreError> {
-    let key = BlobKey::of(bytes);
-    store.put(&key, bytes).await?;
-    Ok(key)
-}
+pub type SharedBlobStore = Arc<dyn BlobStore + Send + Sync>;
 
 pub async fn get_blob(store: &dyn BlobStore, key: &BlobKey) -> Result<Vec<u8>, StoreError> {
     let bytes = store
@@ -92,11 +88,6 @@ pub struct BlobUrl {
 
 impl BlobUrl {
     #[must_use]
-    pub const fn new(media_type: String, key: BlobKey) -> Self {
-        Self { media_type, key }
-    }
-
-    #[must_use]
     pub fn parse(url: &str) -> Option<Self> {
         let rest = url.strip_prefix(URL_SCHEME)?;
         let (media_type, key) = rest.rsplit_once(';')?;
@@ -112,11 +103,6 @@ impl BlobUrl {
     #[must_use]
     pub fn is_blob_url(url: &str) -> bool {
         url.starts_with(URL_SCHEME)
-    }
-
-    #[must_use]
-    pub fn media_type(&self) -> &str {
-        &self.media_type
     }
 
     #[must_use]
@@ -165,7 +151,7 @@ impl std::fmt::Display for BlobUrl {
     }
 }
 
-fn base64_data_url(url: &str) -> Option<(&str, &str)> {
+pub fn base64_data_url(url: &str) -> Option<(&str, &str)> {
     let (header, data) = url.strip_prefix("data:")?.split_once(',')?;
     let media_type = header.strip_suffix(";base64")?;
     (!media_type.is_empty() && !media_type.contains(';')).then_some((media_type, data))

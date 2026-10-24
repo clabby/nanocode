@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use crate::{
     ContentBlock, ToolResultContent,
-    prompt::{IMAGE_URL_UNSUPPORTED, ImageResolution, image_store_error, prepare_base64},
+    prompt::{IMAGE_URL_UNSUPPORTED, ImageResolution, prepare_base64},
 };
 use nanocode_agent_core::NanocodeError;
+use nanocode_durability::{BlobUrl, agent_store_error, base64_data_url};
 use nanocode_media::image::ImageHistory;
 use serde_json::{Value, json};
 
@@ -33,7 +34,7 @@ pub(super) async fn prepare_tool_images(
                         block["source"] = match images
                             .store(&url)
                             .await
-                            .map_err(image_store_error)?
+                            .map_err(agent_store_error)?
                         {
                             Some(blob) => json!({"type": "url", "url": blob}),
                             None => {
@@ -51,9 +52,7 @@ pub(super) async fn prepare_tool_images(
 }
 
 fn is_blob(source: &Value) -> bool {
-    source["url"]
-        .as_str()
-        .is_some_and(nanocode_durability::BlobUrl::is_blob_url)
+    source["url"].as_str().is_some_and(BlobUrl::is_blob_url)
 }
 
 fn reference(source: &Value) -> String {
@@ -86,13 +85,7 @@ enum Rewrite {
 }
 
 fn rewrite(message: &mut HistoryMessage, mut replace: impl FnMut(&Value) -> Option<Rewrite>) {
-    if image_sources(message).next().is_none() {
-        return;
-    }
-    let mut replacements = Vec::new();
-    for source in image_sources(message) {
-        replacements.push(replace(source));
-    }
+    let replacements: Vec<_> = image_sources(message).map(&mut replace).collect();
     if replacements.iter().all(Option::is_none) {
         return;
     }
@@ -169,13 +162,9 @@ pub(super) async fn inline_images(
         let data = images
             .inline(url)
             .await
-            .map_err(image_store_error)?
+            .map_err(agent_store_error)?
             .unwrap_or_default();
-        let (header, data) = data.split_once(',').unwrap_or_default();
-        let media_type = header
-            .strip_prefix("data:")
-            .and_then(|header| header.strip_suffix(";base64"))
-            .unwrap_or_default();
+        let (media_type, data) = base64_data_url(&data).unwrap_or_default();
         loaded.insert(
             url.to_owned(),
             json!({"type": "base64", "media_type": media_type, "data": data}),

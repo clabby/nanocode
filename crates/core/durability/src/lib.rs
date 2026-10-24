@@ -6,7 +6,7 @@ mod staged;
 mod state;
 mod store;
 
-pub use blob::{BlobKey, BlobStore, BlobUrl, get_blob, put_blob};
+pub use blob::{BlobKey, BlobStore, BlobUrl, SharedBlobStore, base64_data_url, get_blob};
 pub use kv::{KeyValue, KeyValueStore, Versioned};
 pub use payload::EncodedPayload;
 pub use sql::{Sql, SqlDialect, SqlRow, SqlStatement, SqlStore};

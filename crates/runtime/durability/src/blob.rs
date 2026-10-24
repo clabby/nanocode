@@ -15,13 +15,6 @@ impl MemoryBlobStore {
     }
 
     #[must_use]
-    pub fn keys(&self) -> Vec<BlobKey> {
-        let mut keys: Vec<_> = self.blobs.load().keys().cloned().collect();
-        keys.sort_unstable();
-        keys
-    }
-
-    #[must_use]
     pub fn len(&self) -> usize {
         self.blobs.load().len()
     }
@@ -34,16 +27,6 @@ impl MemoryBlobStore {
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.blobs.load().values().map(|bytes| bytes.len()).sum()
-    }
-
-    pub fn remove(&self, key: &BlobKey) -> bool {
-        let mut removed = false;
-        self.blobs.rcu(|blobs| {
-            let mut blobs = HashMap::clone(blobs);
-            removed = blobs.remove(key).is_some();
-            blobs
-        });
-        removed
     }
 }
 

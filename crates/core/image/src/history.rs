@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use nanocode_durability_core::{BlobStore, BlobUrl, StoreError};
+use nanocode_durability_core::{BlobUrl, StoreError};
 use nanocode_types_core::{
     PromptInput, UserInput,
     responses::ContentItem,
@@ -9,7 +7,7 @@ use nanocode_types_core::{
 
 pub const DEFAULT_INLINE_IMAGES: usize = 8;
 
-pub type SharedBlobStore = Arc<dyn BlobStore + Send + Sync>;
+pub use nanocode_durability_core::SharedBlobStore;
 
 #[derive(Clone)]
 pub struct ImageHistory {
@@ -49,19 +47,13 @@ impl ImageHistory {
     }
 
     #[must_use]
-    pub const fn inline_images(&self) -> usize {
-        self.inline_images
-    }
-
-    #[must_use]
-    pub const fn evicted(&self, images: usize) -> usize {
+    pub fn evicted(&self, images: usize) -> usize {
         let limit = self.inline_images;
         if images <= limit {
             return 0;
         }
-        let batch = if limit < 2 { 1 } else { limit.div_ceil(2) };
-        let evicted = (images - limit).div_ceil(batch) * batch;
-        if evicted < images { evicted } else { images }
+        let batch = limit.div_ceil(2).max(1);
+        ((images - limit).div_ceil(batch) * batch).min(images)
     }
 
     #[must_use]
@@ -95,20 +87,6 @@ impl ImageHistory {
         Ok(BlobUrl::store_data_url(store.as_ref(), url)
             .await?
             .map(|blob| blob.to_string()))
-    }
-
-    pub async fn store_output(&self, output: &mut ToolOutputBody) -> Result<(), StoreError> {
-        let ToolOutputBody::Content(content) = output else {
-            return Ok(());
-        };
-        for item in content {
-            if let ToolOutputContent::InputImage { image_url, .. } = item
-                && let Some(blob) = self.store(image_url).await?
-            {
-                *image_url = blob;
-            }
-        }
-        Ok(())
     }
 
     pub async fn store_prompt(&self, input: &mut PromptInput) -> Result<(), StoreError> {
@@ -177,7 +155,17 @@ impl ImageHistory {
         output: &mut ToolOutputBody,
     ) -> Result<(), StoreError> {
         crate::prepare_output_images(output).await;
-        self.store_output(output).await
+        let ToolOutputBody::Content(content) = output else {
+            return Ok(());
+        };
+        for item in content {
+            if let ToolOutputContent::InputImage { image_url, .. } = item
+                && let Some(blob) = self.store(image_url).await?
+            {
+                *image_url = blob;
+            }
+        }
+        Ok(())
     }
 }
 

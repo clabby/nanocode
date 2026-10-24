@@ -17,44 +17,25 @@ const IMPLIED_PROTOCOL_VERSION: u32 = 1;
 const DERIVED: &str = "derived";
 
 type Object = BTreeMap<String, Box<RawValue>>;
-
-#[derive(Clone, Copy)]
-pub(crate) enum EventForm<'a> {
-    Full,
-    Compact { session_id: &'a str },
-}
+type Expanded = Result<Option<Box<RawValue>>, serde_json::Error>;
 
 pub(crate) struct Stored<'a> {
     pub(crate) event: &'a SessionEvent,
-    pub(crate) form: EventForm<'a>,
+    pub(crate) compact: Option<&'a str>,
 }
 
 impl Serialize for Stored<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match (self.event, self.form) {
-            (SessionEvent::Agent { event, .. }, EventForm::Full) => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry("source", "agent")?;
-                match without_timing(&event.payload) {
-                    Some(payload) => map.serialize_entry(
-                        "event",
-                        &AgentEvent {
-                            payload: payload.into(),
-                            ..event.clone()
-                        },
-                    )?,
-                    None => map.serialize_entry("event", event)?,
-                }
-                map.end()
-            }
-            (SessionEvent::Agent { event, .. }, EventForm::Compact { session_id }) => {
+        match (self.event, self.compact) {
+            (SessionEvent::Agent { event, .. }, compact) => {
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("source", "agent")?;
                 map.serialize_entry(
                     "event",
-                    &Compact {
+                    &Event {
                         event,
-                        root_session_id: Some(session_id),
+                        root: true,
+                        compact,
                     },
                 )?;
                 map.end()
@@ -65,13 +46,23 @@ impl Serialize for Stored<'_> {
                     root_session_id,
                     update: AgentUpdate::Event { id, event },
                 }),
-                EventForm::Compact { .. },
+                compact @ Some(_),
             ) => {
                 let mut map = serializer.serialize_map(Some(4))?;
                 map.serialize_entry("source", "subagent")?;
                 map.serialize_entry("root_session_id", root_session_id)?;
                 map.serialize_entry("detach", detach)?;
-                map.serialize_entry("update", &ChildEvent { id, event })?;
+                map.serialize_entry(
+                    "update",
+                    &ChildEvent {
+                        id,
+                        event: Event {
+                            event,
+                            root: false,
+                            compact,
+                        },
+                    },
+                )?;
                 map.end()
             }
             (event, _) => event.serialize(serializer),
@@ -81,7 +72,7 @@ impl Serialize for Stored<'_> {
 
 struct ChildEvent<'a> {
     id: &'a AgentId,
-    event: &'a AgentEvent,
+    event: Event<'a>,
 }
 
 impl Serialize for ChildEvent<'_> {
@@ -89,38 +80,34 @@ impl Serialize for ChildEvent<'_> {
         let mut map = serializer.serialize_map(Some(3))?;
         map.serialize_entry("type", "event")?;
         map.serialize_entry("id", self.id)?;
-        map.serialize_entry(
-            "event",
-            &Compact {
-                event: self.event,
-                root_session_id: None,
-            },
-        )?;
+        map.serialize_entry("event", &self.event)?;
         map.end()
     }
 }
 
-struct Compact<'a> {
+struct Event<'a> {
     event: &'a AgentEvent,
-    root_session_id: Option<&'a str>,
+    root: bool,
+    compact: Option<&'a str>,
 }
 
-impl Serialize for Compact<'_> {
+impl Serialize for Event<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let event = self.event;
-        let slim = match self.root_session_id {
-            Some(_) => without_timing(&event.payload),
-            None => None,
-        };
+        let Self {
+            event,
+            root,
+            compact,
+        } = *self;
+        let slim = root.then(|| without_timing(&event.payload)).flatten();
         let payload = slim.as_deref().unwrap_or(&event.payload);
-        let deduplicated = (event.kind == AgentEventKind::ToolResult)
+        let deduplicated = (compact.is_some() && event.kind == AgentEventKind::ToolResult)
             .then(|| deduplicated(payload))
             .flatten();
         let mut map = serializer.serialize_map(None)?;
-        if event.protocol_version != IMPLIED_PROTOCOL_VERSION {
+        if compact.is_none() || event.protocol_version != IMPLIED_PROTOCOL_VERSION {
             map.serialize_entry("protocol_version", &event.protocol_version)?;
         }
-        if self.root_session_id != Some(&*event.request_id) {
+        if !root || compact != Some(&*event.request_id) {
             map.serialize_entry("request_id", &event.request_id)?;
         }
         map.serialize_entry("seq", &event.seq)?;
@@ -141,47 +128,34 @@ fn without_timing(payload: &RawValue) -> Option<Box<RawValue>> {
     to_raw_value(&fields).ok()
 }
 
-enum Derived {
-    StructuredResult,
-    Result,
-    ResultText(Object),
-}
-
 fn deduplicated(payload: &RawValue) -> Option<Box<RawValue>> {
     let mut fields: Object = serde_json::from_str(payload.get()).ok()?;
-    let structured = fields.get("structured_result")?;
-    let result = fields.get("result")?;
-    let derived = match serde_json::from_str::<Object>(result.get()) {
-        Ok(mut wrapper) => {
-            let text = wrapper.get("text")?;
-            if same(text, structured) {
-                Derived::StructuredResult
-            } else if encodes(text, structured) {
-                wrapper.remove("text");
-                Derived::ResultText(wrapper)
-            } else {
-                return None;
-            }
-        }
-        Err(_) if same(result, structured) => Derived::StructuredResult,
-        Err(_) if encodes(result, structured) => Derived::Result,
-        Err(_) => return None,
+    let structured = fields.remove("structured_result")?;
+    let result = fields.remove("result")?;
+    let mut wrapper = serde_json::from_str::<Object>(result.get()).ok();
+    let text = match &wrapper {
+        Some(wrapper) => wrapper.get("text")?,
+        None => &result,
     };
-    let field = match derived {
-        Derived::StructuredResult => {
-            fields.remove("structured_result");
-            "structured_result"
-        }
-        Derived::Result => {
-            fields.remove("result");
-            "result"
-        }
-        Derived::ResultText(wrapper) => {
-            fields.insert("result".into(), to_raw_value(&wrapper).ok()?);
-            "result.text"
-        }
+    let derived = if same(text, &structured) {
+        fields.insert("result".into(), result);
+        "structured_result"
+    } else if encodes(text, &structured) {
+        fields.insert("structured_result".into(), structured);
+        let Some(mut wrapper) = wrapper.take() else {
+            return finish(fields, "result");
+        };
+        wrapper.remove("text");
+        fields.insert("result".into(), to_raw_value(&wrapper).ok()?);
+        "result.text"
+    } else {
+        return None;
     };
-    fields.insert(DERIVED.into(), to_raw_value(field).ok()?);
+    finish(fields, derived)
+}
+
+fn finish(mut fields: Object, derived: &str) -> Option<Box<RawValue>> {
+    fields.insert(DERIVED.into(), to_raw_value(derived).ok()?);
     to_raw_value(&fields).ok()
 }
 
@@ -207,58 +181,50 @@ fn encodes(text: &RawValue, structured: &RawValue) -> bool {
 
 impl LoggedEvent {
     pub fn expanded(&self, session_id: &str) -> Result<Self, serde_json::Error> {
-        Ok(match expand_body(&self.event, session_id)? {
-            Some(event) => Self {
-                event,
-                ..self.clone()
-            },
-            None => self.clone(),
+        Ok(Self {
+            event: expand_body(&self.event, session_id)?.unwrap_or_else(|| self.event.clone()),
+            request_id: self.request_id.clone(),
+            ..*self
         })
     }
 }
 
-fn expand_body(
-    body: &RawValue,
-    session_id: &str,
-) -> Result<Option<Box<RawValue>>, serde_json::Error> {
-    let Ok(mut fields) = serde_json::from_str::<Object>(body.get()) else {
+fn expand_body(body: &RawValue, session_id: &str) -> Expanded {
+    let Ok(fields) = serde_json::from_str::<Object>(body.get()) else {
         return Ok(None);
     };
-    let source = match fields.get("source") {
-        Some(source) => Some(serde_json::from_str::<Cow<'_, str>>(source.get())?),
-        None => None,
-    };
-    let (key, expanded) = match source.as_deref() {
-        Some("agent") => (
-            "event",
-            expand_event(field(&fields, "event")?, Some(session_id))?,
-        ),
-        Some("subagent") => ("update", expand_update(field(&fields, "update")?)?),
+    let source = fields
+        .get("source")
+        .map(|source| serde_json::from_str::<Cow<'_, str>>(source.get()))
+        .transpose()?;
+    let agent = match source.as_deref() {
+        Some("agent") => true,
+        Some("subagent") => false,
         _ => return Ok(None),
     };
-    let Some(expanded) = expanded else {
+    if agent {
+        return replace(fields, "event", |event| {
+            expand_event(event, Some(session_id))
+        });
+    }
+    replace(fields, "update", |update| {
+        let fields: Object = serde_json::from_str(update.get())?;
+        if !fields.contains_key("event") {
+            return Ok(None);
+        }
+        replace(fields, "event", |event| expand_event(event, None))
+    })
+}
+
+fn replace(mut fields: Object, key: &str, expand: impl FnOnce(&RawValue) -> Expanded) -> Expanded {
+    let Some(value) = expand(field(&fields, key)?)? else {
         return Ok(None);
     };
-    fields.insert(key.into(), expanded);
+    fields.insert(key.into(), value);
     to_raw_value(&fields).map(Some)
 }
 
-fn expand_update(update: &RawValue) -> Result<Option<Box<RawValue>>, serde_json::Error> {
-    let mut fields: Object = serde_json::from_str(update.get())?;
-    let Some(event) = fields.get("event") else {
-        return Ok(None);
-    };
-    let Some(event) = expand_event(event, None)? else {
-        return Ok(None);
-    };
-    fields.insert("event".into(), event);
-    to_raw_value(&fields).map(Some)
-}
-
-fn expand_event(
-    event: &RawValue,
-    session_id: Option<&str>,
-) -> Result<Option<Box<RawValue>>, serde_json::Error> {
+fn expand_event(event: &RawValue, session_id: Option<&str>) -> Expanded {
     let mut fields: Object = serde_json::from_str(event.get())?;
     let mut changed = false;
     if !fields.contains_key("protocol_version") {
@@ -284,7 +250,7 @@ fn expand_event(
     changed.then(|| to_raw_value(&fields)).transpose()
 }
 
-fn expand_tool_result(payload: &RawValue) -> Result<Option<Box<RawValue>>, serde_json::Error> {
+fn expand_tool_result(payload: &RawValue) -> Expanded {
     let mut fields: Object = serde_json::from_str(payload.get())?;
     let Some(derived) = fields.remove(DERIVED) else {
         return Ok(None);

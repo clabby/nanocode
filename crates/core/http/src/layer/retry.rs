@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use http::{HeaderMap, HeaderName};
 
-pub const SHOULD_RETRY: HeaderName = HeaderName::from_static("x-should-retry");
+const SHOULD_RETRY: HeaderName = HeaderName::from_static("x-should-retry");
 
 const RETRY_AFTER_MS: HeaderName = HeaderName::from_static("retry-after-ms");
 

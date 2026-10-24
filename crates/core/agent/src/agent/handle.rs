@@ -693,6 +693,21 @@ impl Agent {
         BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed))
     }
 
+    async fn admit(&self, id: Option<&str>) -> Result<(Option<RequestClaim>, BackendTurnKey)> {
+        if id.is_some_and(|id| id.trim().is_empty()) {
+            return Err(NanocodeError::InvalidRequest(
+                "request ID must not be empty".to_owned(),
+            ));
+        }
+        self.resume_interrupted(id).await?;
+        let Some(id) = id else {
+            return Ok((None, self.next_key()));
+        };
+        let claim = self.claim_request(id).await;
+        let key = claim.admitted.key;
+        Ok((Some(claim), key))
+    }
+
     async fn claim_request(&self, id: &str) -> RequestClaim {
         loop {
             let admitted = Arc::new(Admitted {
@@ -726,21 +741,18 @@ impl Agent {
             .0
             .load()
             .iter()
-            .map(|(id, admitted)| (id.clone(), admitted.key))
-            .collect();
-        turns.sort_by_key(|(_, key)| key.0);
-        turns
-            .into_iter()
-            .map(|(id, key)| {
+            .map(|(id, admitted)| {
                 (
-                    id,
+                    id.clone(),
                     TurnControl {
-                        key,
+                        key: admitted.key,
                         backend: Arc::clone(&self.backend),
                     },
                 )
             })
-            .collect()
+            .collect();
+        turns.sort_by_key(|(_, control)| control.key.0);
+        turns
     }
 
     #[must_use]
@@ -802,22 +814,7 @@ impl Agent {
         prompt
             .validate()
             .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
-        if request_id
-            .as_deref()
-            .is_some_and(|request_id| request_id.trim().is_empty())
-        {
-            return Err(NanocodeError::InvalidRequest(
-                "request ID must not be empty".to_owned(),
-            ));
-        }
-        self.resume_interrupted(request_id.as_deref()).await?;
-        let request = match request_id.as_deref() {
-            Some(id) => Some(self.claim_request(id).await),
-            None => None,
-        };
-        let key = request
-            .as_ref()
-            .map_or_else(|| self.next_key(), |claim| claim.admitted.key);
+        let (request, key) = self.admit(request_id.as_deref()).await?;
         let (events, event_stream) = self.events.mirrored_channel();
         let turn_id = nanocode_platform::uuid_v7().to_string();
         let events = events.with_turn_id(turn_id.clone());
@@ -879,22 +876,7 @@ impl Agent {
         prompt
             .validate()
             .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?;
-        if request_id
-            .as_deref()
-            .is_some_and(|request_id| request_id.trim().is_empty())
-        {
-            return Err(NanocodeError::InvalidRequest(
-                "request ID must not be empty".to_owned(),
-            ));
-        }
-        self.resume_interrupted(request_id.as_deref()).await?;
-        let request = match request_id.as_deref() {
-            Some(id) => Some(self.claim_request(id).await),
-            None => None,
-        };
-        let key = request
-            .as_ref()
-            .map_or_else(|| self.next_key(), |claim| claim.admitted.key);
+        let (request, key) = self.admit(request_id.as_deref()).await?;
         let (events, event_stream) = self.events.mirrored_channel();
         let turn_id = nanocode_platform::uuid_v7().to_string();
         let events = events.with_turn_id(turn_id.clone());
