@@ -23,6 +23,7 @@ use crate::{
     },
     input::{Prompt, PromptInput},
     session_log::{LogEntry, LoggedEvent, SessionLog, Started, TurnRecord, TurnState},
+    stored_event::{EventForm, Stored},
 };
 
 pub trait InboxHost: Send + Sync + 'static {
@@ -147,6 +148,7 @@ struct Shared<H: ?Sized> {
     log: Arc<SessionLog<H>>,
     host: Arc<dyn InboxHost>,
     state: Atom<Requests>,
+    session_id: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -163,38 +165,6 @@ struct Envelope<'a> {
     event: &'a SessionEvent,
     #[serde(flatten)]
     annotation: &'a Map<String, Value>,
-}
-
-struct Stored<'a>(&'a SessionEvent);
-
-impl Serialize for Stored<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap as _;
-        let SessionEvent::Agent { event, .. } = self.0 else {
-            return self.0.serialize(serializer);
-        };
-        let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("source", "agent")?;
-        match without_timing(event) {
-            Some(slim) => map.serialize_entry("event", &slim)?,
-            None => map.serialize_entry("event", event)?,
-        }
-        map.end()
-    }
-}
-
-fn without_timing(event: &AgentEvent) -> Option<AgentEvent> {
-    if !event.payload.get().contains("\"timing\"") {
-        return None;
-    }
-    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(event.payload.get()) else {
-        return None;
-    };
-    fields.remove("timing")?;
-    Some(AgentEvent {
-        payload: serde_json::value::to_raw_value(&fields).ok()?.into(),
-        ..event.clone()
-    })
 }
 
 pub(crate) fn accepted_bytes(
@@ -230,7 +200,10 @@ pub(crate) fn accepted_bytes(
         },
         received_ns: u64::MAX,
     };
-    let stored = serde_json::value::to_raw_value(&Stored(&event))?;
+    let stored = serde_json::value::to_raw_value(&Stored {
+        event: &event,
+        form: EventForm::Full,
+    })?;
     Ok(stored.get().len() - serde_json::to_vec(&empty)?.len() + serde_json::to_vec(input)?.len())
 }
 
@@ -277,6 +250,13 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
         Box::pin(async move {
             let annotation = self.0.host.annotate();
             let unannotated = Map::new();
+            let form = if self.0.log.compacts_events() {
+                EventForm::Compact {
+                    session_id: &self.0.session_id,
+                }
+            } else {
+                EventForm::Full
+            };
             let (entries, live): (Vec<_>, Vec<_>) = events
                 .iter()
                 .map(|event| {
@@ -293,7 +273,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
                             annotation: &unannotated,
                         })?;
                     }
-                    let stored = serde_json::value::to_raw_value(&Stored(event))?;
+                    let stored = serde_json::value::to_raw_value(&Stored { event, form })?;
                     Ok((
                         LogEntry {
                             request_id,
@@ -394,6 +374,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             log,
             host,
             state: Atom::default(),
+            session_id,
         });
         let (events, pump) =
             SessionEvents::start(stream, subagents, window, LogSink(Arc::clone(&shared)));

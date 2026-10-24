@@ -642,6 +642,7 @@ fn edit_receipt(rows: &[SqlRow], edit: &str) -> Result<Option<Replaced>, StoreEr
 pub struct SessionLog<H: ?Sized> {
     host: Arc<H>,
     scope: Arc<str>,
+    compact: bool,
     ready: AtomicBool,
     limit: Option<usize>,
     physical_limit: Option<usize>,
@@ -653,11 +654,22 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         Self {
             host,
             scope: scope.into(),
+            compact: false,
             ready: AtomicBool::new(false),
             limit: None,
             physical_limit: None,
             blobs: None,
         }
+    }
+
+    #[must_use]
+    pub const fn compact_events(mut self) -> Self {
+        self.compact = true;
+        self
+    }
+
+    pub(crate) const fn compacts_events(&self) -> bool {
+        self.compact
     }
 
     #[must_use]
