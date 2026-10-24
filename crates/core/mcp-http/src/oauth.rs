@@ -257,6 +257,11 @@ pub struct OAuthRuntime {
     http: reqwest::Client,
     store: Arc<dyn McpOAuthStore>,
     credentials: ArcSwapOption<McpOAuthCredentials>,
+    /// The access token this runtime's last refresh transaction refreshed or
+    /// adopted: it is used until it expires or is refused, even inside the
+    /// refresh skew, so a token that lives less than the skew is not
+    /// refreshed again before every request.
+    settled: ArcSwapOption<String>,
 }
 
 impl OAuthRuntime {
@@ -280,6 +285,7 @@ impl OAuthRuntime {
             http,
             store,
             credentials: ArcSwapOption::from_pointee(credentials),
+            settled: ArcSwapOption::empty(),
         }))
     }
 
@@ -469,6 +475,7 @@ pub fn transport_from_credentials<'call>(
             http: http_client,
             store,
             credentials: ArcSwapOption::from_pointee(staged_credentials),
+            settled: ArcSwapOption::empty(),
         });
         Ok(OAuthTransport {
             runtime,

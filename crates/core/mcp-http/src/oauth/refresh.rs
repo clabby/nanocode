@@ -80,16 +80,24 @@ impl OAuthRuntime {
         self: &'call Arc<Self>,
     ) -> futures_util::future::BoxFuture<'call, Result<(), String>> {
         Box::pin(async move {
-            let refresh_needed = self
-                .credentials
-                .load()
-                .as_ref()
-                .is_none_or(|credentials| credentials.needs_refresh());
+            let refresh_needed = self.credentials.load().as_ref().is_none_or(|credentials| {
+                credentials.needs_refresh()
+                    && (credentials.expired() || !self.settled_on(&credentials.access_token))
+            });
             if !refresh_needed {
                 return Ok(());
             }
             self.spawn_refresh("expiry", None).await
         })
+    }
+
+    /// Whether `access_token` is the one this runtime's last refresh
+    /// transaction refreshed or adopted.
+    fn settled_on(&self, access_token: &str) -> bool {
+        self.settled
+            .load()
+            .as_deref()
+            .is_some_and(|settled| settled == access_token)
     }
 
     /// The server refused `rejected_access_token`: refresh it unless the
@@ -165,6 +173,12 @@ impl OAuthRuntime {
     }
 
     async fn refresh_transaction(&self, rejected_access_token: Option<&str>) -> Result<(), String> {
+        // The token this runtime held before waiting for the lock.
+        let held = self
+            .credentials
+            .load()
+            .as_ref()
+            .map(|credentials| credentials.access_token.clone());
         let _refresh_lock = timeout(
             REFRESH_LOCK_TIMEOUT,
             self.store
@@ -194,7 +208,14 @@ impl OAuthRuntime {
         };
 
         let rejected = rejected_access_token.is_some_and(|token| token == latest.access_token);
-        if !latest.needs_refresh() && !rejected {
+        // Another process refreshed it while this one waited for the lock:
+        // use its token rather than spend another single-use refresh token.
+        let rotated = rejected_access_token.is_none()
+            && held.as_deref() != Some(latest.access_token.as_str())
+            && !latest.expired();
+        if (!latest.needs_refresh() || rotated) && !rejected {
+            self.settled
+                .store(Some(Arc::new(latest.access_token.clone())));
             self.credentials.store(Some(Arc::new(latest)));
             return Ok(());
         }
@@ -295,6 +316,8 @@ impl OAuthRuntime {
             ));
         }
 
+        self.settled
+            .store(Some(Arc::new(refreshed.access_token.clone())));
         self.credentials.store(Some(Arc::new(refreshed)));
         Ok(())
     }
