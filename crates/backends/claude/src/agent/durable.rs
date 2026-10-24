@@ -719,13 +719,28 @@ impl State {
                 tasks: Option<Value>,
                 discovered: HashSet<String>,
             }
-            let receipt: Receipt = serde_json::from_value(value).map_err(recovery_error)?;
-            if !matches!(&receipt.result, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
-            {
+            let mut receipt: Receipt = serde_json::from_value(value).map_err(recovery_error)?;
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } = &mut receipt.result
+            else {
+                return Err(recovery_error(
+                    "tool receipt does not match the admitted call",
+                ));
+            };
+            if tool_use_id != id {
                 return Err(recovery_error(
                     "tool receipt does not match the admitted call",
                 ));
             }
+            super::images::prepare_tool_images(
+                content,
+                crate::prompt::ImageResolution::of(&cursor.template.model),
+                &self.images,
+            )
+            .await?;
             self.restore_tasks(receipt.tasks).map_err(recovery_error)?;
             self.discovered
                 .update(|discovered| discovered.extend(receipt.discovered.iter().cloned()));

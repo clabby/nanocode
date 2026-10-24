@@ -34,7 +34,7 @@ pub use runners::{
 
 pub use nanocode_backend_codex::{Codex, client::OpenAi};
 pub use nanocode_code_mode::Tool;
-pub use nanocode_code_mode::image::{DEFAULT_INLINE_IMAGES, ImageHistory};
+pub use nanocode_code_mode::image::{DEFAULT_INLINE_IMAGES, ImageHistory, SharedBlobStore};
 
 pub use nanocode_code_mode::embedded::{
     CodeModeExecution, CodeModeHost, CodeModeHostError, CodeModeObserver, CodeModeUpdate,

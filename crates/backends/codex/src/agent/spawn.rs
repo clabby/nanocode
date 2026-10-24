@@ -225,6 +225,7 @@ pub(super) fn spawn_agent_driver(
         shutdown: shutdown.clone(),
         checkpoints: Arc::clone(&checkpoints),
         initial_ready: Arc::new(nanocode_sync::Slot::new(Some(initial_ready))),
+        images: spawner.images.clone(),
     });
 
     tools.start_providers();

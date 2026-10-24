@@ -475,6 +475,7 @@ impl ModelRun {
 
         let instruction_revision = self.instruction_revision;
         let execution_steps = self.execution_steps.clone();
+        let images = self.images.clone();
         let solo = prepared.len() == 1;
         let mut executions = prepared
             .into_iter()
@@ -486,6 +487,7 @@ impl ModelRun {
                 let turn_id = turn_id.clone();
                 let host_context = host_context.clone();
                 let execution_steps = execution_steps.clone();
+                let images = images.clone();
                 async move {
                     let started_at = active.started_at;
                     let step_id = format!("tool-{call_index}-{}", call.call_id);
@@ -518,6 +520,7 @@ impl ModelRun {
                                 .store(Some(Arc::new(Instant::now())));
                             Self::execute_model_tool_call(
                                 tools,
+                                &images,
                                 &events,
                                 &tool_call_indices,
                                 call_index,
@@ -792,6 +795,7 @@ impl ModelRun {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_model_tool_call(
         tools: &ToolRuntime,
+        images: &ImageHistory,
         events: &EventSink,
         tool_call_indices: &HashMap<Box<str>, u32>,
         call_index: u32,
@@ -877,8 +881,11 @@ impl ModelRun {
                 }
             };
 
+            images
+                .prepare_output_images(&mut execution.output)
+                .await
+                .map_err(image_store_error)?;
             let structured_result = execution.take_structured_result();
-            prepare_output_images(&mut execution.output).await;
             if let Some(content) = serialize_trace_content(&execution.output) {
                 record_span_content(tool_span, "tool.output", &content);
             }
@@ -1010,8 +1017,11 @@ impl ModelRun {
         if let Some(error) = update_error {
             return Err(error);
         }
+        images
+            .prepare_output_images(&mut execution.output)
+            .await
+            .map_err(image_store_error)?;
         let structured_result = execution.output.structured_result();
-        prepare_output_images(&mut execution.output).await;
         if let Some(content) = serialize_trace_content(&execution.output) {
             record_span_content(tool_span, "tool.output", &content);
         }

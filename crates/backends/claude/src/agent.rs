@@ -3561,6 +3561,7 @@ async fn defer_turn(
                         policy.as_ref(),
                         &id,
                         resolution,
+                        &state.images,
                     )
                     .await;
                     let (prompt, resolution) = match frozen {
@@ -4574,18 +4575,16 @@ impl State {
         }
         request.tool_choice = context.force_text.then(|| json!({"type":"none"}));
 
-        let mut wire = {
-            let messages = images::evict_images(&self.images, wire_messages(messages, &suffix));
-            request
-                .cache_system_prefix_with(&messages)
-                .map_err(provider_error)?;
-            if cancel.is_cancelled() && context.effect.is_none() {
-                return Err(NanocodeError::TurnCancelled.into());
-            }
-            client
-                .prepare_wire(&request, &messages, true)
-                .map_err(provider_error)?
-        };
+        let mut sent = images::evict_images(&self.images, wire_messages(messages, &suffix));
+        request
+            .cache_system_prefix_with(&sent)
+            .map_err(provider_error)?;
+        if cancel.is_cancelled() && context.effect.is_none() {
+            return Err(NanocodeError::TurnCancelled.into());
+        }
+        let mut wire = client
+            .prepare_wire(&request, &sent, true)
+            .map_err(provider_error)?;
         let needs_upgrade = self.code_only && !durable::is_code_only_catalog(&request.tools);
 
         let mut journal = context.journal;
@@ -4659,12 +4658,9 @@ impl State {
         if let Some(upgrade) = &upgrade {
             request.tools = upgrade.code_only_tools.clone();
             suffix.push(Message::text(Role::User, &upgrade.notice).into());
+            sent = images::evict_images(&self.images, wire_messages(messages, &suffix));
             wire = client
-                .prepare_wire(
-                    &request,
-                    &images::evict_images(&self.images, wire_messages(messages, &suffix)),
-                    true,
-                )
+                .prepare_wire(&request, &sent, true)
                 .map_err(provider_error)?;
 
             recovery = Some(ServerRecovery {
@@ -4694,6 +4690,11 @@ impl State {
             }
         }
 
+        if let Some(inlined) = images::inline_images(&self.images, &sent).await? {
+            wire = client
+                .prepare_wire(&request, &inlined, true)
+                .map_err(provider_error)?;
+        }
         let max_attempts = if context.disable_tools { 3 } else { 5 };
         let mut attempt = 0;
         let mut dispatched: Option<u64> = None;
@@ -5447,6 +5448,13 @@ impl State {
         }
     }
 
+    async fn store_prompt_images(&self, prompt: &mut Prompt) -> Result<()> {
+        self.images
+            .store_prompt(&mut prompt.instruction)
+            .await
+            .map_err(crate::prompt::image_store_error)
+    }
+
     async fn accept_steer(
         &self,
         turn: &mut TurnSteering,
@@ -5478,7 +5486,7 @@ impl State {
         if !turn.accepting {
             return Err(NanocodeError::TurnNotSteerable);
         }
-        let frozen = crate::prompt::freeze(prompt, turn.images).await?;
+        let frozen = crate::prompt::freeze(prompt, turn.images, &self.images).await?;
         let local_index = || {
             turn.next_index
                 .checked_add(1)
@@ -5740,6 +5748,13 @@ impl State {
                 });
             }
         }
+        let mut content = content;
+        images::prepare_tool_images(
+            &mut content,
+            crate::prompt::ImageResolution::of(&cursor.template.model),
+            &self.images,
+        )
+        .await?;
         let mut payload =
             top_level_event_fields(&content, structured_result.as_ref(), metadata.as_ref());
         payload.extend([
@@ -5877,7 +5892,7 @@ impl State {
                 let prompt =
                     serde_json::from_str(&steer.input_json).map_err(durable::recovery_error)?;
                 turn.pending.push_back(PendingSteer {
-                    prompt: crate::prompt::freeze(prompt, turn.images).await?,
+                    prompt: crate::prompt::freeze(prompt, turn.images, &self.images).await?,
                     message_id: steer.message_id,
                     index: steer.index,
                     after: steer.accepted_after_model_call_index,
@@ -6457,12 +6472,7 @@ impl State {
                 .collect::<Vec<_>>();
             pending.push(assistant.clone());
             if has_tool_calls {
-                let mut results: Vec<_> = results.into_iter().map(Option::unwrap).collect();
-                images::prepare_tool_images(
-                    &mut results,
-                    crate::prompt::ImageResolution::of(&cursor.template.model),
-                )
-                .await;
+                let results: Vec<_> = results.into_iter().map(Option::unwrap).collect();
                 pending.push(Message::tool_results(results).into());
 
                 conversation.messages = pending.clone();
@@ -6789,10 +6799,11 @@ impl Driver {
         &self,
         key: BackendTurnKey,
         id: Option<String>,
-        prompt: Prompt,
+        mut prompt: Prompt,
     ) -> BackendFuture<Result<()>> {
         let state = self.state.clone();
         Box::pin(async move {
+            state.store_prompt_images(&mut prompt).await?;
             if state.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
@@ -6891,6 +6902,7 @@ impl LifecycleBackend for Driver {
         let state = self.state.clone();
         let parent = tracing::Span::current();
         Box::pin(async move {
+            state.store_prompt_images(&mut request.prompt).await?;
             let (accepted, receipt) = oneshot::channel();
             let task = async move {
                 let result = async move {
@@ -6905,7 +6917,9 @@ impl LifecycleBackend for Driver {
                                 "Claude request_id requires an attached durability policy",
                             ));
                         }
-                        request.prompt = crate::prompt::freeze(request.prompt, resolution).await?;
+                        request.prompt =
+                            crate::prompt::freeze(request.prompt, resolution, &state.images)
+                                .await?;
                         let cancellation = Arc::new(Cancellation::default());
                         return Ok(
                             start_turn(&state, request, resolution, None, cancellation).await
@@ -7007,6 +7021,7 @@ impl LifecycleBackend for Driver {
                         policy.as_ref(),
                         &id,
                         resolution,
+                        &state.images,
                     )
                     .await
                     {
@@ -7031,10 +7046,11 @@ impl LifecycleBackend for Driver {
 
     fn route(&self, request: BackendPrompt) -> BackendFuture<Result<BackendPromptRoute>> {
         let state = self.state.clone();
-        let prompt = request.prompt.clone();
+        let mut prompt = request.prompt.clone();
         let request_id = request.request_id.clone();
         let start = self.submit(request);
         Box::pin(async move {
+            state.store_prompt_images(&mut prompt).await?;
             if state.stopped.load(Ordering::SeqCst) {
                 return Err(NanocodeError::AgentStopped);
             }
@@ -7076,13 +7092,14 @@ impl LifecycleBackend for Driver {
     fn steer_receipt(
         &self,
         id: String,
-        prompt: Prompt,
+        mut prompt: Prompt,
     ) -> BackendFuture<Result<SteerReceiptStatus>> {
-        let policy = self.state.policy.clone();
+        let state = self.state.clone();
         Box::pin(async move {
-            let Some(policy) = policy else {
+            let Some(policy) = state.policy.clone() else {
                 return Ok(SteerReceiptStatus::Unknown);
             };
+            state.store_prompt_images(&mut prompt).await?;
             policy
                 .steer_receipt(id, serde_json::to_string(&prompt).map_err(provider_error)?)
                 .await
