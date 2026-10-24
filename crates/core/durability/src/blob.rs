@@ -124,21 +124,26 @@ impl BlobUrl {
         &self.key
     }
 
+    #[must_use]
+    pub fn from_data_url(url: &str) -> Option<(Self, Vec<u8>)> {
+        let (media_type, data) = base64_data_url(url)?;
+        let bytes = STANDARD.decode(data).ok()?;
+        let blob = Self {
+            media_type: media_type.to_owned(),
+            key: BlobKey::of(&bytes),
+        };
+        Some((blob, bytes))
+    }
+
     pub async fn store_data_url(
         store: &dyn BlobStore,
         url: &str,
     ) -> Result<Option<Self>, StoreError> {
-        let Some((media_type, data)) = base64_data_url(url) else {
+        let Some((blob, bytes)) = Self::from_data_url(url) else {
             return Ok(None);
         };
-        let Ok(bytes) = STANDARD.decode(data) else {
-            return Ok(None);
-        };
-        let key = put_blob(store, &bytes).await?;
-        Ok(Some(Self {
-            media_type: media_type.to_owned(),
-            key,
-        }))
+        store.put(&blob.key, &bytes).await?;
+        Ok(Some(blob))
     }
 
     pub async fn load_data_url(&self, store: &dyn BlobStore) -> Result<String, StoreError> {
