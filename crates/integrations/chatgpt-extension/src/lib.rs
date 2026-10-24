@@ -5,6 +5,7 @@ mod browsers;
 mod host;
 mod native;
 mod proxy;
+mod relay;
 mod steps;
 
 pub use bridge::{Bridge, Guard, Launcher, Registration, Upstream, host_path};

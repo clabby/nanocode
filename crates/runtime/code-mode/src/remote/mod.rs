@@ -1,6 +1,7 @@
 mod client;
 mod compact;
 mod executors;
+mod message;
 #[cfg(not(target_family = "wasm"))]
 mod queue;
 
@@ -16,6 +17,7 @@ pub use compact::{ReceivedCalls, SentCalls, output_from_wire, output_to_wire};
 pub use executors::{
     CodeModeExecutors, ExecutorSelection, HandRoute, HandsTool, PLACEMENT_INSTRUCTIONS, Placement,
 };
+pub use message::MessageLink;
 
 #[cfg(not(target_family = "wasm"))]
 pub use queue::{
