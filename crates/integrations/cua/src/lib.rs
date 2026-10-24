@@ -24,6 +24,7 @@ use tokio::{
 };
 
 const PROVIDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const INTERRUPTED: &str = "CUA session interrupted by caller cancellation or transport failure. Upstream/native input may still be running and effects are uncertain; do not replay uncertain input. Call cua_repl.js_reset, then inspect the surface before continuing. Reset does not prove earlier input stopped.";
 const PINNED_CATALOG: &str = include_str!("catalog.json");
 const CONFIRMATION_POLICY: &str = "No confirmation policy applies.";
 const PROVIDER_ENVIRONMENT: &[&str] = &[
@@ -45,12 +46,61 @@ const PROVIDER_ENVIRONMENT: &[&str] = &[
     "SKY_ENABLE_AUDIO",
 ];
 
+/// How a pinned provider catalog is checked against the provider's live
+/// `tools/list` each time a session starts its provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CatalogCheck {
+    /// The live catalog must equal the pinned one, tool for tool, because the
+    /// model sees the pinned definitions.
+    #[default]
+    Exact,
+    /// The provider must publish every pinned tool name; definitions and extra
+    /// tools may differ. For hosts that show the model a tool of their own and
+    /// call the provider's tools by name through [`ComputerTools::tool`].
+    Names,
+}
+
+/// What is known of a `tools/call` that failed after it was sent: the
+/// provider may have acted, so the host must not replay it blindly. The
+/// provider process was stopped; the session's next call starts a new one.
+/// Calls return it boxed in their `ToolError`, so hosts can downcast to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutcomeUnknown {
+    /// The provider did not answer within [`ComputerConfig::step_timeout`].
+    TimedOut(Duration),
+    /// The provider's transport failed, such as the process exiting or
+    /// writing invalid JSON-RPC, before the call's reply arrived.
+    Transport(String),
+}
+
+impl std::fmt::Display for OutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut(timeout) => write!(
+                formatter,
+                "CUA provider did not finish this call within {} seconds and was stopped; whether the call took effect is unknown",
+                timeout.as_secs()
+            ),
+            Self::Transport(error) => write!(
+                formatter,
+                "CUA provider failed during this call ({error}) and was stopped; whether the call took effect is unknown"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OutcomeUnknown {}
+
 #[derive(Clone, Debug)]
 pub struct ComputerConfig {
     pub executable: PathBuf,
     pub args: Vec<OsString>,
     pub environment: BTreeMap<OsString, OsString>,
     provider_catalog: Option<Vec<ProviderTool>>,
+    catalog_check: CatalogCheck,
+    startup_timeout: Duration,
+    step_timeout: Option<Duration>,
+    restart_after_failure: bool,
     required: Vec<PathBuf>,
 }
 
@@ -122,12 +172,59 @@ impl ComputerConfig {
             args: Vec::new(),
             environment: BTreeMap::new(),
             provider_catalog: None,
+            catalog_check: CatalogCheck::Exact,
+            startup_timeout: PROVIDER_STARTUP_TIMEOUT,
+            step_timeout: None,
+            restart_after_failure: false,
             required: Vec::new(),
         }
     }
 
     pub fn mcp(executable: impl Into<PathBuf>) -> Self {
         Self::new(executable)
+    }
+
+    /// Pins the provider's catalog, so [`ComputerTools::connect`] registers
+    /// these tools without starting the provider; each session starts it on
+    /// its first call and refuses calls, before dispatching any, while its
+    /// live `tools/list` fails `check`. Without a pinned catalog, `connect`
+    /// starts the provider once to discover it.
+    #[must_use]
+    pub fn catalog(mut self, catalog: Vec<ProviderTool>, check: CatalogCheck) -> Self {
+        self.provider_catalog = Some(catalog);
+        self.catalog_check = check;
+        self
+    }
+
+    /// How long starting the provider, initializing it and reading its
+    /// catalog may take before the call fails with nothing dispatched; 120
+    /// seconds by default.
+    #[must_use]
+    pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
+        self
+    }
+
+    /// How long one `tools/call` may wait for its reply, after the provider
+    /// started. A call that runs over stops the provider and fails with
+    /// [`OutcomeUnknown::TimedOut`]. Unlimited by default, so hosts with a
+    /// deadline of their own set one under it.
+    #[must_use]
+    pub fn step_timeout(mut self, timeout: Duration) -> Self {
+        self.step_timeout = Some(timeout);
+        self
+    }
+
+    /// After a call whose outcome is unknown (it timed out, its transport
+    /// failed or its caller went away), the session's next call starts a new
+    /// provider. By default the session instead refuses every call but
+    /// `js_reset` until a reset succeeds, as a REPL provider's state needs;
+    /// providers without one, whose host reports [`OutcomeUnknown`] to the
+    /// model itself, use this.
+    #[must_use]
+    pub fn restart_after_failure(mut self) -> Self {
+        self.restart_after_failure = true;
+        self
     }
 }
 
@@ -460,7 +557,7 @@ async fn run_session(
             model = previous_model;
         }
         if interrupted && name != "js_reset" {
-            let _ = response.send(Err("CUA session interrupted by caller cancellation or transport failure. Upstream/native input may still be running and effects are uncertain; do not replay uncertain input. Call cua_repl.js_reset, then inspect the surface before continuing. Reset does not prove earlier input stopped.".into()));
+            let _ = response.send(Err(INTERRUPTED.into()));
             continue;
         }
 
@@ -471,26 +568,38 @@ async fn run_session(
         let execution = async {
             let mut process = match previous {
                 Some(process) => process,
-                None => Process::start(&config)
-                    .await
-                    .map_err(|error| (false, error))?,
+                None => Process::start(&config).await.map_err(Failure::Unsent)?,
             };
-            let value = process
-                .rpc(
-                    "tools/call",
-                    json!({"name":name,"arguments":arguments,
+            let call = process.rpc(
+                "tools/call",
+                json!({"name":name,"arguments":arguments,
                 "_meta": call_meta(&session, turn_id.as_deref(), &call_id, &model)}),
-                )
-                .await
-                .map_err(|error| (true, error))?;
-            let output = output(value).map_err(|error| (true, error))?;
-            Ok::<_, (bool, ToolError)>((process, output))
+            );
+            let reply = match config.step_timeout {
+                Some(timeout) => tokio::time::timeout(timeout, call)
+                    .await
+                    .map_err(|_| Failure::Unknown(Box::new(OutcomeUnknown::TimedOut(timeout))))?,
+                None => call.await,
+            };
+            let value = match reply {
+                Ok(value) => value,
+                // The provider answered with an error, so its transport is intact.
+                Err(RpcFailure::Reply(error)) => {
+                    return Err(Failure::Answered(Box::new(process), error));
+                }
+                Err(RpcFailure::Transport(error)) => {
+                    let unknown = OutcomeUnknown::Transport(error.to_string());
+                    return Err(Failure::Unknown(Box::new(unknown)));
+                }
+            };
+            let output = output(value).map_err(Failure::Unknown)?;
+            Ok::<_, Failure>((process, output))
         };
         let outcome = tokio::select! {
             biased;
             () = response.closed() => {
                 turns.clear();
-                interrupted = true;
+                interrupted = !config.restart_after_failure;
                 continue;
             }
             outcome = execution => outcome,
@@ -504,14 +613,46 @@ async fn run_session(
                 if response.send(Ok(output)).is_err() {
                     process = None;
                     turns.clear();
-                    interrupted = true;
+                    interrupted = !config.restart_after_failure;
                 }
             }
-            Err((dispatched, error)) => {
-                turns.clear();
-                interrupted |= dispatched;
+            Err(Failure::Answered(owned, error)) => {
+                process = Some(*owned);
                 let _ = response.send(Err(error));
             }
+            Err(Failure::Unsent(error)) => {
+                turns.clear();
+                let _ = response.send(Err(error));
+            }
+            Err(Failure::Unknown(error)) => {
+                turns.clear();
+                interrupted |= !config.restart_after_failure;
+                let _ = response.send(Err(error));
+            }
+        }
+    }
+}
+
+/// Why a session's call failed, and so what happens to its provider.
+enum Failure {
+    /// Nothing was dispatched: the provider did not start or failed its catalog check.
+    Unsent(ToolError),
+    /// The provider answered with a JSON-RPC error; it keeps serving the session.
+    Answered(Box<Process>, ToolError),
+    /// The call may have run; the provider was dropped, which stops it.
+    Unknown(ToolError),
+}
+
+/// A failed JSON-RPC request: a reply that carried an error, or a broken transport.
+enum RpcFailure {
+    Reply(ToolError),
+    Transport(ToolError),
+}
+
+impl From<RpcFailure> for ToolError {
+    fn from(failure: RpcFailure) -> Self {
+        match failure {
+            RpcFailure::Reply(error) | RpcFailure::Transport(error) => error,
         }
     }
 }
@@ -525,9 +666,9 @@ struct Process {
 }
 impl Process {
     async fn start(config: &ComputerConfig) -> Result<Self, ToolError> {
-        tokio::time::timeout(PROVIDER_STARTUP_TIMEOUT, Self::start_and_discover(config))
+        tokio::time::timeout(config.startup_timeout, Self::start_and_discover(config))
             .await
-            .map_err(|_| "CUA provider startup timed out after 120 seconds during initialization or catalog discovery; owned transport discarded. Upstream/native work may continue.")?
+            .map_err(|_| format!("CUA provider startup timed out after {} seconds during initialization or catalog discovery; owned transport discarded. Upstream/native work may continue.", config.startup_timeout.as_secs()))?
     }
 
     async fn start_and_discover(config: &ComputerConfig) -> Result<Self, ToolError> {
@@ -569,15 +710,22 @@ impl Process {
             .await?;
         let catalog = process.discover().await?;
         if let Some(expected) = &config.provider_catalog {
-            let changed = expected
-                .iter()
-                .chain(&catalog)
-                .map(|tool| tool.name.as_str())
-                .filter(|name| {
-                    expected.iter().find(|tool| tool.name == *name)
-                        != catalog.iter().find(|tool| tool.name == *name)
-                })
-                .collect::<BTreeSet<_>>();
+            let changed = match config.catalog_check {
+                CatalogCheck::Exact => expected
+                    .iter()
+                    .chain(&catalog)
+                    .map(|tool| tool.name.as_str())
+                    .filter(|name| {
+                        expected.iter().find(|tool| tool.name == *name)
+                            != catalog.iter().find(|tool| tool.name == *name)
+                    })
+                    .collect::<BTreeSet<_>>(),
+                CatalogCheck::Names => expected
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .filter(|name| !catalog.iter().any(|tool| tool.name == *name))
+                    .collect(),
+            };
             if !changed.is_empty() {
                 return Err(format!(
                     "CUA provider tools differ from the definitions advertised to the model: {}. Nothing was dispatched; calls are refused until the advertised catalog matches this provider version",
@@ -637,41 +785,50 @@ impl Process {
         self.input.flush().await?;
         Ok(())
     }
-    async fn rpc(&mut self, method: &str, params: Value) -> Result<Value, ToolError> {
+    async fn rpc(&mut self, method: &str, params: Value) -> Result<Value, RpcFailure> {
         self.next_id += 1;
         let id = self.next_id;
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await?;
+            .await
+            .map_err(RpcFailure::Transport)?;
         let mut line = Vec::new();
         loop {
-            if self.output.read_until(b'\n', &mut line).await? == 0 {
-                return Err("CUA runtime closed its output".into());
+            let read = self.output.read_until(b'\n', &mut line).await;
+            if read.map_err(|error| RpcFailure::Transport(error.into()))? == 0 {
+                return Err(RpcFailure::Transport(
+                    "CUA runtime closed its output".into(),
+                ));
             }
-            let value: Value = serde_json::from_slice(&line)?;
+            let value: Value = serde_json::from_slice(&line)
+                .map_err(|error| RpcFailure::Transport(error.into()))?;
             line.clear();
             if let Some(method) = value.get("method") {
                 if let Some(request_id) = value.get("id") {
                     self.send(match method.as_str() {
                         Some("elicitation/create") => json!({"jsonrpc":"2.0","id":request_id,"result":elicitation(&value["params"])}),
                         _ => json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"Unsupported provider server request"}}),
-                    }).await?;
+                    }).await.map_err(RpcFailure::Transport)?;
                 }
                 continue;
             }
             if value["id"] != id {
-                return Err("CUA response belongs to a different call".into());
+                return Err(RpcFailure::Transport(
+                    "CUA response belongs to a different call".into(),
+                ));
             }
             if let Some(error) = value.get("error") {
-                return Err(format!(
-                    "CUA: {}",
-                    error["message"].as_str().unwrap_or("runtime error")
-                )
-                .into());
+                return Err(RpcFailure::Reply(
+                    format!(
+                        "CUA: {}",
+                        error["message"].as_str().unwrap_or("runtime error")
+                    )
+                    .into(),
+                ));
             }
             return value
                 .get("result")
                 .cloned()
-                .ok_or_else(|| "CUA response is missing its result".into());
+                .ok_or_else(|| RpcFailure::Transport("CUA response is missing its result".into()));
         }
     }
 }
