@@ -1,6 +1,8 @@
 mod client;
 mod compact;
 mod executors;
+#[cfg(not(target_family = "wasm"))]
+mod queue;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -13,6 +15,11 @@ pub use client::{
 pub use compact::{ReceivedCalls, SentCalls, output_from_wire, output_to_wire};
 pub use executors::{
     CodeModeExecutors, ExecutorSelection, HandRoute, HandsTool, PLACEMENT_INSTRUCTIONS, Placement,
+};
+
+#[cfg(not(target_family = "wasm"))]
+pub use queue::{
+    CommandQueue, Polled, QueueOptions, QueuedCall, Recorded, Settlement, serve_queue,
 };
 
 use crate::embedded::{CodeModeNotification, CodeModeUpdate, NestedToolCall};

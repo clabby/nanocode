@@ -45,6 +45,7 @@ members = [
     "crates/integrations/decisions",
     "crates/integrations/observability",
     "crates/integrations/store-postgres",
+    "crates/integrations/store-sqlx",
     "crates/integrations/store-sqlite",
     "crates/integrations/store-jsonl",
     "crates/tui",
@@ -92,6 +93,7 @@ nanocode-tool-contracts = { version = "0.6.7", path = "crates/core/tool-contract
 nanocode-store-jsonl = { version = "0.6.7", path = "crates/integrations/store-jsonl" }
 nanocode-store-sqlite = { version = "0.6.7", path = "crates/integrations/store-sqlite" }
 nanocode-store-postgres = { version = "0.6.7", path = "crates/integrations/store-postgres" }
+nanocode-store-sqlx = { version = "0.6.7", path = "crates/integrations/store-sqlx" }
 landlock = "0.4.4"
 libc = "0.2"
 base64 = "0.22.1"
@@ -155,6 +157,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["std"] }
 regex = "1"
 rusqlite = { version = "0.38", features = ["bundled"] }
 tokio-postgres = "0.7"
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio"] }
 rquickjs = "0.12.1"
 schemars = "0.8.22"
 seccompiler = "0.5.0"
