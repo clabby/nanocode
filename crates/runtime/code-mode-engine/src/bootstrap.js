@@ -177,7 +177,7 @@
         "setTimeout",
         "clearTimeout",
         ...preludeNames,
-        source,
+        "return (async () => {" + source + "\n})();",
       );
       try {
         await script(
