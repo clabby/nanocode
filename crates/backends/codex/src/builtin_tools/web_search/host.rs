@@ -84,11 +84,11 @@ impl FunctionHandler for HostSearch {
                     Ok(response) => break response,
                 }
             };
-            let SearchResponse { output, results: _ } =
-                serde_json::from_slice(&response).map_err(|error| {
-                    format!("failed to decode standalone web search response: {error}")
-                })?;
-            Ok(Value::String(output))
+            let response: SearchResponse = serde_json::from_slice(&response).map_err(|error| {
+                format!("failed to decode standalone web search response: {error}")
+            })?;
+            drop(response.results);
+            Ok(Value::String(response.output))
         })
     }
 }
