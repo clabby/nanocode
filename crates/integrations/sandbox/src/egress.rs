@@ -29,6 +29,12 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const MAX_HEAD: usize = 8 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Connections one proxy serves at once; more are refused with 503.
+const MAX_CONNECTIONS: usize = 1024;
+/// How long a client may take to send its request head.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the accept loop waits to tell an extra client the proxy is busy.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn other(error: impl Into<Box<dyn Error + Send + Sync>>) -> io::Error {
     io::Error::other(error)
@@ -224,7 +230,15 @@ impl Egress {
         });
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
-            while let Some(client) = accept().await {
+            while let Some(mut client) = accept().await {
+                while connections.try_join_next().is_some() {}
+                if connections.len() >= MAX_CONNECTIONS {
+                    // Refuse rather than wait: open tunnels must not stall
+                    // new connections behind them.
+                    let busy = respond(&mut client, "503 Service Unavailable");
+                    drop(tokio::time::timeout(BUSY_TIMEOUT, busy).await);
+                    continue;
+                }
                 connections.spawn(serve(client, Arc::clone(&rules)));
             }
         });
@@ -238,7 +252,8 @@ impl Egress {
 }
 
 async fn serve<C: Client>(mut client: C, rules: Arc<Rules>) {
-    let Some((head, end)) = read_head(&mut client).await else {
+    let Ok(Some((head, end))) = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client)).await
+    else {
         return;
     };
     let line = head.split(|&b| b == b'\r').next().unwrap_or_default();
@@ -281,7 +296,20 @@ async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Option<(Vec<u8>, usi
 }
 
 async fn respond<S: AsyncWrite + Unpin>(client: &mut S, status: &str) {
-    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    respond_text(client, status, "").await;
+}
+
+/// Answer `status` with a plain-text `body` (none when empty) and close.
+async fn respond_text<S: AsyncWrite + Unpin>(client: &mut S, status: &str, body: &str) {
+    let content_type = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: text/plain\r\n"
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
     client.write_all(response.as_bytes()).await.ok();
 }
 
@@ -303,15 +331,11 @@ async fn allowed<S: AsyncWrite + Unpin>(client: &mut S, rules: &Rules, host: &st
         return true;
     }
     let body = (rules.allowlist.refusal)(host);
-    let response = format!(
-        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
     rules
         .log
         .denied
         .update(|denied| denied.push(host.to_owned()));
-    client.write_all(response.as_bytes()).await.ok();
+    respond_text(client, "403 Forbidden", &body).await;
     false
 }
 
@@ -437,7 +461,8 @@ async fn intercept<C: Client>(
     let Ok(Ok(mut client)) = accepted else {
         return;
     };
-    let Some((head, end)) = read_head(&mut client).await else {
+    let Ok(Some((head, end))) = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client)).await
+    else {
         return;
     };
     let name = injection.header.as_bytes();
