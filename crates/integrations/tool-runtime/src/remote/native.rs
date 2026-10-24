@@ -1299,6 +1299,22 @@ impl Executor {
         self.resumable = false;
     }
 
+    /// Calls `Tool::end_turn` on every registered tool for an ended turn, whether or not this hand
+    /// runs cells for the session, then answers the request. A tool's failure is logged, as the
+    /// attachment endpoint does, and not retried.
+    fn end_turn(&mut self, id: u64, session_id: String, turn_id: String, hook_event_name: String) {
+        let tools: Vec<Arc<dyn crate::Tool>> = self.tools.registered_tools().cloned().collect();
+        let finished = self.finished.clone();
+        self.tasks.spawn(async move {
+            for tool in tools {
+                if let Err(issue) = tool.end_turn(&session_id, &turn_id, &hook_event_name).await {
+                    tracing::warn!(%issue, tool = tool.definition().name(), "hand tool turn cleanup failed; not retried");
+                }
+            }
+            let _ = finished.send(Done { id, live: Ok(None), full: None, status: None });
+        });
+    }
+
     fn finish(&self, id: u64, live: ReplyResult) {
         let _ = self.finished.send(Done {
             id,
@@ -1406,7 +1422,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             if let Some(bytes) = max_frame_bytes { outgoing.limit.fetch_min(bytes, Ordering::Relaxed); }
                             executor.resumable |= resumable;
                             executor.running.insert(id, Running { resumable, connection });
-                            let session_id = match &operation { RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } | RemoteOperation::Call { context, .. } => &context.session_id, RemoteOperation::Cancel { session_id } | RemoteOperation::CancelTurn { session_id } | RemoteOperation::DetachTurn { session_id } | RemoteOperation::BeginTurn { session_id } | RemoteOperation::Preempt { session_id } | RemoteOperation::SettlePreempt { session_id } => session_id }.clone();
+                            if let RemoteOperation::EndTurn { session_id, turn_id, hook_event_name } = operation {
+                                executor.end_turn(id, session_id, turn_id, hook_event_name);
+                                continue;
+                            }
+                            let session_id = match &operation { RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } | RemoteOperation::Call { context, .. } => &context.session_id, RemoteOperation::Cancel { session_id } | RemoteOperation::CancelTurn { session_id } | RemoteOperation::DetachTurn { session_id } | RemoteOperation::BeginTurn { session_id } | RemoteOperation::Preempt { session_id } | RemoteOperation::SettlePreempt { session_id } | RemoteOperation::EndTurn { session_id, .. } => session_id }.clone();
                             if matches!(&operation, RemoteOperation::Execute { selected_tools: Some(_), .. } | RemoteOperation::Call { selected_tools: Some(_), .. }) && executor.tools.has_dynamic_providers() {
                                 executor.finish(id, Err("hand tool selection is unavailable with dynamic hand providers; nothing was dispatched".into()));
                                 continue;
@@ -1508,6 +1528,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                         RemoteOperation::BeginTurn { .. } => { runtime.control().begin_turn(); catalog.begin_turn(); Ok(None) },
                                         RemoteOperation::Preempt { .. } => { runtime.control().preempt_turn().await; Ok(None) },
                                         RemoteOperation::SettlePreempt { .. } => { runtime.control().settle_preempt(); Ok(None) },
+                                        RemoteOperation::EndTurn { .. } => Ok(None),
                                     }
                                 }.await.map_err(|e| e.to_string());
                                 let _ = finished.send(Done { id, live: result, full, status });

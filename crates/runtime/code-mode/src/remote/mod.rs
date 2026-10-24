@@ -135,6 +135,14 @@ pub enum RemoteOperation {
     SettlePreempt {
         session_id: String,
     },
+    /// Turn `turn_id` of `session_id` ended (`hook_event_name` says how, such as `Stop`): the hand
+    /// calls `Tool::end_turn` on each of its tools, which release what that turn held, such as
+    /// browser tabs. Dispatches nothing; hosts send it once they know the turn ended.
+    EndTurn {
+        session_id: String,
+        turn_id: String,
+        hook_event_name: String,
+    },
 }
 
 pub trait RemoteTransport: Send + Sync + 'static {

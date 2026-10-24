@@ -15,7 +15,7 @@ pub use browsers::{
 pub use host::{NativeHost, extension_origin, manifest_path};
 pub use native::{MAX_NATIVE, MAX_RESPONSE, read_body, standalone_reply, write_body};
 pub use proxy::Connection;
-pub use steps::{Reference, Snapshot, Tabs, snapshot};
+pub use steps::{GROUP_TITLE_MAX, Reference, Snapshot, Tabs, group_title, snapshot};
 
 pub const EXTENSION_ID: &str = "hehggadaopoacecdllhhajmbjkdcmajg";
 pub const EDGE_EXTENSION_ID: &str = "odlomjlbamekndcpllcnffbgeohgkmjh";

@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug)]
@@ -21,12 +21,53 @@ pub struct Snapshot {
 #[derive(Default)]
 struct Tab {
     session: String,
+    /// The turn that last used it; the extension closes it when that turn ends.
+    turn: String,
     refs: HashMap<String, Reference>,
 }
 
 #[derive(Default)]
 pub struct Tabs {
     tabs: HashMap<u64, Tab>,
+    /// Each session's tab group title as last given to the extension.
+    titles: HashMap<String, String>,
+    /// When each (session, turn) last ran a step, for `Tabs::end_idle`.
+    active: HashMap<(String, String), Instant>,
+}
+
+/// Longest tab group title the bridge sends: Chrome shows a group's whole title on its chip up to
+/// this many characters.
+pub const GROUP_TITLE_MAX: usize = 32;
+
+/// A session's tab group title: `title` on one line, cut to [`GROUP_TITLE_MAX`] characters with an
+/// ellipsis; `None` for a blank title, when the extension keeps its own "ChatGPT".
+pub fn group_title(title: &str) -> Option<String> {
+    let words = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.is_empty() {
+        return None;
+    }
+    if words.chars().count() <= GROUP_TITLE_MAX {
+        return Some(words);
+    }
+    let cut: String = words.chars().take(GROUP_TITLE_MAX - 1).collect();
+    Some(format!("{}…", cut.trim_end()))
+}
+
+/// The turns in `active` without a step for `idle` at `now`, removed.
+fn idle_turns(
+    active: &mut HashMap<(String, String), Instant>,
+    now: Instant,
+    idle: Duration,
+) -> Vec<(String, String)> {
+    let ended: Vec<_> = active
+        .iter()
+        .filter(|(_, last)| now.saturating_duration_since(**last) >= idle)
+        .map(|(turn, _)| turn.clone())
+        .collect();
+    for turn in &ended {
+        active.remove(turn);
+    }
+    ended
 }
 
 fn url(value: &str) -> Result<String, Error> {
@@ -362,6 +403,8 @@ impl Tabs {
         let session_id = format!("{namespace}:{session}");
         let fallback = format!("{namespace}-no-turn");
         let turn = turn.unwrap_or(&fallback);
+        self.active
+            .insert((session.to_owned(), turn.to_owned()), Instant::now());
         let common = json!({"session_id":session_id,"turn_id":turn});
         let action = input["action"].as_str().ok_or("missing browser action")?;
         let opened = action == "open";
@@ -379,17 +422,21 @@ impl Tabs {
                 tab,
                 Tab {
                     session: session.into(),
+                    turn: turn.into(),
                     ..Tab::default()
                 },
             );
             tab
         } else {
             let tab = input["tab"].as_u64().ok_or("missing browser tab")?;
-            if self.tabs.get(&tab).is_none_or(|t| t.session != session) {
-                return Err(format!(
-                    "tab is not one of this session's {owner} tabs; open one first"
-                )
-                .into());
+            match self.tabs.get_mut(&tab) {
+                Some(known) if known.session == session => known.turn = turn.into(),
+                _ => {
+                    return Err(format!(
+                        "tab is not one of this session's {owner} tabs; open one first"
+                    )
+                    .into());
+                }
             }
             tab
         };
@@ -612,6 +659,69 @@ impl Tabs {
             self.tabs.remove(&tab);
         }
         result
+    }
+
+    /// Names the session's tab group [`group_title`]`(title)` with `nameSession` when that changed
+    /// since the last name the extension accepted; before the session's first tab, the extension
+    /// keeps the name for the group it creates. A blank title sends nothing.
+    pub(crate) fn name(
+        &mut self,
+        ext: &mut Extension,
+        namespace: &str,
+        session: &str,
+        turn: Option<&str>,
+        title: &str,
+    ) -> Result<(), Error> {
+        let Some(title) = group_title(title) else {
+            return Ok(());
+        };
+        if self.titles.get(session) == Some(&title) {
+            return Ok(());
+        }
+        let fallback = format!("{namespace}-no-turn");
+        ext.rpc(
+            "nameSession",
+            json!({"session_id":format!("{namespace}:{session}"),"turn_id":turn.unwrap_or(&fallback),"name":title}),
+        )?;
+        self.titles.insert(session.into(), title);
+        Ok(())
+    }
+
+    /// The session's `turn` ended: the extension closes the tabs it used, as it does when ChatGPT's
+    /// own turns end, and drops its claim on tabs it was handed. The tabs are forgotten here even
+    /// when the extension's reply is an error.
+    pub(crate) fn end_turn(
+        &mut self,
+        ext: &mut Extension,
+        namespace: &str,
+        session: &str,
+        turn: &str,
+    ) -> Result<(), Error> {
+        self.active.remove(&(session.to_owned(), turn.to_owned()));
+        self.tabs
+            .retain(|_, tab| tab.session != session || tab.turn != turn);
+        ext.rpc(
+            "turnEnded",
+            json!({"session_id":format!("{namespace}:{session}"),"turn_id":turn}),
+        )
+        .map(drop)
+    }
+
+    /// Ends every turn that has gone `idle` without a step, as [`Tabs::end_turn`]; the first
+    /// failure is returned after all were tried.
+    pub(crate) fn end_idle(
+        &mut self,
+        ext: &mut Extension,
+        namespace: &str,
+        idle: Duration,
+    ) -> Result<(), Error> {
+        let mut failure = None;
+        for (session, turn) in idle_turns(&mut self.active, Instant::now(), idle) {
+            if let Err(error) = self.end_turn(ext, namespace, &session, &turn) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     fn target(&self, tab: u64, input: &Value) -> Result<(u64, String), Error> {

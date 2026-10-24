@@ -289,9 +289,7 @@ impl Connection {
         turn: Option<&str>,
         input: &Value,
     ) -> Result<(String, Value), Error> {
-        if !self.controls {
-            return Err("this extension connection only forwards to the original host".into());
-        }
+        self.controlled()?;
         tabs.step(
             &mut self.extension,
             &self.namespace,
@@ -300,6 +298,40 @@ impl Connection {
             turn,
             input,
         )
+    }
+
+    /// Names `session`'s tab group after `title` (see [`group_title`](crate::group_title)) when it
+    /// changed. Hosts call it before a session's steps, so its first tab already gets the name.
+    pub fn name_session(
+        &mut self,
+        tabs: &mut Tabs,
+        session: &str,
+        turn: Option<&str>,
+        title: &str,
+    ) -> Result<(), Error> {
+        self.controlled()?;
+        tabs.name(&mut self.extension, &self.namespace, session, turn, title)
+    }
+
+    /// Tells the extension that `turn` of `session` ended, so it closes the tabs that turn used last.
+    pub fn end_turn(&mut self, tabs: &mut Tabs, session: &str, turn: &str) -> Result<(), Error> {
+        self.controlled()?;
+        tabs.end_turn(&mut self.extension, &self.namespace, session, turn)
+    }
+
+    /// Ends, as [`Connection::end_turn`], every turn without a step for `idle`, the host's policy for
+    /// turns whose end it may never hear about. Hosts call it periodically while they wait for steps.
+    pub fn end_idle(&mut self, tabs: &mut Tabs, idle: Duration) -> Result<(), Error> {
+        self.controlled()?;
+        tabs.end_idle(&mut self.extension, &self.namespace, idle)
+    }
+
+    fn controlled(&self) -> Result<(), Error> {
+        if self.controls {
+            Ok(())
+        } else {
+            Err("this extension connection only forwards to the original host".into())
+        }
     }
 
     pub fn finish(self) {
