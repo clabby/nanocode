@@ -43,6 +43,12 @@ const READ_PART: Dialects = [
     "SELECT data FROM log_parts WHERE key = $1::text",
 ];
 const PAYLOAD_MARK: &str = "{\"$nanocode_log\":";
+const LONGEST_SINGLE_KEY_REFERENCE: usize = PAYLOAD_MARK.len()
+    + "[\"b3:\"]".len()
+    + blake3::OUT_LEN * 2
+    + ",\"bytes\":}".len()
+    + u64::MAX.ilog10() as usize
+    + 1;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,12 +155,12 @@ const PAGE: Dialects = [
     "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body FROM events WHERE scope = $1::text AND seq > CAST($2::text AS BIGINT) ORDER BY events.seq LIMIT CAST($3::text AS BIGINT)",
 ];
 const PAGE_BOUNDED: Dialects = [
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body, CAST(rows AS TEXT) FROM (SELECT seq, request_id, created_at, body, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT seq, request_id, created_at, body, CASE WHEN substr(body, 1, 17) = '{\"$nanocode_log\":' THEN CAST(json_extract(body, '$.bytes') AS INTEGER) ELSE length(CAST(body AS BLOB)) END AS size FROM events WHERE scope = ?1 AND seq > CAST(?2 AS INTEGER) ORDER BY seq LIMIT CAST(?3 AS INTEGER)) AS candidates) AS sized WHERE running <= CAST(?4 AS INTEGER) OR position = 1 ORDER BY seq",
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body, CAST(rows AS TEXT) FROM (SELECT seq, request_id, created_at, body, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT seq, request_id, created_at, body, CASE WHEN left(body, 17) = '{\"$nanocode_log\":' THEN CAST(CAST(body AS json) ->> 'bytes' AS BIGINT) ELSE octet_length(body) END AS size FROM events WHERE scope = $1::text AND seq > CAST($2::text AS BIGINT) ORDER BY seq LIMIT CAST($3::text AS BIGINT)) AS candidates) AS sized WHERE running <= CAST($4::text AS BIGINT) OR position = 1 ORDER BY sized.seq",
+    "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body, CAST(sized.rows AS TEXT) FROM (SELECT seq, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT seq, MAX(octet_length(body) - CAST(?5 AS INTEGER), 0) AS size FROM events WHERE scope = ?1 AND seq > CAST(?2 AS INTEGER) ORDER BY seq LIMIT CAST(?3 AS INTEGER)) AS candidates) AS sized JOIN events ON events.seq = sized.seq WHERE sized.running <= CAST(?4 AS INTEGER) OR sized.position = 1 ORDER BY sized.seq",
+    "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body, CAST(sized.rows AS TEXT) FROM (SELECT seq, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT seq, GREATEST(octet_length(body) - CAST($5::text AS BIGINT), 0) AS size FROM events WHERE scope = $1::text AND seq > CAST($2::text AS BIGINT) ORDER BY seq LIMIT CAST($3::text AS BIGINT)) AS candidates) AS sized JOIN events ON events.seq = sized.seq WHERE sized.running <= CAST($4::text AS BIGINT) OR sized.position = 1 ORDER BY sized.seq",
 ];
 const TURN_PAGE_BOUNDED: Dialects = [
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body, CAST(rows AS TEXT) FROM (SELECT seq, request_id, created_at, body, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT events.seq, events.request_id, events.created_at, events.body, CASE WHEN substr(events.body, 1, 17) = '{\"$nanocode_log\":' THEN CAST(json_extract(events.body, '$.bytes') AS INTEGER) ELSE length(CAST(events.body AS BLOB)) END AS size FROM turns JOIN events ON events.seq > MAX(CAST(?3 AS INTEGER), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = ?1 AND turns.request_id = ?2 AND events.scope = ?1 AND events.request_id = ?2 ORDER BY events.seq LIMIT CAST(?4 AS INTEGER)) AS candidates) AS sized WHERE running <= CAST(?5 AS INTEGER) OR position = 1 ORDER BY seq",
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body, CAST(rows AS TEXT) FROM (SELECT seq, request_id, created_at, body, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT events.seq, events.request_id, events.created_at, events.body, CASE WHEN left(events.body, 17) = '{\"$nanocode_log\":' THEN CAST(CAST(events.body AS json) ->> 'bytes' AS BIGINT) ELSE octet_length(events.body) END AS size FROM turns JOIN events ON events.seq > GREATEST(CAST($3::text AS BIGINT), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = $1::text AND turns.request_id = $2::text AND events.scope = $1::text AND events.request_id = $2::text ORDER BY events.seq LIMIT CAST($4::text AS BIGINT)) AS candidates) AS sized WHERE running <= CAST($5::text AS BIGINT) OR position = 1 ORDER BY sized.seq",
+    "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body, CAST(sized.rows AS TEXT) FROM (SELECT seq, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT events.seq, MAX(octet_length(events.body) - CAST(?6 AS INTEGER), 0) AS size FROM turns JOIN events ON events.seq > MAX(CAST(?3 AS INTEGER), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = ?1 AND turns.request_id = ?2 AND events.scope = ?1 AND events.request_id = ?2 ORDER BY events.seq LIMIT CAST(?4 AS INTEGER)) AS candidates) AS sized JOIN events ON events.seq = sized.seq WHERE sized.running <= CAST(?5 AS INTEGER) OR sized.position = 1 ORDER BY sized.seq",
+    "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body, CAST(sized.rows AS TEXT) FROM (SELECT seq, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT events.seq, GREATEST(octet_length(events.body) - CAST($6::text AS BIGINT), 0) AS size FROM turns JOIN events ON events.seq > GREATEST(CAST($3::text AS BIGINT), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = $1::text AND turns.request_id = $2::text AND events.scope = $1::text AND events.request_id = $2::text ORDER BY events.seq LIMIT CAST($4::text AS BIGINT)) AS candidates) AS sized JOIN events ON events.seq = sized.seq WHERE sized.running <= CAST($5::text AS BIGINT) OR sized.position = 1 ORDER BY sized.seq",
 ];
 const TURN_PAGE: Dialects = [
     "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body FROM turns JOIN events ON events.seq > MAX(CAST(?3 AS INTEGER), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = ?1 AND turns.request_id = ?2 AND events.scope = ?1 AND events.request_id = ?2 ORDER BY events.seq LIMIT CAST(?4 AS INTEGER)",
@@ -512,6 +518,10 @@ fn omitted(request_id: Option<&str>, body: &str) -> Result<Box<RawValue>, StoreE
     .map_err(encoding)
 }
 
+fn reference(value: &str) -> Result<PayloadReference, StoreError> {
+    serde_json::from_str(value).map_err(|error| invalid(format!("payload reference: {error}")))
+}
+
 fn now() -> u64 {
     nanocode_platform::system_time()
         .duration_since(UNIX_EPOCH)
@@ -818,7 +828,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 .any(|sql| stmt.sql == dialect.pick(sql))
             {
                 &[3, 10]
-            } else if [PAGE, PAGE_BOUNDED, TURN_PAGE, TURN_PAGE_BOUNDED]
+            } else if [PAGE, TURN_PAGE]
                 .iter()
                 .any(|sql| stmt.sql == dialect.pick(sql))
             {
@@ -953,8 +963,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
     }
 
     async fn load_value(&self, value: &str) -> Result<String, StoreError> {
-        let reference: PayloadReference = serde_json::from_str(value)
-            .map_err(|error| invalid(format!("payload reference: {error}")))?;
+        let reference = reference(value)?;
         let mut decoded = String::new();
         for key in reference.parts {
             if let Some(key) = BlobKey::parse(&key) {
@@ -1567,6 +1576,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         let cursor = after.to_string();
         let count = limit.to_string();
         let bytes = max_bytes.to_string();
+        let reserve = LONGEST_SINGLE_KEY_REFERENCE.to_string();
         let statements = match request_id {
             Some(request_id) => vec![
                 statement(
@@ -1577,16 +1587,16 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 statement(
                     self.host.dialect(),
                     &TURN_PAGE_BOUNDED,
-                    vec![&self.scope, request_id, &cursor, &count, &bytes],
+                    vec![&self.scope, request_id, &cursor, &count, &bytes, &reserve],
                 ),
             ],
             None => vec![statement(
                 self.host.dialect(),
                 &PAGE_BOUNDED,
-                vec![&self.scope, &cursor, &count, &bytes],
+                vec![&self.scope, &cursor, &count, &bytes, &reserve],
             )],
         };
-        let results = self.transaction("page_bounded", statements).await?;
+        let mut results = self.transaction("page_bounded", statements).await?;
         let start = if request_id.is_some() {
             single(&results[0])?
                 .map(|row| text(row, 0).and_then(counter))
@@ -1595,15 +1605,38 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         } else {
             after
         };
-        let rows = results
-            .last()
+        let mut rows = results
+            .pop()
             .ok_or_else(|| invalid("missing bounded page"))?;
         let window = rows
             .first()
             .map(|row| text(row, 4).and_then(counter))
             .transpose()?
             .unwrap_or(0);
-        let mut page = page(rows, start, limit)?;
+        let mut running = 0_usize;
+        let mut fitting = 0;
+        for row in &rows {
+            let body = text(row, 3)?;
+            let bytes = if body.starts_with(PAYLOAD_MARK) {
+                reference(body)?.bytes
+            } else {
+                body.len()
+            };
+            running = running.saturating_add(bytes);
+            if fitting > 0 && running > max_bytes {
+                break;
+            }
+            fitting += 1;
+        }
+        rows.truncate(fitting);
+        for row in &mut rows {
+            if let Some(Some(body)) = row.get_mut(3)
+                && body.starts_with(PAYLOAD_MARK)
+            {
+                *body = self.load_value(body).await?;
+            }
+        }
+        let mut page = page(&rows, start, limit)?;
         page.has_more = page.events.len() as u64 != window || window == limit as u64;
         Ok(page)
     }
