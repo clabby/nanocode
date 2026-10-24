@@ -234,8 +234,7 @@ inherits = "profiling"
 
 [profile.wasm]
 inherits = "release"
-codegen-units = 1
-lto = "fat"
+lto = "off"
 opt-level = "z"
 panic = "abort"
 strip = "symbols"
