@@ -145,6 +145,9 @@ impl RuntimeBackend for ClaudeHarness {
                     builder = builder.model_instructions(model.as_str(), Arc::clone(instructions));
                 }
             }
+            if let Some(images) = settings.images {
+                builder = builder.images(images);
+            }
             if let Some(configure) = configure {
                 builder = configure(builder)?.workspace(workspace.to_string_lossy().into_owned());
             }

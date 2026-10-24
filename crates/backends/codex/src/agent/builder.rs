@@ -56,6 +56,7 @@ pub(super) struct CodexCompatibility {
     pub(super) context: ContextSourceConfig,
     pub(super) execution: ExecutionConfig,
     pub(super) before_compaction: Option<Arc<dyn execution::BeforeCompaction>>,
+    pub(super) images: ImageHistory,
     pub(super) spawn_factory: Option<Arc<dyn backend::AgentFactory>>,
     pub(super) host_context: Option<Arc<str>>,
     pub(super) child_journal: Option<backend::ChildJournal>,
@@ -69,6 +70,7 @@ impl Default for CodexCompatibility {
             context: ContextSourceConfig::default(),
             execution: ExecutionConfig::default(),
             before_compaction: None,
+            images: ImageHistory::default(),
             spawn_factory: None,
             host_context: None,
             child_journal: None,
@@ -96,6 +98,12 @@ impl<F> CodexBuilder<F> {
     #[must_use]
     pub fn before_compaction(mut self, hook: impl execution::BeforeCompaction + 'static) -> Self {
         self.codex.before_compaction = Some(Arc::new(hook));
+        self
+    }
+
+    #[must_use]
+    pub fn images(mut self, images: ImageHistory) -> Self {
+        self.codex.images = images;
         self
     }
 

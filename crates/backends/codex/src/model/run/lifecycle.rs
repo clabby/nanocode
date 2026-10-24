@@ -427,6 +427,7 @@ impl ModelRun {
             factory.profile().prefix(),
             self.config.context_window_tokens,
         );
+        let history = evict_images(&self.images, &history);
         let started_at = Instant::now();
         self.stats.compactions += 1;
         self.events.emit(

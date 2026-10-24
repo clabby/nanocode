@@ -82,7 +82,8 @@ impl ModelRun {
         let reasoning_mode = self.config.reasoning_mode;
         let service_tier = self.service_tier;
         let request_history = conversation.managed.generation_request();
-        let previous_response_id = request_history.previous_response_id();
+        let sent = evict_images(&self.images, &request_history);
+        let previous_response_id = sent.previous_response_id();
         let started_at = Instant::now();
         self.stats.model_calls += 1;
         self.prompt_cache.publish_request(thinking, service_tier);
@@ -104,7 +105,7 @@ impl ModelRun {
         let request = factory
             .generation(
                 call_index,
-                &request_history,
+                &sent,
                 model,
                 conversation.reasoning.request_effort(
                     model,
