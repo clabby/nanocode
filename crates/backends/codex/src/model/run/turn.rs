@@ -288,7 +288,7 @@ impl ModelRun {
         self.restore_runtime(configured, logical_turn)?;
         match outcome {
             Ok(ModelTaskOutcome::Completed(message)) => {
-                self.detach_turn_cells().await;
+                self.terminate_turn_cells().await;
                 self.record_transport();
                 let usage = self.stats.turn_usage();
                 record_turn_usage(&tracing::Span::current(), &usage);
