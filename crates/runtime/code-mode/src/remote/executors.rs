@@ -476,6 +476,18 @@ impl CodeModeExecutors {
             .unwrap_or_default()
     }
 
+    fn stoppable(&self, session_id: &str) -> Vec<Arc<dyn CodeModeHost>> {
+        let mut hosts = self.touched(session_id);
+        if let Placement::Hand(HandRoute {
+            host: Some(host), ..
+        }) = self.placement(session_id)
+            && !hosts.iter().any(|touched| Arc::ptr_eq(touched, &host))
+        {
+            hosts.push(host);
+        }
+        hosts
+    }
+
     pub fn settle_cells(&self, session_id: &str) {
         self.state.update(|state| {
             if let Some(session) = state.sessions.get_mut(session_id) {
@@ -669,7 +681,7 @@ impl CodeModeHost for CodeModeExecutors {
     ) -> HostFuture<'a, Result<(), CodeModeHostError>> {
         Box::pin(async move {
             let mut outcome = Ok(());
-            for host in self.touched(session_id) {
+            for host in self.stoppable(session_id) {
                 let result = host.cancel_turn(session_id).await;
                 outcome = outcome.and(result);
             }
@@ -685,7 +697,7 @@ impl CodeModeHost for CodeModeExecutors {
     ) -> HostFuture<'a, Result<(), CodeModeHostError>> {
         Box::pin(async move {
             let mut outcome = Ok(());
-            for host in self.touched(session_id) {
+            for host in self.stoppable(session_id) {
                 let result = host.cancel_turn_with_updates(session_id, observer).await;
                 outcome = outcome.and(result);
             }
@@ -701,7 +713,7 @@ impl CodeModeHost for CodeModeExecutors {
     ) -> HostFuture<'a, Result<(), CodeModeHostError>> {
         Box::pin(async move {
             let mut outcome = Ok(());
-            for host in self.touched(session_id) {
+            for host in self.stoppable(session_id) {
                 let result = host.cancel_with_updates(session_id, observer).await;
                 outcome = outcome.and(result);
             }
@@ -713,7 +725,7 @@ impl CodeModeHost for CodeModeExecutors {
     fn cancel<'a>(&'a self, session_id: &'a str) -> HostFuture<'a, Result<(), CodeModeHostError>> {
         Box::pin(async move {
             let mut outcome = Ok(());
-            for host in self.touched(session_id) {
+            for host in self.stoppable(session_id) {
                 let result = host.cancel(session_id).await;
                 outcome = outcome.and(result);
             }

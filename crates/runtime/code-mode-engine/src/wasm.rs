@@ -210,6 +210,7 @@ impl EmbeddedHost {
             && let Some(execution) = engine.execution.take()
         {
             execution.close(&engine.runtime);
+            std::mem::forget(engine);
         }
     }
 
@@ -285,6 +286,7 @@ impl Drop for EmbeddedHost {
             && let Some(execution) = engine.execution.take()
         {
             execution.close(&engine.runtime);
+            std::mem::forget(engine);
         }
     }
 }
