@@ -398,6 +398,20 @@ impl RequestHistory {
         self.previous_response_id.as_deref()
     }
 
+    #[must_use]
+    pub const fn incremental_start(&self) -> usize {
+        self.incremental_start
+    }
+
+    pub fn replace_from(&mut self, start: usize, items: Vec<ResponseItem>, continued: bool) {
+        self.full.replace_suffix(start, items);
+        self.incremental = self.full.clone();
+        if !continued {
+            self.incremental_start = 0;
+            self.previous_response_id = None;
+        }
+    }
+
     pub fn fit_context_window(
         &mut self,
         request_prefix: &[ResponseItem],

@@ -32,6 +32,7 @@ pub use durable::{
 };
 use durable::{Cursor, Effect, Journal, Snapshot};
 use history::HistoryMessage;
+use nanocode_media::image::ImageHistory;
 use nanocode_platform::Instant;
 #[cfg(target_family = "wasm")]
 use nanocode_platform::sleep;
@@ -591,6 +592,7 @@ pub struct ClaudeBuilder {
     tool_input_deltas: bool,
     context_window_tokens: u64,
     auto_compact_window_tokens: Option<u64>,
+    images: ImageHistory,
     system: String,
     system_blocks: Option<Vec<Value>>,
     model_systems: Vec<(String, Arc<str>)>,
@@ -658,6 +660,7 @@ impl ClaudeBuilder {
             tool_input_deltas: false,
             context_window_tokens,
             auto_compact_window_tokens: None,
+            images: ImageHistory::default(),
             system: String::new(),
             system_blocks: None,
             model_systems: Vec::new(),
@@ -940,6 +943,11 @@ impl ClaudeBuilder {
 
     pub const fn auto_compact_window_tokens(mut self, tokens: u64) -> Self {
         self.auto_compact_window_tokens = Some(tokens);
+        self
+    }
+
+    pub fn images(mut self, images: ImageHistory) -> Self {
+        self.images = images;
         self
     }
 
@@ -1618,6 +1626,7 @@ impl ClaudeBuilder {
             tool_input_deltas: self.tool_input_deltas,
             context_window_tokens: self.context_window_tokens,
             auto_compact_window_tokens: self.auto_compact_window_tokens,
+            images: self.images,
             session_id,
             lineage,
             conversation_id,
@@ -3100,6 +3109,7 @@ struct State {
     tool_input_deltas: bool,
     context_window_tokens: u64,
     auto_compact_window_tokens: Option<u64>,
+    images: ImageHistory,
     workspace: String,
     workspace_resolver: Option<WorkspaceResolver>,
     child_workspace_init: Option<ChildWorkspaceInit>,
@@ -4565,7 +4575,7 @@ impl State {
         request.tool_choice = context.force_text.then(|| json!({"type":"none"}));
 
         let mut wire = {
-            let messages = wire_messages(messages, &suffix);
+            let messages = images::evict_images(&self.images, wire_messages(messages, &suffix));
             request
                 .cache_system_prefix_with(&messages)
                 .map_err(provider_error)?;
@@ -4650,7 +4660,11 @@ impl State {
             request.tools = upgrade.code_only_tools.clone();
             suffix.push(Message::text(Role::User, &upgrade.notice).into());
             wire = client
-                .prepare_wire(&request, &wire_messages(messages, &suffix), true)
+                .prepare_wire(
+                    &request,
+                    &images::evict_images(&self.images, wire_messages(messages, &suffix)),
+                    true,
+                )
                 .map_err(provider_error)?;
 
             recovery = Some(ServerRecovery {

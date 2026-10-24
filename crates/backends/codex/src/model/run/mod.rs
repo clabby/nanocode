@@ -1,5 +1,6 @@
 use crate::__private::model_contract as model_tool_contract;
 mod continuation;
+mod images;
 mod lifecycle;
 mod responses;
 mod side;
@@ -8,6 +9,7 @@ mod tool_calls;
 mod turn;
 
 use continuation::ExecutionPhase;
+use images::*;
 use lifecycle::*;
 use responses::*;
 use state::*;
@@ -67,7 +69,7 @@ use nanocode_tool_host::{
     ToolContext, Tools,
     code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate},
     contract::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolInput, ToolOutput, ToolOutputBody},
-    image::{prepare_output_images, prepare_user_input},
+    image::{ImageHistory, prepare_output_images, prepare_user_input},
     runtime::{OwnedToolContext, ToolRuntime, ToolRuntimeControl},
 };
 
@@ -102,6 +104,7 @@ pub(crate) struct ModelRun {
     pending_developer_messages: Vec<ResponseItem>,
     execution_steps: Option<ExecutionSteps>,
     before_compaction: Option<Arc<dyn crate::execution::BeforeCompaction>>,
+    images: ImageHistory,
 }
 
 pub(crate) struct TurnSteering {
@@ -307,6 +310,7 @@ impl ModelRun {
             pending_developer_messages: Vec::new(),
             execution_steps: None,
             before_compaction: None,
+            images: ImageHistory::default(),
         }
     }
 
@@ -396,6 +400,7 @@ impl ModelRun {
             pending_developer_messages: Vec::new(),
             execution_steps: None,
             before_compaction: None,
+            images: ImageHistory::default(),
         }
     }
 
@@ -404,6 +409,10 @@ impl ModelRun {
         hook: Option<Arc<dyn crate::execution::BeforeCompaction>>,
     ) {
         self.before_compaction = hook;
+    }
+
+    pub(crate) fn set_images(&mut self, images: ImageHistory) {
+        self.images = images;
     }
 
     pub(crate) fn set_host_context(&mut self, host_context: Option<Arc<str>>) {

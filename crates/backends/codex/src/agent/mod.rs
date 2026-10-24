@@ -13,6 +13,7 @@ use crate::client::{
 use crate::client::{Model, Prompt, Thinking, events::AgentEvents, pricing::ServiceTier};
 
 use nanocode_tool_host::Tools;
+use nanocode_tool_host::image::ImageHistory;
 
 use nanocode_tool_host::ToolsBuildError;
 

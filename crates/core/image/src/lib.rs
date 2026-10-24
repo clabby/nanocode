@@ -12,8 +12,11 @@ use image::{
     ColorType, DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageFormat,
     ImageReader, codecs::jpeg::JpegEncoder,
 };
+mod history;
 mod metadata;
 mod pam;
+
+pub use history::{DEFAULT_INLINE_IMAGES, ImageHistory};
 
 pub use nanocode_types_core::ImageDetail;
 use nanocode_types_core::{PromptInput, UserInput, responses::ContentItem};
