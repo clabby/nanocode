@@ -18,6 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Replies to the host's own requests held before the stdin reader waits; `rpc` drains them.
+const RESPONSES: usize = 256;
+
 pub(crate) struct Extension {
     responses: mpsc::Receiver<Value>,
     output: mpsc::Sender<Vec<u8>>,
@@ -29,7 +32,7 @@ pub(crate) struct Extension {
 
 impl Extension {
     fn start(original: Option<&Path>, args: &[String], namespace: &str) -> Result<Self, Error> {
-        let (sender, responses) = mpsc::channel();
+        let (sender, responses) = mpsc::sync_channel(RESPONSES);
         let (output, outgoing) = mpsc::channel::<Vec<u8>>();
         let connected = Arc::new(AtomicBool::new(true));
         let prefix = random_prefix(namespace)?;
