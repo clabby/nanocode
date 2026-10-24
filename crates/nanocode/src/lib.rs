@@ -46,7 +46,7 @@ pub use nanocode_code_mode::remote::{
     RemoteTransport, ResumedReply,
 };
 pub use nanocode_code_mode::tool;
-pub use nanocode_tool_runtime::{FunctionHandler, FunctionTool, Tools};
+pub use nanocode_tool_runtime::{Failure, FunctionHandler, FunctionTool, Tools, TypedHandler};
 
 pub use nanocode_durability::DurableAgentExt;
 

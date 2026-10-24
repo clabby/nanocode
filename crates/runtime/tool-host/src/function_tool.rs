@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::{future::Future, marker::PhantomData, sync::Arc};
 
-use nanocode_tools::ToolOutputContent;
+use nanocode_tools::{ToolOutputContent, schema_for};
+use schemars::JsonSchema;
+use serde::de::{DeserializeOwned, Error as _};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -17,6 +19,81 @@ pub trait FunctionHandler: Send + Sync + 'static {
 
     fn invalid_input(&self, _name: &str, _error: &str) -> Option<Result<Value, String>> {
         None
+    }
+}
+
+/// Runs a stateful function tool's calls with typed arguments: `Args`
+/// decodes from the call's JSON input, and `failed` turns every error,
+/// including arguments that don't decode, into what the model reads.
+/// [`FunctionTool::typed`] offers `Args`'s JSON Schema as the parameters.
+pub trait TypedHandler<Args, Error>: Send + Sync + 'static {
+    fn call(
+        &self,
+        args: Args,
+        context: ToolContext<'_>,
+    ) -> impl Future<Output = Result<Value, Error>> + MaybeSend;
+
+    /// What the model reads for a call that failed with `error`.
+    fn failed(&self, error: Error) -> Failure;
+}
+
+/// What the model reads for a call a [`TypedHandler`] failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Failure {
+    /// The tool's error, as this text.
+    Error(String),
+    /// A result, such as a structured error the model acts on.
+    Result(Value),
+}
+
+impl From<Failure> for Result<Value, String> {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Error(text) => Err(text),
+            Failure::Result(value) => Ok(value),
+        }
+    }
+}
+
+/// `Send` on native targets, where tool futures move between threads, and
+/// nothing on WASM.
+#[cfg(not(target_family = "wasm"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Send> MaybeSend for T {}
+#[cfg(target_family = "wasm")]
+pub trait MaybeSend {}
+#[cfg(target_family = "wasm")]
+impl<T> MaybeSend for T {}
+
+struct Typed<H, Args, Error>(H, PhantomData<fn() -> (Args, Error)>);
+
+impl<H, Args, Error> FunctionHandler for Typed<H, Args, Error>
+where
+    H: TypedHandler<Args, Error>,
+    Args: DeserializeOwned + 'static,
+    Error: From<serde_json::Error> + 'static,
+{
+    fn call<'a>(
+        &'a self,
+        _name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<Value, String>> {
+        let call = match serde_json::from_value(input) {
+            Ok(args) => Ok(self.0.call(args, context)),
+            Err(error) => Err(self.0.failed(error.into())),
+        };
+        Box::pin(async move {
+            match call {
+                Ok(call) => call.await.or_else(|error| self.0.failed(error).into()),
+                Err(failure) => failure.into(),
+            }
+        })
+    }
+
+    fn invalid_input(&self, _name: &str, error: &str) -> Option<Result<Value, String>> {
+        Some(self.0.failed(serde_json::Error::custom(error).into()).into())
     }
 }
 
@@ -45,6 +122,38 @@ impl FunctionTool {
             parallel: false,
             content_results: false,
         }
+    }
+
+    /// A tool whose calls `handler` runs with typed arguments, offered with
+    /// the JSON Schema of `Args` as its parameters.
+    #[must_use]
+    pub fn typed<Args, Error>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        handler: impl TypedHandler<Args, Error>,
+    ) -> Self
+    where
+        Args: DeserializeOwned + JsonSchema + 'static,
+        Error: From<serde_json::Error> + 'static,
+    {
+        Self::typed_with_parameters(name, description, schema_for::<Args>(), handler)
+    }
+
+    /// [`Self::typed`] with `parameters` the host builds itself, such as a
+    /// schema whose enums are only known at runtime.
+    #[must_use]
+    pub fn typed_with_parameters<Args, Error>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: Value,
+        handler: impl TypedHandler<Args, Error>,
+    ) -> Self
+    where
+        Args: DeserializeOwned + 'static,
+        Error: From<serde_json::Error> + 'static,
+    {
+        let handler = Arc::new(Typed(handler, PhantomData));
+        Self::new(name, description, parameters, handler)
     }
 
     #[must_use]

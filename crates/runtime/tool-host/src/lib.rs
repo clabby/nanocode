@@ -11,7 +11,7 @@ pub mod contract {
 
 pub mod embedded;
 mod function_tool;
-pub use function_tool::{FunctionHandler, FunctionTool};
+pub use function_tool::{Failure, FunctionHandler, FunctionTool, MaybeSend, TypedHandler};
 mod policy;
 mod selection;
 pub use nanocode_code_mode::CodeModeToolObservation;
