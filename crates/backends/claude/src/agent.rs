@@ -1972,6 +1972,42 @@ fn host_reply(output: crate::tools::ToolOutput) -> std::result::Result<ClaudeToo
     })
 }
 
+#[must_use]
+pub fn web_search_tool(
+    client: ClaudeClient,
+    max_tokens: Option<u32>,
+) -> nanocode_tool_host::FunctionTool {
+    struct NestedSearch {
+        client: ClaudeClient,
+        max_tokens: Option<u32>,
+    }
+    impl nanocode_tool_host::FunctionHandler for NestedSearch {
+        fn call<'a>(
+            &'a self,
+            _name: &'a str,
+            input: Value,
+            context: nanocode_tool_host::ToolContext<'a>,
+        ) -> nanocode_tool_host::embedded::HostFuture<'a, std::result::Result<Value, String>>
+        {
+            let model = context.model().to_owned();
+            Box::pin(async move {
+                nested_web_search(&self.client, &model, self.max_tokens, input)
+                    .await
+                    .map(Value::String)
+            })
+        }
+    }
+    let upstream =
+        crate::upstream::tool_definition("WebSearch").expect("upstream WebSearch definition");
+    nanocode_tool_host::FunctionTool::new(
+        upstream.name.clone(),
+        upstream.description.clone(),
+        upstream.input_schema.clone(),
+        Arc::new(NestedSearch { client, max_tokens }),
+    )
+    .parallel_tool_calls(true)
+}
+
 async fn nested_web_search(
     client: &ClaudeClient,
     model: &str,

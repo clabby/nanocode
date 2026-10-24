@@ -33,6 +33,11 @@ pub use runtime_config::{ImageGenerationConfig, WebSearchConfig};
 pub mod image_generation;
 #[cfg(not(target_family = "wasm"))]
 pub mod web_search;
+#[cfg(target_family = "wasm")]
+#[path = "web_search/host.rs"]
+mod web_search_host;
+#[cfg(target_family = "wasm")]
+pub use web_search_host::web_search_tool;
 
 pub use nanocode_tools::tool;
 
