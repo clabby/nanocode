@@ -1,6 +1,7 @@
 use super::*;
 use crate::client::responses::FunctionOutputContent;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use nanocode_code_mode::code_mode::NestedToolCall;
 use nanocode_code_mode::contract::ToolOutputContent;
 use nanocode_sync::Slot;
 
@@ -275,6 +276,7 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                     progress
                 });
 
+                let logged = logged_nested_result(call);
                 self.events.emit(
                     AgentEventKind::ToolResult,
                     ToolResultEvent {
@@ -283,10 +285,19 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
                         status: status(call.success),
                         duration_ns: call.duration_ns,
                         started_after_ns: Some(call.started_after_ns),
-                        result: &call.output,
-                        structured_result: &call.structured_result,
-                        metadata: call.metadata.as_deref(),
+                        result: logged
+                            .as_ref()
+                            .map_or(&call.output, |logged| &logged.result),
+                        structured_result: logged
+                            .as_ref()
+                            .map_or(&call.structured_result, |logged| &logged.structured_result),
+                        metadata: match &logged {
+                            Some(logged) if !logged.metadata => None,
+                            _ => call.metadata.as_deref(),
+                        },
                         cell: None,
+                        truncated: logged.is_some(),
+                        original_bytes: logged.as_ref().map(|logged| logged.original_bytes),
                     },
                 )
             }
@@ -302,6 +313,104 @@ impl CodeModeObserver for NestedToolEventObserver<'_> {
             self.error = Some(error.into());
         }
     }
+}
+
+const LOGGED_RESULT_BYTES: usize = 32 * 1024;
+const LOGGED_PREVIEW_BYTES: usize = 16 * 1024;
+const LOGGED_METADATA_BYTES: usize = 4096;
+
+struct LoggedResult {
+    result: ToolOutputBody,
+    structured_result: Value,
+    metadata: bool,
+    original_bytes: usize,
+}
+
+fn encoded_len(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::String(text) => text.len(),
+        value => serde_json::to_string(value).map_or(0, |text| text.len()),
+    }
+}
+
+fn utf8_prefix(text: &str, bytes: usize) -> &str {
+    &text[..text.floor_char_boundary(bytes)]
+}
+
+fn logged_nested_result(call: &NestedToolCall) -> Option<LoggedResult> {
+    let structured = &call.structured_result;
+    let (output_bytes, duplicate) = match &call.output {
+        ToolOutputBody::Text(text) => (
+            text.len(),
+            structured.as_str() == Some(text.as_str())
+                || (text.len() == encoded_len(structured)
+                    && serde_json::from_str::<Value>(text).ok().as_ref() == Some(structured)),
+        ),
+        ToolOutputBody::Content(content) => {
+            let bytes = serde_json::to_string(content).map_or(0, |text| text.len());
+            (bytes, bytes == encoded_len(structured))
+        }
+    };
+    let metadata_bytes = call.metadata.as_deref().map_or(0, |raw| raw.get().len());
+    let original_bytes = output_bytes
+        + if duplicate {
+            0
+        } else {
+            encoded_len(structured)
+        }
+        + metadata_bytes;
+    if original_bytes <= LOGGED_RESULT_BYTES {
+        return None;
+    }
+    let result = match &call.output {
+        ToolOutputBody::Text(text) => {
+            ToolOutputBody::Text(utf8_prefix(text, LOGGED_PREVIEW_BYTES).to_owned())
+        }
+        ToolOutputBody::Content(content) => {
+            let mut budget = LOGGED_PREVIEW_BYTES;
+            ToolOutputBody::Content(
+                content
+                    .iter()
+                    .map(|item| match item {
+                        ToolOutputContent::InputText { text } => {
+                            let kept = utf8_prefix(text, budget);
+                            budget -= kept.len();
+                            ToolOutputContent::InputText {
+                                text: kept.to_owned(),
+                            }
+                        }
+                        item => item.clone(),
+                    })
+                    .collect(),
+            )
+        }
+    };
+    let structured_result = match structured {
+        Value::Object(object) => {
+            let reference = ["image_url", "file_id"]
+                .into_iter()
+                .filter_map(|key| {
+                    object
+                        .get(key)
+                        .filter(|field| field.is_string())
+                        .map(|field| (key.to_owned(), field.clone()))
+                })
+                .collect::<serde_json::Map<_, _>>();
+            if reference.is_empty() {
+                Value::Null
+            } else {
+                Value::Object(reference)
+            }
+        }
+        _ => Value::Null,
+    };
+    Some(LoggedResult {
+        result,
+        structured_result,
+        metadata: metadata_bytes <= LOGGED_METADATA_BYTES,
+        original_bytes,
+    })
 }
 
 pub(super) struct DetachedNestedToolEvents {
@@ -698,6 +807,8 @@ impl ModelRun {
                 structured_result: &completed.structured_result,
                 metadata: completed.metadata.as_deref(),
                 cell: completed.cell.as_ref(),
+                truncated: false,
+                original_bytes: None,
             },
         )?;
         Ok(())
@@ -735,6 +846,8 @@ impl ModelRun {
                 structured_result: &structured_result,
                 metadata: None,
                 cell: None,
+                truncated: false,
+                original_bytes: None,
             },
         )?;
         Ok(output)

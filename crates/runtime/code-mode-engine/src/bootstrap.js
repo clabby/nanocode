@@ -91,6 +91,11 @@
       nativeContent(jsonStringify({ type: "input_text", text: stringify(value) }));
     }
 
+    function log(...values) {
+      text(values.map((value) => typeof value === "string" ? value : value instanceof Error ? errorText(value) : stringify(value)).join(" "));
+    }
+    const console = Object.freeze({ log, info: log, warn: log, error: log, debug: log });
+
     function notify(value) {
       const notification = stringify(value);
       if (!notification.trim()) throw "notify expects non-empty text";
@@ -176,6 +181,7 @@
         "exit",
         "setTimeout",
         "clearTimeout",
+        "console",
         ...preludeNames,
         "return (async () => {" + source + "\n})();",
       );
@@ -195,6 +201,7 @@
           exit,
           nativeSetTimeout,
           nativeClearTimeout,
+          console,
           ...preludeNames.map((name) => prelude[name]),
         );
       } catch (error) {
