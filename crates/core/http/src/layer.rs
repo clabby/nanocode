@@ -4,6 +4,7 @@ use futures_util::Stream;
 use http::{HeaderMap, Method, StatusCode};
 
 pub mod origin;
+pub mod retry;
 
 #[cfg(not(target_family = "wasm"))]
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

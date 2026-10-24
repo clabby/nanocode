@@ -304,6 +304,7 @@ impl NoticeOutcome {
             (NanocodeError::AgentStopped | NanocodeError::TurnStopped, _)
             | (_, Some(ExecutionPolicyDisposition::Reopen)) => Self::Stopped,
             (_, Some(ExecutionPolicyDisposition::Retry)) => Self::Pending,
+            (NanocodeError::Response(failure), _) if failure.retryable() => Self::Pending,
             _ => Self::Unread,
         }
     }

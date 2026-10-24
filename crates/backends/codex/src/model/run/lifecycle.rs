@@ -481,13 +481,13 @@ impl ModelRun {
                     Ok(success) => success,
                     Err(error) => {
                         let error = NanocodeError::from(error);
-
-                        if error.responses_error().is_none() {
+                        let Some(source) = error.responses_error() else {
+                            return Err(error);
+                        };
+                        if source.retry_advice().is_some() {
                             return Err(error);
                         }
-                        let requires_session_stop = error
-                            .responses_error()
-                            .is_some_and(|source| source.is_misalignment_policy_violation());
+                        let requires_session_stop = source.is_misalignment_policy_violation();
                         let recovery = if error.requires_image_repair() {
                             crate::error::CompactionRecovery::ReplaceRejectedImages
                         } else {

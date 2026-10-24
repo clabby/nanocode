@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, header};
-use nanocode_http::layer;
+use nanocode_http::layer::{self, retry};
 
 #[cfg(target_family = "wasm")]
 pub(crate) mod socket;
@@ -47,13 +47,12 @@ pub async fn send_http(
             headers: request.http_headers()?,
             body: body.as_bytes().to_vec(),
         })
-        .await
-        .map_err(|error| HostError::new(error.detail()).with_reconnectable(error.is_retryable()))?;
+        .await?;
     let (status, headers, mut stream, _) = response.into_parts();
     if !status.is_success() {
         let mut rejected = Vec::new();
         while let Some(chunk) = stream.next().await {
-            rejected.extend(chunk.map_err(|error| HostError::new(error.detail()))?);
+            rejected.extend(chunk?);
         }
         return Err(HostError::rejected(
             status.as_u16(),
@@ -71,13 +70,7 @@ struct LayerBody(layer::Body);
 
 impl HostHttpBody for LayerBody {
     fn next(&mut self) -> HostFuture<'_, Result<Option<Vec<u8>>, HostError>> {
-        Box::pin(async move {
-            self.0
-                .next()
-                .await
-                .transpose()
-                .map_err(|error| HostError::new(error.detail()))
-        })
+        Box::pin(async move { Ok(self.0.next().await.transpose()?) })
     }
 }
 
@@ -396,6 +389,8 @@ pub enum HostError {
         body: String,
 
         retry_after: Option<super::RetryAfter>,
+
+        should_retry: Option<bool>,
     },
 }
 
@@ -418,19 +413,18 @@ impl HostError {
             status,
             body: body.into(),
             retry_after,
+            should_retry: None,
         }
     }
 
     #[must_use]
     pub fn rejected(status: u16, headers: &HeaderMap, body: impl Into<String>) -> Self {
-        Self::handshake_rejected(
+        Self::HandshakeRejected {
             status,
-            body,
-            headers
-                .get(header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(super::RetryAfter::from_header),
-        )
+            body: body.into(),
+            retry_after: super::RetryAfter::from_headers(headers),
+            should_retry: retry::should_retry(headers),
+        }
     }
 
     #[must_use]
@@ -461,6 +455,12 @@ impl HostError {
                 ..
             }
         )
+    }
+}
+
+impl From<layer::Error> for HostError {
+    fn from(error: layer::Error) -> Self {
+        Self::new(error.detail()).with_reconnectable(error.is_retryable() || error.is_timeout())
     }
 }
 

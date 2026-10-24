@@ -1,3 +1,5 @@
+use http::{HeaderMap, header};
+use nanocode_http::layer::retry;
 #[cfg(target_family = "wasm")]
 use nanocode_platform::Instant;
 use nanocode_platform::{SystemTime, UNIX_EPOCH};
@@ -34,6 +36,13 @@ impl RetryAfter {
     #[must_use]
     pub fn from_header(value: &str) -> Option<Self> {
         Self::from_header_received(value, RetryReceipt::now())
+    }
+
+    #[must_use]
+    pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        retry::retry_after_ms(headers)
+            .and_then(Self::from_delay)
+            .or_else(|| Self::from_header(headers.get(header::RETRY_AFTER)?.to_str().ok()?))
     }
 
     #[must_use]
