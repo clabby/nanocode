@@ -6,7 +6,7 @@ use crate::client::{
 };
 use http::header;
 #[cfg(not(target_family = "wasm"))]
-use nanocode_http::layer;
+use nanocode_http::layer::{self, retry};
 
 #[cfg(not(target_family = "wasm"))]
 use crate::client::RetryAfter;
@@ -197,7 +197,8 @@ impl ResponsesHttp {
             .map_err(map_http_error)?;
         let status = response.status();
         if !status.is_success() {
-            let retry_after = retry_after(response.headers());
+            let retry_after = RetryAfter::from_headers(response.headers());
+            let should_retry = retry::should_retry(response.headers());
 
             tracing::debug!(
                 target: "nanocode::responses::http",
@@ -210,6 +211,7 @@ impl ResponsesHttp {
                 status.as_u16(),
                 body,
                 retry_after,
+                should_retry,
             ));
         }
         let metadata = HttpMetadata {
@@ -254,12 +256,12 @@ impl ResponsesHttp {
             .map_err(map_layer_error)?;
         let (status, headers, body, events) = response.into_parts();
         if !status.is_success() {
-            let retry_after = retry_after(&headers);
             let body = collect_layered(body).await.unwrap_or_default();
             return Err(ResponsesError::http_rejected(
                 status.as_u16(),
                 body,
-                retry_after,
+                RetryAfter::from_headers(&headers),
+                retry::should_retry(&headers),
             ));
         }
         let metadata = HttpMetadata {
@@ -555,14 +557,6 @@ impl SseDecoder {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<RetryAfter> {
-    headers
-        .get(header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(RetryAfter::from_header)
-}
-
-#[cfg(not(target_family = "wasm"))]
 fn encode_error(error: &dyn std::error::Error) -> ResponsesError {
     ResponsesError::HttpRequest {
         retryable: false,
@@ -682,7 +676,8 @@ pub(crate) fn map_host_error(error: HostError) -> ResponsesError {
             status,
             body,
             retry_after,
-        } => ResponsesError::http_rejected(status, body, retry_after),
+            should_retry,
+        } => ResponsesError::http_rejected(status, body, retry_after, should_retry),
         HostError::Transport {
             detail,
             reconnectable,

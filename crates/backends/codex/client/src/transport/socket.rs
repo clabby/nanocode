@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
+use nanocode_http::layer::retry;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -453,17 +454,11 @@ fn map_handshake_error(error: WebSocketError) -> ResponsesError {
             detail: error.to_string(),
         };
     };
-    let status = response.status().as_u16();
-    let retry_after = response
-        .headers()
-        .get(header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(crate::client::RetryAfter::from_header);
-    let body = handshake_rejection_detail(response.body().as_deref(), response.headers());
     ResponsesError::HandshakeRejected {
-        status,
-        body,
-        retry_after,
+        status: response.status().as_u16(),
+        body: handshake_rejection_detail(response.body().as_deref(), response.headers()),
+        retry_after: crate::client::RetryAfter::from_headers(response.headers()),
+        should_retry: retry::should_retry(response.headers()),
     }
 }
 

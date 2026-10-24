@@ -50,10 +50,12 @@ impl ResponsesSocket {
                     status,
                     body,
                     retry_after,
+                    should_retry,
                 } => ResponsesError::HandshakeRejected {
                     status,
                     body,
                     retry_after,
+                    should_retry,
                 },
                 error => ResponsesError::Handshake {
                     reconnectable: error.is_reconnectable(),
