@@ -16,7 +16,7 @@ mod history;
 mod metadata;
 mod pam;
 
-pub use history::{DEFAULT_INLINE_IMAGES, ImageHistory};
+pub use history::{DEFAULT_INLINE_IMAGES, ImageHistory, SharedBlobStore};
 
 pub use nanocode_types_core::ImageDetail;
 use nanocode_types_core::{PromptInput, UserInput, responses::ContentItem};

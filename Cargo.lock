@@ -2164,6 +2164,7 @@ dependencies = [
  "image",
  "image-webp",
  "memchr",
+ "nanocode-durability-core",
  "nanocode-types-core",
  "png",
  "sha1",

@@ -440,7 +440,11 @@ impl ModelRun {
             }
         };
         let Some(compacted) = compacted else {
-            let user_content = prepare_user_input(&task.instruction).await;
+            let user_content = self
+                .images
+                .prepare_user_input(&task.instruction)
+                .await
+                .map_err(image_store_error)?;
             session
                 .conversation
                 .append(prompt_messages(task, user_content));
@@ -497,7 +501,11 @@ impl ModelRun {
                     .append([host_context(host_instructions)]);
             }
         }
-        let user_content = prepare_user_input(&task.instruction).await;
+        let user_content = self
+            .images
+            .prepare_user_input(&task.instruction)
+            .await
+            .map_err(image_store_error)?;
         session
             .conversation
             .append(prompt_messages(task, user_content));
@@ -547,7 +555,11 @@ impl ModelRun {
             tool_control.begin_turn();
             self.active_tools = Some(tool_control);
             let factory = self.attempt_factory(&tools)?.for_logical_turn(logical_turn);
-            let user_content = prepare_user_input(&task.instruction).await;
+            let user_content = self
+                .images
+                .prepare_user_input(&task.instruction)
+                .await
+                .map_err(image_store_error)?;
             let mut context = ContextState::new(selected_agents_md, ContextBaseline::Missing);
             context.observe_host_instructions(&self.config.host_instructions());
             let context_snapshot = context.capture(
@@ -1090,7 +1102,11 @@ impl ModelRun {
                 self.instruction_revision = Some(revision);
             }
             let instruction_bytes = steer.prompt.text_bytes();
-            let user_content = prepare_user_input(&steer.prompt.instruction).await;
+            let user_content = self
+                .images
+                .prepare_user_input(&steer.prompt.instruction)
+                .await
+                .map_err(image_store_error)?;
             conversation.append(prompt_messages(&steer.prompt, user_content));
             self.stats.steers += 1;
             self.events.emit(

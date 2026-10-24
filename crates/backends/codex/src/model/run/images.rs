@@ -1,5 +1,11 @@
+use std::collections::HashMap;
+
 use super::*;
 use crate::client::responses::FunctionOutputContent;
+
+pub(super) fn image_store_error(error: nanocode_durability::StoreError) -> NanocodeError {
+    nanocode_durability::agent_error(error.into())
+}
 
 enum Image<'a> {
     Url(&'a str),
@@ -35,19 +41,28 @@ fn images(item: &ResponseItem) -> Vec<Image<'_>> {
     }
 }
 
-fn omit(item: &mut ResponseItem, mut placeholder: impl FnMut(Image<'_>) -> Option<String>) {
+enum Rewrite {
+    Omit(String),
+    Inline(Box<str>),
+}
+
+fn rewrite(item: &mut ResponseItem, mut replace: impl FnMut(Image<'_>) -> Option<Rewrite>) {
     match item {
         ResponseItem::Message { content, .. } => {
             for part in content {
                 let replacement = match part {
-                    ContentItem::InputImage { image_url, .. } => placeholder(Image::Url(image_url)),
-                    ContentItem::InputImageFile { file_id, .. } => {
-                        placeholder(Image::File(file_id))
-                    }
+                    ContentItem::InputImage { image_url, .. } => replace(Image::Url(image_url)),
+                    ContentItem::InputImageFile { file_id, .. } => replace(Image::File(file_id)),
                     _ => continue,
                 };
-                if let Some(text) = replacement {
-                    *part = ContentItem::InputText { text: text.into() };
+                match (replacement, part) {
+                    (Some(Rewrite::Omit(text)), part) => {
+                        *part = ContentItem::InputText { text: text.into() };
+                    }
+                    (Some(Rewrite::Inline(url)), ContentItem::InputImage { image_url, .. }) => {
+                        *image_url = url;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -62,15 +77,22 @@ fn omit(item: &mut ResponseItem, mut placeholder: impl FnMut(Image<'_>) -> Optio
             for part in content {
                 let replacement = match part {
                     FunctionOutputContent::InputImage { image_url, .. } => {
-                        placeholder(Image::Url(image_url))
+                        replace(Image::Url(image_url))
                     }
                     FunctionOutputContent::InputImageFile { file_id, .. } => {
-                        placeholder(Image::File(file_id))
+                        replace(Image::File(file_id))
                     }
                     _ => continue,
                 };
-                if let Some(text) = replacement {
-                    *part = FunctionOutputContent::InputText { text: text.into() };
+                match (replacement, part) {
+                    (Some(Rewrite::Omit(text)), part) => {
+                        *part = FunctionOutputContent::InputText { text: text.into() };
+                    }
+                    (
+                        Some(Rewrite::Inline(url)),
+                        FunctionOutputContent::InputImage { image_url, .. },
+                    ) => *image_url = url,
+                    _ => {}
                 }
             }
         }
@@ -102,13 +124,13 @@ pub(super) fn evict_images(limit: &ImageHistory, history: &RequestHistory) -> Re
         .iter_from(start)
         .cloned()
         .map(|mut item| {
-            omit(&mut item, |image| {
+            rewrite(&mut item, |image| {
                 ordinal += 1;
                 (ordinal <= evicted).then(|| {
-                    limit.omitted(match image {
+                    Rewrite::Omit(limit.omitted(match image {
                         Image::Url(url) => url,
                         Image::File(file_id) => file_id,
-                    })
+                    }))
                 })
             });
             item
@@ -117,4 +139,43 @@ pub(super) fn evict_images(limit: &ImageHistory, history: &RequestHistory) -> Re
     let mut sent = history.clone();
     sent.replace_from(start, replacement, limit.evicted(sent_before) == evicted);
     sent
+}
+
+pub(super) async fn inline_images(
+    limit: &ImageHistory,
+    history: RequestHistory,
+) -> Result<RequestHistory> {
+    let full = history.full();
+    let mut start = None;
+    let mut loaded = HashMap::new();
+    for (index, item) in full.iter().enumerate() {
+        for image in images(item) {
+            let Image::Url(url) = image else { continue };
+            if loaded.contains_key(url) {
+                continue;
+            }
+            let Some(data) = limit.inline(url).await.map_err(image_store_error)? else {
+                continue;
+            };
+            start.get_or_insert(index);
+            loaded.insert(url.to_owned(), data.into_boxed_str());
+        }
+    }
+    let Some(start) = start else {
+        return Ok(history);
+    };
+    let replacement = full
+        .iter_from(start)
+        .cloned()
+        .map(|mut item| {
+            rewrite(&mut item, |image| match image {
+                Image::Url(url) => loaded.get(url).cloned().map(Rewrite::Inline),
+                Image::File(_) => None,
+            });
+            item
+        })
+        .collect();
+    let mut sent = history.clone();
+    sent.replace_from(start, replacement, true);
+    Ok(sent)
 }

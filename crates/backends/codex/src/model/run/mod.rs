@@ -69,7 +69,7 @@ use nanocode_tool_host::{
     ToolContext, Tools,
     code_mode::{CodeModeExecution, CodeModeObserver, CodeModeUpdate},
     contract::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolInput, ToolOutput, ToolOutputBody},
-    image::{ImageHistory, prepare_output_images, prepare_user_input},
+    image::{ImageHistory, prepare_output_images},
     runtime::{OwnedToolContext, ToolRuntime, ToolRuntimeControl},
 };
 
