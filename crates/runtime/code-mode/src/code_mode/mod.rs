@@ -60,6 +60,7 @@ const CELL_RUNNING: u8 = 0;
 const CELL_TERMINATING: u8 = 1;
 const CELL_COMPLETION_CLAIMED: u8 = 2;
 const CELL_CLOSED: u8 = 3;
+const LOGGED_NESTED_CALLS_PER_TOOL: u64 = 100;
 
 pub struct CodeModeRuntime {
     admission: Sequencer,
@@ -203,9 +204,14 @@ enum CellUpdate {
         name: String,
         input: Arc<Value>,
         delivered: bool,
+        logged: bool,
     },
     NestedCall(ObservedNestedCall),
     Notification {
+        notification: CodeModeNotification,
+        delivered: bool,
+    },
+    Unlogged {
         notification: CodeModeNotification,
         delivered: bool,
     },
@@ -238,6 +244,7 @@ struct ObservedNestedCall {
     call: NestedToolCall,
     process_trace: Option<ToolProcessTraceWire>,
     delivered: bool,
+    logged: bool,
     receipts: Vec<Arc<dyn ToolReceipt>>,
 }
 
@@ -247,6 +254,44 @@ struct PendingCall {
     input: Arc<Value>,
     started: Instant,
     started_after_ns: u64,
+    logged: bool,
+}
+
+struct UnloggedCalls {
+    parent_call_id: String,
+    counts: HashMap<String, u64>,
+    updates: mpsc::UnboundedSender<CellUpdate>,
+}
+
+impl UnloggedCalls {
+    fn admit(&mut self, name: &str) -> bool {
+        let count = self.counts.entry(name.to_owned()).or_default();
+        *count += 1;
+        *count <= LOGGED_NESTED_CALLS_PER_TOOL
+    }
+}
+
+impl Drop for UnloggedCalls {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .drain()
+            .filter(|(_, count)| *count > LOGGED_NESTED_CALLS_PER_TOOL)
+            .collect::<Vec<_>>();
+        counts.sort();
+        for (name, count) in counts {
+            let _ = self.updates.send(CellUpdate::Unlogged {
+                notification: CodeModeNotification::new(
+                    &self.parent_call_id,
+                    format!(
+                        "{} more {name} calls in this cell ran without being logged one by one",
+                        count - LOGGED_NESTED_CALLS_PER_TOOL
+                    ),
+                ),
+                delivered: false,
+            });
+        }
+    }
 }
 
 struct PendingCallReceipts {
@@ -279,6 +324,7 @@ impl Drop for PendingCallReceipts {
                     call,
                     process_trace: None,
                     delivered: false,
+                    logged: pending.logged,
                     receipts: Vec::new(),
                 }));
         }
@@ -1115,19 +1161,28 @@ async fn relay_cell_updates(
                 name,
                 input,
                 delivered,
+                logged,
             } => {
-                sink.update(CodeModeUpdate::NestedCallStarted {
-                    call_id,
-                    name,
-                    input,
-                });
+                if *logged {
+                    sink.update(CodeModeUpdate::NestedCallStarted {
+                        call_id,
+                        name,
+                        input,
+                    });
+                }
                 *delivered = true;
             }
             CellUpdate::NestedCall(call) => {
-                sink.update(CodeModeUpdate::NestedCallCompleted(&call.call));
+                if call.logged {
+                    sink.update(CodeModeUpdate::NestedCallCompleted(&call.call));
+                }
                 call.delivered = true;
             }
             CellUpdate::Notification {
+                notification,
+                delivered,
+            }
+            | CellUpdate::Unlogged {
                 notification,
                 delivered,
             } => {
@@ -1260,8 +1315,9 @@ async fn observe_updates(
                 name,
                 input,
                 delivered,
+                logged,
             }) => {
-                if !delivered {
+                if logged && !delivered {
                     observer.update(CodeModeUpdate::NestedCallStarted {
                         call_id: &call_id,
                         name: &name,
@@ -1270,11 +1326,21 @@ async fn observe_updates(
                 }
             }
             Some(CellUpdate::NestedCall(mut call)) => {
-                if !call.delivered {
+                if call.logged && !call.delivered {
                     observer.update(CodeModeUpdate::NestedCallCompleted(&call.call));
                 }
                 observation.receipts.append(&mut call.receipts);
-                observation.buffered.nested_calls.push(call);
+                if call.logged {
+                    observation.buffered.nested_calls.push(call);
+                }
+            }
+            Some(CellUpdate::Unlogged {
+                notification,
+                delivered,
+            }) => {
+                if !delivered {
+                    observer.update(CodeModeUpdate::Notification(&notification));
+                }
             }
             Some(CellUpdate::Notification {
                 notification,
@@ -1463,6 +1529,11 @@ impl EmbeddedHost {
         actor_started_at: Instant,
     ) -> Result<CellTerminal, HostFailure> {
         let mut pending_calls: FuturesUnordered<CallFuture<'_>> = FuturesUnordered::new();
+        let mut unlogged = UnloggedCalls {
+            parent_call_id: parent_call_id.to_owned(),
+            counts: HashMap::new(),
+            updates: updates.clone(),
+        };
         let mut pending_receipts = PendingCallReceipts {
             calls: HashMap::new(),
             updates: updates.clone(),
@@ -1501,18 +1572,21 @@ impl EmbeddedHost {
                             let nested_call_id = format!("{}/code-{id}", context.call_id);
                             let started = Instant::now();
                             let input = Arc::new(input);
+                            let logged = unlogged.admit(&name);
                             pending_receipts.calls.insert(id, PendingCall {
                                 call_id: nested_call_id.clone(),
                                 name: name.clone(),
                                 input: Arc::clone(&input),
                                 started,
                                 started_after_ns: u64::try_from(started.duration_since(actor_started_at).as_nanos()).unwrap_or(u64::MAX),
+                                logged,
                             });
                             let _ = updates.send(CellUpdate::NestedCallStarted {
                                 call_id: nested_call_id,
                                 name: name.clone(),
                                 input: Arc::clone(&input),
                                 delivered: false,
+                                logged,
                             });
                             let nested_call = execute_nested_call(
                                 tools,
@@ -1576,7 +1650,10 @@ impl EmbeddedHost {
         } = completed;
         let success = call.success;
 
-        pending_receipts.calls.remove(&id);
+        let logged = pending_receipts
+            .calls
+            .remove(&id)
+            .is_none_or(|pending| pending.logged);
         call.input = Arc::unwrap_or_clone(input);
         let encoded = serde_json::to_string(&call.structured_result).map_err(|error| {
             HostFailure::new(format!("failed to encode Code Mode tool result: {error}"))
@@ -1588,6 +1665,7 @@ impl EmbeddedHost {
                 call,
                 process_trace,
                 delivered: false,
+                logged,
                 receipts,
             }));
         self.worker
