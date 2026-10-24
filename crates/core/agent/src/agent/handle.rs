@@ -61,14 +61,19 @@ impl Interrupted {
 }
 
 #[derive(Default)]
-pub(super) struct Requests(ArcSwap<std::collections::HashMap<String, Arc<Signal>>>);
+pub(super) struct Requests(ArcSwap<std::collections::HashMap<String, Arc<Admitted>>>);
 
 pub(super) use nanocode_sync::Signal;
+
+struct Admitted {
+    key: BackendTurnKey,
+    settled: Signal,
+}
 
 struct RequestClaim {
     requests: Arc<Requests>,
     id: String,
-    signal: Arc<Signal>,
+    admitted: Arc<Admitted>,
 }
 
 impl Drop for RequestClaim {
@@ -77,13 +82,13 @@ impl Drop for RequestClaim {
             let mut requests = std::collections::HashMap::clone(requests);
             if requests
                 .get(&self.id)
-                .is_some_and(|current| Arc::ptr_eq(current, &self.signal))
+                .is_some_and(|current| Arc::ptr_eq(current, &self.admitted))
             {
                 requests.remove(&self.id);
             }
             requests
         });
-        self.signal.fire();
+        self.admitted.settled.fire();
     }
 }
 
@@ -667,7 +672,7 @@ impl Agent {
     async fn resume_turn(&self, id: String, input: serde_json::Value) -> Result<()> {
         let prompt = self.backend.decode_durable_prompt(input)?;
         let claim = self.claim_request(&id).await;
-        let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
+        let key = claim.admitted.key;
         let (events, _turn_events) = self.events.mirrored_channel();
         let events = events.with_turn_id(id.clone());
         let turn = self
@@ -684,27 +689,58 @@ impl Agent {
         Ok(())
     }
 
+    fn next_key(&self) -> BackendTurnKey {
+        BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed))
+    }
+
     async fn claim_request(&self, id: &str) -> RequestClaim {
         loop {
-            let signal = Arc::new(Signal::new());
+            let admitted = Arc::new(Admitted {
+                key: self.next_key(),
+                settled: Signal::new(),
+            });
             let previous = self.requests.0.rcu(|requests| {
                 let mut requests = std::collections::HashMap::clone(requests);
                 requests
                     .entry(id.to_owned())
-                    .or_insert_with(|| Arc::clone(&signal));
+                    .or_insert_with(|| Arc::clone(&admitted));
                 requests
             });
             match previous.get(id) {
-                Some(running) => running.wait().await,
+                Some(running) => running.settled.wait().await,
                 None => {
                     return RequestClaim {
                         requests: Arc::clone(&self.requests),
                         id: id.to_owned(),
-                        signal,
+                        admitted,
                     };
                 }
             }
         }
+    }
+
+    #[must_use]
+    pub fn turn_controls(&self) -> Vec<(String, TurnControl)> {
+        let mut turns: Vec<_> = self
+            .requests
+            .0
+            .load()
+            .iter()
+            .map(|(id, admitted)| (id.clone(), admitted.key))
+            .collect();
+        turns.sort_by_key(|(_, key)| key.0);
+        turns
+            .into_iter()
+            .map(|(id, key)| {
+                (
+                    id,
+                    TurnControl {
+                        key,
+                        backend: Arc::clone(&self.backend),
+                    },
+                )
+            })
+            .collect()
     }
 
     #[must_use]
@@ -779,7 +815,9 @@ impl Agent {
             Some(id) => Some(self.claim_request(id).await),
             None => None,
         };
-        let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
+        let key = request
+            .as_ref()
+            .map_or_else(|| self.next_key(), |claim| claim.admitted.key);
         let (events, event_stream) = self.events.mirrored_channel();
         let turn_id = nanocode_platform::uuid_v7().to_string();
         let events = events.with_turn_id(turn_id.clone());
@@ -854,7 +892,9 @@ impl Agent {
             Some(id) => Some(self.claim_request(id).await),
             None => None,
         };
-        let key = BackendTurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
+        let key = request
+            .as_ref()
+            .map_or_else(|| self.next_key(), |claim| claim.admitted.key);
         let (events, event_stream) = self.events.mirrored_channel();
         let turn_id = nanocode_platform::uuid_v7().to_string();
         let events = events.with_turn_id(turn_id.clone());
