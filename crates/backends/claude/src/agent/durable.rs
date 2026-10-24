@@ -754,10 +754,15 @@ impl State {
             ContentBlock::tool_result_content(id, ToolResultContent::Text(
                 "Code Mode admission was lost during recovery; prior effects may have outcome unknown. No code was executed in this attempt. Reconcile those effects before using a fresh cell from a new model request.".into()
             ), true)
+        } else if let Some(handler) = handler
+            && matches!(name, "exec" | "wait")
+        {
+            self.call_tool(id, name, input, handler, events, (cursor, cancel))
+                .await?
         } else if let Some(handler) = handler {
             tokio::select! {
                 biased;
-                result = self.call_tool(id, name, input, handler, events, cursor) => result?,
+                result = self.call_tool(id, name, input, handler, events, (cursor, cancel)) => result?,
                 () = cancel.cancelled() => unknown(),
             }
         } else if self.code_only

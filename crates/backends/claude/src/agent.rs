@@ -215,6 +215,11 @@ pub enum ClaudeNestedToolUpdate {
         text: String,
     },
 }
+impl ClaudeNestedToolUpdate {
+    fn outcome_unknown(&self) -> bool {
+        matches!(self, Self::Completed(call) if call.pointer("/structured_result/outcome").and_then(Value::as_str) == Some("unknown"))
+    }
+}
 
 #[derive(Clone)]
 pub struct ClaudeToolProgress(tokio::sync::mpsc::UnboundedSender<ClaudeNestedToolUpdate>);
@@ -3040,6 +3045,8 @@ struct StartedToolCall<'a> {
 }
 impl StartedToolCall<'_> {
     const REASON: &'static str = "Tool execution interrupted; outcome unknown. Do not assume it did not run or automatically repeat it.";
+    const STOPPED: &'static str = "Tool execution stopped by the user. The cell was terminated and no nested tool call was left running.";
+    const STOPPED_UNKNOWN: &'static str = "Tool execution stopped by the user. The cell was terminated while a nested tool call was still running; that call's outcome is unknown. Do not assume it did not run or automatically repeat it.";
 }
 impl Drop for StartedToolCall<'_> {
     fn drop(&mut self) {
@@ -3320,6 +3327,9 @@ impl Cancellation {
     }
     fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::SeqCst) != Self::LIVE
+    }
+    fn stopped(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == Self::STOPPED
     }
     fn interruption(&self, automatic: bool) -> NanocodeError {
         if !automatic && self.state.load(Ordering::SeqCst) == Self::STOPPED {
@@ -5133,6 +5143,18 @@ impl State {
         self.emit_run_finished(events, &result, reasoning_mode, &effort, ns);
         result
     }
+    fn stop_code_cells(
+        &self,
+        progress: &tokio::sync::mpsc::UnboundedSender<ClaudeNestedToolUpdate>,
+    ) -> BackendFuture<()> {
+        let cleanups = self.code_turn_cleanup.clone();
+        let progress = progress.clone();
+        Box::pin(async move {
+            for cleanup in &cleanups {
+                cleanup(ClaudeToolProgress(progress.clone())).await;
+            }
+        })
+    }
     async fn settle_code_turn(&self, events: &AgentEventPublisher, model_call_index: u32) {
         for cleanup in &self.code_turn_cleanup {
             let (sender, mut updates) = tokio::sync::mpsc::unbounded_channel();
@@ -5620,8 +5642,9 @@ impl State {
         input: &Value,
         handler: &Handler,
         events: &AgentEventPublisher,
-        cursor: &Cursor,
+        control: (&Cursor, &Cancellation),
     ) -> Result<ContentBlock> {
+        let (cursor, cancel) = control;
         let index = cursor.index;
         self.emit(
             events,
@@ -5660,23 +5683,67 @@ impl State {
             completed: HashSet::new(),
             unknown: Vec::new(),
         };
+        let mut stopped = false;
+        let mut stopped_unknown = false;
         let outcome = if matches!(name, "exec" | "wait") {
             let (sender, mut updates) = tokio::sync::mpsc::unbounded_channel();
+            let stopper = sender.clone();
             let mut invocation = invocation;
             invocation.progress = Some(ClaudeToolProgress(sender));
-            let call = handler(input.clone(), invocation);
-            tokio::pin!(call);
+            let mut call = handler(input.clone(), invocation);
             let outcome = loop {
                 tokio::select! {
                     biased;
                     Some(update) = updates.recv() => live.publish(update),
-                    outcome = &mut call => break outcome,
+                    outcome = &mut call => break Some(outcome),
+                    () = cancel.cancelled() => {
+                        if cancel.stopped() {
+                            return Ok(ContentBlock::tool_result_content(
+                                id,
+                                ToolResultContent::Text(StartedToolCall::REASON.into()),
+                                true,
+                            ));
+                        }
+                        break None;
+                    }
                 }
             };
             while let Ok(update) = updates.try_recv() {
                 live.publish(update);
             }
-            outcome
+            match outcome {
+                Some(outcome) => outcome,
+                None => {
+                    drop(call);
+                    stopped = true;
+                    let stop = self.stop_code_cells(&stopper);
+                    drop(stopper);
+                    tokio::pin!(stop);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            Some(update) = updates.recv() => {
+                                stopped_unknown |= update.outcome_unknown();
+                                live.publish(update);
+                            }
+                            () = &mut stop => break,
+                        }
+                    }
+                    while let Ok(update) = updates.try_recv() {
+                        stopped_unknown |= update.outcome_unknown();
+                        live.publish(update);
+                    }
+                    stopped_unknown |= !live.open.is_empty();
+                    Ok(ClaudeToolReply::success(ToolResultContent::Text(
+                        (if stopped_unknown {
+                            StartedToolCall::STOPPED_UNKNOWN
+                        } else {
+                            StartedToolCall::STOPPED
+                        })
+                        .into(),
+                    )))
+                }
+            }
         } else {
             handler(input.clone(), invocation).await
         };
@@ -5700,6 +5767,7 @@ impl State {
         };
 
         started.open = false;
+        let is_error = is_error || stopped;
 
         if matches!(name, "exec" | "wait")
             && let Some(code) = metadata
@@ -5762,7 +5830,13 @@ impl State {
             ("tool".to_owned(), json!(name)),
             (
                 "status".to_owned(),
-                json!(if is_error { "failed" } else { "completed" }),
+                json!(if stopped {
+                    "cancelled"
+                } else if is_error {
+                    "failed"
+                } else {
+                    "completed"
+                }),
             ),
             (
                 "duration_ns".to_owned(),
@@ -6434,17 +6508,14 @@ impl State {
                         });
                     }
                     while remaining > 0 {
-                        tokio::select! {
-                            biased;
-                            next = calls.next() => {
-                                let Some((position, result)) = next else { break };
-                                interrupted |= result.is_none();
-                                results[position] = result.transpose()?;
-                                remaining -= 1;
-                            }
-                            () = cancel.cancelled() => { interrupted = true; break; }
-                        }
+                        let Some((position, result)) = calls.next().await else {
+                            break;
+                        };
+                        interrupted |= result.is_none();
+                        results[position] = result.transpose()?;
+                        remaining -= 1;
                     }
+                    interrupted |= cancel.is_cancelled();
                     if interrupted {
                         break;
                     }
