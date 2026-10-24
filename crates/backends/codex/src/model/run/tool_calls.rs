@@ -462,6 +462,7 @@ pub(super) struct TurnTeardownEvents<'a> {
     tool_call_indices: &'a HashMap<Box<str>, u32>,
     active: Vec<Arc<ArcSwap<ActiveToolProgress>>>,
     progress: ArcSwap<ActiveToolProgress>,
+    pub(super) terminated: Vec<(String, String)>,
 }
 
 impl<'a> TurnTeardownEvents<'a> {
@@ -475,11 +476,17 @@ impl<'a> TurnTeardownEvents<'a> {
             tool_call_indices,
             active: active.iter().map(|call| call.progress.clone()).collect(),
             progress: ArcSwap::default(),
+            terminated: Vec::new(),
         }
     }
 }
 
 impl CodeModeObserver for TurnTeardownEvents<'_> {
+    fn cell_terminated(&mut self, origin_call_id: &str, output: &str) {
+        self.terminated
+            .push((origin_call_id.to_owned(), output.to_owned()));
+    }
+
     fn update(&mut self, update: CodeModeUpdate<'_>) {
         let mut observer = NestedToolEventObserver {
             events: self.events,
@@ -814,6 +821,7 @@ impl ModelRun {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_cancelled_tool_result(
         &self,
         call_id: &str,
@@ -822,14 +830,20 @@ impl ModelRun {
         started_after_ns: Option<u64>,
         shell_abort_format: bool,
         span: Option<&tracing::Span>,
+        partial_output: Option<&str>,
     ) -> Result<ToolOutputBody> {
         let duration_ns = elapsed_ns(started_at);
         let elapsed_seconds = started_at.elapsed().as_secs_f64();
-        let output = ToolOutputBody::Text(if shell_abort_format {
+        let mut text = if shell_abort_format {
             format!("Wall time: {elapsed_seconds:.1} seconds\naborted by user")
         } else {
             format!("aborted by user after {:.1}s", elapsed_seconds.max(0.1))
-        });
+        };
+        if let Some(partial) = partial_output {
+            text.push_str("; output before it stopped:\n");
+            text.push_str(partial);
+        }
+        let output = ToolOutputBody::Text(text);
         let structured_result = output.structured_result();
         if let Some(span) = span {
             record_tool_span_terminal(span, "cancelled", "ERROR", duration_ns, &output);

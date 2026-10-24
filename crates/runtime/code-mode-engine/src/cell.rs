@@ -3,6 +3,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Duration
 use nanocode_platform::Instant;
 use rquickjs::{
     CatchResultExt, Coerced, Ctx, Exception, FromJs, Function, Persistent, Promise,
+    context::EvalOptions,
     function::{Func, Opt, Rest},
     promise::PromiseState,
 };
@@ -277,6 +278,23 @@ pub(crate) fn install_native_functions<'js>(
         .catch(ctx)
         .map_err(|error| format!("failed to install QuickJS load callback: {error}"))?;
 
+    globals
+        .set(
+            "__nanocodeScript",
+            Func::from(
+                |ctx: Ctx<'js>, source: String| -> rquickjs::Result<Promise<'js>> {
+                    let mut options = EvalOptions::default();
+                    options.global = true;
+                    options.strict = false;
+                    options.promise = true;
+                    options.filename = Some("<input>".to_owned());
+                    ctx.eval_with_options(source, options)
+                },
+            ),
+        )
+        .catch(ctx)
+        .map_err(|error| format!("failed to install QuickJS script callback: {error}"))?;
+
     let notify_state = Rc::clone(state);
     globals
         .set(
@@ -387,6 +405,7 @@ pub(crate) fn remove_native_globals(ctx: &Ctx<'_>) -> Result<(), String> {
         "__nanocodeContent",
         "__nanocodeLoad",
         "__nanocodeNotify",
+        "__nanocodeScript",
         "__nanocodeYield",
         "__nanocodeSetTimeout",
         "__nanocodeClearTimeout",

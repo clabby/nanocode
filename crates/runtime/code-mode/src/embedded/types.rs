@@ -165,6 +165,8 @@ pub trait CodeModeObserver: Send {
     fn update(&mut self, update: CodeModeUpdate<'_>);
 
     fn completed(&mut self) {}
+
+    fn cell_terminated(&mut self, _origin_call_id: &str, _output: &str) {}
 }
 
 #[derive(Debug, Deserialize)]

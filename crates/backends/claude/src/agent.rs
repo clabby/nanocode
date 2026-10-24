@@ -214,6 +214,11 @@ pub enum ClaudeNestedToolUpdate {
         call_id: String,
         text: String,
     },
+
+    Terminated {
+        call_id: String,
+        output: String,
+    },
 }
 impl ClaudeNestedToolUpdate {
     fn outcome_unknown(&self) -> bool {
@@ -3273,6 +3278,7 @@ impl LiveNestedCalls<'_> {
                     json!({"call_id": call_id, "text": text}),
                 );
             }
+            ClaudeNestedToolUpdate::Terminated { .. } => {}
         }
     }
 
@@ -5719,11 +5725,18 @@ impl State {
                     let stop = self.stop_code_cells(&stopper);
                     drop(stopper);
                     tokio::pin!(stop);
+                    let mut partial = Vec::new();
+                    let mut collect = |update: &ClaudeNestedToolUpdate| {
+                        if let ClaudeNestedToolUpdate::Terminated { call_id, output } = update {
+                            partial.push((call_id.clone(), output.clone()));
+                        }
+                    };
                     loop {
                         tokio::select! {
                             biased;
                             Some(update) = updates.recv() => {
                                 stopped_unknown |= update.outcome_unknown();
+                                collect(&update);
                                 live.publish(update);
                             }
                             () = &mut stop => break,
@@ -5731,17 +5744,24 @@ impl State {
                     }
                     while let Ok(update) = updates.try_recv() {
                         stopped_unknown |= update.outcome_unknown();
+                        collect(&update);
                         live.publish(update);
                     }
                     stopped_unknown |= !live.open.is_empty();
-                    Ok(ClaudeToolReply::success(ToolResultContent::Text(
-                        (if stopped_unknown {
-                            StartedToolCall::STOPPED_UNKNOWN
-                        } else {
-                            StartedToolCall::STOPPED
-                        })
-                        .into(),
-                    )))
+                    let mut text = String::from(if stopped_unknown {
+                        StartedToolCall::STOPPED_UNKNOWN
+                    } else {
+                        StartedToolCall::STOPPED
+                    });
+                    let own = partial
+                        .iter()
+                        .position(|(origin, _)| origin == id)
+                        .or_else(|| (name == "wait" && !partial.is_empty()).then_some(0));
+                    if let Some(index) = own {
+                        text.push_str(" Output before it stopped:\n");
+                        text.push_str(&partial[index].1);
+                    }
+                    Ok(ClaudeToolReply::success(ToolResultContent::Text(text)))
                 }
             }
         } else {

@@ -260,6 +260,15 @@ impl Call {
 struct Progress<'a>(Option<&'a ClaudeToolProgress>);
 
 impl CodeModeObserver for Progress<'_> {
+    fn cell_terminated(&mut self, origin_call_id: &str, output: &str) {
+        if let Some(progress) = self.0 {
+            progress.update(ClaudeNestedToolUpdate::Terminated {
+                call_id: origin_call_id.to_owned(),
+                output: output.to_owned(),
+            });
+        }
+    }
+
     fn update(&mut self, update: CodeModeUpdate<'_>) {
         let Some(progress) = self.0 else {
             return;

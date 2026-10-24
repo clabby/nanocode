@@ -391,6 +391,9 @@ impl ModelRun {
             &self.active_tool_calls,
         );
         tools.cancel_turn_with_updates(&mut observer).await;
+        let terminated = std::mem::take(&mut observer.terminated);
+        drop(observer);
+        self.terminated_cell_output.extend(terminated);
     }
 
     pub(crate) fn emit_terminal(&self, status: &'static str) -> Result<()> {
@@ -747,6 +750,7 @@ impl ModelRun {
 
     pub(super) fn commit_interrupted_checkpoint(&mut self) -> Result<ModelCheckpoint> {
         let mut aborted_outputs = Vec::with_capacity(self.active_tool_calls.len());
+        let mut terminated = std::mem::take(&mut self.terminated_cell_output);
         for call in std::mem::take(&mut self.active_tool_calls) {
             let completed = call.completion.take();
             if let Some(completed) = completed {
@@ -763,9 +767,20 @@ impl ModelRun {
                     Some(started_after_ns),
                     false,
                     None,
+                    None,
                 )?;
             }
             self.finish_cancelled_tool_work(&call);
+            let partial = match terminated
+                .iter()
+                .position(|(origin, _)| *origin == call.call_id)
+            {
+                Some(index) => Some(terminated.remove(index).1),
+                None if call.name == "wait" && !terminated.is_empty() => {
+                    Some(terminated.remove(0).1)
+                }
+                None => None,
+            };
             let output = self.emit_cancelled_tool_result(
                 &call.call_id,
                 &call.name,
@@ -773,6 +788,7 @@ impl ModelRun {
                 None,
                 call.shell_abort_format,
                 Some(&call.span),
+                partial.as_deref(),
             )?;
             aborted_outputs.push(match call.kind {
                 CodeCallKind::Custom => custom_tool_output(call.call_id, output),

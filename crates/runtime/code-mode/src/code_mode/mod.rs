@@ -61,6 +61,9 @@ const CELL_TERMINATING: u8 = 1;
 const CELL_COMPLETION_CLAIMED: u8 = 2;
 const CELL_CLOSED: u8 = 3;
 const LOGGED_NESTED_CALLS_PER_TOOL: u64 = 100;
+const STREAM_OUTPUT_AFTER: Duration = Duration::from_millis(500);
+const STREAMED_OUTPUT_BYTES: usize = 64 * 1024;
+const TERMINATED_OUTPUT_BYTES: usize = 16 * 1024;
 
 pub struct CodeModeRuntime {
     admission: Sequencer,
@@ -180,6 +183,8 @@ struct CellObservationState {
     replay: VecDeque<CellUpdate>,
     buffered: ObservationBuffer,
     receipts: Vec<Arc<dyn ToolReceipt>>,
+    streamed: usize,
+    streamed_bytes: usize,
 }
 
 #[derive(Default)]
@@ -970,6 +975,8 @@ impl LiveCell {
                 replay: VecDeque::new(),
                 buffered: ObservationBuffer::default(),
                 receipts: Vec::new(),
+                streamed: 0,
+                streamed_bytes: 0,
             })),
             lifecycle,
             terminate: Slot::new(Some(terminate)),
@@ -1247,6 +1254,8 @@ async fn observe_updates(
     let mut yield_timer =
         yield_after.map(|yield_after| Box::pin(nanocode_platform::sleep(yield_after)));
     let mut preempt_remaining = None;
+    let mut stream_open = false;
+    let mut stream_timer = Box::pin(nanocode_platform::sleep(STREAM_OUTPUT_AFTER));
     loop {
         let yield_deadline_elapsed =
             yield_deadline.is_some_and(|yield_deadline| yield_deadline <= Instant::now());
@@ -1255,7 +1264,7 @@ async fn observe_updates(
         }
         let preempted = preempt_remaining.is_some();
         if preempt_remaining == Some(0) {
-            let buffered = std::mem::take(&mut observation.buffered);
+            let buffered = take_buffered(observation);
             return running_observation(
                 tools,
                 cell.id,
@@ -1292,7 +1301,7 @@ async fn observe_updates(
                     None => std::future::pending().await,
                 }
             } => {
-                let buffered = std::mem::take(&mut observation.buffered);
+                let buffered = take_buffered(observation);
                 return running_observation(
                     tools,
                     cell.id,
@@ -1303,11 +1312,29 @@ async fn observe_updates(
                     buffered.notifications,
                 );
             }
+            () = stream_timer.as_mut(), if !terminating && !stream_open => {
+                stream_open = true;
+                stream_output(&cell.origin_call_id, observation, observer);
+                continue;
+            }
             update = observation.updates.recv(), if !yield_deadline_elapsed => update,
             }
         };
         if let Some(remaining) = &mut preempt_remaining {
             *remaining = remaining.saturating_sub(1);
+        }
+        if stream_open
+            && matches!(
+                update,
+                Some(
+                    CellUpdate::NestedCallStarted { .. }
+                        | CellUpdate::NestedCall(_)
+                        | CellUpdate::Notification { .. }
+                        | CellUpdate::Unlogged { .. }
+                )
+            )
+        {
+            stream_output(&cell.origin_call_id, observation, observer);
         }
         match update {
             Some(CellUpdate::NestedCallStarted {
@@ -1351,10 +1378,15 @@ async fn observe_updates(
                 }
                 observation.buffered.notifications.push(notification);
             }
-            Some(CellUpdate::Content(item)) => observation.buffered.content.push(item),
+            Some(CellUpdate::Content(item)) => {
+                observation.buffered.content.push(item);
+                if stream_open && observation.replay.is_empty() && observation.updates.is_empty() {
+                    stream_output(&cell.origin_call_id, observation, observer);
+                }
+            }
             Some(CellUpdate::Yielded) if terminating => {}
             Some(CellUpdate::Yielded) => {
-                let buffered = std::mem::take(&mut observation.buffered);
+                let buffered = take_buffered(observation);
                 return running_observation(
                     tools,
                     cell.id,
@@ -1366,7 +1398,7 @@ async fn observe_updates(
                 );
             }
             Some(CellUpdate::Completed) => {
-                let buffered = std::mem::take(&mut observation.buffered);
+                let buffered = take_buffered(observation);
                 return (
                     observed_execution(
                         tools,
@@ -1382,7 +1414,14 @@ async fn observe_updates(
                 );
             }
             Some(CellUpdate::Terminated) => {
-                let buffered = std::mem::take(&mut observation.buffered);
+                if terminating {
+                    let text = terminated_output(&observation.buffered.content);
+                    stream_output(&cell.origin_call_id, observation, observer);
+                    if !text.is_empty() {
+                        observer.cell_terminated(&cell.origin_call_id, &text);
+                    }
+                }
+                let buffered = take_buffered(observation);
                 return (
                     observed_execution(
                         tools,
@@ -1404,7 +1443,7 @@ async fn observe_updates(
                     .push(ToolOutputContent::InputText {
                         text: format!("Script error:\n{message}"),
                     });
-                let buffered = std::mem::take(&mut observation.buffered);
+                let buffered = take_buffered(observation);
                 return (
                     observed_execution(
                         tools,
@@ -1424,7 +1463,7 @@ async fn observe_updates(
                     .buffered
                     .content
                     .push(ToolOutputContent::InputText { text: message });
-                let buffered = std::mem::take(&mut observation.buffered);
+                let buffered = take_buffered(observation);
                 return (
                     observed_execution(
                         tools,
@@ -1446,7 +1485,7 @@ async fn observe_updates(
                     .push(ToolOutputContent::InputText {
                         text: "local code-mode cell ended before a result".to_owned(),
                     });
-                let buffered = std::mem::take(&mut observation.buffered);
+                let buffered = take_buffered(observation);
                 return (
                     observed_execution(
                         tools,
@@ -1463,6 +1502,69 @@ async fn observe_updates(
             }
         }
     }
+}
+
+fn take_buffered(observation: &mut CellObservationState) -> ObservationBuffer {
+    observation.streamed = 0;
+    observation.streamed_bytes = 0;
+    std::mem::take(&mut observation.buffered)
+}
+
+fn content_text(content: &[ToolOutputContent]) -> String {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ToolOutputContent::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const fn char_floor(text: &str, mut index: usize) -> usize {
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn terminated_output(content: &[ToolOutputContent]) -> String {
+    let text = content_text(content);
+    if text.len() <= TERMINATED_OUTPUT_BYTES {
+        return text;
+    }
+    let mut start = text.len() - TERMINATED_OUTPUT_BYTES;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…\n{}", &text[start..])
+}
+
+fn stream_output(
+    call_id: &str,
+    observation: &mut CellObservationState,
+    observer: &mut dyn CodeModeObserver,
+) {
+    let start = observation.streamed.min(observation.buffered.content.len());
+    observation.streamed = observation.buffered.content.len();
+    if observation.streamed_bytes >= STREAMED_OUTPUT_BYTES {
+        return;
+    }
+    let mut text = content_text(&observation.buffered.content[start..]);
+    if text.is_empty() {
+        return;
+    }
+    let room = STREAMED_OUTPUT_BYTES - observation.streamed_bytes;
+    if text.len() > room {
+        text.truncate(char_floor(&text, room));
+        text.push_str("\n… the rest of the output arrives with the cell's result");
+        observation.streamed_bytes = STREAMED_OUTPUT_BYTES;
+    } else {
+        observation.streamed_bytes += text.len();
+    }
+    observer.update(CodeModeUpdate::Notification(&CodeModeNotification::new(
+        call_id, text,
+    )));
 }
 
 fn running_observation(

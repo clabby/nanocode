@@ -4,6 +4,7 @@
   const nativeContent = __nanocodeContent;
   const nativeLoad = __nanocodeLoad;
   const nativeNotify = __nanocodeNotify;
+  const nativeScript = __nanocodeScript;
   const nativeYield = __nanocodeYield;
   const nativeSetTimeout = __nanocodeSetTimeout;
   const nativeClearTimeout = __nanocodeClearTimeout;
@@ -166,6 +167,49 @@
         ) ?? {}
         : {};
       const preludeNames = Object.keys(prelude);
+      const cellGlobals = {
+        tools,
+        ALL_TOOLS: allTools,
+        toolSchema,
+        text,
+        image,
+        audio,
+        generatedImage,
+        notify,
+        store,
+        load,
+        yield_control,
+        exit,
+        setTimeout: nativeSetTimeout,
+        clearTimeout: nativeClearTimeout,
+        console,
+        ...prelude,
+      };
+      let completion;
+      try {
+        for (const name of Object.keys(cellGlobals)) {
+          Object.defineProperty(globalThis, name, {
+            value: cellGlobals[name],
+            writable: true,
+            configurable: true,
+            enumerable: false,
+          });
+        }
+        completion = nativeScript(source);
+      } catch {
+        completion = undefined;
+      }
+      if (completion) {
+        try {
+          await completion;
+        } catch (error) {
+          if (error !== EXIT) throw error;
+        }
+        return jsonStringify({
+          type: "done",
+          stored: Object.fromEntries(storedWrites),
+        });
+      }
       const script = new AsyncFunction(
         "tools",
         "ALL_TOOLS",
