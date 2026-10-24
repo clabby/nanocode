@@ -6,6 +6,7 @@ mod router;
 mod runtime;
 mod session_events;
 mod session_log;
+mod stored_event;
 mod turn_inbox;
 pub use router::{
     CheckpointFormats, Harness, HarnessBuilder, HarnessRequest, NoFormats, session_store,

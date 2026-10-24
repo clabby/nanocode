@@ -23,6 +23,7 @@ use crate::{
     },
     input::{Prompt, PromptInput},
     session_log::{LogEntry, LoggedEvent, SessionLog, Started, TurnRecord, TurnState},
+    stored_event::Stored,
 };
 
 pub trait InboxHost: Send + Sync + 'static {
@@ -149,38 +150,6 @@ struct Envelope<'a> {
     event: &'a SessionEvent,
     #[serde(flatten)]
     annotation: &'a Map<String, Value>,
-}
-
-struct Stored<'a>(&'a SessionEvent);
-
-impl Serialize for Stored<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap as _;
-        let SessionEvent::Agent { event, .. } = self.0 else {
-            return self.0.serialize(serializer);
-        };
-        let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("source", "agent")?;
-        match without_timing(event) {
-            Some(slim) => map.serialize_entry("event", &slim)?,
-            None => map.serialize_entry("event", event)?,
-        }
-        map.end()
-    }
-}
-
-fn without_timing(event: &AgentEvent) -> Option<AgentEvent> {
-    if !event.payload.get().contains("\"timing\"") {
-        return None;
-    }
-    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(event.payload.get()) else {
-        return None;
-    };
-    fields.remove("timing")?;
-    Some(AgentEvent {
-        payload: serde_json::value::to_raw_value(&fields).ok()?.into(),
-        ..event.clone()
-    })
 }
 
 pub(crate) fn accepted_bytes(
