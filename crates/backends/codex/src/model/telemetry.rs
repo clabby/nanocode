@@ -212,6 +212,10 @@ pub(super) struct ToolResultEvent<'a> {
     pub(super) metadata: Option<&'a RawValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) cell: Option<&'a nanocode_code_mode::code_mode::CodeModeCell>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) original_bytes: Option<usize>,
 }
 
 #[derive(Serialize)]
