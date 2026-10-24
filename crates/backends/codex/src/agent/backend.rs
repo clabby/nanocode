@@ -48,6 +48,14 @@ pub(super) struct LocalLifecycle {
     pub(super) checkpoints: Arc<CheckpointSource>,
 
     pub(super) initial_ready: Arc<nanocode_sync::Slot<oneshot::Receiver<Result<()>>>>,
+    pub(super) images: ImageHistory,
+}
+
+async fn store_prompt_images(images: &ImageHistory, prompt: &mut Prompt) -> Result<()> {
+    images
+        .store_prompt(&mut prompt.instruction)
+        .await
+        .map_err(|error| nanocode_durability::agent_error(error.into()))
 }
 
 const CODEX_CAPABILITIES: Capabilities = {
@@ -93,11 +101,13 @@ impl LifecycleBackend for LocalLifecycle {
         self.execution.durable_state_id().map(Persistence::durable)
     }
 
-    fn submit(&self, request: BackendPrompt) -> BackendFuture<Result<BackendTurn>> {
+    fn submit(&self, mut request: BackendPrompt) -> BackendFuture<Result<BackendTurn>> {
         let commands = self.commands.clone();
         let execution = self.execution.clone();
         let shutdown = self.shutdown.clone();
+        let images = self.images.clone();
         Box::pin(async move {
+            store_prompt_images(&images, &mut request.prompt).await?;
             let execution_operation =
                 request
                     .request_id
@@ -154,11 +164,13 @@ impl LifecycleBackend for LocalLifecycle {
         })
     }
 
-    fn route(&self, request: BackendPrompt) -> BackendFuture<Result<BackendPromptRoute>> {
+    fn route(&self, mut request: BackendPrompt) -> BackendFuture<Result<BackendPromptRoute>> {
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();
         let execution = self.execution.clone();
+        let images = self.images.clone();
         Box::pin(async move {
+            store_prompt_images(&images, &mut request.prompt).await?;
             if let Some(id) = &request.request_id
                 && execution
                     .identified_steer_accepted(id.clone(), &request.prompt)
@@ -206,10 +218,12 @@ impl LifecycleBackend for LocalLifecycle {
         })
     }
 
-    fn steer(&self, key: BackendTurnKey, prompt: Prompt) -> BackendFuture<Result<()>> {
+    fn steer(&self, key: BackendTurnKey, mut prompt: Prompt) -> BackendFuture<Result<()>> {
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();
+        let images = self.images.clone();
         Box::pin(async move {
+            store_prompt_images(&images, &mut prompt).await?;
             request_command(&commands, &shutdown, |result| Command::Steer {
                 key: TurnKey(key.0),
                 prompt,
@@ -223,11 +237,13 @@ impl LifecycleBackend for LocalLifecycle {
         &self,
         key: BackendTurnKey,
         id: String,
-        prompt: Prompt,
+        mut prompt: Prompt,
     ) -> BackendFuture<Result<()>> {
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();
+        let images = self.images.clone();
         Box::pin(async move {
+            store_prompt_images(&images, &mut prompt).await?;
             request_command(&commands, &shutdown, |result| Command::SteerWithId {
                 key: TurnKey(key.0),
                 id,
@@ -241,10 +257,14 @@ impl LifecycleBackend for LocalLifecycle {
     fn steer_receipt(
         &self,
         id: String,
-        prompt: Prompt,
+        mut prompt: Prompt,
     ) -> BackendFuture<Result<SteerReceiptStatus>> {
         let execution = self.execution.clone();
-        Box::pin(async move { execution.steer_receipt(id, &prompt).await })
+        let images = self.images.clone();
+        Box::pin(async move {
+            store_prompt_images(&images, &mut prompt).await?;
+            execution.steer_receipt(id, &prompt).await
+        })
     }
 
     fn withdraw_steer(&self, key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {

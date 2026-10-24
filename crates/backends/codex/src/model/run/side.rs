@@ -49,6 +49,7 @@ impl ModelCheckpoint {
     pub(crate) async fn side_question(
         &self,
         config: &ModelConfig,
+        images: &ImageHistory,
         mut client: ResponsesClientBox,
         model: Model,
         thinking: Thinking,
@@ -77,9 +78,10 @@ impl ModelCheckpoint {
                 text: side_question_prompt(question).into_boxed_str(),
             }],
         )]);
+        let history = evict_images(images, &conversation.managed.generation_request());
         let request = factory.generation(
             1,
-            &conversation.managed.generation_request(),
+            &inline_images(images, history).await?,
             model,
             conversation.reasoning.request_effort(
                 model,

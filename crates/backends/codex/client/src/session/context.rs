@@ -132,6 +132,7 @@ impl ContextManager {
                 let invalid = match part {
                     FunctionOutputContent::InputImage { image_url, .. } => {
                         !valid_tool_image_data_url(image_url)
+                            && !image_url.starts_with("nanocode-blob:")
                     }
                     FunctionOutputContent::InputImageFile { file_id, .. } => {
                         !crate::client::responses::valid_image_file_id(file_id)

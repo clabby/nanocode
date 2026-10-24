@@ -6,6 +6,8 @@ use std::{
 
 #[cfg(not(target_family = "wasm"))]
 use http::header;
+#[cfg(not(target_family = "wasm"))]
+use nanocode_http::layer::retry;
 use serde_json::{Map, Value, json};
 
 use crate::client::{
@@ -251,14 +253,7 @@ impl ChatGateway {
             .map_err(map_http_error)?;
         let status = response.status();
         if !status.is_success() {
-            let retry_after = response
-                .headers()
-                .get(header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(RetryAfter::from_header);
-
-            drop(response);
-            return Err(provider_rejected(status.as_u16(), retry_after));
+            return Err(provider_rejected(status.as_u16(), response.headers()));
         }
         if compact {
             let completion: Value = stall(self.stall_timeout, response.json())
@@ -422,7 +417,7 @@ fn map_http_error(error: reqwest::Error) -> ResponsesError {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn provider_rejected(status: u16, retry_after: Option<RetryAfter>) -> ResponsesError {
+fn provider_rejected(status: u16, headers: &http::HeaderMap) -> ResponsesError {
     let (code, message) = if (300..400).contains(&status) {
         (
             "provider_redirect",
@@ -437,7 +432,8 @@ fn provider_rejected(status: u16, retry_after: Option<RetryAfter>) -> ResponsesE
             "error": { "type": "provider_error", "code": code, "message": message }
         })
         .to_string(),
-        retry_after,
+        retry_after: RetryAfter::from_headers(headers),
+        should_retry: retry::should_retry(headers),
     }
 }
 
@@ -465,6 +461,7 @@ fn reject(code: &'static str, message: impl Into<String>) -> ResponsesError {
         })
         .to_string(),
         retry_after: None,
+        should_retry: None,
     }
 }
 

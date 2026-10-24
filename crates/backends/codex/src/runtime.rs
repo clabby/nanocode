@@ -133,6 +133,9 @@ impl RuntimeBackend for CodexHarness {
                     builder = builder.model_instructions(model, Arc::clone(instructions));
                 }
             }
+            if let Some(images) = settings.images {
+                builder = builder.images(images);
+            }
             if let Some(configure) = configure {
                 builder = configure(builder)?.workspace(workspace.to_path_buf());
             }

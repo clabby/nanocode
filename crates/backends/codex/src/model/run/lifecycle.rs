@@ -373,7 +373,6 @@ impl ModelRun {
         let step_id = format!("compaction-{after_model_call_index}");
         let model = self.model;
         let service_tier = self.service_tier;
-        let trigger = compaction::trigger();
 
         if let Some(hook) = &self.before_compaction {
             use crate::execution::{BeforeCompactionRequest, CompactionReceipt};
@@ -427,6 +426,7 @@ impl ModelRun {
             factory.profile().prefix(),
             self.config.context_window_tokens,
         );
+        let history = evict_images(&self.images, &history);
         let started_at = Instant::now();
         self.stats.compactions += 1;
         self.events.emit(
@@ -438,16 +438,19 @@ impl ModelRun {
                 previous_response_id: history.previous_response_id(),
             },
         )?;
-        let request = factory.compaction(
-            after_model_call_index,
-            &history,
-            trigger,
-            model,
-            request_effort,
-            service_tier,
-        );
-        let span = compaction_span(after_model_call_index, request.input_item_count());
-        let request = request.with_input_trace(trace_content_enabled().then(|| span.clone()));
+        let build = |history: &RequestHistory| {
+            factory.compaction(
+                after_model_call_index,
+                history,
+                compaction::trigger(),
+                model,
+                request_effort,
+                service_tier,
+            )
+        };
+        let span = compaction_span(after_model_call_index, build(&history).input_item_count());
+        let trace = trace_content_enabled().then(|| span.clone());
+        let images = self.images.clone();
         let mut lifecycle = CompactionLifecycle {
             events: &self.events,
             stats: &mut self.stats,
@@ -477,17 +480,19 @@ impl ModelRun {
             let recorded_result = if let Some(output) = recovered {
                 output
             } else {
+                let request =
+                    build(&inline_images(&images, history).await?).with_input_trace(trace);
                 let success = match self.client.execute(request).instrument(span.clone()).await {
                     Ok(success) => success,
                     Err(error) => {
                         let error = NanocodeError::from(error);
-
-                        if error.responses_error().is_none() {
+                        let Some(source) = error.responses_error() else {
+                            return Err(error);
+                        };
+                        if source.retry_advice().is_some() {
                             return Err(error);
                         }
-                        let requires_session_stop = error
-                            .responses_error()
-                            .is_some_and(|source| source.is_misalignment_policy_violation());
+                        let requires_session_stop = source.is_misalignment_policy_violation();
                         let recovery = if error.requires_image_repair() {
                             crate::error::CompactionRecovery::ReplaceRejectedImages
                         } else {

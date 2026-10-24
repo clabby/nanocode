@@ -329,6 +329,7 @@ fn spawn_side_question(
         return;
     };
     let config = Arc::clone(&spawner.config);
+    let images = spawner.images.clone();
     let service = (spawner.service_factory)(Arc::clone(&config));
     let thread_id = session_id.to_owned();
     let host_context = spawner.host_context.as_ref().map(Arc::clone);
@@ -337,6 +338,7 @@ fn spawn_side_question(
             .model()
             .side_question(
                 &config,
+                &images,
                 service,
                 defaults.model,
                 defaults.thinking,

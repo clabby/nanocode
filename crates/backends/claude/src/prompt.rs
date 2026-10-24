@@ -5,7 +5,8 @@ use nanocode_agent_core::{
     NanocodeError, Result,
     input::{Prompt, PromptInput, PromptMessageRole, UserInput},
 };
-use nanocode_media::image::prepare_base64_images;
+use nanocode_durability::BlobUrl;
+use nanocode_media::image::{ImageHistory, prepare_base64_images};
 use serde_json::json;
 use std::io::Cursor;
 
@@ -19,6 +20,10 @@ const MAX_TOTAL_BYTES: usize = 20 * 1024 * 1024;
 
 const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FILENAME_BYTES: usize = 255;
+
+pub(crate) fn image_store_error(error: nanocode_durability::StoreError) -> NanocodeError {
+    nanocode_durability::agent_error(error.into())
+}
 
 fn invalid(message: impl Into<String>) -> NanocodeError {
     NanocodeError::InvalidRequest(message.into())
@@ -175,6 +180,9 @@ fn image_type(bytes: &[u8]) -> Result<&'static str> {
 }
 
 pub(crate) fn image_source(value: &str) -> Result<(serde_json::Value, usize)> {
+    if BlobUrl::is_blob_url(value) {
+        return Ok((json!({"type":"url","url":value}), 0));
+    }
     if let Some(data) = value.strip_prefix("data:") {
         if value.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 + 64 {
             return Err(invalid("Claude image exceeds 5 MiB"));
@@ -330,16 +338,24 @@ const fn local_image(_path: &std::path::Path) -> std::result::Result<String, &'s
     Err("requires a native filesystem")
 }
 
-pub(crate) async fn freeze(mut prompt: Prompt, resolution: ImageResolution) -> Result<Prompt> {
+pub(crate) async fn freeze(
+    mut prompt: Prompt,
+    resolution: ImageResolution,
+    images: &ImageHistory,
+) -> Result<Prompt> {
+    images
+        .load_prompt(&mut prompt.instruction)
+        .await
+        .map_err(image_store_error)?;
     if let PromptInput::Content(items) = &mut prompt.instruction {
         if items.len() > 100 {
             return Err(invalid("Claude prompt exceeds 100 content items"));
         }
-        let images = items
+        let image_count = items
             .iter()
             .filter(|item| matches!(item, UserInput::Image { .. } | UserInput::LocalImage { .. }))
             .count();
-        if images > MAX_IMAGES {
+        if image_count > MAX_IMAGES {
             return Err(invalid("Claude prompt exceeds 20 images"));
         }
         let mut total = 0;
@@ -384,6 +400,11 @@ pub(crate) async fn freeze(mut prompt: Prompt, resolution: ImageResolution) -> R
                     if total > MAX_TOTAL_BYTES {
                         return Err(invalid("Claude prompt exceeds 20 MiB of media data"));
                     }
+                    let image_url = images
+                        .store(&image_url)
+                        .await
+                        .map_err(image_store_error)?
+                        .unwrap_or(image_url);
                     UserInput::Image { image_url, detail }
                 }
                 Err(note) => UserInput::Text {
@@ -458,6 +479,7 @@ pub(crate) async fn freeze_admitted(
     policy: &dyn crate::execution::ClaudeExecutionPolicy,
     id: &str,
     resolution: ImageResolution,
+    images: &ImageHistory,
 ) -> Result<(Prompt, ImageResolution)> {
     let continuation = policy.continuation(id.into()).await?;
     let resolution = continuation
@@ -466,7 +488,7 @@ pub(crate) async fn freeze_admitted(
         .map_or(resolution, ImageResolution::of);
     let has_local = matches!(&prompt.instruction, PromptInput::Content(items) if items.iter().any(|item| matches!(item, UserInput::LocalImage { .. })));
     if !has_local {
-        return Ok((freeze(prompt, resolution).await?, resolution));
+        return Ok((freeze(prompt, resolution, images).await?, resolution));
     }
 
     if let Some(cursor) = continuation {
@@ -496,10 +518,10 @@ pub(crate) async fn freeze_admitted(
         crate::execution::Step::Replay(value) => {
             let receipt = serde_json::from_value(value)
                 .map_err(|_| invalid("invalid frozen Claude prompt receipt"))?;
-            freeze(receipt, resolution).await?
+            freeze(receipt, resolution, images).await?
         }
         crate::execution::Step::Execute => {
-            let frozen = freeze(prompt, resolution).await?;
+            let frozen = freeze(prompt, resolution, images).await?;
             let value = serde_json::to_value(&frozen)
                 .map_err(|_| invalid("cannot encode frozen Claude prompt"))?;
             policy

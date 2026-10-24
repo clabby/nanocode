@@ -214,6 +214,12 @@ impl<B, D: RuntimeDefaults> RuntimeBuilder<B, D> {
     }
 
     #[must_use]
+    pub fn images(mut self, images: nanocode_tool_host::image::ImageHistory) -> Self {
+        self.data.settings.images = Some(images);
+        self
+    }
+
+    #[must_use]
     pub fn workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
         self.data.workspace = Some(workspace.into());
         self

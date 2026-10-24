@@ -1,5 +1,7 @@
 use std::{borrow::Cow, sync::Arc};
 
+use nanocode_http::layer::retry;
+
 use super::RetryAfter;
 
 use super::api_error::{
@@ -38,6 +40,8 @@ pub enum ResponsesError {
         body: String,
 
         retry_after: Option<RetryAfter>,
+
+        should_retry: Option<bool>,
     },
 
     #[error("failed to send a Responses WebSocket frame: {detail}")]
@@ -109,6 +113,8 @@ pub enum ResponsesError {
         body: String,
 
         retry_after: Option<RetryAfter>,
+
+        should_retry: Option<bool>,
     },
 
     #[error("Responses HTTPS stream contained invalid UTF-8: {detail}")]
@@ -127,11 +133,6 @@ const INVALID_IMAGE_ERROR: &str = "The image data you provided does not represen
 impl ResponsesError {
     #[must_use]
     pub fn retry_advice(&self) -> Option<RetryAdvice> {
-        if matches!(self, Self::HttpRejected { body, .. } | Self::HandshakeRejected { body, .. }
-            if api_error_is_terminal(body))
-        {
-            return None;
-        }
         let (class, server_delay) = match self {
             Self::Handshake {
                 reconnectable: true,
@@ -140,20 +141,22 @@ impl ResponsesError {
             Self::HandshakeTimeout { .. } => ("handshake_timeout", None),
 
             Self::HandshakeRejected {
-                status: 403,
-                retry_after,
-                ..
-            } => ("handshake_forbidden", *retry_after),
-            Self::HandshakeRejected {
                 status,
+                body,
                 retry_after,
-                ..
-            } if *status == 429 => ("handshake_rate_limit", *retry_after),
-            Self::HandshakeRejected {
-                status,
-                retry_after,
-                ..
-            } if (500..=599).contains(status) => ("handshake_server", *retry_after),
+                should_retry,
+            } if should_retry.unwrap_or_else(|| {
+                (*status == 403 || retry::retryable_status(*status)) && !api_error_is_terminal(body)
+            }) =>
+            {
+                let class = match status {
+                    403 => "handshake_forbidden",
+                    429 => "handshake_rate_limit",
+                    500..=599 => "handshake_server",
+                    _ => "handshake_rejected",
+                };
+                (class, *retry_after)
+            }
             Self::SendTimeout { .. } => ("send_timeout", None),
             Self::Send {
                 reconnectable: true,
@@ -173,14 +176,20 @@ impl ResponsesError {
             } => ("https_transport", None),
             Self::HttpRejected {
                 status,
+                body,
                 retry_after,
-                ..
-            } if *status == 429 => ("https_rate_limit", *retry_after),
-            Self::HttpRejected {
-                status,
-                retry_after,
-                ..
-            } if (500..=599).contains(status) => ("https_server", *retry_after),
+                should_retry,
+            } if should_retry.unwrap_or_else(|| {
+                retry::retryable_status(*status) && !api_error_is_terminal(body)
+            }) =>
+            {
+                let class = match status {
+                    429 => "https_rate_limit",
+                    500..=599 => "https_server",
+                    _ => "https_rejected",
+                };
+                (class, *retry_after)
+            }
             _ => return None,
         };
         Some(RetryAdvice {
@@ -202,9 +211,12 @@ impl ResponsesError {
     pub(crate) fn is_terminal_provider_error(&self) -> bool {
         match self {
             Self::Api { event, .. } => api_error_is_terminal(event),
-            Self::HttpRejected { body, .. } | Self::HandshakeRejected { body, .. } => {
-                api_error_is_terminal(body)
+            Self::HttpRejected {
+                body, should_retry, ..
             }
+            | Self::HandshakeRejected {
+                body, should_retry, ..
+            } => *should_retry != Some(true) && api_error_is_terminal(body),
             _ => false,
         }
     }
@@ -348,6 +360,7 @@ impl ResponsesError {
         status: u16,
         body: String,
         retry_after: Option<RetryAfter>,
+        should_retry: Option<bool>,
     ) -> Self {
         if status == 400 {
             let classified = Self::api_event(body.clone());
@@ -362,6 +375,7 @@ impl ResponsesError {
             status,
             body,
             retry_after,
+            should_retry,
         }
     }
 

@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use serde_json::{Map, Value, value::RawValue};
 
 use crate::{
-    durability::{EncodedPayload, Sql, SqlDialect, SqlRow, SqlStatement, StoreError},
+    durability::{
+        BlobKey, BlobStore, BlobUrl, EncodedPayload, Sql, SqlDialect, SqlRow, SqlStatement,
+        StoreError, get_blob,
+    },
     input::{Prompt, PromptInput, UserInput},
     turn_inbox::accepted_bytes,
 };
@@ -40,6 +43,12 @@ const READ_PART: Dialects = [
     "SELECT data FROM log_parts WHERE key = $1::text",
 ];
 const PAYLOAD_MARK: &str = "{\"$nanocode_log\":";
+const LONGEST_SINGLE_KEY_REFERENCE: usize = PAYLOAD_MARK.len()
+    + "[\"b3:\"]".len()
+    + blake3::OUT_LEN * 2
+    + ",\"bytes\":}".len()
+    + u64::MAX.ilog10() as usize
+    + 1;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,12 +155,12 @@ const PAGE: Dialects = [
     "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body FROM events WHERE scope = $1::text AND seq > CAST($2::text AS BIGINT) ORDER BY events.seq LIMIT CAST($3::text AS BIGINT)",
 ];
 const PAGE_BOUNDED: Dialects = [
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body, CAST(rows AS TEXT) FROM (SELECT seq, request_id, created_at, body, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT seq, request_id, created_at, body, CASE WHEN substr(body, 1, 17) = '{\"$nanocode_log\":' THEN CAST(json_extract(body, '$.bytes') AS INTEGER) ELSE length(CAST(body AS BLOB)) END AS size FROM events WHERE scope = ?1 AND seq > CAST(?2 AS INTEGER) ORDER BY seq LIMIT CAST(?3 AS INTEGER)) AS candidates) AS sized WHERE running <= CAST(?4 AS INTEGER) OR position = 1 ORDER BY seq",
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body, CAST(rows AS TEXT) FROM (SELECT seq, request_id, created_at, body, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT seq, request_id, created_at, body, CASE WHEN left(body, 17) = '{\"$nanocode_log\":' THEN CAST(CAST(body AS json) ->> 'bytes' AS BIGINT) ELSE octet_length(body) END AS size FROM events WHERE scope = $1::text AND seq > CAST($2::text AS BIGINT) ORDER BY seq LIMIT CAST($3::text AS BIGINT)) AS candidates) AS sized WHERE running <= CAST($4::text AS BIGINT) OR position = 1 ORDER BY sized.seq",
+    "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body, CAST(sized.rows AS TEXT) FROM (SELECT seq, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT seq, MAX(octet_length(body) - CAST(?5 AS INTEGER), 0) AS size FROM events WHERE scope = ?1 AND seq > CAST(?2 AS INTEGER) ORDER BY seq LIMIT CAST(?3 AS INTEGER)) AS candidates) AS sized JOIN events ON events.seq = sized.seq WHERE sized.running <= CAST(?4 AS INTEGER) OR sized.position = 1 ORDER BY sized.seq",
+    "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body, CAST(sized.rows AS TEXT) FROM (SELECT seq, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT seq, GREATEST(octet_length(body) - CAST($5::text AS BIGINT), 0) AS size FROM events WHERE scope = $1::text AND seq > CAST($2::text AS BIGINT) ORDER BY seq LIMIT CAST($3::text AS BIGINT)) AS candidates) AS sized JOIN events ON events.seq = sized.seq WHERE sized.running <= CAST($4::text AS BIGINT) OR sized.position = 1 ORDER BY sized.seq",
 ];
 const TURN_PAGE_BOUNDED: Dialects = [
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body, CAST(rows AS TEXT) FROM (SELECT seq, request_id, created_at, body, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT events.seq, events.request_id, events.created_at, events.body, CASE WHEN substr(events.body, 1, 17) = '{\"$nanocode_log\":' THEN CAST(json_extract(events.body, '$.bytes') AS INTEGER) ELSE length(CAST(events.body AS BLOB)) END AS size FROM turns JOIN events ON events.seq > MAX(CAST(?3 AS INTEGER), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = ?1 AND turns.request_id = ?2 AND events.scope = ?1 AND events.request_id = ?2 ORDER BY events.seq LIMIT CAST(?4 AS INTEGER)) AS candidates) AS sized WHERE running <= CAST(?5 AS INTEGER) OR position = 1 ORDER BY seq",
-    "SELECT CAST(seq AS TEXT), request_id, CAST(created_at AS TEXT), body, CAST(rows AS TEXT) FROM (SELECT seq, request_id, created_at, body, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT events.seq, events.request_id, events.created_at, events.body, CASE WHEN left(events.body, 17) = '{\"$nanocode_log\":' THEN CAST(CAST(events.body AS json) ->> 'bytes' AS BIGINT) ELSE octet_length(events.body) END AS size FROM turns JOIN events ON events.seq > GREATEST(CAST($3::text AS BIGINT), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = $1::text AND turns.request_id = $2::text AND events.scope = $1::text AND events.request_id = $2::text ORDER BY events.seq LIMIT CAST($4::text AS BIGINT)) AS candidates) AS sized WHERE running <= CAST($5::text AS BIGINT) OR position = 1 ORDER BY sized.seq",
+    "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body, CAST(sized.rows AS TEXT) FROM (SELECT seq, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT events.seq, MAX(octet_length(events.body) - CAST(?6 AS INTEGER), 0) AS size FROM turns JOIN events ON events.seq > MAX(CAST(?3 AS INTEGER), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = ?1 AND turns.request_id = ?2 AND events.scope = ?1 AND events.request_id = ?2 ORDER BY events.seq LIMIT CAST(?4 AS INTEGER)) AS candidates) AS sized JOIN events ON events.seq = sized.seq WHERE sized.running <= CAST(?5 AS INTEGER) OR sized.position = 1 ORDER BY sized.seq",
+    "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body, CAST(sized.rows AS TEXT) FROM (SELECT seq, SUM(size) OVER (ORDER BY seq) AS running, ROW_NUMBER() OVER (ORDER BY seq) AS position, COUNT(*) OVER () AS rows FROM (SELECT events.seq, GREATEST(octet_length(events.body) - CAST($6::text AS BIGINT), 0) AS size FROM turns JOIN events ON events.seq > GREATEST(CAST($3::text AS BIGINT), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = $1::text AND turns.request_id = $2::text AND events.scope = $1::text AND events.request_id = $2::text ORDER BY events.seq LIMIT CAST($4::text AS BIGINT)) AS candidates) AS sized JOIN events ON events.seq = sized.seq WHERE sized.running <= CAST($5::text AS BIGINT) OR sized.position = 1 ORDER BY sized.seq",
 ];
 const TURN_PAGE: Dialects = [
     "SELECT CAST(events.seq AS TEXT), events.request_id, CAST(events.created_at AS TEXT), events.body FROM turns JOIN events ON events.seq > MAX(CAST(?3 AS INTEGER), turns.first_seq - 1) AND events.seq <= COALESCE(turns.last_seq, 9223372036854775807) WHERE turns.scope = ?1 AND turns.request_id = ?2 AND events.scope = ?1 AND events.request_id = ?2 ORDER BY events.seq LIMIT CAST(?4 AS INTEGER)",
@@ -509,6 +518,10 @@ fn omitted(request_id: Option<&str>, body: &str) -> Result<Box<RawValue>, StoreE
     .map_err(encoding)
 }
 
+fn reference(value: &str) -> Result<PayloadReference, StoreError> {
+    serde_json::from_str(value).map_err(|error| invalid(format!("payload reference: {error}")))
+}
+
 fn now() -> u64 {
     nanocode_platform::system_time()
         .duration_since(UNIX_EPOCH)
@@ -603,6 +616,19 @@ fn edited(prompt: &Prompt, text: &str) -> Result<Prompt, StoreError> {
     Ok(prompt)
 }
 
+type BlobWrites = BTreeMap<BlobKey, Vec<u8>>;
+
+#[derive(Default)]
+struct Spill {
+    parts: Vec<(String, String)>,
+    blobs: BlobWrites,
+}
+
+struct Blobs {
+    store: Arc<dyn BlobStore + Send + Sync>,
+    threshold: usize,
+}
+
 fn edit_receipt(rows: &[SqlRow], edit: &str) -> Result<Option<Replaced>, StoreError> {
     Ok(single(rows)?.map(|row| {
         if optional(row, 0) == Some(edit) {
@@ -616,9 +642,11 @@ fn edit_receipt(rows: &[SqlRow], edit: &str) -> Result<Option<Replaced>, StoreEr
 pub struct SessionLog<H: ?Sized> {
     host: Arc<H>,
     scope: Arc<str>,
+    compact: bool,
     ready: AtomicBool,
     limit: Option<usize>,
     physical_limit: Option<usize>,
+    blobs: Option<Blobs>,
 }
 
 impl<H: Sql + ?Sized> SessionLog<H> {
@@ -626,10 +654,22 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         Self {
             host,
             scope: scope.into(),
+            compact: false,
             ready: AtomicBool::new(false),
             limit: None,
             physical_limit: None,
+            blobs: None,
         }
+    }
+
+    #[must_use]
+    pub const fn compact_events(mut self) -> Self {
+        self.compact = true;
+        self
+    }
+
+    pub(crate) const fn compacts_events(&self) -> bool {
+        self.compact
     }
 
     #[must_use]
@@ -641,6 +681,12 @@ impl<H: Sql + ?Sized> SessionLog<H> {
     #[must_use]
     pub const fn logical_limit(mut self, bytes: usize) -> Self {
         self.limit = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    pub fn blobs(mut self, store: Arc<dyn BlobStore + Send + Sync>, threshold: usize) -> Self {
+        self.blobs = Some(Blobs { store, threshold });
         self
     }
 
@@ -719,7 +765,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             self.migrate().await?;
         }
         let dialect = self.host.dialect();
-        let mut parts = Vec::new();
+        let mut spill = Spill::default();
         let mut values = Vec::with_capacity(statements.len());
         for stmt in &statements {
             let slot = if [
@@ -758,7 +804,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                     .map(|(_, value)| value.len())
                     .sum::<usize>();
                 let overhead = record_bytes(TURN_TEXTS, other, TURN_INTEGERS);
-                params[slot] = self.store_value(stmt.params[slot], overhead, false, &mut parts)?;
+                params[slot] = self.store_value(stmt.params[slot], overhead, false, &mut spill)?;
             }
             if self
                 .physical_limit
@@ -770,7 +816,9 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             }
             values.push(params);
         }
-        let mut prepared: Vec<_> = parts
+        self.put_blobs(&spill.blobs).await?;
+        let mut prepared: Vec<_> = spill
+            .parts
             .iter()
             .map(|(key, data)| statement(dialect, &PART, vec![key, data]))
             .collect();
@@ -792,7 +840,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 .any(|sql| stmt.sql == dialect.pick(sql))
             {
                 &[3, 10]
-            } else if [PAGE, PAGE_BOUNDED, TURN_PAGE, TURN_PAGE_BOUNDED]
+            } else if [PAGE, TURN_PAGE]
                 .iter()
                 .any(|sql| stmt.sql == dialect.pick(sql))
             {
@@ -820,16 +868,52 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         value: &'a str,
         overhead: usize,
         force: bool,
-        parts: &mut Vec<(String, String)>,
+        spill: &mut Spill,
     ) -> Result<Cow<'a, str>, StoreError> {
         if !force
             && !value.starts_with(PAYLOAD_MARK)
             && self
                 .physical_limit
                 .is_none_or(|limit| value.len().saturating_add(overhead) <= limit)
+            && self
+                .blobs
+                .as_ref()
+                .is_none_or(|blobs| value.len() <= blobs.threshold)
         {
             return Ok(Cow::Borrowed(value));
         }
+        let keys = if self.blobs.is_some() {
+            let key = BlobKey::of(value.as_bytes());
+            let reference = key.as_str().to_owned();
+            spill
+                .blobs
+                .entry(key)
+                .or_insert_with(|| value.as_bytes().to_vec());
+            vec![reference]
+        } else {
+            self.parts(value, &mut spill.parts)?
+        };
+        let reference = serde_json::to_string(&PayloadReference {
+            parts: keys,
+            bytes: value.len(),
+        })
+        .map_err(encoding)?;
+        if self
+            .physical_limit
+            .is_some_and(|limit| reference.len().saturating_add(overhead) > limit)
+        {
+            return Err(StoreError::NotCommitted(
+                "session log reference exceeds the physical row limit".into(),
+            ));
+        }
+        Ok(Cow::Owned(reference))
+    }
+
+    fn parts(
+        &self,
+        value: &str,
+        parts: &mut Vec<(String, String)>,
+    ) -> Result<Vec<String>, StoreError> {
         let part_overhead = record_bytes(2, blake3::OUT_LEN * 2, 0);
         let capacity = self
             .physical_limit
@@ -857,27 +941,56 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             parts.push((key, data.to_owned()));
             remaining = rest;
         }
-        let reference = serde_json::to_string(&PayloadReference {
-            parts: keys,
-            bytes: value.len(),
-        })
-        .map_err(encoding)?;
-        if self
-            .physical_limit
-            .is_some_and(|limit| reference.len().saturating_add(overhead) > limit)
-        {
-            return Err(StoreError::NotCommitted(
-                "session log reference exceeds the physical row limit".into(),
-            ));
+        Ok(keys)
+    }
+
+    fn stored_prompt<'p>(&self, prompt: &'p Prompt, writes: &mut BlobWrites) -> Cow<'p, Prompt> {
+        if self.blobs.is_none() {
+            return Cow::Borrowed(prompt);
         }
-        Ok(Cow::Owned(reference))
+        let mut stored = prompt.clone();
+        if let PromptInput::Content(items) = &mut stored.instruction {
+            for item in items {
+                if let UserInput::Image { image_url, .. } = item
+                    && let Some((blob, bytes)) = BlobUrl::from_data_url(image_url)
+                {
+                    *image_url = blob.to_string();
+                    writes.entry(blob.key().clone()).or_insert(bytes);
+                }
+            }
+        }
+        Cow::Owned(stored)
+    }
+
+    async fn put_blobs(&self, writes: &BlobWrites) -> Result<(), StoreError> {
+        let Some(blobs) = &self.blobs else {
+            return Ok(());
+        };
+        for (key, bytes) in writes {
+            blobs.store.put(key, bytes).await.map_err(|error| {
+                StoreError::NotCommitted(format!("store session log blob {key}: {error}"))
+            })?;
+        }
+        Ok(())
     }
 
     async fn load_value(&self, value: &str) -> Result<String, StoreError> {
-        let reference: PayloadReference = serde_json::from_str(value)
-            .map_err(|error| invalid(format!("payload reference: {error}")))?;
+        let reference = reference(value)?;
         let mut decoded = String::new();
         for key in reference.parts {
+            if let Some(key) = BlobKey::parse(&key) {
+                let blobs = self.blobs.as_ref().ok_or_else(|| {
+                    invalid(format!(
+                        "session log value {key} is in a blob store the log lacks"
+                    ))
+                })?;
+                let bytes = get_blob(&*blobs.store, &key).await?;
+                decoded.push_str(
+                    std::str::from_utf8(&bytes)
+                        .map_err(|error| invalid(format!("session log blob {key}: {error}")))?,
+                );
+                continue;
+            }
             let results = self
                 .run(
                     "log_part",
@@ -899,8 +1012,10 @@ impl<H: Sql + ?Sized> SessionLog<H> {
 
     pub async fn submit(&self, submission: &Submission) -> Result<Submitted, StoreError> {
         let id = submission.request_id.as_str();
-        let prompt = serde_json::to_string(&submission.prompt).map_err(encoding)?;
         let digest = submission_digest(&submission.prompt, submission.hand.as_deref())?;
+        let mut images = BlobWrites::new();
+        let stored = self.stored_prompt(&submission.prompt, &mut images);
+        let prompt = serde_json::to_string(&*stored).map_err(encoding)?;
         let body = serde_json::to_string(&Lifecycle {
             kind: "queued",
             request_id: id,
@@ -923,13 +1038,14 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             let accepted = event_bytes(
                 &self.scope,
                 Some(id),
-                accepted_bytes(id, &submission.prompt.instruction).map_err(encoding)?,
+                accepted_bytes(id, &stored.instruction).map_err(encoding)?,
             );
             let bytes = row.max(accepted);
             if bytes > limit {
                 return Ok(Submitted::TooLarge { bytes, limit });
             }
         }
+        self.put_blobs(&images).await?;
         let turn = match submission.hand.as_deref() {
             Some(hand) => statement(
                 self.host.dialect(),
@@ -1187,8 +1303,10 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 return Ok(edit_receipt(&results[0], &edit)?.unwrap_or(Replaced::NotQueued));
             };
             let prompt = edited(prompt, text)?;
-            let encoded = serde_json::to_string(&prompt).map_err(encoding)?;
             let digest = submission_digest(&prompt, turn.hand.as_deref())?;
+            let mut images = BlobWrites::new();
+            let stored = self.stored_prompt(&prompt, &mut images);
+            let encoded = serde_json::to_string(&*stored).map_err(encoding)?;
             if let Some(limit) = self.limit {
                 let row = record_bytes(
                     TURN_TEXTS,
@@ -1204,7 +1322,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 let accepted = event_bytes(
                     &self.scope,
                     Some(request_id),
-                    accepted_bytes(request_id, &prompt.instruction).map_err(encoding)?,
+                    accepted_bytes(request_id, &stored.instruction).map_err(encoding)?,
                 );
                 let receipt = event_bytes(&self.scope, Some(request_id), body.len());
                 let bytes = row.max(accepted).max(receipt);
@@ -1212,6 +1330,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                     return Ok(Replaced::TooLarge { bytes, limit });
                 }
             }
+            self.put_blobs(&images).await?;
             let created = now().to_string();
             let results = self
                 .transaction(
@@ -1469,6 +1588,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         let cursor = after.to_string();
         let count = limit.to_string();
         let bytes = max_bytes.to_string();
+        let reserve = LONGEST_SINGLE_KEY_REFERENCE.to_string();
         let statements = match request_id {
             Some(request_id) => vec![
                 statement(
@@ -1479,16 +1599,16 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 statement(
                     self.host.dialect(),
                     &TURN_PAGE_BOUNDED,
-                    vec![&self.scope, request_id, &cursor, &count, &bytes],
+                    vec![&self.scope, request_id, &cursor, &count, &bytes, &reserve],
                 ),
             ],
             None => vec![statement(
                 self.host.dialect(),
                 &PAGE_BOUNDED,
-                vec![&self.scope, &cursor, &count, &bytes],
+                vec![&self.scope, &cursor, &count, &bytes, &reserve],
             )],
         };
-        let results = self.transaction("page_bounded", statements).await?;
+        let mut results = self.transaction("page_bounded", statements).await?;
         let start = if request_id.is_some() {
             single(&results[0])?
                 .map(|row| text(row, 0).and_then(counter))
@@ -1497,15 +1617,38 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         } else {
             after
         };
-        let rows = results
-            .last()
+        let mut rows = results
+            .pop()
             .ok_or_else(|| invalid("missing bounded page"))?;
         let window = rows
             .first()
             .map(|row| text(row, 4).and_then(counter))
             .transpose()?
             .unwrap_or(0);
-        let mut page = page(rows, start, limit)?;
+        let mut running = 0_usize;
+        let mut fitting = 0;
+        for row in &rows {
+            let body = text(row, 3)?;
+            let bytes = if body.starts_with(PAYLOAD_MARK) {
+                reference(body)?.bytes
+            } else {
+                body.len()
+            };
+            running = running.saturating_add(bytes);
+            if fitting > 0 && running > max_bytes {
+                break;
+            }
+            fitting += 1;
+        }
+        rows.truncate(fitting);
+        for row in &mut rows {
+            if let Some(Some(body)) = row.get_mut(3)
+                && body.starts_with(PAYLOAD_MARK)
+            {
+                *body = self.load_value(body).await?;
+            }
+        }
+        let mut page = page(&rows, start, limit)?;
         page.has_more = page.events.len() as u64 != window || window == limit as u64;
         Ok(page)
     }
@@ -1546,7 +1689,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         if turns.is_empty() {
             return Ok(0);
         }
-        let mut parts = Vec::new();
+        let mut spill = Spill::default();
         let mut rows = turns
             .iter()
             .map(|turn| {
@@ -1555,7 +1698,11 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                     digest: submission_digest(&turn.prompt, turn.hand.as_deref())?,
                     status: turn.state.as_str(),
                     prompt: (!turn.state.is_terminal())
-                        .then(|| serde_json::to_string(&turn.prompt))
+                        .then(|| {
+                            serde_json::to_string(
+                                &*self.stored_prompt(&turn.prompt, &mut spill.blobs),
+                            )
+                        })
                         .transpose()
                         .map_err(encoding)?,
                     hand: turn.hand.as_deref(),
@@ -1587,7 +1734,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                         prompt,
                         record_bytes(TURN_TEXTS, other, TURN_INTEGERS),
                         force,
-                        &mut parts,
+                        &mut spill,
                     )?
                     .into_owned(),
                 );
@@ -1611,7 +1758,9 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             })
             .collect::<Result<_, _>>()
             .map_err(encoding)?;
-        let mut statements: Vec<_> = parts
+        self.put_blobs(&spill.blobs).await?;
+        let mut statements: Vec<_> = spill
+            .parts
             .iter()
             .map(|(key, data)| statement(self.host.dialect(), &PART, vec![key, data]))
             .collect();

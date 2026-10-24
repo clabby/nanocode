@@ -82,7 +82,8 @@ impl ModelRun {
         let reasoning_mode = self.config.reasoning_mode;
         let service_tier = self.service_tier;
         let request_history = conversation.managed.generation_request();
-        let previous_response_id = request_history.previous_response_id();
+        let sent = evict_images(&self.images, &request_history);
+        let previous_response_id = sent.previous_response_id();
         let started_at = Instant::now();
         self.stats.model_calls += 1;
         self.prompt_cache.publish_request(thinking, service_tier);
@@ -101,19 +102,16 @@ impl ModelRun {
                     .then(|| factory.profile().prompt_cache_key()),
             },
         )?;
-        let request = factory
-            .generation(
-                call_index,
-                &request_history,
-                model,
-                conversation.reasoning.request_effort(
-                    model,
-                    thinking,
-                    self.config.supports_reasoning_effort_updates(model),
-                ),
-                service_tier,
-            )
-            .with_model_call_started_at(started_at);
+        let effort = conversation.reasoning.request_effort(
+            model,
+            thinking,
+            self.config.supports_reasoning_effort_updates(model),
+        );
+        let build = |history: &RequestHistory| {
+            factory
+                .generation(call_index, history, model, effort, service_tier)
+                .with_model_call_started_at(started_at)
+        };
         let span = model_call_span(
             &self.provider_session_id,
             call_index,
@@ -121,9 +119,9 @@ impl ModelRun {
             reasoning_mode.as_str(),
             thinking.as_str(),
             previous_response_id.is_some(),
-            request.input_item_count(),
+            build(&sent).input_item_count(),
         );
-        let request = request.with_input_trace(trace_content_enabled().then(|| span.clone()));
+        let trace = trace_content_enabled().then(|| span.clone());
         let execution_steps = self.execution_steps.clone();
         let recovered = if let Some(steps) = &execution_steps {
             let admitted = match admitted {
@@ -153,6 +151,7 @@ impl ModelRun {
         let (recorded_result, transport_continuation_valid) = if let Some(output) = recovered {
             (output, false)
         } else {
+            let request = build(&inline_images(&self.images, sent).await?).with_input_trace(trace);
             let preparation_ns = elapsed_ns(started_at);
             let success = match self.client.execute(request).instrument(span.clone()).await {
                 Ok(success) => success,

@@ -291,6 +291,7 @@ enum NoticeOutcome {
     Undelivered,
     Pending,
     Cancelled,
+    Failed,
     Stopped,
 }
 
@@ -304,7 +305,8 @@ impl NoticeOutcome {
             (NanocodeError::AgentStopped | NanocodeError::TurnStopped, _)
             | (_, Some(ExecutionPolicyDisposition::Reopen)) => Self::Stopped,
             (_, Some(ExecutionPolicyDisposition::Retry)) => Self::Pending,
-            _ => Self::Unread,
+            (NanocodeError::Response(failure), _) if failure.retryable() => Self::Pending,
+            _ => Self::Failed,
         }
     }
 
@@ -3981,7 +3983,7 @@ impl Registry {
                 self.schedule_parent_continuation(root_session_id, id, revision);
             }
             NoticeOutcome::Pending => self.retry_completion(root_session_id, id, revision),
-            NoticeOutcome::Cancelled => {
+            NoticeOutcome::Cancelled | NoticeOutcome::Failed => {
                 if !self
                     .park_completion(root_session_id, id, revision, true)
                     .await
@@ -4019,14 +4021,14 @@ impl Registry {
         root_session_id: &str,
         id: AgentId,
         revision: u64,
-        cancelled: bool,
+        held: bool,
     ) -> bool {
         let parked = {
             let mut state = self.state.acquire().await;
             let Some(scope) = state.scopes.get_mut(root_session_id) else {
                 return false;
             };
-            let lineage = cancelled
+            let lineage = held
                 || scope.sessions.values().any(|session| {
                     session.completion_parked && session.pending_completion.is_some()
                 });

@@ -16,13 +16,14 @@ use serde_json::{Map, Value};
 
 use crate::{
     Agent, AgentRuntime, DurableOutcome, EventSink, NanocodeError, PromptRequest, SessionEvent,
-    SessionEvents, SteerReceiptStatus, TurnControl,
+    SessionEvents, SteerReceiptStatus,
     durability::{SessionRecord, SessionStore, Sql, StoreError},
     events::{
         AGENT_EVENT_PROTOCOL_VERSION, AcceptedInput, AgentEvent, AgentEventKind, AgentEventTiming,
     },
     input::{Prompt, PromptInput},
     session_log::{LogEntry, LoggedEvent, SessionLog, Started, TurnRecord, TurnState},
+    stored_event::{EventForm, Stored},
 };
 
 pub trait InboxHost: Send + Sync + 'static {
@@ -93,12 +94,16 @@ pub enum MovedQueued {
     Unknown,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Run {
+    Inbox,
+    Resumed,
+}
+
 #[derive(Clone, Default)]
 struct Request {
-    running: bool,
-    inbox: bool,
+    running: Option<Run>,
     cancelled: bool,
-    control: Option<TurnControl>,
 }
 
 #[derive(Clone, Default)]
@@ -115,17 +120,27 @@ impl Requests {
     }
 
     fn idle(&self) -> bool {
-        !self.requests.values().any(|request| request.running)
+        !self
+            .requests
+            .values()
+            .any(|request| request.running.is_some())
     }
 
     fn tidy(&mut self, id: &str) {
         if self
             .requests
             .get(id)
-            .is_some_and(|request| !request.running && !request.cancelled)
+            .is_some_and(|request| request.running.is_none() && !request.cancelled)
         {
             self.requests.remove(id);
         }
+    }
+
+    fn finished(&mut self, id: &str) {
+        if let Some(request) = self.requests.get_mut(id) {
+            request.cancelled = false;
+        }
+        self.tidy(id);
     }
 }
 
@@ -133,6 +148,7 @@ struct Shared<H: ?Sized> {
     log: Arc<SessionLog<H>>,
     host: Arc<dyn InboxHost>,
     state: Atom<Requests>,
+    session_id: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -149,38 +165,6 @@ struct Envelope<'a> {
     event: &'a SessionEvent,
     #[serde(flatten)]
     annotation: &'a Map<String, Value>,
-}
-
-struct Stored<'a>(&'a SessionEvent);
-
-impl Serialize for Stored<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap as _;
-        let SessionEvent::Agent { event, .. } = self.0 else {
-            return self.0.serialize(serializer);
-        };
-        let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("source", "agent")?;
-        match without_timing(event) {
-            Some(slim) => map.serialize_entry("event", &slim)?,
-            None => map.serialize_entry("event", event)?,
-        }
-        map.end()
-    }
-}
-
-fn without_timing(event: &AgentEvent) -> Option<AgentEvent> {
-    if !event.payload.get().contains("\"timing\"") {
-        return None;
-    }
-    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(event.payload.get()) else {
-        return None;
-    };
-    fields.remove("timing")?;
-    Some(AgentEvent {
-        payload: serde_json::value::to_raw_value(&fields).ok()?.into(),
-        ..event.clone()
-    })
 }
 
 pub(crate) fn accepted_bytes(
@@ -216,7 +200,10 @@ pub(crate) fn accepted_bytes(
         },
         received_ns: u64::MAX,
     };
-    let stored = serde_json::value::to_raw_value(&Stored(&event))?;
+    let stored = serde_json::value::to_raw_value(&Stored {
+        event: &event,
+        form: EventForm::Full,
+    })?;
     Ok(stored.get().len() - serde_json::to_vec(&empty)?.len() + serde_json::to_vec(input)?.len())
 }
 
@@ -238,7 +225,7 @@ impl<H: ?Sized> Shared<H> {
                     state
                         .requests
                         .get(&accepted)
-                        .is_some_and(|request| request.running && request.inbox)
+                        .is_some_and(|request| request.running == Some(Run::Inbox))
                 }) =>
             {
                 self.state.update(|state| {
@@ -263,6 +250,13 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
         Box::pin(async move {
             let annotation = self.0.host.annotate();
             let unannotated = Map::new();
+            let form = if self.0.log.compacts_events() {
+                EventForm::Compact {
+                    session_id: &self.0.session_id,
+                }
+            } else {
+                EventForm::Full
+            };
             let (entries, live): (Vec<_>, Vec<_>) = events
                 .iter()
                 .map(|event| {
@@ -279,7 +273,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> EventSink for LogSink<H> {
                             annotation: &unannotated,
                         })?;
                     }
-                    let stored = serde_json::value::to_raw_value(&Stored(event))?;
+                    let stored = serde_json::value::to_raw_value(&Stored { event, form })?;
                     Ok((
                         LogEntry {
                             request_id,
@@ -320,8 +314,7 @@ impl<H: ?Sized> Drop for Claim<'_, H> {
     fn drop(&mut self) {
         self.0.state.update(|state| {
             if let Some(request) = state.requests.get_mut(self.1) {
-                request.running = false;
-                request.control = None;
+                request.running = None;
             }
             state.tidy(self.1);
         });
@@ -381,6 +374,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             log,
             host,
             state: Atom::default(),
+            session_id,
         });
         let (events, pump) =
             SessionEvents::start(stream, subagents, window, LogSink(Arc::clone(&shared)));
@@ -483,13 +477,12 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
                     .or_default()
                     .cancelled = true;
             });
-            let live = self.shared.state.read(|state| {
-                state
-                    .requests
-                    .get(request_id)
-                    .and_then(|request| request.control.clone())
-            });
-            if let Some(control) = live {
+            let live = self
+                .agent
+                .turn_controls()
+                .into_iter()
+                .find(|(id, _)| id == request_id);
+            if let Some((_, control)) = live {
                 ignore_inactive(control.cancel().await)?;
             }
         }
@@ -502,23 +495,19 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         id: &str,
         prompt: Prompt,
     ) -> Result<bool, InboxError> {
-        let live = self.shared.state.read(|state| {
-            let steerable =
-                |request: &&Request| request.running && request.inbox && !request.cancelled;
-            match target {
-                Some(target) => state.requests.get(target).filter(steerable),
-                None => state.requests.values().find(steerable),
+        for (request_id, control) in self.agent.turn_controls() {
+            if target.is_some_and(|target| target != request_id)
+                || self.shared.state.read(|state| state.cancelled(&request_id))
+            {
+                continue;
             }
-            .and_then(|request| request.control.clone())
-        });
-        let Some(control) = live else {
-            return Ok(false);
-        };
-        match control.steer_with_id(id.to_owned(), prompt).await {
-            Ok(()) => Ok(true),
-            Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => Ok(false),
-            Err(error) => Err(error.into()),
+            match control.steer_with_id(id.to_owned(), prompt.clone()).await {
+                Ok(()) => return Ok(true),
+                Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        Ok(false)
     }
 
     pub async fn move_queued(
@@ -650,7 +639,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
                 .await
             };
         };
-        match self.execute(id, prompt, cancel, true).await {
+        match self.execute(id, prompt, cancel, Run::Inbox).await {
             DurableOutcome::Completed(message) => {
                 let ok = serde_json::json!({"ok": {
                     "session_id": self.session_id(),
@@ -691,7 +680,9 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         };
         self.shared.host.place(self.session_id(), hand.as_deref());
         let cancel = abandoned || self.shared.state.read(|state| state.cancelled(&id));
-        Ok(match self.execute(&id, prompt, cancel, false).await {
+        let outcome = self.execute(&id, prompt, cancel, Run::Resumed).await;
+        self.shared.state.update(|state| state.finished(&id));
+        Ok(match outcome {
             DurableOutcome::Waiting => Driven::Waiting(id),
             DurableOutcome::Interrupted => Driven::Interrupted(id),
             _ => Driven::Resumed(id),
@@ -706,12 +697,7 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
     ) -> Result<Driven, InboxError> {
         outcome.extend(self.shared.host.finishing(id).await);
         let finished = self.shared.log.finish(id, state, &outcome).await?;
-        self.shared.state.update(|state| {
-            if let Some(request) = state.requests.get_mut(id) {
-                request.cancelled = false;
-            }
-            state.tidy(id);
-        });
+        self.shared.state.update(|state| state.finished(id));
         let Some((record, event)) = finished else {
             return Ok(match self.shared.log.turn(id).await? {
                 Some(record) => Driven::Finished(record),
@@ -722,15 +708,14 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
         Ok(Driven::Finished(record))
     }
 
-    async fn execute(&self, id: &str, prompt: Prompt, cancel: bool, inbox: bool) -> DurableOutcome {
+    async fn execute(&self, id: &str, prompt: Prompt, cancel: bool, run: Run) -> DurableOutcome {
         let claimed = self.shared.state.update(|state| {
             let request = state.requests.entry(id.to_owned()).or_default();
-            if request.running {
+            if request.running.is_some() {
                 return false;
             }
-            request.running = true;
-            request.inbox = inbox;
-            request.control = None;
+            request.running = Some(run);
+            request.cancelled |= cancel;
             true
         });
         if !claimed {
@@ -761,12 +746,6 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnInbox<H> {
             request = request.cancel_on_admission();
         }
         let turn = self.agent.prompt(request).await?;
-        let control = turn.control();
-        self.shared.state.update(|state| {
-            if let Some(request) = state.requests.get_mut(id) {
-                request.control = Some(control.clone());
-            }
-        });
         if cancelled() {
             ignore_inactive(turn.cancel().await)?;
         }
