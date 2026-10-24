@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use nanocode_agent_core::{AgentHandle, BackendId, ModelSelection, Result, backend::BackendFuture};
 use nanocode_durability::{CheckpointFormat, SessionStore, SharedStore};
-use nanocode_tool_host::{Tools, ToolsBuildError};
+use nanocode_tool_host::{Tools, ToolsBuildError, image::ImageHistory};
 
 pub type AgentResult = Result<(crate::Agent, crate::AgentEvents)>;
 pub type ToolsFactory =
@@ -34,6 +34,7 @@ impl AgentTools {
 pub struct Settings {
     pub instructions: Option<Arc<str>>,
     pub model_instructions: Vec<(ModelSelection, Arc<str>)>,
+    pub images: Option<ImageHistory>,
     pub tools: Option<AgentTools>,
     #[cfg(not(target_family = "wasm"))]
     pub providers: Vec<Arc<dyn nanocode_tool_host::runtime::DynamicToolProvider>>,
@@ -47,6 +48,7 @@ impl Settings {
                 true => fallback.model_instructions.clone(),
                 false => self.model_instructions,
             },
+            images: self.images.or_else(|| fallback.images.clone()),
             tools: self.tools.or_else(|| fallback.tools.clone()),
             #[cfg(not(target_family = "wasm"))]
             providers: match self.providers.is_empty() {
