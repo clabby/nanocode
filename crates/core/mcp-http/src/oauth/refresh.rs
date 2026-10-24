@@ -41,6 +41,11 @@ fn refresh_for(key: &str) -> Arc<Refresh> {
 }
 
 impl McpOAuthCredentials {
+    fn expired(&self) -> bool {
+        self.expires_at_millis
+            .is_some_and(|expires_at| now_millis() >= expires_at)
+    }
+
     fn needs_refresh(&self) -> bool {
         self.expires_at_millis.is_some_and(|expires_at| {
             now_millis().saturating_add(REFRESH_SKEW_MILLIS) >= expires_at
@@ -54,6 +59,10 @@ impl McpOAuthCredentials {
             .client_secret
             .clone_from(&previous.client_secret);
         credentials.secret_in_body = previous.secret_in_body;
+        credentials
+            .token_endpoint
+            .clone_from(&previous.token_endpoint);
+        credentials.resource.clone_from(&previous.resource);
         if response.refresh_token.is_none() {
             credentials
                 .refresh_token
@@ -83,7 +92,9 @@ impl OAuthRuntime {
         })
     }
 
-    pub(crate) async fn refresh_after_rejection(
+    /// The server refused `rejected_access_token`: refresh it unless the
+    /// store already holds a newer one, and return the current token.
+    pub async fn refresh_after_rejection(
         self: &Arc<Self>,
         rejected_access_token: &str,
     ) -> Result<String, String> {
@@ -92,13 +103,34 @@ impl OAuthRuntime {
         self.current_access_token().await
     }
 
+    /// The server refused `access_token` even though it was just refreshed
+    /// after a rejection: tell the store authorization is required.
+    pub async fn refused_after_refresh(&self, access_token: &str) {
+        let current = self
+            .credentials
+            .load()
+            .as_ref()
+            .is_some_and(|credentials| credentials.access_token == access_token);
+        if current {
+            self.store
+                .authorization_required(&self.server_name, &self.server_url)
+                .await;
+        }
+    }
+
     async fn spawn_refresh(
         self: &Arc<Self>,
         reason: &'static str,
         rejected_access_token: Option<String>,
     ) -> Result<(), String> {
         let runtime = Arc::clone(self);
-        let refresh = refresh_for(&format!("{}\0{}", self.server_name, self.server_url));
+        // Per store too: hosts with a store per user may reuse server names.
+        let refresh = refresh_for(&format!(
+            "{:p}\0{}\0{}",
+            Arc::as_ptr(&self.store),
+            self.server_name,
+            self.server_url
+        ));
         refresh
             .run(|| async move {
                 let server_name = runtime.server_name.clone();
@@ -161,40 +193,6 @@ impl OAuthRuntime {
             ));
         };
 
-        let metadata = timeout(
-            REFRESH_REQUEST_TIMEOUT,
-            super::discover(&self.http, &self.base_url),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "timed out after {REFRESH_REQUEST_TIMEOUT:?} resolving current OAuth metadata for `{}`",
-                self.server_name
-            )
-        })?
-        .map_err(|error| {
-            format!(
-                "failed to resolve current OAuth metadata for `{}`: {error}",
-                self.server_name
-            )
-        })?
-        .metadata;
-        super::validate_authorization_server_endpoints(&metadata).map_err(|error| {
-            format!(
-                "current OAuth metadata for `{}` is invalid: {error}",
-                self.server_name
-            )
-        })?;
-        let current_issuer = super::authorization_issuer(&metadata)?;
-        super::validate_refresh_token_issuer(&latest, current_issuer.as_deref()).map_err(
-            |error| {
-                format!(
-                    "OAuth refresh credentials for `{}` cannot be used: {error}",
-                    self.server_name
-                )
-            },
-        )?;
-
         let rejected = rejected_access_token.is_some_and(|token| token == latest.access_token);
         if !latest.needs_refresh() && !rejected {
             self.credentials.store(Some(Arc::new(latest)));
@@ -205,6 +203,9 @@ impl OAuthRuntime {
             .as_deref()
             .filter(|token| !token.trim().is_empty())
         else {
+            self.store
+                .authorization_required(&self.server_name, &self.server_url)
+                .await;
             return Err(format!(
                 "OAuth credentials for `{}` cannot be refreshed; authorization required",
                 self.server_name
@@ -213,25 +214,56 @@ impl OAuthRuntime {
 
         self.credentials.store(Some(Arc::new(latest.clone())));
         let mut scopes = latest.scopes.clone();
-        metadata.add_offline_access(&mut scopes);
+        let (token_endpoint, resource) = match (&latest.token_endpoint, &self.base_url) {
+            (Some(token_endpoint), _) => (
+                token_endpoint.clone(),
+                latest
+                    .resource
+                    .clone()
+                    .unwrap_or_else(|| self.server_url.clone()),
+            ),
+            (None, Some(base_url)) => {
+                let metadata = self.current_metadata(base_url, &latest).await?;
+                metadata.add_offline_access(&mut scopes);
+                let resource = latest
+                    .resource
+                    .clone()
+                    .unwrap_or_else(|| base_url.to_string());
+                (metadata.token_endpoint, resource)
+            }
+            (None, None) => {
+                return Err(format!(
+                    "OAuth credentials for `{}` do not name their token endpoint",
+                    self.server_name
+                ));
+            }
+        };
         let request = nanocode_mcp::oauth::refresh_token_request(
             &latest.client_authentication(),
             refresh_token,
             &scopes,
-            self.base_url.as_str(),
+            &resource,
         );
         let response = match timeout(
             REFRESH_REQUEST_TIMEOUT,
-            super::token_endpoint_request(&self.http, &metadata.token_endpoint, request),
+            super::token_endpoint_request(&self.http, &token_endpoint, request),
         )
         .await
         {
             Ok(Ok(response)) => response,
             Ok(Err(error @ TokenError::Rejected(_))) => {
+                self.store
+                    .authorization_required(&self.server_name, &self.server_url)
+                    .await;
                 return Err(format!(
                     "OAuth refresh token for `{}` was rejected; authorization required: OAuth refresh token was rejected: {error}",
                     self.server_name
                 ));
+            }
+            // A token that has not expired yet may still work.
+            Ok(Err(_)) | Err(_) if rejected_access_token.is_none() && !latest.expired() => {
+                self.credentials.store(Some(Arc::new(latest)));
+                return Ok(());
             }
             Ok(Err(error)) => {
                 return Err(format!(
@@ -265,5 +297,45 @@ impl OAuthRuntime {
 
         self.credentials.store(Some(Arc::new(refreshed)));
         Ok(())
+    }
+
+    /// The authorization server's current metadata, checked against the
+    /// issuer that issued `latest`.
+    async fn current_metadata(
+        &self,
+        base_url: &reqwest::Url,
+        latest: &McpOAuthCredentials,
+    ) -> Result<nanocode_mcp::oauth::AuthorizationMetadata, String> {
+        let metadata = timeout(REFRESH_REQUEST_TIMEOUT, super::discover(&self.http, base_url))
+            .await
+            .map_err(|_| {
+                format!(
+                    "timed out after {REFRESH_REQUEST_TIMEOUT:?} resolving current OAuth metadata for `{}`",
+                    self.server_name
+                )
+            })?
+            .map_err(|error| {
+                format!(
+                    "failed to resolve current OAuth metadata for `{}`: {error}",
+                    self.server_name
+                )
+            })?
+            .metadata;
+        super::validate_authorization_server_endpoints(&metadata).map_err(|error| {
+            format!(
+                "current OAuth metadata for `{}` is invalid: {error}",
+                self.server_name
+            )
+        })?;
+        let current_issuer = super::authorization_issuer(&metadata)?;
+        super::validate_refresh_token_issuer(latest, current_issuer.as_deref()).map_err(
+            |error| {
+                format!(
+                    "OAuth refresh credentials for `{}` cannot be used: {error}",
+                    self.server_name
+                )
+            },
+        )?;
+        Ok(metadata)
     }
 }

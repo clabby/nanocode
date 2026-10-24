@@ -68,6 +68,8 @@ pub struct McpOAuthCredentials {
     issuer: Option<String>,
     expires_at_millis: Option<u64>,
     scopes: Vec<String>,
+    token_endpoint: Option<String>,
+    resource: Option<String>,
 }
 
 pub trait McpOAuthRefreshGuard: Send {}
@@ -86,6 +88,8 @@ impl McpOAuthCredentials {
             issuer: None,
             expires_at_millis: None,
             scopes: Vec::new(),
+            token_endpoint: None,
+            resource: None,
         }
     }
 
@@ -128,6 +132,32 @@ impl McpOAuthCredentials {
     pub fn scopes(mut self, scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.scopes = scopes.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Refresh at this token endpoint, as the sign-in found it, instead of
+    /// discovering the server's authorization again before each refresh.
+    #[must_use]
+    pub fn token_endpoint(mut self, token_endpoint: impl Into<String>) -> Self {
+        self.token_endpoint = Some(token_endpoint.into());
+        self
+    }
+
+    /// The resource indicator (RFC 8707) refreshes send instead of the
+    /// server URL; empty sends none.
+    #[must_use]
+    pub fn resource(mut self, resource: impl Into<String>) -> Self {
+        self.resource = Some(resource.into());
+        self
+    }
+
+    #[must_use]
+    pub fn stored_token_endpoint(&self) -> Option<&str> {
+        self.token_endpoint.as_deref()
+    }
+
+    #[must_use]
+    pub fn resource_indicator(&self) -> Option<&str> {
+        self.resource.as_deref()
     }
 
     #[must_use]
@@ -177,6 +207,8 @@ impl McpOAuthCredentials {
             issuer,
             expires_at_millis,
             scopes: response.scopes().unwrap_or_default(),
+            token_endpoint: None,
+            resource: None,
         }
     }
 }
@@ -203,18 +235,54 @@ pub trait McpOAuthStore: Send + Sync {
     ) -> Result<Box<dyn McpOAuthRefreshGuard>, String> {
         Ok(Box::new(()))
     }
+
+    /// The stored sign-in can no longer be used: the authorization server
+    /// rejected its refresh token, it has none, or the server refused an
+    /// access token just refreshed. Only authorizing again helps.
+    fn authorization_required<'call>(
+        &'call self,
+        _server_name: &'call str,
+        _server_url: &'call str,
+    ) -> futures_util::future::BoxFuture<'call, ()> {
+        Box::pin(async {})
+    }
 }
 
 pub struct OAuthRuntime {
     server_name: String,
     server_url: String,
-    base_url: Url,
+    /// The MCP server's URL, which refreshes discover from; `None` for
+    /// credentials that name their token endpoint.
+    base_url: Option<Url>,
     http: reqwest::Client,
     store: Arc<dyn McpOAuthStore>,
     credentials: ArcSwapOption<McpOAuthCredentials>,
 }
 
 impl OAuthRuntime {
+    /// A runtime for credentials that name their token endpoint, which
+    /// refreshes without discovery, for any API the token is for: `server_url`
+    /// only names it, with `server_name`, to the store.
+    pub fn stored(
+        server_name: impl Into<String>,
+        server_url: impl Into<String>,
+        http: reqwest::Client,
+        store: Arc<dyn McpOAuthStore>,
+        credentials: McpOAuthCredentials,
+    ) -> Result<Arc<Self>, String> {
+        if credentials.token_endpoint.is_none() {
+            return Err("OAuth credentials do not name their token endpoint".to_owned());
+        }
+        Ok(Arc::new(Self {
+            server_name: server_name.into(),
+            server_url: server_url.into(),
+            base_url: None,
+            http,
+            store,
+            credentials: ArcSwapOption::from_pointee(credentials),
+        }))
+    }
+
     pub fn access_token<'call>(
         self: &'call Arc<Self>,
     ) -> futures_util::future::BoxFuture<'call, Result<String, String>> {
@@ -369,6 +437,14 @@ pub fn transport_from_credentials<'call>(
         let base_url = Url::parse(server_url).map_err(|error| {
             format!("failed to initialize MCP OAuth state: URL parse error: {error}")
         })?;
+        if credentials.token_endpoint.is_some() {
+            let runtime =
+                OAuthRuntime::stored(server_name, server_url, http_client, store, credentials)?;
+            return Ok(OAuthTransport {
+                runtime,
+                metadata_cache_hit: false,
+            });
+        }
         let (metadata, metadata_cache_hit) =
             if let Some(metadata) = metadata_cache.get(server_name, server_url).await {
                 (metadata, true)
@@ -389,7 +465,7 @@ pub fn transport_from_credentials<'call>(
         let runtime = Arc::new(OAuthRuntime {
             server_name: server_name.to_owned(),
             server_url: server_url.to_owned(),
-            base_url,
+            base_url: Some(base_url),
             http: http_client,
             store,
             credentials: ArcSwapOption::from_pointee(staged_credentials),

@@ -488,11 +488,19 @@ impl Shared {
         match fresh {
             Ok(fresh) if fresh != sent => {
                 let retried = self.attempt(method, &headers, body, Some(&fresh)).await?;
-                if let HttpAuth::Source(source) = &self.auth
-                    && challenged(&retried)
-                    && let Err(error) = source.rejected(&fresh).await
-                {
-                    tracing::debug!("bearer source refused a rejected refreshed token: {error}");
+                if challenged(&retried) {
+                    match &self.auth {
+                        HttpAuth::Source(source) => {
+                            if let Err(error) = source.rejected(&fresh).await {
+                                tracing::debug!(
+                                    "bearer source refused a rejected refreshed token: {error}"
+                                );
+                            }
+                        }
+                        #[cfg(not(target_family = "wasm"))]
+                        HttpAuth::OAuth(runtime) => runtime.refused_after_refresh(&fresh).await,
+                        HttpAuth::None | HttpAuth::Bearer(_) => {}
+                    }
                 }
                 return Ok(retried);
             }
