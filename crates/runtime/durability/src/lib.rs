@@ -31,6 +31,7 @@ pub use nanocode_durability_core::{
     SqlStatement, SqlStore, StagedStore, StagedWrites, StateCommit, StateCursor, StatePage,
     StateQuery, StateReader, StateStore, StateSummary, StoreError, StoreEvent, StoreFuture,
     StoreRecord, StoreReplacement, StoreUpdate, StoredEvent, StoredState, SummaryUpdate, Versioned,
+    get_blob, put_blob,
 };
 pub use paged::{
     PagedWriter, PayloadReader, Prepared, Sequence, SequenceCache, load_sequence, seal_sequence,

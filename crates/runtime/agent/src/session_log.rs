@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use serde_json::{Map, Value, value::RawValue};
 
 use crate::{
-    durability::{EncodedPayload, Sql, SqlDialect, SqlRow, SqlStatement, StoreError},
+    durability::{
+        BlobKey, BlobStore, BlobUrl, EncodedPayload, Sql, SqlDialect, SqlRow, SqlStatement,
+        StoreError, get_blob,
+    },
     input::{Prompt, PromptInput, UserInput},
     turn_inbox::accepted_bytes,
 };
@@ -603,6 +606,19 @@ fn edited(prompt: &Prompt, text: &str) -> Result<Prompt, StoreError> {
     Ok(prompt)
 }
 
+type BlobWrites = BTreeMap<BlobKey, Vec<u8>>;
+
+#[derive(Default)]
+struct Spill {
+    parts: Vec<(String, String)>,
+    blobs: BlobWrites,
+}
+
+struct Blobs {
+    store: Arc<dyn BlobStore + Send + Sync>,
+    threshold: usize,
+}
+
 fn edit_receipt(rows: &[SqlRow], edit: &str) -> Result<Option<Replaced>, StoreError> {
     Ok(single(rows)?.map(|row| {
         if optional(row, 0) == Some(edit) {
@@ -619,6 +635,7 @@ pub struct SessionLog<H: ?Sized> {
     ready: AtomicBool,
     limit: Option<usize>,
     physical_limit: Option<usize>,
+    blobs: Option<Blobs>,
 }
 
 impl<H: Sql + ?Sized> SessionLog<H> {
@@ -629,6 +646,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             ready: AtomicBool::new(false),
             limit: None,
             physical_limit: None,
+            blobs: None,
         }
     }
 
@@ -641,6 +659,12 @@ impl<H: Sql + ?Sized> SessionLog<H> {
     #[must_use]
     pub const fn logical_limit(mut self, bytes: usize) -> Self {
         self.limit = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    pub fn blobs(mut self, store: Arc<dyn BlobStore + Send + Sync>, threshold: usize) -> Self {
+        self.blobs = Some(Blobs { store, threshold });
         self
     }
 
@@ -719,7 +743,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             self.migrate().await?;
         }
         let dialect = self.host.dialect();
-        let mut parts = Vec::new();
+        let mut spill = Spill::default();
         let mut values = Vec::with_capacity(statements.len());
         for stmt in &statements {
             let slot = if [
@@ -758,7 +782,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                     .map(|(_, value)| value.len())
                     .sum::<usize>();
                 let overhead = record_bytes(TURN_TEXTS, other, TURN_INTEGERS);
-                params[slot] = self.store_value(stmt.params[slot], overhead, false, &mut parts)?;
+                params[slot] = self.store_value(stmt.params[slot], overhead, false, &mut spill)?;
             }
             if self
                 .physical_limit
@@ -770,7 +794,9 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             }
             values.push(params);
         }
-        let mut prepared: Vec<_> = parts
+        self.put_blobs(&spill.blobs).await?;
+        let mut prepared: Vec<_> = spill
+            .parts
             .iter()
             .map(|(key, data)| statement(dialect, &PART, vec![key, data]))
             .collect();
@@ -820,16 +846,52 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         value: &'a str,
         overhead: usize,
         force: bool,
-        parts: &mut Vec<(String, String)>,
+        spill: &mut Spill,
     ) -> Result<Cow<'a, str>, StoreError> {
         if !force
             && !value.starts_with(PAYLOAD_MARK)
             && self
                 .physical_limit
                 .is_none_or(|limit| value.len().saturating_add(overhead) <= limit)
+            && self
+                .blobs
+                .as_ref()
+                .is_none_or(|blobs| value.len() <= blobs.threshold)
         {
             return Ok(Cow::Borrowed(value));
         }
+        let keys = if self.blobs.is_some() {
+            let key = BlobKey::of(value.as_bytes());
+            let reference = key.as_str().to_owned();
+            spill
+                .blobs
+                .entry(key)
+                .or_insert_with(|| value.as_bytes().to_vec());
+            vec![reference]
+        } else {
+            self.parts(value, &mut spill.parts)?
+        };
+        let reference = serde_json::to_string(&PayloadReference {
+            parts: keys,
+            bytes: value.len(),
+        })
+        .map_err(encoding)?;
+        if self
+            .physical_limit
+            .is_some_and(|limit| reference.len().saturating_add(overhead) > limit)
+        {
+            return Err(StoreError::NotCommitted(
+                "session log reference exceeds the physical row limit".into(),
+            ));
+        }
+        Ok(Cow::Owned(reference))
+    }
+
+    fn parts(
+        &self,
+        value: &str,
+        parts: &mut Vec<(String, String)>,
+    ) -> Result<Vec<String>, StoreError> {
         let part_overhead = record_bytes(2, blake3::OUT_LEN * 2, 0);
         let capacity = self
             .physical_limit
@@ -857,20 +919,37 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             parts.push((key, data.to_owned()));
             remaining = rest;
         }
-        let reference = serde_json::to_string(&PayloadReference {
-            parts: keys,
-            bytes: value.len(),
-        })
-        .map_err(encoding)?;
-        if self
-            .physical_limit
-            .is_some_and(|limit| reference.len().saturating_add(overhead) > limit)
-        {
-            return Err(StoreError::NotCommitted(
-                "session log reference exceeds the physical row limit".into(),
-            ));
+        Ok(keys)
+    }
+
+    fn stored_prompt<'p>(&self, prompt: &'p Prompt, writes: &mut BlobWrites) -> Cow<'p, Prompt> {
+        if self.blobs.is_none() {
+            return Cow::Borrowed(prompt);
         }
-        Ok(Cow::Owned(reference))
+        let mut stored = prompt.clone();
+        if let PromptInput::Content(items) = &mut stored.instruction {
+            for item in items {
+                if let UserInput::Image { image_url, .. } = item
+                    && let Some((blob, bytes)) = BlobUrl::from_data_url(image_url)
+                {
+                    *image_url = blob.to_string();
+                    writes.entry(blob.key().clone()).or_insert(bytes);
+                }
+            }
+        }
+        Cow::Owned(stored)
+    }
+
+    async fn put_blobs(&self, writes: &BlobWrites) -> Result<(), StoreError> {
+        let Some(blobs) = &self.blobs else {
+            return Ok(());
+        };
+        for (key, bytes) in writes {
+            blobs.store.put(key, bytes).await.map_err(|error| {
+                StoreError::NotCommitted(format!("store session log blob {key}: {error}"))
+            })?;
+        }
+        Ok(())
     }
 
     async fn load_value(&self, value: &str) -> Result<String, StoreError> {
@@ -878,6 +957,19 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             .map_err(|error| invalid(format!("payload reference: {error}")))?;
         let mut decoded = String::new();
         for key in reference.parts {
+            if let Some(key) = BlobKey::parse(&key) {
+                let blobs = self.blobs.as_ref().ok_or_else(|| {
+                    invalid(format!(
+                        "session log value {key} is in a blob store the log lacks"
+                    ))
+                })?;
+                let bytes = get_blob(&*blobs.store, &key).await?;
+                decoded.push_str(
+                    std::str::from_utf8(&bytes)
+                        .map_err(|error| invalid(format!("session log blob {key}: {error}")))?,
+                );
+                continue;
+            }
             let results = self
                 .run(
                     "log_part",
@@ -899,8 +991,10 @@ impl<H: Sql + ?Sized> SessionLog<H> {
 
     pub async fn submit(&self, submission: &Submission) -> Result<Submitted, StoreError> {
         let id = submission.request_id.as_str();
-        let prompt = serde_json::to_string(&submission.prompt).map_err(encoding)?;
         let digest = submission_digest(&submission.prompt, submission.hand.as_deref())?;
+        let mut images = BlobWrites::new();
+        let stored = self.stored_prompt(&submission.prompt, &mut images);
+        let prompt = serde_json::to_string(&*stored).map_err(encoding)?;
         let body = serde_json::to_string(&Lifecycle {
             kind: "queued",
             request_id: id,
@@ -923,13 +1017,14 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             let accepted = event_bytes(
                 &self.scope,
                 Some(id),
-                accepted_bytes(id, &submission.prompt.instruction).map_err(encoding)?,
+                accepted_bytes(id, &stored.instruction).map_err(encoding)?,
             );
             let bytes = row.max(accepted);
             if bytes > limit {
                 return Ok(Submitted::TooLarge { bytes, limit });
             }
         }
+        self.put_blobs(&images).await?;
         let turn = match submission.hand.as_deref() {
             Some(hand) => statement(
                 self.host.dialect(),
@@ -1187,8 +1282,10 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 return Ok(edit_receipt(&results[0], &edit)?.unwrap_or(Replaced::NotQueued));
             };
             let prompt = edited(prompt, text)?;
-            let encoded = serde_json::to_string(&prompt).map_err(encoding)?;
             let digest = submission_digest(&prompt, turn.hand.as_deref())?;
+            let mut images = BlobWrites::new();
+            let stored = self.stored_prompt(&prompt, &mut images);
+            let encoded = serde_json::to_string(&*stored).map_err(encoding)?;
             if let Some(limit) = self.limit {
                 let row = record_bytes(
                     TURN_TEXTS,
@@ -1204,7 +1301,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                 let accepted = event_bytes(
                     &self.scope,
                     Some(request_id),
-                    accepted_bytes(request_id, &prompt.instruction).map_err(encoding)?,
+                    accepted_bytes(request_id, &stored.instruction).map_err(encoding)?,
                 );
                 let receipt = event_bytes(&self.scope, Some(request_id), body.len());
                 let bytes = row.max(accepted).max(receipt);
@@ -1212,6 +1309,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                     return Ok(Replaced::TooLarge { bytes, limit });
                 }
             }
+            self.put_blobs(&images).await?;
             let created = now().to_string();
             let results = self
                 .transaction(
@@ -1546,7 +1644,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         if turns.is_empty() {
             return Ok(0);
         }
-        let mut parts = Vec::new();
+        let mut spill = Spill::default();
         let mut rows = turns
             .iter()
             .map(|turn| {
@@ -1555,7 +1653,11 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                     digest: submission_digest(&turn.prompt, turn.hand.as_deref())?,
                     status: turn.state.as_str(),
                     prompt: (!turn.state.is_terminal())
-                        .then(|| serde_json::to_string(&turn.prompt))
+                        .then(|| {
+                            serde_json::to_string(
+                                &*self.stored_prompt(&turn.prompt, &mut spill.blobs),
+                            )
+                        })
                         .transpose()
                         .map_err(encoding)?,
                     hand: turn.hand.as_deref(),
@@ -1587,7 +1689,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
                         prompt,
                         record_bytes(TURN_TEXTS, other, TURN_INTEGERS),
                         force,
-                        &mut parts,
+                        &mut spill,
                     )?
                     .into_owned(),
                 );
@@ -1611,7 +1713,9 @@ impl<H: Sql + ?Sized> SessionLog<H> {
             })
             .collect::<Result<_, _>>()
             .map_err(encoding)?;
-        let mut statements: Vec<_> = parts
+        self.put_blobs(&spill.blobs).await?;
+        let mut statements: Vec<_> = spill
+            .parts
             .iter()
             .map(|(key, data)| statement(self.host.dialect(), &PART, vec![key, data]))
             .collect();
