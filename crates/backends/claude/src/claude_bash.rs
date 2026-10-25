@@ -7,11 +7,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use nanocode_agent_core::{Agent, PromptRequest, WeakAgent};
-use nanocode_process_contracts::{ForegroundExecutor, OutputSink};
+use nanocode_process_contracts::{ForegroundExecutor, LastActivity, OutputSink};
 use nanocode_sync::{Atom, Signal};
 use nanocode_tool_host::{
     SessionEnvironment, Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult,
-    ToolsBuilder,
+    ToolsBuilder, contract::RunningTask,
 };
 use serde_json::{Value, json};
 use std::{
@@ -48,6 +48,7 @@ struct Job {
     expired: Arc<AtomicBool>,
     capped: Arc<Signal>,
     written: Arc<Signal>,
+    activity: Arc<LastActivity>,
     id: String,
     command: String,
     label: String,
@@ -143,16 +144,21 @@ impl Drop for Job {
         self.abort.abort();
     }
 }
-struct FileSink(mpsc::UnboundedSender<Vec<u8>>);
+struct FileSink {
+    chunks: mpsc::UnboundedSender<Vec<u8>>,
+    activity: Arc<LastActivity>,
+}
 impl OutputSink for FileSink {
     fn write(&self, bytes: &[u8]) {
-        let _ = self.0.send(bytes.to_vec());
+        self.activity.touch();
+        let _ = self.chunks.send(bytes.to_vec());
     }
 }
 async fn output_file(
     session: &str,
     id: &str,
     capped: Arc<Signal>,
+    activity: Arc<LastActivity>,
 ) -> Option<(PathBuf, FileSink, Arc<Signal>)> {
     let directory = std::env::temp_dir()
         .join("nanocode")
@@ -188,7 +194,14 @@ async fn output_file(
         let _ = file.flush().await;
         done.fire();
     }));
-    Some((path, FileSink(sender), written))
+    Some((
+        path,
+        FileSink {
+            chunks: sender,
+            activity,
+        },
+        written,
+    ))
 }
 async fn stall(job: &Job, binding: &Binding) {
     let Some(path) = &job.output else {
@@ -510,14 +523,16 @@ impl BashExecutor for LocalBash {
             self.jobs.next.fetch_add(1, Ordering::Relaxed)
         );
         let capped = Arc::new(Signal::new());
-        let (output, sink, written) = match output_file(&session, &id, Arc::clone(&capped)).await {
-            Some((path, sink, written)) => (Some(path), Some(sink), written),
-            None => {
-                let written = Arc::new(Signal::new());
-                written.fire();
-                (None, None, written)
-            }
-        };
+        let activity = Arc::new(LastActivity::new());
+        let (output, sink, written) =
+            match output_file(&session, &id, Arc::clone(&capped), Arc::clone(&activity)).await {
+                Some((path, sink, written)) => (Some(path), Some(sink), written),
+                None => {
+                    let written = Arc::new(Signal::new());
+                    written.fire();
+                    (None, None, written)
+                }
+            };
         let (sender, receiver) = watch::channel(None);
         let (arm, armed) = oneshot::channel::<Duration>();
         let expired = Arc::new(AtomicBool::new(false));
@@ -572,6 +587,7 @@ impl BashExecutor for LocalBash {
                 expired,
                 capped,
                 written,
+                activity,
                 id: id.clone(),
                 command,
                 label,
@@ -659,6 +675,7 @@ pub(super) fn install(
     };
     tools = tools.tool(BashTool {
         bash: ClaudeBash::new(executor.clone()),
+        jobs: executor.jobs.clone(),
         session,
     });
     for name in ["TaskOutput", "TaskStop"] {
@@ -671,6 +688,7 @@ pub(super) fn install(
 }
 struct BashTool {
     bash: ClaudeBash<LocalBash>,
+    jobs: Arc<Jobs>,
     session: Option<SessionEnvironment>,
 }
 #[async_trait]
@@ -682,6 +700,20 @@ impl Tool for BashTool {
             schema["description"].as_str().unwrap_or_default(),
             schema["input_schema"].clone(),
         )
+    }
+    fn running_tasks(&self) -> Vec<RunningTask> {
+        self.jobs.entries.read(|entries| {
+            entries
+                .jobs
+                .values()
+                .filter(|job| job.status() == "running")
+                .map(|job| RunningTask {
+                    id: job.id.clone(),
+                    label: job.label.clone(),
+                    silent_for: job.activity.silent_for(),
+                })
+                .collect()
+        })
     }
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
         let input = input.decode_json::<Value>()?;
