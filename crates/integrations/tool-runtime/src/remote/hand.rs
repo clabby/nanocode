@@ -45,6 +45,7 @@ pub struct Hand {
     tools: crate::Tools,
     policy: SocketPolicy,
     activity: HandActivity,
+    callback_hold: Option<Duration>,
 }
 
 impl Hand {
@@ -66,6 +67,7 @@ impl Hand {
             tools,
             policy: SocketPolicy::runner(),
             activity: HandActivity::default(),
+            callback_hold: None,
         }
     }
 
@@ -84,6 +86,12 @@ impl Hand {
     #[must_use]
     pub fn directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.directory = Some(directory.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn callback_hold(mut self, hold: Duration) -> Self {
+        self.callback_hold = Some(hold);
         self
     }
 
@@ -149,6 +157,7 @@ impl Hand {
                 name: Some(name),
                 runtime_id: Some(uuid::Uuid::new_v4().to_string()),
                 callback_timeout: None,
+                callback_hold: self.callback_hold,
             };
             let policy = self.policy;
             match self.endpoint {
