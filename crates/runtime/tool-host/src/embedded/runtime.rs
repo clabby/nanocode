@@ -28,6 +28,7 @@ pub struct EmbeddedToolRuntime {
     local: Vec<LocalTool>,
     callable_tool_names: ArcSwap<HashSet<String>>,
     policies: Vec<Arc<dyn crate::CodeModeToolPolicy>>,
+    recovery: Option<Arc<dyn crate::ToolRecovery>>,
 }
 
 struct LocalTool {
@@ -59,6 +60,7 @@ impl EmbeddedToolRuntime {
                 .collect(),
             callable_tool_names: ArcSwap::default(),
             policies: Vec::new(),
+            recovery: None,
         }
     }
 
@@ -75,6 +77,7 @@ impl EmbeddedToolRuntime {
         self.host.clone_from(&tools.embedded_host);
         self.session_id.clone_from(&tools.embedded_session_id);
         self.policies = tools.code_mode_policies();
+        self.recovery = tools.recovery();
         self.local
             .extend(tools.registered.iter().map(|registered| LocalTool {
                 name: Arc::from(registered.handler.definition().name()),
@@ -448,6 +451,10 @@ impl EmbeddedToolRuntime {
         }
         host.execute_with_updates(source, context.as_context(), observer)
             .await
+    }
+
+    pub async fn recover_tool(&self, name: &str, context: ToolContext<'_>) -> Option<ToolOutput> {
+        self.recovery.as_ref()?.recover(name, context).await
     }
 
     pub async fn recover_code(

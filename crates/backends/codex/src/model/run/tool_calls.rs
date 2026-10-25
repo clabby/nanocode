@@ -638,9 +638,7 @@ impl ModelRun {
                             crate::agent::ExecutionStep::Execute => None,
                             crate::agent::ExecutionStep::Interrupted => {
                                 interrupted = true;
-                                if call.namespace.is_none()
-                                    && matches!(call.name.as_str(), "exec" | "wait")
-                                {
+                                if !matches!(call.kind, CodeCallKind::ToolSearch) {
                                     recover = true;
                                     None
                                 } else {
@@ -1012,7 +1010,16 @@ impl ModelRun {
             .with_instruction_revision(instruction_revision)
             .with_host_context(host_context)
             .with_turn_id(Some(turn_id));
-            let mut execution = if tools.is_code_only() {
+            let mut execution = if recover {
+                let Some(recovered) = tools.recover_tool(&qualified_name, context).await else {
+                    return Ok(Self::interrupted_tool_call(
+                        call.kind,
+                        &call.call_id,
+                        &qualified_name,
+                    ));
+                };
+                recovered
+            } else if tools.is_code_only() {
                 ToolOutput::error(
                     "This tool requires Code Mode; no direct handler was invoked. Reconcile any prior recovered effect before calling it through tools inside exec.",
                 )

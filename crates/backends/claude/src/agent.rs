@@ -181,6 +181,7 @@ type Handler = Arc<dyn Fn(Value, ClaudeToolInvocation) -> ToolResultFuture + Sen
 type ToolCleanup = Arc<dyn Fn() -> BackendFuture<()> + Send + Sync>;
 type CodeTurnCleanup = Arc<dyn Fn(ClaudeToolProgress) -> BackendFuture<()> + Send + Sync>;
 type NestedToolLookup = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type ToolRecovery = Arc<dyn Fn(&str, ClaudeToolInvocation) -> ToolResultFuture + Send + Sync>;
 pub(crate) type Steer = Arc<dyn Fn(String) -> BackendFuture<bool> + Send + Sync>;
 type AgentBound = Arc<dyn Fn(&Agent, &Steer) + Send + Sync>;
 
@@ -198,8 +199,6 @@ pub struct ClaudeToolInvocation {
     pub host_context: Option<Arc<str>>,
 
     pub progress: Option<ClaudeToolProgress>,
-
-    pub recovering: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -278,6 +277,7 @@ pub struct ClaudeTools {
     pub(crate) code_turn_preempt: Vec<ToolCleanup>,
     pub(crate) code_turn_settle: Vec<ToolCleanup>,
     pub(crate) nested_tools: Option<NestedToolLookup>,
+    pub(crate) recovery: Option<ToolRecovery>,
     pub(crate) shared_catalog: Option<(nanocode_tool_host::Tools, std::path::PathBuf, AgentHandle)>,
     pub(crate) shared_tool_names: HashSet<String>,
     pub(crate) shared_shutdown: Option<ToolCleanup>,
@@ -312,6 +312,7 @@ impl nanocode_tools::ToolCollection for ClaudeTools {
             self.code_turn_preempt = replacement.code_turn_preempt;
             self.code_turn_settle = replacement.code_turn_settle;
             self.nested_tools = replacement.nested_tools;
+            self.recovery = replacement.recovery;
             self.shared_catalog = replacement.shared_catalog;
             return Ok(self);
         }
@@ -470,9 +471,6 @@ fn hooked_handler(
         let handler = handler.clone();
         let hooks = hooks.clone();
         Box::pin(async move {
-            if invocation.recovering {
-                return handler(input, invocation).await;
-            }
             let input = match hooks.before(&name, &input, &invocation).await {
                 Ok(crate::ClaudeToolDecision::Allow) => input,
                 Ok(crate::ClaudeToolDecision::UpdateInput(updated)) if updated.is_object() => {
@@ -1321,9 +1319,11 @@ impl ClaudeBuilder {
         let mut code_turn_settle = Vec::new();
         let mut agent_bound = Vec::new();
         let mut nested_tools = None;
+        let mut recovery = None;
         if let Some(factory) = &self.tools_factory {
             let native = factory(handle.clone())?;
             nested_tools = native.nested_tools;
+            recovery = native.recovery;
             custom_tool_search = native.custom_tool_search;
             self.client_tool_search |= custom_tool_search;
             self.tools.extend(native.tools);
@@ -1520,6 +1520,7 @@ impl ClaudeBuilder {
                 code_turn_preempt: Vec::new(),
                 code_turn_settle: Vec::new(),
                 nested_tools: nested_tools.clone(),
+                recovery: recovery.clone(),
                 shared_catalog: None,
                 shared_tool_names: HashSet::new(),
                 shared_shutdown: None,
@@ -1527,6 +1528,7 @@ impl ClaudeBuilder {
             };
             let adapted = adapter(catalog)?;
             nested_tools = adapted.nested_tools;
+            recovery = adapted.recovery;
             for (definition, handler) in adapted.tools {
                 if definition.name.is_empty()
                     || !definition.input_schema.is_object()
@@ -1659,6 +1661,7 @@ impl ClaudeBuilder {
             code_turn_preempt,
             code_turn_settle,
             nested_tools,
+            recovery,
             dynamic_tools: self.dynamic_tools,
             tool_hooks: self.tool_hooks,
             server_tools: self.server_tools,
@@ -3143,6 +3146,7 @@ struct State {
     client_tool_search: bool,
     code_only: bool,
     nested_tools: Option<NestedToolLookup>,
+    recovery: Option<ToolRecovery>,
     parallel_tools: bool,
 
     parallel_safe_tools: HashSet<String>,
@@ -5651,7 +5655,6 @@ impl State {
         id: &str,
         events: &AgentEventPublisher,
         cursor: &Cursor,
-        recovering: bool,
     ) -> ClaudeToolInvocation {
         ClaudeToolInvocation {
             model: cursor.template.model.clone(),
@@ -5665,7 +5668,6 @@ impl State {
             instruction_revision: cursor.instruction_revision,
             host_context: cursor.host_context(self),
             progress: None,
-            recovering,
         }
     }
 
@@ -5679,10 +5681,13 @@ impl State {
         control: (&Cursor, &Cancellation),
     ) -> Result<Option<ContentBlock>> {
         let (cursor, cancel) = control;
-        let invocation = self.invocation(id, events, cursor, true);
+        let Some(recovery) = &self.recovery else {
+            return Ok(None);
+        };
+        let invocation = self.invocation(id, events, cursor);
         let reply = tokio::select! {
             biased;
-            reply = handler(input.clone(), invocation) => reply,
+            reply = recovery(name, invocation) => reply,
             () = cancel.cancelled() => return Ok(None),
         };
         match reply {
@@ -5726,7 +5731,7 @@ impl State {
             began,
             open: true,
         };
-        let invocation = self.invocation(id, events, cursor, false);
+        let invocation = self.invocation(id, events, cursor);
 
         let mut live = LiveNestedCalls {
             state: self,
