@@ -139,6 +139,12 @@ impl<'a> ToolContext<'a> {
     }
 
     #[must_use]
+    pub const fn with_session_id(mut self, session_id: &'a str) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    #[must_use]
     pub const fn with_turn_id(mut self, turn_id: Option<&'a str>) -> Self {
         self.turn_id = turn_id;
         self

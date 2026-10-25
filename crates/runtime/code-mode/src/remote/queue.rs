@@ -50,6 +50,21 @@ pub enum Settlement {
     Unknown,
 }
 
+impl Settlement {
+    #[must_use]
+    pub fn outcome(&self) -> Option<Value> {
+        match self {
+            Self::Completed(output) => {
+                Some(serde_json::json!({"status": "completed", "output": output}))
+            }
+            Self::Unavailable(message) => {
+                Some(serde_json::json!({"status": "unavailable", "message": message}))
+            }
+            Self::Requeue | Self::Unknown => None,
+        }
+    }
+}
+
 pub trait CommandQueue: Send + Sync + 'static {
     type Origin: Clone + Send + Sync + 'static;
     type Error: std::fmt::Display + Send + 'static;
