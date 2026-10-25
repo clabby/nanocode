@@ -13,6 +13,7 @@ autobenches = false
 [dependencies]
 nanocode-home.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

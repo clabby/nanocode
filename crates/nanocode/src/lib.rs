@@ -7,11 +7,12 @@ pub use nanocode_agent::{
     ExecutionPolicyDisposition, ForkPoint, ForkRequest, HarnessFamily, Lineage, ModelCapabilities,
     ModelTransport, Mutability, NanocodeError, Origin, Persistence, PromptRequest, PromptRoute,
     ReportedTurnUsage, ServiceTier, SessionCheckpoint, SessionInfo, SideAnswer, SteerReceiptStatus,
-    Turn, TurnControl, TurnResult, TurnUsage, UsdAmount, WeakAgent,
+    Turn, TurnControl, TurnResult, TurnUsage, UsageRecord, UsdAmount, WeakAgent,
 };
 pub use nanocode_agent::{
     BackendId, BackendKind, BackendRegistration as Backend, BackendRequest, ModelSelection,
 };
+pub use nanocode_agent::{ModelInfo, model_catalog};
 pub use nanocode_platform as platform;
 pub use nanocode_process_contracts as process;
 
@@ -91,7 +92,7 @@ pub fn session_store<S: durability::StateStore + 'static>(
 }
 pub use nanocode_subagents::{
     AgentContext, AgentDescriptor, AgentId, AgentMessageUpdate, AgentStatus, AgentUpdate,
-    ScopedAgentUpdate, SubagentControl, SubagentRuntimeId,
+    RunningSubagents, ScopedAgentUpdate, SubagentCompletion, SubagentControl, SubagentRuntimeId,
 };
 pub type Defaults = nanocode_agent_host::Defaults<CodexHarness, ClaudeHarness>;
 pub type Nanocode = nanocode_agent::Runtime<Defaults>;

@@ -185,11 +185,15 @@ pub struct RunStarted {
     pub instruction_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RunSteered {
     pub steer_index: u32,
 
     pub instruction_bytes: usize,
+
+    /// The ID the host steered with (`TurnControl::steer_with_id`), if any.
+    #[serde(default)]
+    pub message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

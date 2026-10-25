@@ -38,9 +38,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument;
 
 mod activity;
+mod completion;
 mod focus;
 
 pub use activity::SubagentActivity;
+pub use completion::{RunningSubagents, SubagentCompletion};
 
 pub(super) struct ChildSession {
     pub(super) descriptor: AgentDescriptor,

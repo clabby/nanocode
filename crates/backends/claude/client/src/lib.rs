@@ -1212,6 +1212,26 @@ impl ClaudeClient {
         }
     }
 
+    /// A client of the Messages API under `base_url` (such as
+    /// `https://api.anthropic.com/v1`) with `api_key`, whose connections time
+    /// out after `connect_timeout` and whose responses fail as timeouts once
+    /// they send nothing for `idle_timeout`.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn messages_api(
+        base_url: &str,
+        api_key: impl Into<String>,
+        connect_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Result<Self, reqwest::Error> {
+        nanocode_tls::install_default_rustls_crypto_provider();
+        let http = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .read_timeout(idle_timeout)
+            .build()?;
+        let endpoint = format!("{}/messages", base_url.trim_end_matches('/'));
+        Ok(Self::new(http, endpoint, api_key))
+    }
+
     pub fn with_auth_headers(
         http: HttpClient,
         endpoint: impl Into<String>,

@@ -12,7 +12,10 @@ pub use error::{
     BackendError, BackendFailure, CompactionRecovery, ExecutionPolicyDisposition, NanocodeError,
     Result,
 };
-pub use harness::{ClaudeModel, HarnessFamily, ModelCapabilities, ModelSelection, ModelTransport};
+pub use harness::{
+    ClaudeModel, HarnessFamily, ModelCapabilities, ModelInfo, ModelSelection, ModelTransport,
+    model_catalog,
+};
 pub use nanocode_types::{Model, ReasoningMode, Thinking, events::AgentEvents};
 pub use session::{
     Capabilities, ForkPoint, ForkRequest, Lineage, Mutability, Origin, Persistence,
@@ -20,7 +23,7 @@ pub use session::{
 };
 pub use usage::{
     AgentUsage, CostStatus, EstimatedUsdCost, ReportedCost, ReportedTurnUsage, ServiceTier,
-    TurnUsage, UsdAmount,
+    TurnUsage, UsageRecord, UsdAmount,
 };
 
 pub mod backend {

@@ -193,3 +193,48 @@ impl TurnUsage {
         self.cost_status
     }
 }
+
+/// What one turn or run used and cost under its model, for hosts that keep
+/// usage totals by model: [`UsageRecord::new`] from a turn's [`TurnUsage`], or
+/// from a run's terminal event. `cost_nano_usd` is the estimated or
+/// provider-reported cost, `None` when unpriced.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UsageRecord {
+    pub model: String,
+    pub input: u64,
+    pub cached_input: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub cost_nano_usd: Option<u64>,
+}
+
+impl UsageRecord {
+    #[must_use]
+    pub fn new(model: impl Into<String>, usage: &TurnUsage) -> Self {
+        Self {
+            model: model.into(),
+            input: usage.input_tokens,
+            cached_input: usage.cached_input_tokens,
+            output: usage.output_tokens,
+            reasoning: usage.reasoning_output_tokens,
+            cost_nano_usd: usage.estimated_cost().map(|cost| cost.amount().nano_usd()),
+        }
+    }
+}
+
+impl From<&nanocode_types_core::events::RunTerminal> for UsageRecord {
+    fn from(run: &nanocode_types_core::events::RunTerminal) -> Self {
+        let usage = &run.metrics.usage;
+        Self {
+            model: run.model.clone(),
+            input: usage.input_tokens,
+            cached_input: usage.cached_input_tokens,
+            output: usage.output_tokens,
+            reasoning: usage.reasoning_output_tokens,
+            cost_nano_usd: run
+                .estimated_cost
+                .as_ref()
+                .map(|cost| cost.amount().nano_usd()),
+        }
+    }
+}

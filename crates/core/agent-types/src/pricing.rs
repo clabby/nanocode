@@ -54,14 +54,12 @@ impl ClaudeModel {
     #[must_use]
     pub fn estimate_cost(self, tokens: ClaudeTokens, fast_mode: bool) -> Option<EstimatedUsdCost> {
         let rates = self.rates(tokens.prompt_tokens(), fast_mode)?;
-        let cache_write = UsdAmount::saturating_mul(
-            tokens.cache_write_5m_input_tokens,
-            rates.cache_write_5m,
-        )
-        .saturating_add(UsdAmount::saturating_mul(
-            tokens.cache_write_1h_input_tokens,
-            rates.cache_write_1h,
-        ));
+        let cache_write =
+            UsdAmount::saturating_mul(tokens.cache_write_5m_input_tokens, rates.cache_write_5m)
+                .saturating_add(UsdAmount::saturating_mul(
+                    tokens.cache_write_1h_input_tokens,
+                    rates.cache_write_1h,
+                ));
         Some(EstimatedUsdCost::new(
             UsdAmount::saturating_mul(tokens.input_tokens, rates.input),
             UsdAmount::saturating_mul(tokens.cache_read_input_tokens, rates.cache_read),
