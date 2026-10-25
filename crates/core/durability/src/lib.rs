@@ -9,7 +9,9 @@ mod store;
 pub use blob::{BlobKey, BlobStore, BlobUrl, SharedBlobStore, base64_data_url, get_blob};
 pub use kv::{KeyValue, KeyValueStore, Versioned};
 pub use payload::EncodedPayload;
-pub use sql::{Sql, SqlDialect, SqlRow, SqlStatement, SqlStore};
+pub use sql::{
+    Migration, MissingColumn, Sql, SqlDialect, SqlRow, SqlStatement, SqlStore, migrate_format,
+};
 pub use staged::{StagedStore, StagedWrites};
 pub use state::{
     DurableCheckpoint, IdentifiedSteerReceipt, JournalState, OperationState, OperationStatus,

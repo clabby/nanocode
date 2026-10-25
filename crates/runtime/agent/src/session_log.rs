@@ -13,8 +13,8 @@ use serde_json::{Map, Value, value::RawValue};
 
 use crate::{
     durability::{
-        BlobKey, BlobUrl, EncodedPayload, SharedBlobStore, Sql, SqlDialect, SqlRow, SqlStatement,
-        StoreError, get_blob,
+        BlobKey, BlobUrl, EncodedPayload, Migration, MissingColumn, SharedBlobStore, Sql,
+        SqlDialect, SqlRow, SqlStatement, StoreError, get_blob, migrate_format,
     },
     input::{Prompt, PromptInput, UserInput},
     turn_inbox::accepted_bytes,
@@ -34,6 +34,13 @@ const SCHEMA: [[&str; 3]; 2] = [
         "CREATE TABLE IF NOT EXISTS turns (scope TEXT NOT NULL, request_id TEXT NOT NULL, digest TEXT NOT NULL, status TEXT NOT NULL, prompt TEXT, hand TEXT, metadata TEXT NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0, note TEXT, first_seq BIGINT NOT NULL, last_seq BIGINT, retry TEXT, PRIMARY KEY (scope, request_id))",
     ],
 ];
+const MIGRATIONS: [Migration; 1] = [Migration {
+    statements: [&SCHEMA[0], &SCHEMA[1]],
+    adopt: Some(MissingColumn {
+        probe: RETRY_COLUMN,
+        add: ADD_RETRY_COLUMN,
+    }),
+}];
 const PART: Dialects = [
     "INSERT INTO log_parts (key, data) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
     "INSERT INTO log_parts (key, data) VALUES ($1::text, $2::text) ON CONFLICT DO NOTHING",
@@ -476,13 +483,6 @@ fn single(rows: &[SqlRow]) -> Result<Option<&SqlRow>, StoreError> {
     }
 }
 
-fn present(rows: &[SqlRow]) -> Result<bool, StoreError> {
-    Ok(single(rows)?
-        .map(|row| text(row, 0))
-        .transpose()?
-        .is_some_and(|count| count != "0"))
-}
-
 fn raw(json: String) -> Result<Box<RawValue>, StoreError> {
     RawValue::from_string(json).map_err(|error| invalid(format!("stored JSON: {error}")))
 }
@@ -715,39 +715,10 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         Ok(results)
     }
 
-    async fn migrate(&self) -> Result<(), StoreError> {
-        let dialect = self.host.dialect();
-        let statements: Vec<_> = SCHEMA[dialect as usize]
-            .iter()
-            .chain([&dialect.pick(&RETRY_COLUMN)])
-            .map(|sql| SqlStatement {
-                sql,
-                params: Vec::new(),
-            })
-            .collect();
-        let results = self.run("schema", &statements).await?;
-        if !present(&results[SCHEMA[dialect as usize].len()])?
-            && let Err(error) = self
-                .run(
-                    "schema",
-                    &[statement(
-                        self.host.dialect(),
-                        &ADD_RETRY_COLUMN,
-                        Vec::new(),
-                    )],
-                )
-                .await
-            && !present(
-                &self
-                    .run(
-                        "schema",
-                        &[statement(self.host.dialect(), &RETRY_COLUMN, Vec::new())],
-                    )
-                    .await?[0],
-            )?
-        {
-            return Err(error);
-        }
+    pub const FORMAT: u32 = MIGRATIONS.len() as u32;
+
+    pub async fn migrate(&self) -> Result<(), StoreError> {
+        migrate_format(&*self.host, "session_log", &MIGRATIONS).await?;
         self.ready.store(true, Ordering::Release);
         Ok(())
     }
