@@ -219,6 +219,19 @@ impl RemoteCodeModeHost {
         self
     }
 
+    pub fn recover_call<'a>(
+        &'a self,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<Option<ToolOutput>, CodeModeHostError>> {
+        Box::pin(async move {
+            let context = RemoteContext::from_context(context);
+            let Some(reply) = self.transport.recover(&context) else {
+                return Ok(None);
+            };
+            reply.await?.map(output_from_wire).transpose()
+        })
+    }
+
     fn selected_tools(&self, session_id: &str) -> Result<Option<Vec<String>>, CodeModeHostError> {
         let Some(selection) = &self.selection else {
             return Ok(None);

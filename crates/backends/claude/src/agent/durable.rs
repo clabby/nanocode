@@ -747,7 +747,7 @@ impl State {
             ContentBlock::tool_result_content(id, ToolResultContent::Text("Tool execution interrupted; outcome unknown. Do not assume it did not run or automatically repeat it.".into()), true)
         };
         let recovered = match handler {
-            Some(handler) if interrupted && matches!(name, "exec" | "wait") => {
+            Some(handler) if interrupted => {
                 self.recover_tool(id, name, input, handler, events, (cursor, cancel))
                     .await?
             }

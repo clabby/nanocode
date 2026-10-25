@@ -11,6 +11,15 @@ pub mod contract {
 
 pub mod embedded;
 mod function_tool;
+
+pub trait ToolRecovery: Send + Sync + 'static {
+    fn recover<'a>(
+        &'a self,
+        name: &'a str,
+        context: nanocode_tools::ToolContext<'a>,
+    ) -> embedded::HostFuture<'a, Option<nanocode_tools::ToolOutput>>;
+}
+
 pub use function_tool::{Failure, FunctionHandler, FunctionTool, MaybeSend, TypedHandler};
 mod policy;
 mod selection;
