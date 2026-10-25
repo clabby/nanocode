@@ -927,6 +927,13 @@ impl Agent {
         self.backend.set_thinking(thinking).await
     }
 
+    /// Sets the context size, in tokens, at which the agent compacts its history by itself, from
+    /// the next turn on; `None` restores the backend's own default. The limit is capped at the
+    /// model's context window and is not persisted with the agent.
+    pub async fn set_auto_compact_token_limit(&self, limit: Option<u64>) -> Result<()> {
+        self.backend.set_auto_compact_token_limit(limit).await
+    }
+
     pub async fn set_fast_mode(&self, enabled: bool) -> Result<()> {
         self.set_service_tier(ServiceTier::from_fast_mode(enabled))
             .await

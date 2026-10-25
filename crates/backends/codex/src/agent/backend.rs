@@ -334,6 +334,17 @@ impl LifecycleBackend for LocalLifecycle {
         })
     }
 
+    fn set_auto_compact_token_limit(&self, limit: Option<u64>) -> BackendFuture<Result<()>> {
+        let commands = self.commands.clone();
+        let shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            request_command(&commands, &shutdown, |result| {
+                Command::SetAutoCompactTokenLimit { limit, result }
+            })
+            .await
+        })
+    }
+
     fn set_fast_mode(&self, enabled: bool) -> BackendFuture<Result<()>> {
         self.set_service_tier(ServiceTier::from_fast_mode(enabled))
     }

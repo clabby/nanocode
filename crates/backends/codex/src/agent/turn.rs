@@ -83,6 +83,10 @@ pub(super) enum Command {
         thinking: Thinking,
         result: oneshot::Sender<Result<()>>,
     },
+    SetAutoCompactTokenLimit {
+        limit: Option<u64>,
+        result: oneshot::Sender<Result<()>>,
+    },
     SetServiceTier {
         service_tier: ServiceTier,
         result: oneshot::Sender<Result<()>>,

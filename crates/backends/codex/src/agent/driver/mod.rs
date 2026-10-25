@@ -507,6 +507,11 @@ impl AgentDriver {
                     drop(result.send(outcome));
                     continue;
                 }
+                if let Command::SetAutoCompactTokenLimit { limit, result } = command {
+                    Arc::make_mut(&mut self.spawner.config).auto_compact_token_limit = limit;
+                    drop(result.send(Ok(())));
+                    continue;
+                }
                 if let Command::SetServiceTier {
                     service_tier,
                     result,
@@ -994,6 +999,10 @@ impl AgentDriver {
                                             drop(result.send(outcome));
                                         }
                                         Some(Command::Preconnect { result }) => {
+                                            drop(result.send(Ok(())));
+                                        }
+                                        Some(Command::SetAutoCompactTokenLimit { limit, result }) => {
+                                            Arc::make_mut(&mut self.spawner.config).auto_compact_token_limit = limit;
                                             drop(result.send(Ok(())));
                                         }
                                         Some(Command::SetServiceTier { service_tier, result }) => {
@@ -1793,6 +1802,10 @@ impl AgentDriver {
                                 drop(result.send(outcome));
                             }
                             Some(Command::Preconnect { result }) => {
+                                drop(result.send(Ok(())));
+                            }
+                            Some(Command::SetAutoCompactTokenLimit { limit, result }) => {
+                                Arc::make_mut(&mut self.spawner.config).auto_compact_token_limit = limit;
                                 drop(result.send(Ok(())));
                             }
                             Some(Command::SetServiceTier { service_tier, result }) => {
