@@ -198,6 +198,8 @@ pub struct ClaudeToolInvocation {
     pub host_context: Option<Arc<str>>,
 
     pub progress: Option<ClaudeToolProgress>,
+
+    pub recovering: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -468,6 +470,9 @@ fn hooked_handler(
         let handler = handler.clone();
         let hooks = hooks.clone();
         Box::pin(async move {
+            if invocation.recovering {
+                return handler(input, invocation).await;
+            }
             let input = match hooks.before(&name, &input, &invocation).await {
                 Ok(crate::ClaudeToolDecision::Allow) => input,
                 Ok(crate::ClaudeToolDecision::UpdateInput(updated)) if updated.is_object() => {
@@ -5641,7 +5646,30 @@ impl State {
         Ok(consumed)
     }
 
-    async fn call_tool(
+    fn invocation(
+        &self,
+        id: &str,
+        events: &AgentEventPublisher,
+        cursor: &Cursor,
+        recovering: bool,
+    ) -> ClaudeToolInvocation {
+        ClaudeToolInvocation {
+            model: cursor.template.model.clone(),
+            session_id: self.session_id.clone(),
+            root_session_id: self.lineage.root_session_id.clone(),
+            turn_id: cursor
+                .operation
+                .clone()
+                .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
+            call_id: id.to_owned(),
+            instruction_revision: cursor.instruction_revision,
+            host_context: cursor.host_context(self),
+            progress: None,
+            recovering,
+        }
+    }
+
+    async fn recover_tool(
         &self,
         id: &str,
         name: &str,
@@ -5649,8 +5677,40 @@ impl State {
         handler: &Handler,
         events: &AgentEventPublisher,
         control: (&Cursor, &Cancellation),
-    ) -> Result<ContentBlock> {
+    ) -> Result<Option<ContentBlock>> {
         let (cursor, cancel) = control;
+        let invocation = self.invocation(id, events, cursor, true);
+        let reply = tokio::select! {
+            biased;
+            reply = handler(input.clone(), invocation) => reply,
+            () = cancel.cancelled() => return Ok(None),
+        };
+        match reply {
+            Ok(reply) => self
+                .call_tool(
+                    id,
+                    name,
+                    input,
+                    handler,
+                    events,
+                    (cursor, cancel, Some(reply)),
+                )
+                .await
+                .map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        id: &str,
+        name: &str,
+        input: &Value,
+        handler: &Handler,
+        events: &AgentEventPublisher,
+        control: (&Cursor, &Cancellation, Option<ClaudeToolReply>),
+    ) -> Result<ContentBlock> {
+        let (cursor, cancel, recovered) = control;
         let index = cursor.index;
         self.emit(
             events,
@@ -5666,19 +5726,7 @@ impl State {
             began,
             open: true,
         };
-        let invocation = ClaudeToolInvocation {
-            model: cursor.template.model.clone(),
-            session_id: self.session_id.clone(),
-            root_session_id: self.lineage.root_session_id.clone(),
-            turn_id: cursor
-                .operation
-                .clone()
-                .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
-            call_id: id.to_owned(),
-            instruction_revision: cursor.instruction_revision,
-            host_context: cursor.host_context(self),
-            progress: None,
-        };
+        let invocation = self.invocation(id, events, cursor, false);
 
         let mut live = LiveNestedCalls {
             state: self,
@@ -5691,7 +5739,9 @@ impl State {
         };
         let mut stopped = false;
         let mut stopped_unknown = false;
-        let outcome = if matches!(name, "exec" | "wait") {
+        let outcome = if let Some(reply) = recovered {
+            Ok(reply)
+        } else if matches!(name, "exec" | "wait") {
             let (sender, mut updates) = tokio::sync::mpsc::unbounded_channel();
             let stopper = sender.clone();
             let mut invocation = invocation;

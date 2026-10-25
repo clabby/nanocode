@@ -211,6 +211,16 @@ impl Call {
         .with_host_context(invocation.host_context.as_deref())
         .with_instruction_revision(invocation.instruction_revision);
         let mut progress = Progress(invocation.progress.as_ref());
+        if invocation.recovering {
+            return match self {
+                Self::Exec | Self::Wait => match runtime.recover_code(context).await {
+                    Ok(Some(execution)) => Ok(code_reply(execution, &invocation.call_id)),
+                    Ok(None) => Err("not recovered".into()),
+                    Err(error) => Err(error.to_string()),
+                },
+                Self::Function(_) => Err("not recovered".into()),
+            };
+        }
         let execution = match self {
             Self::Exec => {
                 let code = input

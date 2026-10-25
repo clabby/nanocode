@@ -630,6 +630,26 @@ impl CodeModeHost for CodeModeExecutors {
         Box::pin(self.wait_routed(input, context, observer))
     }
 
+    fn recover<'a>(
+        &'a self,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
+        Box::pin(async move {
+            let Placement::Hand(HandRoute {
+                name,
+                host: Some(host),
+            }) = self.placement(context.session_id())
+            else {
+                return Ok(None);
+            };
+            let recovered = host.recover(context).await?;
+            if let Some(execution) = &recovered {
+                self.record(context.session_id(), Some(&name), execution);
+            }
+            Ok(recovered)
+        })
+    }
+
     fn bind_session(&self, session_id: &str, backend: &str) {
         self.state.update(|state| {
             state.backends.insert(session_id.into(), backend.into());
