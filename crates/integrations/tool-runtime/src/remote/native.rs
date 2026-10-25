@@ -188,15 +188,42 @@ async fn connect(
     target: crate::attachment::AttachmentTarget,
     policy: SocketPolicy,
 ) -> Result<DialedSocket, CodeModeHostError> {
-    dial(&target, policy)
+    dial(&target, &http::HeaderMap::new(), policy)
         .await
         .map_err(|failure| match failure {
             Dial::Rejected(error, _) | Dial::Failed(error) => error,
         })
 }
 
+pub(super) fn request_headers(
+    pairs: &[(String, String)],
+) -> Result<http::HeaderMap, CodeModeHostError> {
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in pairs {
+        let header = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|issue| error(format!("invalid hand header name {name:?}: {issue}")))?;
+        let reserved = matches!(
+            header,
+            http::header::AUTHORIZATION
+                | http::header::CONNECTION
+                | http::header::HOST
+                | http::header::UPGRADE
+        ) || header.as_str().starts_with("sec-websocket-");
+        if reserved {
+            return Err(error(format!(
+                "hand header {name:?} is set by the WebSocket upgrade or the runner credential"
+            )));
+        }
+        let value = http::HeaderValue::from_str(value)
+            .map_err(|issue| error(format!("invalid value for hand header {name:?}: {issue}")))?;
+        headers.append(header, value);
+    }
+    Ok(headers)
+}
+
 pub(super) async fn dial(
     target: &crate::attachment::AttachmentTarget,
+    headers: &http::HeaderMap,
     policy: SocketPolicy,
 ) -> Result<DialedSocket, Dial> {
     validate_policy(policy).map_err(|issue| Dial::Rejected(issue, None))?;
@@ -209,6 +236,9 @@ pub(super) async fn dial(
     let mut bearer = http::HeaderValue::from_str(&format!("Bearer {}", target.bearer()))
         .map_err(|issue| Dial::Rejected(error(issue), None))?;
     bearer.set_sensitive(true);
+    for (name, value) in headers {
+        request.headers_mut().append(name, value.clone());
+    }
     request
         .headers_mut()
         .insert(http::header::AUTHORIZATION, bearer);
@@ -221,7 +251,7 @@ pub(super) async fn dial(
     .map(|(socket, _)| socket)
     .map_err(|issue| match issue {
         tungstenite::Error::Http(response)
-            if matches!(response.status().as_u16(), 401 | 403 | 410) =>
+            if matches!(response.status().as_u16(), 401 | 403 | 410 | 426) =>
         {
             Dial::Rejected(
                 error(format!(
