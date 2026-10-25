@@ -241,6 +241,7 @@ fn settle(engine: &mut Engine, result: Result<(), String>, exhausted: bool) -> R
     let Some(execution) = engine.execution.as_ref() else {
         return result;
     };
+    execution.state.borrow().flush_text();
     let finished = match (&result, &execution.promise) {
         (Err(error), _) => Some(Err(error.clone())),
         (Ok(()), None) => Some(Err("embedded QuickJS execution has no result".to_owned())),
@@ -263,7 +264,6 @@ fn settle(engine: &mut Engine, result: Result<(), String>, exhausted: bool) -> R
         Err(_) if exhausted => {
             let state = execution.state.borrow();
             state
-                .event_tx
                 .send(RuntimeEvent::Error {
                     cell_id: state.execution_id,
                     message: EXHAUSTED.to_owned(),

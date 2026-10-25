@@ -108,6 +108,48 @@ pub(crate) struct ExecutionState {
     rejections: Rejections,
     uncaught: Option<SavedFunction>,
     failure: Option<String>,
+    pending_text: RefCell<Option<String>>,
+}
+
+const PENDING_TEXT_BYTES: usize = 64 * 1024;
+
+impl ExecutionState {
+    pub(crate) fn send(
+        &self,
+        event: RuntimeEvent,
+    ) -> Result<(), mpsc::error::SendError<RuntimeEvent>> {
+        self.flush_text();
+        self.event_tx.send(event)
+    }
+
+    pub(crate) fn flush_text(&self) {
+        let Some(text) = self.pending_text.borrow_mut().take() else {
+            return;
+        };
+        let _ = self.event_tx.send(RuntimeEvent::Content {
+            cell_id: self.execution_id,
+            content: ToolOutputContent::InputText { text },
+        });
+    }
+
+    fn push_text(&self, text: String) {
+        let full = {
+            let mut pending = self.pending_text.borrow_mut();
+            match pending.as_mut() {
+                Some(buffered) => {
+                    buffered.push('\n');
+                    buffered.push_str(&text);
+                }
+                None => *pending = Some(text),
+            }
+            pending
+                .as_ref()
+                .is_some_and(|buffered| buffered.len() >= PENDING_TEXT_BYTES)
+        };
+        if full {
+            self.flush_text();
+        }
+    }
 }
 
 pub(crate) struct PendingTimeout {
@@ -149,6 +191,7 @@ pub(crate) fn new_state(
         rejections,
         uncaught: None,
         failure: None,
+        pending_text: RefCell::new(None),
     }))
 }
 
@@ -265,7 +308,7 @@ pub(crate) fn install_native_functions<'js>(
                             Persistent::save(&ctx, reject),
                         ),
                     );
-                    let _ = state.event_tx.send(RuntimeEvent::ToolCall {
+                    let _ = state.send(RuntimeEvent::ToolCall {
                         cell_id: state.execution_id,
                         id,
                         name,
@@ -301,10 +344,15 @@ pub(crate) fn install_native_functions<'js>(
                         content => content,
                     };
                     let state = content_state.borrow();
-                    let _ = state.event_tx.send(RuntimeEvent::Content {
-                        cell_id: state.execution_id,
-                        content,
-                    });
+                    match content {
+                        ToolOutputContent::InputText { text } => state.push_text(text),
+                        content => {
+                            let _ = state.send(RuntimeEvent::Content {
+                                cell_id: state.execution_id,
+                                content,
+                            });
+                        }
+                    }
                     Ok(())
                 },
             ),
@@ -355,7 +403,7 @@ pub(crate) fn install_native_functions<'js>(
             "__nanocodeNotify",
             Func::from(move |text: String| {
                 let state = notify_state.borrow();
-                let _ = state.event_tx.send(RuntimeEvent::Notify {
+                let _ = state.send(RuntimeEvent::Notify {
                     cell_id: state.execution_id,
                     text,
                 });
@@ -370,7 +418,7 @@ pub(crate) fn install_native_functions<'js>(
             "__nanocodeYield",
             Func::from(move || {
                 let state = yield_state.borrow();
-                let _ = state.event_tx.send(RuntimeEvent::Yielded {
+                let _ = state.send(RuntimeEvent::Yielded {
                     cell_id: state.execution_id,
                 });
             }),
@@ -533,7 +581,6 @@ pub(crate) fn send_terminal(
         }
     };
     state
-        .event_tx
         .send(event)
         .map_err(|_| "embedded QuickJS execution observer closed".to_owned())
 }
@@ -624,6 +671,7 @@ pub(crate) fn drain_jobs(ctx: &Ctx<'_>, state: &Rc<RefCell<ExecutionState>>) {
             (rejections, state.uncaught.clone())
         };
         if rejections.is_empty() {
+            state.borrow().flush_text();
             return;
         }
         for rejection in rejections {
