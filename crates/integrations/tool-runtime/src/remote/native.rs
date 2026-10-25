@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -52,6 +52,63 @@ pub struct ExecutorOptions {
     pub name: Option<String>,
     pub runtime_id: Option<String>,
     pub callback_timeout: Option<Duration>,
+}
+
+#[derive(Clone)]
+pub struct HandActivity {
+    shared: Arc<ActivityShared>,
+}
+
+struct ActivityShared {
+    draining: AtomicBool,
+    busy: watch::Sender<usize>,
+}
+
+impl Default for HandActivity {
+    fn default() -> Self {
+        Self {
+            shared: Arc::new(ActivityShared {
+                draining: AtomicBool::new(false),
+                busy: watch::channel(0).0,
+            }),
+        }
+    }
+}
+
+impl HandActivity {
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        *self.shared.busy.borrow() > 0
+    }
+
+    pub async fn idle(&self) {
+        let _ = self
+            .shared
+            .busy
+            .subscribe()
+            .wait_for(|busy| *busy == 0)
+            .await;
+    }
+
+    pub fn drain(&self) {
+        self.shared.draining.store(true, Ordering::Release);
+    }
+
+    fn draining(&self) -> bool {
+        self.shared.draining.load(Ordering::Acquire)
+    }
+
+    fn report(&self, was: bool, now: bool) {
+        if was != now {
+            self.shared.busy.send_modify(|busy| {
+                if now {
+                    *busy += 1;
+                } else {
+                    *busy -= 1;
+                }
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1149,6 +1206,7 @@ pub async fn serve_connect(
             runtime_id: None,
             callback_timeout: Some(policy.request_timeout),
         },
+        HandActivity::default(),
     )
     .await
 }
@@ -1170,6 +1228,7 @@ pub async fn serve_accept(
             runtime_id: None,
             callback_timeout: Some(policy.request_timeout),
         },
+        HandActivity::default(),
     )
     .await
 }
@@ -1181,7 +1240,15 @@ pub async fn serve_connect_with(
     options: ExecutorOptions,
 ) -> Result<(), CodeModeHostError> {
     let socket = connect(target, policy).await?;
-    serve_once(socket, workspace, tools, policy, options).await
+    serve_once(
+        socket,
+        workspace,
+        tools,
+        policy,
+        options,
+        HandActivity::default(),
+    )
+    .await
 }
 pub async fn serve_stream(
     stream: TcpStream,
@@ -1191,8 +1258,28 @@ pub async fn serve_stream(
     policy: SocketPolicy,
     options: ExecutorOptions,
 ) -> Result<(), CodeModeHostError> {
+    serve_tracked_stream(
+        stream,
+        bearer,
+        workspace,
+        tools,
+        policy,
+        options,
+        HandActivity::default(),
+    )
+    .await
+}
+pub(super) async fn serve_tracked_stream(
+    stream: TcpStream,
+    bearer: &str,
+    workspace: &Path,
+    tools: crate::Tools,
+    policy: SocketPolicy,
+    options: ExecutorOptions,
+    activity: HandActivity,
+) -> Result<(), CodeModeHostError> {
     let socket = handshake(stream, bearer, policy).await?;
-    serve_once(socket, workspace, tools, policy, options).await
+    serve_once(socket, workspace, tools, policy, options, activity).await
 }
 
 async fn serve_once<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -1201,8 +1288,9 @@ async fn serve_once<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     tools: crate::Tools,
     policy: SocketPolicy,
     options: ExecutorOptions,
+    activity: HandActivity,
 ) -> Result<(), CodeModeHostError> {
-    let mut executor = Executor::new(workspace.to_owned(), tools, options);
+    let mut executor = Executor::new(workspace.to_owned(), tools, options, activity);
     let result = serve(socket, &mut executor, policy).await;
     executor.reset().await;
     result
@@ -1264,10 +1352,17 @@ pub(super) struct Executor {
     retained: HashMap<u64, String>,
     connection: u64,
     resumable: bool,
+    activity: HandActivity,
+    busy: bool,
 }
 
 impl Executor {
-    pub(super) fn new(workspace: PathBuf, tools: crate::Tools, options: ExecutorOptions) -> Self {
+    pub(super) fn new(
+        workspace: PathBuf,
+        tools: crate::Tools,
+        options: ExecutorOptions,
+        activity: HandActivity,
+    ) -> Self {
         let outgoing = Outgoing {
             wire: Arc::default(),
             limit: Arc::new(AtomicUsize::new(usize::MAX)),
@@ -1301,7 +1396,22 @@ impl Executor {
             retained: HashMap::new(),
             connection: 0,
             resumable: false,
+            activity,
+            busy: false,
         }
+    }
+
+    fn publish(&mut self) {
+        let busy = !self.running.is_empty()
+            || !self.retained.is_empty()
+            || !self.bus.pending.read(|pending| pending.is_empty())
+            || self
+                .runtimes
+                .0
+                .values()
+                .any(|(_, catalog)| catalog.state.read(|state| !state.origins.is_empty()));
+        self.activity.report(self.busy, busy);
+        self.busy = busy;
     }
 
     async fn definitions(&mut self) -> Vec<ToolDefinition> {
@@ -1337,6 +1447,7 @@ impl Executor {
         self.turn_calls.clear();
         self.retained.clear();
         self.resumable = false;
+        self.publish();
     }
 
     /// Calls `Tool::end_turn` on every registered tool for an ended turn, whether or not this hand
@@ -1415,6 +1526,12 @@ impl Executor {
     }
 }
 
+impl Drop for Executor {
+    fn drop(&mut self) {
+        self.activity.report(self.busy, false);
+    }
+}
+
 pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut socket: WebSocketStream<S>,
     executor: &mut Executor,
@@ -1447,6 +1564,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let hands: Arc<dyn HandCalls> = executor.callbacks.clone();
     let result = async {
         loop {
+            executor.publish();
             tokio::select! {
                 result = &mut writer.0 => return result.map_err(error)?,
                 Some(done) = executor.results.recv() => {
@@ -1464,6 +1582,11 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             if let Some(bytes) = max_frame_bytes { outgoing.limit.fetch_min(bytes, Ordering::Relaxed); }
                             executor.resumable |= resumable;
                             executor.running.insert(id, Running { resumable, connection });
+                            executor.publish();
+                            if executor.activity.draining() && matches!(&operation, RemoteOperation::Execute { .. } | RemoteOperation::Call { .. }) {
+                                executor.finish(id, Err(NOT_RECEIVED.into()));
+                                continue;
+                            }
                             if let RemoteOperation::EndTurn { session_id, turn_id, hook_event_name } = operation {
                                 executor.end_turn(id, session_id, turn_id, hook_event_name);
                                 continue;
@@ -1599,5 +1722,6 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     if !executor.resumable {
         executor.reset().await;
     }
+    executor.publish();
     result
 }
