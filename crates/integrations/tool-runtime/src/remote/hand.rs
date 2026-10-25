@@ -7,8 +7,8 @@ use std::{
 use tokio::net::TcpListener;
 
 use super::native::{
-    Dial, Executor, ExecutorOptions, SocketPolicy, dial, error, serve, serve_stream,
-    validate_policy,
+    Dial, Executor, ExecutorOptions, SocketPolicy, dial, error, request_headers, serve,
+    serve_stream, validate_policy,
 };
 use crate::embedded::CodeModeHostError;
 
@@ -19,7 +19,7 @@ pub enum HandEndpoint {
 }
 
 /// What a [`Hand`] is doing. `Rejected` means the brain refused the connection's upgrade
-/// with HTTP `status` (401, 403 or 410): it no longer accepts the runner credential, so
+/// with HTTP `status` (401, 403 or 410, or 426 when it no longer serves the hand's protocol), so
 /// `Hand::run` returns its error instead of retrying. Hosts that sign in again on a refused
 /// credential match this event rather than the error's text.
 #[derive(Clone, Debug)]
@@ -40,6 +40,7 @@ pub struct Hand {
     endpoint: HandEndpoint,
     token: String,
     name: Option<String>,
+    headers: Vec<(String, String)>,
     directory: Option<PathBuf>,
     tools: crate::Tools,
     policy: SocketPolicy,
@@ -59,6 +60,7 @@ impl Hand {
             endpoint,
             token,
             name: None,
+            headers: Vec::new(),
             directory: None,
             tools,
             policy: SocketPolicy::runner(),
@@ -68,6 +70,12 @@ impl Hand {
     #[must_use]
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 
@@ -140,6 +148,7 @@ impl Hand {
                 HandEndpoint::Connect(endpoint) => {
                     let target = crate::attachment::AttachmentTarget::new(endpoint, self.token)
                         .map_err(error)?;
+                    let headers = request_headers(&self.headers)?;
                     let mut backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
                     let mut executor = Executor::new(directory, self.tools, options);
                     loop {
@@ -147,7 +156,7 @@ impl Hand {
                         events(HandEvent::Connecting {
                             endpoint: endpoint.clone(),
                         });
-                        match dial(&target, policy).await {
+                        match dial(&target, &headers, policy).await {
                             Ok(socket) => {
                                 events(HandEvent::Connected { endpoint });
                                 let started = Instant::now();
