@@ -238,9 +238,6 @@ pub struct Registry {
     completion_retries: Atom<HashMap<(String, AgentId), (u32, bool)>>,
     completion_dispatch: Atom<HashMap<(String, AgentId), Sequencer>>,
     completion_routes: Atom<HashMap<(String, AgentId), u64>>,
-    /// For each result a tool output routes, the receipts of every tool output that returned it,
-    /// so whichever reaches the model first reads it. A result routed to a completion notice has
-    /// none and is left to the notice.
     result_readers: Atom<HashMap<(String, AgentId), Readers>>,
     root_watches: Atom<HashSet<String>>,
     running_roots: Atom<HashSet<String>>,
@@ -4328,8 +4325,6 @@ impl Registry {
         if claimed.is_empty() {
             return (joined > 0).then_some(receipt as Arc<dyn ToolReceipt>);
         }
-        // Each result has its own watcher: an output that later returns only one of them reads
-        // only that one.
         let watched = claimed
             .into_iter()
             .map(|claim| (claim, parent.subscribe()))
@@ -4370,7 +4365,6 @@ impl Registry {
         Some(receipt)
     }
 
-    /// A receipt for the root's pending results that a directory listing returned.
     pub(crate) async fn observe_listed(
         self: &Arc<Self>,
         session_id: &str,

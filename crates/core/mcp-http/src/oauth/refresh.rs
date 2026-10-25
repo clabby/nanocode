@@ -91,8 +91,6 @@ impl OAuthRuntime {
         })
     }
 
-    /// Whether `access_token` is the one this runtime's last refresh
-    /// transaction refreshed or adopted.
     fn settled_on(&self, access_token: &str) -> bool {
         self.settled
             .load()
@@ -100,8 +98,6 @@ impl OAuthRuntime {
             .is_some_and(|settled| settled == access_token)
     }
 
-    /// The server refused `rejected_access_token`: refresh it unless the
-    /// store already holds a newer one, and return the current token.
     pub async fn refresh_after_rejection(
         self: &Arc<Self>,
         rejected_access_token: &str,
@@ -111,8 +107,6 @@ impl OAuthRuntime {
         self.current_access_token().await
     }
 
-    /// The server refused `access_token` even though it was just refreshed
-    /// after a rejection: tell the store authorization is required.
     pub async fn refused_after_refresh(&self, access_token: &str) {
         let current = self
             .credentials
@@ -126,10 +120,6 @@ impl OAuthRuntime {
         }
     }
 
-    /// Call an API with the current access token. When `refused` says the
-    /// server refused the token, refresh it and call once more, and when it
-    /// refuses the refreshed token too, tell the store authorization is
-    /// required. Fails only when no token could be had.
     pub async fn with_access_token<T, Call, Answer>(
         self: &Arc<Self>,
         mut call: Call,
@@ -158,7 +148,6 @@ impl OAuthRuntime {
         rejected_access_token: Option<String>,
     ) -> Result<(), String> {
         let runtime = Arc::clone(self);
-        // Per store too: hosts with a store per user may reuse server names.
         let store = self.store.refresh_key().map_or_else(
             || format!("{:p}", Arc::as_ptr(&self.store)),
             |key| format!("key:{key}"),
@@ -201,7 +190,6 @@ impl OAuthRuntime {
     }
 
     async fn refresh_transaction(&self, rejected_access_token: Option<&str>) -> Result<(), String> {
-        // The token this runtime held before waiting for the lock.
         let held = self
             .credentials
             .load()
@@ -236,8 +224,6 @@ impl OAuthRuntime {
         };
 
         let rejected = rejected_access_token.is_some_and(|token| token == latest.access_token);
-        // Another process refreshed it while this one waited for the lock:
-        // use its token rather than spend another single-use refresh token.
         let rotated = rejected_access_token.is_none()
             && held.as_deref() != Some(latest.access_token.as_str())
             && !latest.expired();
@@ -309,7 +295,6 @@ impl OAuthRuntime {
                     self.server_name
                 ));
             }
-            // A token that has not expired yet may still work.
             Ok(Err(_)) | Err(_) if rejected_access_token.is_none() && !latest.expired() => {
                 self.credentials.store(Some(Arc::new(latest)));
                 return Ok(());
@@ -350,8 +335,6 @@ impl OAuthRuntime {
         Ok(())
     }
 
-    /// The authorization server's current metadata, checked against the
-    /// issuer that issued `latest`.
     async fn current_metadata(
         &self,
         base_url: &reqwest::Url,

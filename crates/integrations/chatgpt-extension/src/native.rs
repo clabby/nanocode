@@ -14,7 +14,6 @@ pub fn read_body(reader: &mut impl Read) -> io::Result<Vec<u8>> {
             "native message exceeds 8 MiB",
         ));
     }
-    // Read what arrives rather than allocating the claimed size up front.
     let mut body = Vec::new();
     if reader.take(size as u64).read_to_end(&mut body)? != size {
         return Err(io::ErrorKind::UnexpectedEof.into());

@@ -1212,10 +1212,6 @@ impl ClaudeClient {
         }
     }
 
-    /// A client of the Messages API under `base_url` (such as
-    /// `https://api.anthropic.com/v1`) with `api_key`, whose connections time
-    /// out after `connect_timeout` and whose responses fail as timeouts once
-    /// they send nothing for `idle_timeout`.
     #[cfg(not(target_family = "wasm"))]
     pub fn messages_api(
         base_url: &str,

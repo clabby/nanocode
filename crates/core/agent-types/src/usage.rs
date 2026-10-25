@@ -194,10 +194,6 @@ impl TurnUsage {
     }
 }
 
-/// What one turn or run used and cost under its model, for hosts that keep
-/// usage totals by model: [`UsageRecord::new`] from a turn's [`TurnUsage`], or
-/// from a run's terminal event. `cost_nano_usd` is the estimated or
-/// provider-reported cost, `None` when unpriced.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UsageRecord {
     pub model: String,

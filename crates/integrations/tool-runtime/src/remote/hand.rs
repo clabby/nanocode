@@ -18,10 +18,6 @@ pub enum HandEndpoint {
     Listen(SocketAddr),
 }
 
-/// What a [`Hand`] is doing. `Rejected` means the brain refused the connection's upgrade
-/// with HTTP `status` (401, 403 or 410, or 426 when it no longer serves the hand's protocol), so
-/// `Hand::run` returns its error instead of retrying. Hosts that sign in again on a refused
-/// credential match this event rather than the error's text.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum HandEvent {

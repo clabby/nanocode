@@ -29,11 +29,8 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const MAX_HEAD: usize = 8 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Connections one proxy serves at once; more are refused with 503.
 const MAX_CONNECTIONS: usize = 1024;
-/// How long a client may take to send its request head.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long the accept loop waits to tell an extra client the proxy is busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn other(error: impl Into<Box<dyn Error + Send + Sync>>) -> io::Error {
@@ -147,11 +144,6 @@ impl Tls {
 
 pub struct Allowlist {
     pub hosts: Vec<String>,
-    /// Host patterns, matched like `hosts`, that may reach non-public addresses (see
-    /// [`is_public`]) when dialed directly. Every other host is resolved, and the proxy
-    /// connects only to a public address it found, so neither an allowlisted name that resolves
-    /// to, say, 127.0.0.1 or the cloud metadata service nor an IP literal reaches them. Hosts
-    /// reached through `tailnet` are not checked: the SOCKS server resolves them.
     pub private_hosts: Vec<String>,
     pub injections: Vec<Injection>,
     pub tls: Arc<Tls>,
@@ -159,13 +151,6 @@ pub struct Allowlist {
     pub refusal: fn(&str) -> String,
 }
 
-/// Whether the proxy may dial `address` for a host outside `Allowlist::private_hosts`: not
-/// an address of this machine or its networks in the IANA special-purpose registries (RFC 6890):
-/// unspecified and "this network" (0.0.0.0/8, ::), loopback (127.0.0.0/8, ::1), private
-/// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) and unique local (fc00::/7, which holds AWS's
-/// IPv6 metadata address), link-local (169.254.0.0/16, which holds the cloud metadata service,
-/// and fe80::/10), multicast and broadcast. IPv4-mapped IPv6 addresses are judged as IPv4.
-/// Shared address space (100.64.0.0/10) stays reachable: Tailscale addresses its devices there.
 #[must_use]
 pub const fn is_public(address: IpAddr) -> bool {
     match address.to_canonical() {
@@ -267,8 +252,6 @@ impl Egress {
             while let Some(mut client) = accept().await {
                 while connections.try_join_next().is_some() {}
                 if connections.len() >= MAX_CONNECTIONS {
-                    // Refuse rather than wait: open tunnels must not stall
-                    // new connections behind them.
                     let busy = respond(&mut client, "503 Service Unavailable");
                     drop(tokio::time::timeout(BUSY_TIMEOUT, busy).await);
                     continue;
@@ -333,7 +316,6 @@ async fn respond<S: AsyncWrite + Unpin>(client: &mut S, status: &str) {
     respond_text(client, status, "").await;
 }
 
-/// Answer `status` with a plain-text `body` (none when empty) and close.
 async fn respond_text<S: AsyncWrite + Unpin>(client: &mut S, status: &str, body: &str) {
     let content_type = if body.is_empty() {
         ""
@@ -383,7 +365,6 @@ async fn unreachable<S: AsyncWrite + Unpin>(client: &mut S, rules: &Rules, host:
 
 enum Dialed {
     Connected(TcpStream),
-    /// The host resolved only to addresses `is_public` refuses.
     Private,
     Failed,
 }
@@ -403,9 +384,6 @@ async fn dial(rules: &Rules, host: &str, port: u16) -> Dialed {
     }
 }
 
-/// Resolves `host` once and connects to the first address it may reach, so a name that
-/// resolves again to another address (DNS rebinding) cannot slip past the check. `None` when
-/// every address was refused.
 async fn direct(rules: &Rules, host: &str, port: u16) -> io::Result<Option<TcpStream>> {
     let private = rules
         .allowlist

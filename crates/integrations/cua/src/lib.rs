@@ -65,30 +65,16 @@ const PROVIDER_ENVIRONMENT: &[&str] = &[
     "SKY_ENABLE_AUDIO",
 ];
 
-/// How a pinned provider catalog is checked against the provider's live
-/// `tools/list` each time a session starts its provider.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CatalogCheck {
-    /// The live catalog must equal the pinned one, tool for tool, because the
-    /// model sees the pinned definitions.
     #[default]
     Exact,
-    /// The provider must publish every pinned tool name; definitions and extra
-    /// tools may differ. For hosts that show the model a tool of their own and
-    /// call the provider's tools by name through [`ComputerTools::tool`].
     Names,
 }
 
-/// What is known of a `tools/call` that failed after it was sent: the
-/// provider may have acted, so the host must not replay it blindly. The
-/// provider process was stopped; the session's next call starts a new one.
-/// Calls return it boxed in their `ToolError`, so hosts can downcast to it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutcomeUnknown {
-    /// The provider did not answer within [`ComputerConfig::step_timeout`].
     TimedOut(Duration),
-    /// The provider's transport failed, such as the process exiting or
-    /// writing invalid JSON-RPC, before the call's reply arrived.
     Transport(String),
 }
 
@@ -268,22 +254,18 @@ impl ComputerConfig {
         Self::new(executable)
     }
 
-    /// The provider's arguments.
     #[must_use]
     pub fn args(mut self, args: impl IntoIterator<Item = impl Into<OsString>>) -> Self {
         self.args = args.into_iter().map(Into::into).collect();
         self
     }
 
-    /// Sets `name` in the provider's environment, on top of the inherited `PROVIDER_ENVIRONMENT`.
     #[must_use]
     pub fn env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.environment.insert(name.into(), value.into());
         self
     }
 
-    /// Passes every variable of this process whose name starts with `prefix` to the provider, as
-    /// it is now, such as a host's own tuning variables for its provider.
     #[must_use]
     pub fn inherit_env_prefix(mut self, prefix: &str) -> Self {
         self.environment.extend(
@@ -293,11 +275,6 @@ impl ComputerConfig {
         self
     }
 
-    /// Pins the provider's catalog, so [`ComputerTools::connect`] registers
-    /// these tools without starting the provider; each session starts it on
-    /// its first call and refuses calls, before dispatching any, while its
-    /// live `tools/list` fails `check`. Without a pinned catalog, `connect`
-    /// starts the provider once to discover it.
     #[must_use]
     pub fn catalog(mut self, catalog: Vec<ProviderTool>, check: CatalogCheck) -> Self {
         self.provider_catalog = Some(catalog);
@@ -305,31 +282,18 @@ impl ComputerConfig {
         self
     }
 
-    /// How long starting the provider, initializing it and reading its
-    /// catalog may take before the call fails with nothing dispatched; 120
-    /// seconds by default.
     #[must_use]
     pub fn startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
         self
     }
 
-    /// How long one `tools/call` may wait for its reply, after the provider
-    /// started. A call that runs over stops the provider and fails with
-    /// [`OutcomeUnknown::TimedOut`]. Unlimited by default, so hosts with a
-    /// deadline of their own set one under it.
     #[must_use]
     pub fn step_timeout(mut self, timeout: Duration) -> Self {
         self.step_timeout = Some(timeout);
         self
     }
 
-    /// After a call whose outcome is unknown (it timed out, its transport
-    /// failed or its caller went away), the session's next call starts a new
-    /// provider. By default the session instead refuses every call but
-    /// `js_reset` until a reset succeeds, as a REPL provider's state needs;
-    /// providers without one, whose host reports [`OutcomeUnknown`] to the
-    /// model itself, use this.
     #[must_use]
     pub fn restart_after_failure(mut self) -> Self {
         self.restart_after_failure = true;
@@ -394,8 +358,6 @@ pub struct ProviderTool {
 }
 
 impl ProviderTool {
-    /// A tool called `name` with an object input schema and nothing else, for a pinned catalog
-    /// checked with [`CatalogCheck::Names`].
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -728,7 +690,6 @@ async fn run_session(
             };
             let value = match reply {
                 Ok(value) => value,
-                // The provider answered with an error, so its transport is intact.
                 Err(RpcFailure::Reply(error)) => {
                     return Err(Failure::Answered(Box::new(process), error));
                 }
@@ -778,17 +739,12 @@ async fn run_session(
     }
 }
 
-/// Why a session's call failed, and so what happens to its provider.
 enum Failure {
-    /// Nothing was dispatched: the provider did not start or failed its catalog check.
     Unsent(ToolError),
-    /// The provider answered with a JSON-RPC error; it keeps serving the session.
     Answered(Box<Process>, ToolError),
-    /// The call may have run; the provider was dropped, which stops it.
     Unknown(ToolError),
 }
 
-/// A failed JSON-RPC request: a reply that carried an error, or a broken transport.
 enum RpcFailure {
     Reply(ToolError),
     Transport(ToolError),

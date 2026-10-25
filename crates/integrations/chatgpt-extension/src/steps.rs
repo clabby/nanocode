@@ -21,7 +21,6 @@ pub struct Snapshot {
 #[derive(Default)]
 struct Tab {
     session: String,
-    /// The turn that last used it; the extension closes it when that turn ends.
     turn: String,
     refs: HashMap<String, Reference>,
 }
@@ -29,18 +28,12 @@ struct Tab {
 #[derive(Default)]
 pub struct Tabs {
     tabs: HashMap<u64, Tab>,
-    /// Each session's tab group title as last given to the extension.
     titles: HashMap<String, String>,
-    /// When each (session, turn) last ran a step, for `Tabs::end_idle`.
     active: HashMap<(String, String), Instant>,
 }
 
-/// Longest tab group title the bridge sends: Chrome shows a group's whole title on its chip up to
-/// this many characters.
 pub const GROUP_TITLE_MAX: usize = 32;
 
-/// A session's tab group title: `title` on one line, cut to [`GROUP_TITLE_MAX`] characters with an
-/// ellipsis; `None` for a blank title, when the extension keeps its own "ChatGPT".
 pub fn group_title(title: &str) -> Option<String> {
     let words = title.split_whitespace().collect::<Vec<_>>().join(" ");
     if words.is_empty() {
@@ -53,7 +46,6 @@ pub fn group_title(title: &str) -> Option<String> {
     Some(format!("{}…", cut.trim_end()))
 }
 
-/// The turns in `active` without a step for `idle` at `now`, removed.
 fn idle_turns(
     active: &mut HashMap<(String, String), Instant>,
     now: Instant,
@@ -661,9 +653,6 @@ impl Tabs {
         result
     }
 
-    /// Names the session's tab group [`group_title`]`(title)` with `nameSession` when that changed
-    /// since the last name the extension accepted; before the session's first tab, the extension
-    /// keeps the name for the group it creates. A blank title sends nothing.
     pub(crate) fn name(
         &mut self,
         ext: &mut Extension,
@@ -687,9 +676,6 @@ impl Tabs {
         Ok(())
     }
 
-    /// The session's `turn` ended: the extension closes the tabs it used, as it does when ChatGPT's
-    /// own turns end, and drops its claim on tabs it was handed. The tabs are forgotten here even
-    /// when the extension's reply is an error.
     pub(crate) fn end_turn(
         &mut self,
         ext: &mut Extension,
@@ -707,8 +693,6 @@ impl Tabs {
         .map(drop)
     }
 
-    /// Ends every turn that has gone `idle` without a step, as [`Tabs::end_turn`]; the first
-    /// failure is returned after all were tried.
     pub(crate) fn end_idle(
         &mut self,
         ext: &mut Extension,

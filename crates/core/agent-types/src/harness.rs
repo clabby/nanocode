@@ -490,19 +490,13 @@ impl ModelCapabilities {
     }
 }
 
-/// A model as a catalog lists it: its harness and ID, display name, and the
-/// efforts, service tiers and reasoning modes it accepts, from its
-/// [`ModelCapabilities`]. Hosts that offer models build their lists from it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ModelInfo {
     pub harness: HarnessFamily,
     pub id: String,
     pub name: &'static str,
-    /// The reasoning efforts it accepts, lowest first.
     pub efforts: Vec<Thinking>,
-    /// Its default reasoning effort.
     pub effort: Thinking,
-    /// Whether it has a fast mode: quicker output at a higher price.
     pub fast: bool,
     pub service_tiers: Vec<ServiceTier>,
     pub reasoning_modes: Vec<ReasoningMode>,
@@ -522,7 +516,6 @@ impl ModelInfo {
         }
     }
 
-    /// A model's entry as served natively.
     pub fn of(model: &ModelSelection) -> Self {
         Self::new(&model.capabilities(ModelTransport::Native))
     }
@@ -531,13 +524,11 @@ impl ModelInfo {
         ModelSelection::new(self.harness.clone(), self.id.clone())
     }
 
-    /// Whether it runs at `thinking` and, when `fast`, in fast mode.
     pub fn runs(&self, thinking: Thinking, fast: bool) -> bool {
         self.efforts.contains(&thinking) && (!fast || self.fast)
     }
 }
 
-/// Every built-in harness's models over `transport`, as [`ModelInfo`].
 pub fn model_catalog(transport: ModelTransport) -> impl Iterator<Item = ModelInfo> {
     HarnessFamily::builtin()
         .into_iter()

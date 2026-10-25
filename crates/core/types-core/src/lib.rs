@@ -31,10 +31,6 @@ pub enum Model {
     #[serde(rename = "mimo-v2.6-pro", alias = "mimo")]
     Mimo,
 
-    /// OpenAI's Daybreak Blue: reduced cyber refusals for defensive security
-    /// work, served by GPT-6 Sol, for accounts in OpenAI's Daybreak program.
-    /// Kept out of [`Model::ALL`]; hosts choose it, such as after a GPT model
-    /// refused a request under OpenAI's cyber policy.
     #[serde(rename = "gpt-daybreak-blue-latest", alias = "daybreak-blue")]
     DaybreakBlue,
 

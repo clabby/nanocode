@@ -134,16 +134,12 @@ impl McpOAuthCredentials {
         self
     }
 
-    /// Refresh at this token endpoint, as the sign-in found it, instead of
-    /// discovering the server's authorization again before each refresh.
     #[must_use]
     pub fn token_endpoint(mut self, token_endpoint: impl Into<String>) -> Self {
         self.token_endpoint = Some(token_endpoint.into());
         self
     }
 
-    /// The resource indicator (RFC 8707) refreshes send instead of the
-    /// server URL; empty sends none.
     #[must_use]
     pub fn resource(mut self, resource: impl Into<String>) -> Self {
         self.resource = Some(resource.into());
@@ -236,14 +232,8 @@ pub trait McpOAuthStore: Send + Sync {
         Ok(Box::new(()))
     }
 
-    /// The stored sign-in can no longer be used: the authorization server
-    /// rejected its refresh token, it has none, or the server refused an
-    /// access token just refreshed. Only authorizing again helps.
     async fn authorization_required(&self, _server_name: &str, _server_url: &str) {}
 
-    /// Names the credentials this store holds, so `OAuthRuntime` refreshes of one sign-in join
-    /// in process across store instances, such as the user's ID for a host that builds a store
-    /// per call. `None` (the default) joins refreshes per store instance only.
     fn refresh_key(&self) -> Option<String> {
         None
     }
@@ -252,23 +242,14 @@ pub trait McpOAuthStore: Send + Sync {
 pub struct OAuthRuntime {
     server_name: String,
     server_url: String,
-    /// The MCP server's URL, which refreshes discover from; `None` for
-    /// credentials that name their token endpoint.
     base_url: Option<Url>,
     http: reqwest::Client,
     store: Arc<dyn McpOAuthStore>,
     credentials: ArcSwapOption<McpOAuthCredentials>,
-    /// The access token this runtime's last refresh transaction refreshed or
-    /// adopted: it is used until it expires or is refused, even inside the
-    /// refresh skew, so a token that lives less than the skew is not
-    /// refreshed again before every request.
     settled: ArcSwapOption<String>,
 }
 
 impl OAuthRuntime {
-    /// A runtime for credentials that name their token endpoint, which
-    /// refreshes without discovery, for any API the token is for: `server_url`
-    /// only names it, with `server_name`, to the store.
     pub fn stored(
         server_name: impl Into<String>,
         server_url: impl Into<String>,
@@ -749,16 +730,12 @@ pub struct OAuthServer {
 }
 
 impl OAuthServer {
-    /// The issuer its metadata names, without a trailing slash, which keys a
-    /// web backend's registered client and the token sets it issued.
     #[must_use]
     pub fn issuer(&self) -> Option<&str> {
         let issuer = self.metadata.issuer.as_deref();
         issuer.map(|issuer| issuer.trim_end_matches('/'))
     }
 
-    /// Every endpoint its metadata names (authorization, token, and
-    /// registration and revocation when offered), for hosts that vet them.
     pub fn endpoints(&self) -> impl Iterator<Item = &str> {
         let metadata = &self.metadata;
         [
@@ -856,8 +833,6 @@ pub async fn revoke_token(
     nanocode_mcp::oauth::parse_revocation_response(status, &body)
 }
 
-/// Revoke a sign-in (RFC 7009): its refresh token when it has one, which
-/// ends the grant, else its access token.
 pub async fn revoke_sign_in(
     http: &reqwest::Client,
     endpoint: &str,
@@ -1282,13 +1257,8 @@ async fn complete_login(
     saved
 }
 
-/// The client type the OAuth functions here take.
 pub type HttpClient = reqwest::Client;
 
-/// A client for a web backend's OAuth requests to third parties' URLs (discovery, registration,
-/// token exchange and revocation): with the rustls provider installed, `user_agent` (some servers
-/// refuse requests without one), no redirects, so none sends a token elsewhere, HTTPS only when
-/// `https_only`, and each request bounded by `timeout`.
 pub fn http_client(
     user_agent: &str,
     https_only: bool,

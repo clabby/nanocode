@@ -6,10 +6,6 @@ use tokio::sync::Mutex;
 use super::{PEER_CLOSED, RemoteDelivery, RemoteFrame, RemoteLink};
 use crate::embedded::{CodeModeHostError, HostFuture};
 
-/// A [`RemoteLink`] over a message connection such as a server's WebSocket. `stream` yields the
-/// peer's text messages, or an error that fails the link, and ends when the peer closes; `sink`
-/// takes text messages as `M` and may be shared with the host's own writes, such as pings.
-/// `close` writes nothing: the host closes the connection, with a reason of its own.
 pub struct MessageLink<St, Si, M> {
     stream: Mutex<St>,
     sink: Arc<Mutex<Si>>,
@@ -87,9 +83,6 @@ where
     }
 }
 
-/// What a WebSocket message is to [`websocket`]: text for the link, a ping with the pong that
-/// answers it, a pong, the peer's close, or another message, such as a binary one, that fails the
-/// link with this text.
 pub enum SocketMessage<M> {
     Text(String),
     Ping(M),
@@ -98,12 +91,6 @@ pub enum SocketMessage<M> {
     Invalid(&'static str),
 }
 
-/// A [`MessageLink`] over a WebSocket whose library reads and writes messages as `M`, which
-/// `classify` tells apart, with the WebSocket's ping and pong: it answers the peer's pings, and the
-/// returned future writes `ping()` every `interval` and resolves with why the connection is lost,
-/// when a ping write fails or nothing answered for `timeout`. A host runs it beside the link, such
-/// as [`serve_queue`](super::serve_queue)'s `failed`. A read error fails the link as
-/// `socket read failed` and a close ends it as [`PEER_CLOSED`].
 #[cfg(not(target_family = "wasm"))]
 #[expect(clippy::type_complexity, reason = "the link's boxed message stream")]
 pub fn websocket<St, Si, M, E>(
@@ -127,7 +114,6 @@ where
     use tokio::time::Instant;
 
     let start = Instant::now();
-    // When the peer last answered, as milliseconds since `start`.
     let answered = Arc::new(AtomicU64::new(0));
     let (writer, pong) = (Arc::clone(&sink), Arc::clone(&answered));
     let messages = stream.filter_map(move |message| {

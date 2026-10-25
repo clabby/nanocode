@@ -191,7 +191,6 @@ pub struct RunSteered {
 
     pub instruction_bytes: usize,
 
-    /// The ID the host steered with (`TurnControl::steer_with_id`), if any.
     #[serde(default)]
     pub message_id: Option<String>,
 }

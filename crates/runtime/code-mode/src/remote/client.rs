@@ -96,11 +96,6 @@ struct CallbackState {
 
 type Callbacks = HashMap<(String, String), CallbackState>;
 
-/// Receipts of a cell's nested calls by callback origin, kept until the reply that returns the
-/// finished cell's output names its carrier. A runner may report the cell complete, ending its
-/// callback state, before that reply, so receipts live apart from it. Entries hold weak
-/// references because the subagent runtime holds every receipt whose result is still unsettled;
-/// entries whose receipts were all released are pruned as new receipts arrive.
 type Receipts = HashMap<(String, String), Vec<Weak<dyn ToolReceipt>>>;
 
 type Sending<'a> = (HostFuture<'a, Result<(), CodeModeHostError>>, Vec<u64>);

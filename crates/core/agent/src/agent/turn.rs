@@ -155,7 +155,6 @@ impl TurnResult {
         self.usage.as_ref()
     }
 
-    /// The turn's usage under the model its checkpoint ran, when it has both.
     #[must_use]
     pub fn usage_record(&self) -> Option<crate::UsageRecord> {
         let usage = self.usage.as_ref()?;

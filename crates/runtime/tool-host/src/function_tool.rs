@@ -22,10 +22,6 @@ pub trait FunctionHandler: Send + Sync + 'static {
     }
 }
 
-/// Runs a stateful function tool's calls with typed arguments: `Args`
-/// decodes from the call's JSON input, and `failed` turns every error,
-/// including arguments that don't decode, into what the model reads.
-/// [`FunctionTool::typed`] offers `Args`'s JSON Schema as the parameters.
 pub trait TypedHandler<Args, Error>: Send + Sync + 'static {
     fn call(
         &self,
@@ -33,16 +29,12 @@ pub trait TypedHandler<Args, Error>: Send + Sync + 'static {
         context: ToolContext<'_>,
     ) -> impl Future<Output = Result<Value, Error>> + MaybeSend;
 
-    /// What the model reads for a call that failed with `error`.
     fn failed(&self, error: Error) -> Failure;
 }
 
-/// What the model reads for a call a [`TypedHandler`] failed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Failure {
-    /// The tool's error, as this text.
     Error(String),
-    /// A result, such as a structured error the model acts on.
     Result(Value),
 }
 
@@ -55,8 +47,6 @@ impl From<Failure> for Result<Value, String> {
     }
 }
 
-/// `Send` on native targets, where tool futures move between threads, and
-/// nothing on WASM.
 #[cfg(not(target_family = "wasm"))]
 pub trait MaybeSend: Send {}
 #[cfg(not(target_family = "wasm"))]
@@ -124,8 +114,6 @@ impl FunctionTool {
         }
     }
 
-    /// A tool whose calls `handler` runs with typed arguments, offered with
-    /// the JSON Schema of `Args` as its parameters.
     #[must_use]
     pub fn typed<Args, Error>(
         name: impl Into<String>,
@@ -139,8 +127,6 @@ impl FunctionTool {
         Self::typed_with_parameters(name, description, schema_for::<Args>(), handler)
     }
 
-    /// [`Self::typed`] with `parameters` the host builds itself, such as a
-    /// schema whose enums are only known at runtime.
     #[must_use]
     pub fn typed_with_parameters<Args, Error>(
         name: impl Into<String>,

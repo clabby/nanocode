@@ -291,9 +291,6 @@ impl OpenAiBuilder<StandardServiceFactory> {
         self
     }
 
-    /// Sends requests through an HTTP client whose connections time out after
-    /// `connect_timeout` and whose responses fail as retryable timeouts once
-    /// they send nothing for `idle_timeout`.
     #[cfg(not(target_family = "wasm"))]
     pub fn http_timeouts(
         self,
