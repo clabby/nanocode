@@ -1380,7 +1380,17 @@ async fn observe_updates(
                 observation.buffered.notifications.push(notification);
             }
             Some(CellUpdate::Content(item)) => {
-                observation.buffered.content.push(item);
+                let unstreamed = observation.buffered.content.len() > observation.streamed;
+                match (observation.buffered.content.last_mut(), item) {
+                    (
+                        Some(ToolOutputContent::InputText { text: last }),
+                        ToolOutputContent::InputText { text },
+                    ) if unstreamed => {
+                        last.push('\n');
+                        last.push_str(&text);
+                    }
+                    (_, item) => observation.buffered.content.push(item),
+                }
                 if stream_open && observation.replay.is_empty() && observation.updates.is_empty() {
                     stream_output(&cell.origin_call_id, observation, observer);
                 }

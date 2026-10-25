@@ -99,20 +99,35 @@ fn bound_tool_result(content: ToolResultContent) -> ToolResultContent {
         ToolResultContent::Text(text) => {
             ToolResultContent::Text(truncate_middle(&text, TOOL_RESULT_TOKEN_LIMIT))
         }
-        ToolResultContent::Blocks(mut blocks) => {
+        ToolResultContent::Blocks(blocks) => {
             let mut remaining = TOOL_RESULT_TOKEN_LIMIT;
-            for block in &mut blocks {
+            let mut omitted = 0_usize;
+            let mut bounded_blocks = Vec::with_capacity(blocks.len().min(64));
+            for mut block in blocks {
                 if block["type"] != "text" {
+                    bounded_blocks.push(block);
                     continue;
                 }
                 let Some(text) = block["text"].as_str() else {
+                    bounded_blocks.push(block);
                     continue;
                 };
+                if remaining == 0 {
+                    omitted += 1;
+                    continue;
+                }
                 let bounded = truncate_middle(text, remaining);
                 remaining = remaining.saturating_sub(estimate_text_tokens(text));
                 block["text"] = bounded.into();
+                bounded_blocks.push(block);
             }
-            ToolResultContent::Blocks(blocks)
+            if omitted > 0 {
+                bounded_blocks.push(json!({
+                    "type": "text",
+                    "text": format!("[{omitted} more text blocks omitted]"),
+                }));
+            }
+            ToolResultContent::Blocks(bounded_blocks)
         }
     }
 }
