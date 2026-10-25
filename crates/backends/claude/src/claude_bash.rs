@@ -144,22 +144,23 @@ impl Drop for Job {
         self.abort.abort();
     }
 }
-struct FileSink {
-    chunks: mpsc::UnboundedSender<Vec<u8>>,
+struct TaskSink {
+    file: Option<mpsc::UnboundedSender<Vec<u8>>>,
     activity: Arc<LastActivity>,
 }
-impl OutputSink for FileSink {
+impl OutputSink for TaskSink {
     fn write(&self, bytes: &[u8]) {
         self.activity.touch();
-        let _ = self.chunks.send(bytes.to_vec());
+        if let Some(file) = &self.file {
+            let _ = file.send(bytes.to_vec());
+        }
     }
 }
 async fn output_file(
     session: &str,
     id: &str,
     capped: Arc<Signal>,
-    activity: Arc<LastActivity>,
-) -> Option<(PathBuf, FileSink, Arc<Signal>)> {
+) -> Option<(PathBuf, mpsc::UnboundedSender<Vec<u8>>, Arc<Signal>)> {
     let directory = std::env::temp_dir()
         .join("nanocode")
         .join(session)
@@ -194,14 +195,7 @@ async fn output_file(
         let _ = file.flush().await;
         done.fire();
     }));
-    Some((
-        path,
-        FileSink {
-            chunks: sender,
-            activity,
-        },
-        written,
-    ))
+    Some((path, sender, written))
 }
 async fn stall(job: &Job, binding: &Binding) {
     let Some(path) = &job.output else {
@@ -524,15 +518,18 @@ impl BashExecutor for LocalBash {
         );
         let capped = Arc::new(Signal::new());
         let activity = Arc::new(LastActivity::new());
-        let (output, sink, written) =
-            match output_file(&session, &id, Arc::clone(&capped), Arc::clone(&activity)).await {
-                Some((path, sink, written)) => (Some(path), Some(sink), written),
-                None => {
-                    let written = Arc::new(Signal::new());
-                    written.fire();
-                    (None, None, written)
-                }
-            };
+        let (output, file, written) = match output_file(&session, &id, Arc::clone(&capped)).await {
+            Some((path, file, written)) => (Some(path), Some(file), written),
+            None => {
+                let written = Arc::new(Signal::new());
+                written.fire();
+                (None, None, written)
+            }
+        };
+        let sink = TaskSink {
+            file,
+            activity: Arc::clone(&activity),
+        };
         let (sender, receiver) = watch::channel(None);
         let (arm, armed) = oneshot::channel::<Duration>();
         let expired = Arc::new(AtomicBool::new(false));
@@ -566,7 +563,7 @@ impl BashExecutor for LocalBash {
                         &workspace,
                         &request,
                         Duration::MAX,
-                        sink.as_ref().map(|sink| sink as &dyn OutputSink),
+                        Some(&sink as &dyn OutputSink),
                     ) => result,
                     () = deadline => {
                         stopped.store(true, Ordering::SeqCst);
