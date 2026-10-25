@@ -542,20 +542,41 @@ async fn execute_code_call(
     context: ToolContext<'_>,
     observer: &mut dyn CodeModeObserver,
     tool_span: &tracing::Span,
-) -> Result<CodeModeExecution> {
-    if let Some(context) = owned_context {
+    recover: bool,
+) -> Result<Option<CodeModeExecution>> {
+    if recover {
+        let recovered = tools
+            .recover_code(context)
+            .instrument(tool_span.clone())
+            .await
+            .unwrap_or(None);
+        for nested in recovered
+            .iter()
+            .flat_map(|execution| &execution.nested_calls)
+        {
+            observer.update(CodeModeUpdate::NestedCallStarted {
+                call_id: &nested.call_id,
+                name: &nested.name,
+                input: &nested.input,
+            });
+            observer.update(CodeModeUpdate::NestedCallCompleted(nested));
+        }
+        return Ok(recovered);
+    }
+    let execution = if let Some(context) = owned_context {
         tools
             .execute_code_owned_with_updates(&call.input, context, observer)
             .instrument(tool_span.clone())
             .await
-            .map_err(interrupted_tool_host)
+            .map_err(interrupted_tool_host)?
     } else {
         tools
             .wait_for_code_with_updates(&call.input, context, observer)
             .instrument(tool_span.clone())
             .await
-            .map_err(interrupted_tool_host)
-    }
+            .map_err(interrupted_tool_host)?
+    };
+    Ok(Some(execution))
 }
 
 fn interrupted_tool_host(error: nanocode_code_mode::embedded::CodeModeHostError) -> NanocodeError {
@@ -608,6 +629,7 @@ impl ModelRun {
                     let started_at = active.started_at;
                     let step_id = format!("tool-{call_index}-{}", call.call_id);
                     let mut interrupted = false;
+                    let mut recover = false;
                     let recovered = if let Some(steps) = &execution_steps {
                         match steps
                             .begin::<_, CompletedToolCall>(&step_id, "tool_call", &call)
@@ -616,7 +638,16 @@ impl ModelRun {
                             crate::agent::ExecutionStep::Execute => None,
                             crate::agent::ExecutionStep::Interrupted => {
                                 interrupted = true;
-                                Some(Self::interrupted_tool_call(&active))
+                                if !matches!(call.kind, CodeCallKind::ToolSearch) {
+                                    recover = true;
+                                    None
+                                } else {
+                                    Some(Self::interrupted_tool_call(
+                                        active.kind,
+                                        &active.call_id,
+                                        &active.name,
+                                    ))
+                                }
                             }
                             crate::agent::ExecutionStep::Replay(output) => Some(output),
                         }
@@ -650,6 +681,7 @@ impl ModelRun {
                                 started_at,
                                 &active.progress,
                                 &active.span,
+                                recover,
                             )
                             .await
                         };
@@ -896,19 +928,19 @@ impl ModelRun {
         }
     }
 
-    fn interrupted_tool_call(active: &ActiveToolCall) -> CompletedToolCall {
+    fn interrupted_tool_call(kind: CodeCallKind, call_id: &str, name: &str) -> CompletedToolCall {
         let output = ToolOutputBody::Text(
             "Tool execution interrupted by a host crash; outcome unknown. Do not assume it did not run or automatically repeat it.".into(),
         );
-        let response_item = match active.kind {
-            CodeCallKind::Custom => custom_tool_output(active.call_id.clone(), output.clone()),
-            CodeCallKind::Function => function_tool_output(active.call_id.clone(), output.clone()),
-            CodeCallKind::ToolSearch => tool_search_output(active.call_id.clone(), Vec::new()),
+        let response_item = match kind {
+            CodeCallKind::Custom => custom_tool_output(call_id.to_owned(), output.clone()),
+            CodeCallKind::Function => function_tool_output(call_id.to_owned(), output.clone()),
+            CodeCallKind::ToolSearch => tool_search_output(call_id.to_owned(), Vec::new()),
         };
         CompletedToolCall {
             cell: None,
-            call_id: active.call_id.clone(),
-            tool: active.name.clone(),
+            call_id: call_id.to_owned(),
+            tool: name.to_owned(),
             success: false,
             duration_ns: 0,
             work_duration_ns: 0,
@@ -936,6 +968,7 @@ impl ModelRun {
         started_at: Instant,
         progress: &ArcSwap<ActiveToolProgress>,
         tool_span: &tracing::Span,
+        recover: bool,
     ) -> Result<CompletedToolCall> {
         let qualified_name = qualified_tool_name(&call);
         if let Some(message) = unsupported_tool_message(tools, &call) {
@@ -977,7 +1010,16 @@ impl ModelRun {
             .with_instruction_revision(instruction_revision)
             .with_host_context(host_context)
             .with_turn_id(Some(turn_id));
-            let mut execution = if tools.is_code_only() {
+            let mut execution = if recover {
+                let Some(recovered) = tools.recover_tool(&qualified_name, context).await else {
+                    return Ok(Self::interrupted_tool_call(
+                        call.kind,
+                        &call.call_id,
+                        &qualified_name,
+                    ));
+                };
+                recovered
+            } else if tools.is_code_only() {
                 ToolOutput::error(
                     "This tool requires Code Mode; no direct handler was invoked. Reconcile any prior recovered effect before calling it through tools inside exec.",
                 )
@@ -1103,15 +1145,19 @@ impl ModelRun {
                 metadata: execution.metadata,
             });
         }
-        let owned_context = owned_code_context(
-            &call,
-            history,
-            session_id,
-            turn_id,
-            model,
-            host_context,
-            instruction_revision,
-        )?;
+        let owned_context = if recover {
+            None
+        } else {
+            owned_code_context(
+                &call,
+                history,
+                session_id,
+                turn_id,
+                model,
+                host_context,
+                instruction_revision,
+            )?
+        };
         let context = ToolContext::new(
             model.as_str(),
             session_id,
@@ -1130,15 +1176,23 @@ impl ModelRun {
             parent_call_id: &call.call_id,
             error: None,
         };
-        let mut execution = execute_code_call(
+        let Some(mut execution) = execute_code_call(
             tools,
             &call,
             owned_context,
             context,
             &mut observer,
             tool_span,
+            recover,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(Self::interrupted_tool_call(
+                call.kind,
+                &call.call_id,
+                &qualified_name,
+            ));
+        };
         let update_error = observer.error.take();
         drop(observer);
         if let Some(error) = update_error {

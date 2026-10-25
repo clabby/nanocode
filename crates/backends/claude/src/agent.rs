@@ -196,6 +196,7 @@ type Handler = Arc<dyn Fn(Value, ClaudeToolInvocation) -> ToolResultFuture + Sen
 type ToolCleanup = Arc<dyn Fn() -> BackendFuture<()> + Send + Sync>;
 type CodeTurnCleanup = Arc<dyn Fn(ClaudeToolProgress) -> BackendFuture<()> + Send + Sync>;
 type NestedToolLookup = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type ToolRecovery = Arc<dyn Fn(&str, ClaudeToolInvocation) -> ToolResultFuture + Send + Sync>;
 pub(crate) type Steer = Arc<dyn Fn(String) -> BackendFuture<bool> + Send + Sync>;
 type AgentBound = Arc<dyn Fn(&Agent, &Steer) + Send + Sync>;
 
@@ -291,6 +292,7 @@ pub struct ClaudeTools {
     pub(crate) code_turn_preempt: Vec<ToolCleanup>,
     pub(crate) code_turn_settle: Vec<ToolCleanup>,
     pub(crate) nested_tools: Option<NestedToolLookup>,
+    pub(crate) recovery: Option<ToolRecovery>,
     pub(crate) shared_catalog: Option<(nanocode_tool_host::Tools, std::path::PathBuf, AgentHandle)>,
     pub(crate) shared_tool_names: HashSet<String>,
     pub(crate) shared_shutdown: Option<ToolCleanup>,
@@ -325,6 +327,7 @@ impl nanocode_tools::ToolCollection for ClaudeTools {
             self.code_turn_preempt = replacement.code_turn_preempt;
             self.code_turn_settle = replacement.code_turn_settle;
             self.nested_tools = replacement.nested_tools;
+            self.recovery = replacement.recovery;
             self.shared_catalog = replacement.shared_catalog;
             return Ok(self);
         }
@@ -1331,9 +1334,11 @@ impl ClaudeBuilder {
         let mut code_turn_settle = Vec::new();
         let mut agent_bound = Vec::new();
         let mut nested_tools = None;
+        let mut recovery = None;
         if let Some(factory) = &self.tools_factory {
             let native = factory(handle.clone())?;
             nested_tools = native.nested_tools;
+            recovery = native.recovery;
             custom_tool_search = native.custom_tool_search;
             self.client_tool_search |= custom_tool_search;
             self.tools.extend(native.tools);
@@ -1530,6 +1535,7 @@ impl ClaudeBuilder {
                 code_turn_preempt: Vec::new(),
                 code_turn_settle: Vec::new(),
                 nested_tools: nested_tools.clone(),
+                recovery: recovery.clone(),
                 shared_catalog: None,
                 shared_tool_names: HashSet::new(),
                 shared_shutdown: None,
@@ -1537,6 +1543,7 @@ impl ClaudeBuilder {
             };
             let adapted = adapter(catalog)?;
             nested_tools = adapted.nested_tools;
+            recovery = adapted.recovery;
             for (definition, handler) in adapted.tools {
                 if definition.name.is_empty()
                     || !definition.input_schema.is_object()
@@ -1669,6 +1676,7 @@ impl ClaudeBuilder {
             code_turn_preempt,
             code_turn_settle,
             nested_tools,
+            recovery,
             dynamic_tools: self.dynamic_tools,
             tool_hooks: self.tool_hooks,
             server_tools: self.server_tools,
@@ -3153,6 +3161,7 @@ struct State {
     client_tool_search: bool,
     code_only: bool,
     nested_tools: Option<NestedToolLookup>,
+    recovery: Option<ToolRecovery>,
     parallel_tools: bool,
 
     parallel_safe_tools: HashSet<String>,
@@ -5656,7 +5665,28 @@ impl State {
         Ok(consumed)
     }
 
-    async fn call_tool(
+    fn invocation(
+        &self,
+        id: &str,
+        events: &AgentEventPublisher,
+        cursor: &Cursor,
+    ) -> ClaudeToolInvocation {
+        ClaudeToolInvocation {
+            model: cursor.template.model.clone(),
+            session_id: self.session_id.clone(),
+            root_session_id: self.lineage.root_session_id.clone(),
+            turn_id: cursor
+                .operation
+                .clone()
+                .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
+            call_id: id.to_owned(),
+            instruction_revision: cursor.instruction_revision,
+            host_context: cursor.host_context(self),
+            progress: None,
+        }
+    }
+
+    async fn recover_tool(
         &self,
         id: &str,
         name: &str,
@@ -5664,8 +5694,43 @@ impl State {
         handler: &Handler,
         events: &AgentEventPublisher,
         control: (&Cursor, &Cancellation),
-    ) -> Result<ContentBlock> {
+    ) -> Result<Option<ContentBlock>> {
         let (cursor, cancel) = control;
+        let Some(recovery) = &self.recovery else {
+            return Ok(None);
+        };
+        let invocation = self.invocation(id, events, cursor);
+        let reply = tokio::select! {
+            biased;
+            reply = recovery(name, invocation) => reply,
+            () = cancel.cancelled() => return Ok(None),
+        };
+        match reply {
+            Ok(reply) => self
+                .call_tool(
+                    id,
+                    name,
+                    input,
+                    handler,
+                    events,
+                    (cursor, cancel, Some(reply)),
+                )
+                .await
+                .map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        id: &str,
+        name: &str,
+        input: &Value,
+        handler: &Handler,
+        events: &AgentEventPublisher,
+        control: (&Cursor, &Cancellation, Option<ClaudeToolReply>),
+    ) -> Result<ContentBlock> {
+        let (cursor, cancel, recovered) = control;
         let index = cursor.index;
         self.emit(
             events,
@@ -5681,19 +5746,7 @@ impl State {
             began,
             open: true,
         };
-        let invocation = ClaudeToolInvocation {
-            model: cursor.template.model.clone(),
-            session_id: self.session_id.clone(),
-            root_session_id: self.lineage.root_session_id.clone(),
-            turn_id: cursor
-                .operation
-                .clone()
-                .unwrap_or_else(|| events.turn_id().unwrap_or(events.request_id()).to_owned()),
-            call_id: id.to_owned(),
-            instruction_revision: cursor.instruction_revision,
-            host_context: cursor.host_context(self),
-            progress: None,
-        };
+        let invocation = self.invocation(id, events, cursor);
 
         let mut live = LiveNestedCalls {
             state: self,
@@ -5706,7 +5759,9 @@ impl State {
         };
         let mut stopped = false;
         let mut stopped_unknown = false;
-        let outcome = if matches!(name, "exec" | "wait") {
+        let outcome = if let Some(reply) = recovered {
+            Ok(reply)
+        } else if matches!(name, "exec" | "wait") {
             let (sender, mut updates) = tokio::sync::mpsc::unbounded_channel();
             let stopper = sender.clone();
             let mut invocation = invocation;

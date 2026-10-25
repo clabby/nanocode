@@ -746,7 +746,17 @@ impl State {
         let unknown = || {
             ContentBlock::tool_result_content(id, ToolResultContent::Text("Tool execution interrupted; outcome unknown. Do not assume it did not run or automatically repeat it.".into()), true)
         };
-        let result = if interrupted {
+        let recovered = match handler {
+            Some(handler) if interrupted => {
+                self.recover_tool(id, name, input, handler, events, (cursor, cancel))
+                    .await?
+            }
+            _ => None,
+        };
+        let interrupted = interrupted && recovered.is_none();
+        let result = if let Some(recovered) = recovered {
+            recovered
+        } else if interrupted {
             ContentBlock::tool_result_content(id, ToolResultContent::Text("Tool execution interrupted by a host crash; outcome unknown. Do not assume it did not run or automatically repeat it.".into()), true)
         } else if cancel.is_cancelled() {
             unknown()
@@ -757,12 +767,12 @@ impl State {
         } else if let Some(handler) = handler
             && matches!(name, "exec" | "wait")
         {
-            self.call_tool(id, name, input, handler, events, (cursor, cancel))
+            self.call_tool(id, name, input, handler, events, (cursor, cancel, None))
                 .await?
         } else if let Some(handler) = handler {
             tokio::select! {
                 biased;
-                result = self.call_tool(id, name, input, handler, events, (cursor, cancel)) => result?,
+                result = self.call_tool(id, name, input, handler, events, (cursor, cancel, None)) => result?,
                 () = cancel.cancelled() => unknown(),
             }
         } else if self.code_only

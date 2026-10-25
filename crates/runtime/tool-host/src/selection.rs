@@ -112,6 +112,8 @@ pub struct Tools {
     pub(crate) excluded_code_tools: HashSet<String>,
 
     code_mode_policies: Vec<Arc<dyn crate::CodeModeToolPolicy>>,
+
+    recovery: Option<Arc<dyn crate::ToolRecovery>>,
 }
 
 impl Default for Tools {
@@ -161,6 +163,7 @@ impl Default for Tools {
             code_mode_policies: Vec::new(),
             #[cfg(not(target_family = "wasm"))]
             excluded_code_tools: HashSet::new(),
+            recovery: None,
         }
     }
 }
@@ -369,6 +372,10 @@ impl Tools {
     #[must_use]
     pub const fn exposure(&self) -> ToolExposure {
         self.exposure
+    }
+
+    pub(crate) fn recovery(&self) -> Option<Arc<dyn crate::ToolRecovery>> {
+        self.recovery.clone()
     }
 
     #[must_use]
@@ -672,6 +679,12 @@ impl ToolsBuilder {
 
             exposure: None,
         });
+        self
+    }
+
+    #[must_use]
+    pub fn tool_recovery(mut self, recovery: Arc<dyn crate::ToolRecovery>) -> Self {
+        self.tools.recovery = Some(recovery);
         self
     }
 

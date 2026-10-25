@@ -6,7 +6,7 @@ use crate::{
 };
 use nanocode_agent_core::{AgentHandle, NanocodeError, Result};
 use nanocode_tool_host::{
-    ToolContext, ToolDefinition as RuntimeDefinition, ToolInput, Tools,
+    ToolContext, ToolDefinition as RuntimeDefinition, ToolInput, ToolOutput, Tools,
     contract::{ToolOutputBody, ToolOutputContent},
     embedded::{
         CodeModeExecution, CodeModeObserver, CodeModeUpdate, NestedToolCall, OwnedToolContext,
@@ -55,6 +55,12 @@ pub(super) fn install(
     }
     let nested = Arc::clone(&runtime);
     native.nested_tools = Some(Arc::new(move |name| nested.contains(name)));
+    let recovery = Arc::clone(&runtime);
+    native.recovery = Some(Arc::new(move |name, invocation| {
+        let runtime = Arc::clone(&recovery);
+        let name = name.to_owned();
+        Box::pin(async move { Call::recover(&runtime, &name, &invocation).await })
+    }));
     let preempt = Arc::clone(&guard);
     native.code_turn_preempt.push(Arc::new(move || {
         let guard = Arc::clone(&preempt);
@@ -233,28 +239,60 @@ impl Call {
             Self::Function(name) => {
                 let raw =
                     serde_json::value::to_raw_value(&input).map_err(|error| error.to_string())?;
-                let mut output = runtime
+                let output = runtime
                     .execute_tool(&name, ToolInput::Function(raw), context)
                     .await
                     .map_err(|error| error.to_string())?;
-                let structured_result = Some(output.take_structured_result());
-                let metadata = output
-                    .metadata
-                    .take()
-                    .map(|value| serde_json::from_str(value.get()))
-                    .transpose()
-                    .map_err(|error| error.to_string())?;
-                return Ok(reply(
-                    output.output,
-                    output.success,
-                    metadata,
-                    structured_result,
-                ));
+                return tool_reply(output);
             }
         }
         .map_err(|error| error.to_string())?;
         Ok(code_reply(execution, &invocation.call_id))
     }
+
+    async fn recover(
+        runtime: &ToolRuntime,
+        name: &str,
+        invocation: &ClaudeToolInvocation,
+    ) -> std::result::Result<ClaudeToolReply, String> {
+        let context = ToolContext::new(
+            &invocation.model,
+            &invocation.session_id,
+            &invocation.call_id,
+            &[],
+            usize::MAX,
+        )
+        .with_turn_id(Some(&invocation.turn_id))
+        .with_host_context(invocation.host_context.as_deref())
+        .with_instruction_revision(invocation.instruction_revision);
+        if matches!(name, "exec" | "wait") {
+            return match runtime.recover_code(context).await {
+                Ok(Some(execution)) => Ok(code_reply(execution, &invocation.call_id)),
+                Ok(None) => Err("not recovered".into()),
+                Err(error) => Err(error.to_string()),
+            };
+        }
+        match runtime.recover_tool(name, context).await {
+            Some(output) => tool_reply(output),
+            None => Err("not recovered".into()),
+        }
+    }
+}
+
+fn tool_reply(mut output: ToolOutput) -> std::result::Result<ClaudeToolReply, String> {
+    let structured_result = Some(output.take_structured_result());
+    let metadata = output
+        .metadata
+        .take()
+        .map(|value| serde_json::from_str(value.get()))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok(reply(
+        output.output,
+        output.success,
+        metadata,
+        structured_result,
+    ))
 }
 
 struct Progress<'a>(Option<&'a ClaudeToolProgress>);
