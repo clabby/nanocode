@@ -1289,27 +1289,21 @@ impl crate::runtime::DynamicToolProvider for CallbackCatalog {
     }
 }
 
+const fn policy_options(policy: SocketPolicy) -> ExecutorOptions {
+    ExecutorOptions {
+        name: None,
+        runtime_id: None,
+        callback_timeout: Some(policy.request_timeout),
+        callback_hold: None,
+    }
+}
 pub async fn serve_connect(
     target: crate::attachment::AttachmentTarget,
     workspace: &Path,
     tools: crate::Tools,
     policy: SocketPolicy,
 ) -> Result<(), CodeModeHostError> {
-    let socket = connect(target, policy).await?;
-    serve_once(
-        socket,
-        workspace,
-        tools,
-        policy,
-        ExecutorOptions {
-            name: None,
-            runtime_id: None,
-            callback_timeout: Some(policy.request_timeout),
-            callback_hold: None,
-        },
-        HandActivity::default(),
-    )
-    .await
+    serve_connect_with(target, workspace, tools, policy, policy_options(policy)).await
 }
 pub async fn serve_accept(
     listener: &TcpListener,
@@ -1324,12 +1318,7 @@ pub async fn serve_accept(
         workspace,
         tools,
         policy,
-        ExecutorOptions {
-            name: None,
-            runtime_id: None,
-            callback_timeout: Some(policy.request_timeout),
-            callback_hold: None,
-        },
+        policy_options(policy),
         HandActivity::default(),
     )
     .await
