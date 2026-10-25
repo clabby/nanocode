@@ -75,6 +75,15 @@ pub enum StoreError {
     #[error("durability store operation was not committed: {0}")]
     NotCommitted(String),
 
+    #[error(
+        "{component} storage format {stored} is newer than this release supports (format {known}); upgrade before opening it"
+    )]
+    UnsupportedFormat {
+        component: &'static str,
+        stored: u64,
+        known: u32,
+    },
+
     #[error("durability store failed: {0}")]
     Backend(String),
 }

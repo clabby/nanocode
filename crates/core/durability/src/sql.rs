@@ -68,6 +68,111 @@ pub trait Sql {
 
 type Dialects = [&'static str; 2];
 
+#[derive(Clone, Copy, Debug)]
+pub struct MissingColumn {
+    pub probe: Dialects,
+    pub add: Dialects,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Migration {
+    pub statements: [&'static [&'static str]; 2],
+    pub adopt: Option<MissingColumn>,
+}
+
+const CREATE_FORMATS: Dialects = [
+    "CREATE TABLE IF NOT EXISTS nanocode_formats (component TEXT PRIMARY KEY, version INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS nanocode_formats (component TEXT PRIMARY KEY, version BIGINT NOT NULL)",
+];
+const READ_FORMAT: Dialects = [
+    "SELECT CAST(version AS TEXT) FROM nanocode_formats WHERE component = ?1",
+    "SELECT CAST(version AS TEXT) FROM nanocode_formats WHERE component = $1::text",
+];
+const WRITE_FORMAT: Dialects = [
+    "INSERT INTO nanocode_formats (component, version) VALUES (?1, CAST(?2 AS INTEGER)) ON CONFLICT (component) DO UPDATE SET version = excluded.version",
+    "INSERT INTO nanocode_formats (component, version) VALUES ($1::text, CAST($2::text AS BIGINT)) ON CONFLICT (component) DO UPDATE SET version = excluded.version",
+];
+
+async fn run_checked<H: Sql + ?Sized>(
+    host: &H,
+    operation: &'static str,
+    statements: &[SqlStatement<'_>],
+) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+    let results = host.transaction(operation, statements).await?;
+    if results.len() != statements.len() {
+        return Err(StoreError::Backend(format!(
+            "SQL host answered {} of {} statements",
+            results.len(),
+            statements.len()
+        )));
+    }
+    Ok(results)
+}
+
+pub async fn migrate_format<H: Sql + ?Sized>(
+    host: &H,
+    component: &'static str,
+    migrations: &[Migration],
+) -> Result<(), StoreError> {
+    let dialect = host.dialect();
+    let results = run_checked(
+        host,
+        "format",
+        &[
+            statement(dialect, &CREATE_FORMATS, Vec::new()),
+            statement(dialect, &READ_FORMAT, vec![component]),
+        ],
+    )
+    .await?;
+    let stored = match single(&results[1])? {
+        Some(row) => counter(row, 0)?,
+        None => 0,
+    };
+    let known = u32::try_from(migrations.len()).unwrap_or(u32::MAX);
+    if stored > u64::from(known) {
+        return Err(StoreError::UnsupportedFormat {
+            component,
+            stored,
+            known,
+        });
+    }
+    for (index, migration) in migrations.iter().enumerate().skip(stored as usize) {
+        let version = (index + 1).to_string();
+        let write = statement(dialect, &WRITE_FORMAT, vec![component, &version]);
+        let schema = migration.statements[dialect as usize]
+            .iter()
+            .map(|sql| SqlStatement {
+                sql,
+                params: Vec::new(),
+            });
+        let Some(adopt) = migration.adopt else {
+            let statements: Vec<_> = schema.chain([write]).collect();
+            run_checked(host, "format", &statements).await?;
+            continue;
+        };
+        let probe = || statement(dialect, &adopt.probe, Vec::new());
+        let statements: Vec<_> = schema.chain([probe()]).collect();
+        let results = run_checked(host, "format", &statements).await?;
+        if !column_present(&results[statements.len() - 1])? {
+            let add = [statement(dialect, &adopt.add, Vec::new())];
+            if let Err(error) = run_checked(host, "format", &add).await
+                && !column_present(&run_checked(host, "format", &[probe()]).await?[0])?
+            {
+                return Err(error);
+            }
+        }
+        run_checked(host, "format", &[write]).await?;
+    }
+    Ok(())
+}
+
+fn column_present(rows: &[SqlRow]) -> Result<bool, StoreError> {
+    match single(rows)? {
+        Some(row) => Ok(counter(row, 0)? > 0),
+        None => Ok(false),
+    }
+}
+
 const SCHEMA: [&[&str]; 2] = [
     &[
         "CREATE TABLE IF NOT EXISTS states (id TEXT PRIMARY KEY, revision TEXT NOT NULL, payload TEXT NOT NULL)",
@@ -288,6 +393,11 @@ impl Replacement<'_> {
     }
 }
 
+const MIGRATIONS: [Migration; 1] = [Migration {
+    statements: SCHEMA,
+    adopt: None,
+}];
+
 pub struct SqlStore<H: ?Sized> {
     host: Arc<H>,
     ready: bool,
@@ -305,6 +415,14 @@ impl<H: Sql + ?Sized> SqlStore<H> {
         Self { host, ready: false }
     }
 
+    pub const FORMAT: u32 = MIGRATIONS.len() as u32;
+
+    pub async fn migrate(&mut self) -> Result<(), StoreError> {
+        migrate_format(&*self.host, "records", &MIGRATIONS).await?;
+        self.ready = true;
+        Ok(())
+    }
+
     pub fn host(&self) -> &H {
         &self.host
     }
@@ -314,28 +432,10 @@ impl<H: Sql + ?Sized> SqlStore<H> {
         operation: &'static str,
         statements: Vec<SqlStatement<'_>>,
     ) -> Result<Vec<Vec<SqlRow>>, StoreError> {
-        let dialect = self.host.dialect();
-        let schema = SCHEMA[dialect as usize];
-        let schema = if self.ready { 0 } else { schema.len() };
-        let statements: Vec<_> = SCHEMA[dialect as usize][..schema]
-            .iter()
-            .map(|sql| SqlStatement {
-                sql,
-                params: Vec::new(),
-            })
-            .chain(statements)
-            .collect();
-        let mut results = self.host.transaction(operation, &statements).await?;
-        if results.len() != statements.len() {
-            return Err(StoreError::Backend(format!(
-                "SQL host answered {} of {} statements",
-                results.len(),
-                statements.len()
-            )));
+        if !self.ready {
+            self.migrate().await?;
         }
-        results.drain(..schema);
-        self.ready = true;
-        Ok(results)
+        run_checked(&*self.host, operation, &statements).await
     }
 
     async fn query(

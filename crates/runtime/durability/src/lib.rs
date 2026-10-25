@@ -29,11 +29,11 @@ pub use memory::MemoryStore;
 pub use nanocode_durability_core::{
     BlobKey, BlobStore, BlobUrl, Committed, EncodedPayload, Error, EventCursor, EventHit,
     EventHits, EventOrder, EventPage, EventQuery, EventRange, IndexedState, KeyValue,
-    KeyValueStore, OwnedCommit, OwnedState, OwnerId, OwnerToken, Result, SharedBlobStore, Sql,
-    SqlDialect, SqlRow, SqlStatement, SqlStore, StagedStore, StagedWrites, StateCommit,
-    StateCursor, StatePage, StateQuery, StateReader, StateStore, StateSummary, StoreError,
-    StoreEvent, StoreFuture, StoreRecord, StoreReplacement, StoreUpdate, StoredEvent, StoredState,
-    SummaryUpdate, Versioned, base64_data_url, get_blob,
+    KeyValueStore, Migration, MissingColumn, OwnedCommit, OwnedState, OwnerId, OwnerToken, Result,
+    SharedBlobStore, Sql, SqlDialect, SqlRow, SqlStatement, SqlStore, StagedStore, StagedWrites,
+    StateCommit, StateCursor, StatePage, StateQuery, StateReader, StateStore, StateSummary,
+    StoreError, StoreEvent, StoreFuture, StoreRecord, StoreReplacement, StoreUpdate, StoredEvent,
+    StoredState, SummaryUpdate, Versioned, base64_data_url, get_blob, migrate_format,
 };
 pub use paged::{
     PagedWriter, PayloadReader, Prepared, Sequence, SequenceCache, load_sequence, seal_sequence,
