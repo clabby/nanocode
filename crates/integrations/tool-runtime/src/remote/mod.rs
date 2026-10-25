@@ -13,6 +13,6 @@ pub use hand::{Hand, HandEndpoint, HandEvent};
 pub(crate) use native::SocketShutdown;
 #[cfg(not(target_family = "wasm"))]
 pub use native::{
-    ExecutorOptions, SocketPolicy, SocketTransport, serve_accept, serve_connect,
+    ExecutorOptions, HandActivity, SocketPolicy, SocketTransport, serve_accept, serve_connect,
     serve_connect_with, serve_stream,
 };

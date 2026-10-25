@@ -7,8 +7,8 @@ use std::{
 use tokio::net::TcpListener;
 
 use super::native::{
-    Dial, Executor, ExecutorOptions, SocketPolicy, dial, error, request_headers, serve,
-    serve_stream, validate_policy,
+    Dial, Executor, ExecutorOptions, HandActivity, SocketPolicy, dial, error, request_headers,
+    serve, serve_tracked_stream, validate_policy,
 };
 use crate::embedded::CodeModeHostError;
 
@@ -44,6 +44,7 @@ pub struct Hand {
     directory: Option<PathBuf>,
     tools: crate::Tools,
     policy: SocketPolicy,
+    activity: HandActivity,
 }
 
 impl Hand {
@@ -64,6 +65,7 @@ impl Hand {
             directory: None,
             tools,
             policy: SocketPolicy::runner(),
+            activity: HandActivity::default(),
         }
     }
 
@@ -89,6 +91,11 @@ impl Hand {
     pub const fn policy(mut self, policy: SocketPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    #[must_use]
+    pub fn activity(&self) -> HandActivity {
+        self.activity.clone()
     }
 
     pub fn machine_name() -> Result<String, CodeModeHostError> {
@@ -150,7 +157,8 @@ impl Hand {
                         .map_err(error)?;
                     let headers = request_headers(&self.headers)?;
                     let mut backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
-                    let mut executor = Executor::new(directory, self.tools, options);
+                    let mut executor =
+                        Executor::new(directory, self.tools, options, self.activity.clone());
                     loop {
                         let endpoint = target.endpoint().to_string();
                         events(HandEvent::Connecting {
@@ -221,8 +229,9 @@ impl Hand {
                                     let directory = directory.clone();
                                     let tools = self.tools.clone();
                                     let options = options.clone();
+                                    let activity = self.activity.clone();
                                     connections.spawn(async move {
-                                        serve_stream(stream, &token, &directory, tools, policy, options).await
+                                        serve_tracked_stream(stream, &token, &directory, tools, policy, options, activity).await
                                     });
                                 }
                                 Err(issue) => events(HandEvent::Disconnected { reason: issue.to_string() }),
