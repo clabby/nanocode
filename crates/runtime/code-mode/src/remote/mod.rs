@@ -624,6 +624,18 @@ impl RemoteCatalog {
     pub fn resumes(&self) -> Option<&str> {
         self.runtime_id.as_deref().filter(|_| self.resumable)
     }
+
+    #[must_use]
+    pub fn publishes(&self, name: &str) -> bool {
+        self.definitions
+            .iter()
+            .any(|definition| definition.name() == name)
+    }
+
+    #[must_use]
+    pub fn frame_limit(&self, limit: usize) -> usize {
+        self.max_frame_bytes.map_or(limit, |bytes| bytes.min(limit))
+    }
 }
 
 impl TryFrom<RemoteFrame> for RemoteCatalog {
