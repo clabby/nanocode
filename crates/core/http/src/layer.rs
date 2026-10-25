@@ -80,7 +80,6 @@ impl Response {
         self.events.take()
     }
 
-    #[must_use]
     pub fn into_parts(self) -> (StatusCode, HeaderMap, Body, Option<Box<dyn EventHook>>) {
         (self.status, self.headers, self.body, self.events)
     }

@@ -80,10 +80,6 @@ fn deserialize_output_budget<'de, D: serde::Deserializer<'de>>(
 }
 
 impl RemoteContext {
-    /// A context with only a call's IDs, as a host that queued the call
-    /// without a model session sends it: no model, history, instruction
-    /// revision or host context, and no token budget beyond the tool's own
-    /// (JavaScript's largest safe integer, the attachment protocol's).
     #[must_use]
     pub fn new(session_id: String, call_id: String, turn_id: Option<String>) -> Self {
         Self {
@@ -151,10 +147,6 @@ pub enum RemoteOperation {
     DetachTurn {
         session_id: String,
     },
-    /// Cancels the current turn of `session_id`: its cells and every `Call` in flight for the
-    /// session. With `turn_id`, only the `Call`s whose context names that turn are cancelled,
-    /// so stopping one turn leaves other turns' calls in the same session running; cells are
-    /// left alone, since a hand tracks them by session only.
     CancelTurn {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,9 +164,6 @@ pub enum RemoteOperation {
     SettlePreempt {
         session_id: String,
     },
-    /// Turn `turn_id` of `session_id` ended (`hook_event_name` says how, such as `Stop`): the hand
-    /// calls `Tool::end_turn` on each of its tools, which release what that turn held, such as
-    /// browser tabs. Dispatches nothing; hosts send it once they know the turn ended.
     EndTurn {
         session_id: String,
         turn_id: String,
@@ -242,12 +231,22 @@ impl RemoteCodeModeHost {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<Option<ToolOutput>, CodeModeHostError>> {
         Box::pin(async move {
-            let context = RemoteContext::from_context(context);
-            let Some(reply) = self.transport.recover(&context) else {
-                return Ok(None);
-            };
-            reply.await?.map(output_from_wire).transpose()
+            self.recovered(context)
+                .await?
+                .map(output_from_wire)
+                .transpose()
         })
+    }
+
+    async fn recovered(
+        &self,
+        context: ToolContext<'_>,
+    ) -> Result<Option<Value>, CodeModeHostError> {
+        let context = RemoteContext::from_context(context);
+        match self.transport.recover(&context) {
+            Some(reply) => reply.await,
+            None => Ok(None),
+        }
     }
 
     fn selected_tools(&self, session_id: &str) -> Result<Option<Vec<String>>, CodeModeHostError> {
@@ -396,11 +395,7 @@ impl CodeModeHost for RemoteCodeModeHost {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
         Box::pin(async move {
-            let context = RemoteContext::from_context(context);
-            let Some(reply) = self.transport.recover(&context) else {
-                return Ok(None);
-            };
-            let Some(mut value) = reply.await? else {
+            let Some(mut value) = self.recovered(context).await? else {
                 return Ok(None);
             };
             ReceivedCalls::default().execution(&mut value)?;

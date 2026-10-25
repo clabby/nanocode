@@ -215,7 +215,6 @@ pub trait Tool: Send + Sync + 'static {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    #[must_use]
     fn end_turn<'life0, 'life1, 'life2, 'life3, 'async_trait>(
         &'life0 self,
         _session_id: &'life1 str,
@@ -251,7 +250,6 @@ pub trait Tool: Send + Sync + 'static {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    #[must_use]
     fn execute<'life0, 'life1, 'async_trait>(
         &'life0 self,
         input: ToolInput,

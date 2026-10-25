@@ -68,7 +68,6 @@ impl ContextManager {
         self.items.is_empty()
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &ResponseItem> {
         self.items.iter()
     }

@@ -136,7 +136,6 @@ impl ManagedSessionState {
         self.context.is_empty()
     }
 
-    #[must_use]
     pub fn history(&self) -> impl ExactSizeIterator<Item = &ResponseItem> {
         self.context.iter()
     }

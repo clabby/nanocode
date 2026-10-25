@@ -239,8 +239,6 @@ fn config(policy: SocketPolicy) -> tungstenite::protocol::WebSocketConfig {
 type DialedSocket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
 pub(super) enum Dial {
-    /// Retrying cannot help; the status is the brain's HTTP refusal of the upgrade, if that was
-    /// the reason.
     Rejected(CodeModeHostError, Option<u16>),
     Failed(CodeModeHostError),
 }
@@ -746,9 +744,14 @@ impl Outgoing {
     }
     fn queue(&self, text: String) {
         let mut backlog = self.backlog();
-        if backlog.is_empty() && self.push(text.clone()).is_ok() {
-            return;
-        }
+        let text = if backlog.is_empty() {
+            match self.offer(text) {
+                Ok(()) => return,
+                Err((text, _)) => text,
+            }
+        } else {
+            text
+        };
         if backlog.len() >= MAX_BUFFERED_FRAMES {
             backlog.pop_front();
         }
@@ -757,7 +760,7 @@ impl Outgoing {
     fn flush(&self) -> Result<(), CodeModeHostError> {
         let mut backlog = self.backlog();
         while let Some(text) = backlog.pop_front() {
-            if let Err(issue) = self.push(text.clone()) {
+            if let Err((text, issue)) = self.offer(text) {
                 backlog.push_front(text);
                 return Err(issue);
             }
@@ -771,9 +774,15 @@ impl Outgoing {
         self.wire.get().is_some()
     }
     fn push(&self, text: String) -> Result<(), CodeModeHostError> {
+        self.offer(text).map_err(|(_, issue)| issue)
+    }
+    fn offer(&self, text: String) -> Result<(), (String, CodeModeHostError)> {
         match Option::clone(&self.wire.get()) {
-            Some(wire) => wire.send(text).map_err(error),
-            None => Err(error(BRAIN_DISCONNECTED)),
+            Some(wire) => wire.send(text).map_err(|issue| {
+                let reason = error(&issue);
+                (issue.0, reason)
+            }),
+            None => Err((text, error(BRAIN_DISCONNECTED))),
         }
     }
     fn send(&self, frame: &Frame) -> Result<(), CodeModeHostError> {
@@ -1439,8 +1448,6 @@ pub(super) struct Executor {
     results: mpsc::UnboundedReceiver<Done>,
     running: HashMap<u64, Running>,
     calls: HashMap<String, CancellationToken>,
-    /// Child tokens of `calls` for the `Call`s of one turn, by session and turn ID, so a
-    /// turn-scoped `CancelTurn` cancels only that turn's calls. `EndTurn` drops a turn's entry.
     turn_calls: HashMap<(String, String), CancellationToken>,
     retained: HashMap<u64, String>,
     connection: u64,
@@ -1557,9 +1564,6 @@ impl Executor {
         self.publish();
     }
 
-    /// Calls `Tool::end_turn` on every registered tool for an ended turn, whether or not this hand
-    /// runs cells for the session, then answers the request. A tool's failure is logged, as the
-    /// attachment endpoint does, and not retried.
     fn end_turn(&mut self, id: u64, session_id: String, turn_id: String, hook_event_name: String) {
         self.turn_calls
             .remove(&(session_id.clone(), turn_id.clone()));

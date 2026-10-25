@@ -206,16 +206,7 @@ impl Call {
         input: Value,
         invocation: &ClaudeToolInvocation,
     ) -> std::result::Result<ClaudeToolReply, String> {
-        let context = ToolContext::new(
-            &invocation.model,
-            &invocation.session_id,
-            &invocation.call_id,
-            &[],
-            usize::MAX,
-        )
-        .with_turn_id(Some(&invocation.turn_id))
-        .with_host_context(invocation.host_context.as_deref())
-        .with_instruction_revision(invocation.instruction_revision);
+        let context = tool_context(invocation);
         let mut progress = Progress(invocation.progress.as_ref());
         let execution = match self {
             Self::Exec => {
@@ -255,16 +246,7 @@ impl Call {
         name: &str,
         invocation: &ClaudeToolInvocation,
     ) -> std::result::Result<ClaudeToolReply, String> {
-        let context = ToolContext::new(
-            &invocation.model,
-            &invocation.session_id,
-            &invocation.call_id,
-            &[],
-            usize::MAX,
-        )
-        .with_turn_id(Some(&invocation.turn_id))
-        .with_host_context(invocation.host_context.as_deref())
-        .with_instruction_revision(invocation.instruction_revision);
+        let context = tool_context(invocation);
         if matches!(name, "exec" | "wait") {
             return match runtime.recover_code(context).await {
                 Ok(Some(execution)) => Ok(code_reply(execution, &invocation.call_id)),
@@ -277,6 +259,19 @@ impl Call {
             None => Err("not recovered".into()),
         }
     }
+}
+
+fn tool_context(invocation: &ClaudeToolInvocation) -> ToolContext<'_> {
+    ToolContext::new(
+        &invocation.model,
+        &invocation.session_id,
+        &invocation.call_id,
+        &[],
+        usize::MAX,
+    )
+    .with_turn_id(Some(&invocation.turn_id))
+    .with_host_context(invocation.host_context.as_deref())
+    .with_instruction_revision(invocation.instruction_revision)
 }
 
 fn tool_reply(mut output: ToolOutput) -> std::result::Result<ClaudeToolReply, String> {
