@@ -1658,6 +1658,7 @@ impl ClaudeBuilder {
             tool_input_deltas: self.tool_input_deltas,
             context_window_tokens: self.context_window_tokens,
             auto_compact_window_tokens: self.auto_compact_window_tokens,
+            auto_compact_token_limit: Atom::default(),
             images: self.images,
             session_id,
             lineage,
@@ -3144,6 +3145,8 @@ struct State {
     tool_input_deltas: bool,
     context_window_tokens: u64,
     auto_compact_window_tokens: Option<u64>,
+    /// A host's override of the compaction threshold, which the next turn's cursor takes.
+    auto_compact_token_limit: Atom<Option<u64>>,
     images: ImageHistory,
     workspace: String,
     workspace_resolver: Option<WorkspaceResolver>,
@@ -5284,6 +5287,9 @@ impl State {
             .collect()
     }
     fn compaction_threshold(&self) -> u64 {
+        if let Some(limit) = *self.auto_compact_token_limit.get() {
+            return limit.min(self.context_window_tokens);
+        }
         let reserve = 20_000u64 + 13_000;
         let window = self
             .auto_compact_window_tokens
@@ -7354,6 +7360,17 @@ impl LifecycleBackend for Driver {
             state
                 .thinking_disabled
                 .store(thinking == Thinking::None, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+    fn set_auto_compact_token_limit(&self, limit: Option<u64>) -> BackendFuture<Result<()>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let _admission = state.admission.enter().await;
+            if state.stopped.load(Ordering::SeqCst) {
+                return Err(NanocodeError::AgentStopped);
+            }
+            state.auto_compact_token_limit.set(limit);
             Ok(())
         })
     }

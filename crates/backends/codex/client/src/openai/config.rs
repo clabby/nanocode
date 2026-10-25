@@ -40,6 +40,10 @@ pub struct ModelConfig {
 
     pub context_window_tokens: u64,
 
+    /// Overrides the context size at which the agent compacts itself; `None` keeps the model's
+    /// default, which only some models have.
+    pub auto_compact_token_limit: Option<u64>,
+
     pub responses_transport: ResponsesTransport,
 
     pub websocket_warmup: bool,
@@ -187,6 +191,7 @@ impl ModelConfig {
             thinking_explicit: false,
             service_tier: ServiceTier::Standard,
             context_window_tokens: CONTEXT_WINDOW_TOKENS,
+            auto_compact_token_limit: None,
             responses_transport: ResponsesTransport::default(),
             websocket_warmup: false,
             raw_api_events: false,

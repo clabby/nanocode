@@ -408,6 +408,9 @@ impl LifecycleBackend for Owned {
     fn set_fast_mode(&self, enabled: bool) -> BackendFuture<Result<()>> {
         self.0.backend().set_fast_mode(enabled)
     }
+    fn set_auto_compact_token_limit(&self, limit: Option<u64>) -> BackendFuture<Result<()>> {
+        self.0.backend().set_auto_compact_token_limit(limit)
+    }
     fn set_service_tier(&self, service_tier: ServiceTier) -> BackendFuture<Result<()>> {
         self.0.backend().set_service_tier(service_tier)
     }

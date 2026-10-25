@@ -100,6 +100,16 @@ pub(super) struct CompactionContext<'a> {
 }
 
 impl ModelRun {
+    /// The context size at which the run compacts itself: the host's override, capped at the
+    /// context window, else the model's default, which only some models have.
+    pub(super) fn auto_compact_token_limit(&self) -> Option<u64> {
+        let window = self.config.context_window_tokens;
+        self.config
+            .auto_compact_token_limit
+            .map(|limit| limit.min(window))
+            .or_else(|| compaction::auto_compact_token_limit(self.model.as_str(), window))
+    }
+
     pub(super) async fn maybe_compact(
         &mut self,
         after_model_call_index: u32,
@@ -108,10 +118,7 @@ impl ModelRun {
         context: CompactionContext<'_>,
     ) -> Result<bool> {
         let CompactionContext { snapshot, phase } = context;
-        let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(
-            self.model.as_str(),
-            self.config.context_window_tokens,
-        ) else {
+        let Some(auto_compact_token_limit) = self.auto_compact_token_limit() else {
             return Ok(false);
         };
         let active_context_tokens = conversation.active_context_tokens();

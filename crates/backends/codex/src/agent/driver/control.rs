@@ -303,6 +303,7 @@ pub(super) async fn begin_shutdown(
             | Command::CancelActive { result }
             | Command::SetModel { result, .. }
             | Command::SetThinking { result, .. }
+            | Command::SetAutoCompactTokenLimit { result, .. }
             | Command::SetServiceTier { result, .. }
             | Command::Preconnect { result }
             | Command::Compact { result, .. } => {
@@ -520,6 +521,7 @@ pub(super) fn handle_idle_command(
             drop(result.send(Err(NanocodeError::TurnNotCancellable)));
         }
         Command::SetThinking { result, .. }
+        | Command::SetAutoCompactTokenLimit { result, .. }
         | Command::SetServiceTier { result, .. }
         | Command::Preconnect { result } => {
             drop(result.send(Ok(())));

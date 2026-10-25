@@ -354,6 +354,12 @@ pub trait LifecycleBackend: Send + Sync + 'static {
 
     fn set_fast_mode(&self, enabled: bool) -> BackendFuture<Result<()>>;
 
+    /// Sets the context size, in tokens, at which the agent compacts its history by itself, from
+    /// the next turn on; `None` restores the backend's own default.
+    fn set_auto_compact_token_limit(&self, _limit: Option<u64>) -> BackendFuture<Result<()>> {
+        unsupported("auto_compact_token_limit")
+    }
+
     fn set_service_tier(&self, service_tier: ServiceTier) -> BackendFuture<Result<()>> {
         match service_tier {
             ServiceTier::Standard => self.set_fast_mode(false),
