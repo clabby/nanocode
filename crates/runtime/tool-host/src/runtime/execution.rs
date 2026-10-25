@@ -1,6 +1,6 @@
 use super::*;
 use crate::embedded::{CodeModeHost, CodeModeHostError};
-use nanocode_code_mode::remote::{CodeModeExecutors, Placement};
+use nanocode_code_mode::remote::{CodeModeExecutors, HandRoute, Placement};
 use nanocode_sync::Atom;
 
 pub struct ToolRuntime {
@@ -241,6 +241,21 @@ impl ToolRuntime {
                         .wait_for_code_with_updates(input, context, observer)
                         .await
                 }
+            }
+        })
+    }
+
+    pub fn recover_code<'call>(
+        &'call self,
+        context: ToolContext<'call>,
+    ) -> futures_util::future::BoxFuture<
+        'call,
+        Result<Option<CodeModeExecution>, crate::embedded::CodeModeHostError>,
+    > {
+        Box::pin(async move {
+            match &self.inner {
+                Runtime::Native(runtime) => runtime.recover_code(context).await,
+                Runtime::Host(runtime) => runtime.recover_code(context).await,
             }
         })
     }
@@ -781,6 +796,26 @@ impl NativeToolRuntime {
                     "no Code Mode placement is available for this session",
                 )),
             })
+        })
+    }
+
+    pub fn recover_code<'call>(
+        &'call self,
+        context: ToolContext<'call>,
+    ) -> futures_util::future::BoxFuture<
+        'call,
+        Result<Option<CodeModeExecution>, crate::embedded::CodeModeHostError>,
+    > {
+        Box::pin(async move {
+            match (&self.executors, self.placement(context.session_id())) {
+                (
+                    Some(_),
+                    Placement::Hand(HandRoute {
+                        host: Some(host), ..
+                    }),
+                ) => host.recover(context).await,
+                _ => Ok(None),
+            }
         })
     }
 

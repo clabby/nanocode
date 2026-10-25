@@ -450,6 +450,16 @@ impl EmbeddedToolRuntime {
             .await
     }
 
+    pub async fn recover_code(
+        &self,
+        context: ToolContext<'_>,
+    ) -> Result<Option<CodeModeExecution>, CodeModeHostError> {
+        match &self.host {
+            Some(host) => host.recover(context).await,
+            None => Ok(None),
+        }
+    }
+
     pub async fn wait_for_code(
         &self,
         input: &str,

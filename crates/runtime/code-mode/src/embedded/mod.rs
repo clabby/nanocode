@@ -197,6 +197,13 @@ pub trait CodeModeHost: Send + Sync + 'static {
         })
     }
 
+    fn recover<'a>(
+        &'a self,
+        _context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn route_hands(&self, _name: &str, _hands: std::sync::Arc<dyn HandCalls>) {}
 
     fn bind_session(&self, _session_id: &str, _backend: &str) {}
@@ -306,6 +313,12 @@ impl<T: CodeModeHost + ?Sized> CodeModeHost for std::sync::Arc<T> {
         context: ToolContext<'a>,
     ) -> HostFuture<'a, Result<ToolOutput, CodeModeHostError>> {
         (**self).call(name, input, context)
+    }
+    fn recover<'a>(
+        &'a self,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
+        (**self).recover(context)
     }
     fn route_hands(&self, name: &str, hands: std::sync::Arc<dyn HandCalls>) {
         (**self).route_hands(name, hands);
