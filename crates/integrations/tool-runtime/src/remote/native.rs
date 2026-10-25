@@ -8,11 +8,11 @@ use crate::{
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -52,7 +52,11 @@ pub struct ExecutorOptions {
     pub name: Option<String>,
     pub runtime_id: Option<String>,
     pub callback_timeout: Option<Duration>,
+    pub callback_hold: Option<Duration>,
 }
+
+const DEFAULT_CALLBACK_HOLD: Duration = Duration::from_secs(60);
+const MAX_BUFFERED_FRAMES: usize = 1024;
 
 #[derive(Clone)]
 pub(crate) struct SocketShutdown {
@@ -646,11 +650,38 @@ const CALLBACK_DROPPED: &str = "the hand's connection to its brain dropped while
 struct Outgoing {
     wire: Arc<Atom<Option<mpsc::UnboundedSender<String>>>>,
     limit: Arc<AtomicUsize>,
+    backlog: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl Outgoing {
+    fn backlog(&self) -> MutexGuard<'_, VecDeque<String>> {
+        self.backlog.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn queue(&self, text: String) {
+        let mut backlog = self.backlog();
+        if backlog.is_empty() && self.push(text.clone()).is_ok() {
+            return;
+        }
+        if backlog.len() >= MAX_BUFFERED_FRAMES {
+            backlog.pop_front();
+        }
+        backlog.push_back(text);
+    }
+    fn flush(&self) -> Result<(), CodeModeHostError> {
+        let mut backlog = self.backlog();
+        while let Some(text) = backlog.pop_front() {
+            if let Err(issue) = self.push(text.clone()) {
+                backlog.push_front(text);
+                return Err(issue);
+            }
+        }
+        Ok(())
+    }
     fn encode(&self, frame: &Frame) -> Result<String, CodeModeHostError> {
         frame.encode(self.limit.load(Ordering::Relaxed))
+    }
+    fn connected(&self) -> bool {
+        self.wire.get().is_some()
     }
     fn push(&self, text: String) -> Result<(), CodeModeHostError> {
         match Option::clone(&self.wire.get()) {
@@ -812,11 +843,13 @@ impl CodeModeObserver for DetachedObserver {
             origin_call_id: self.origin_call_id.clone(),
             update,
         };
-        let _ = self
+        let text = self
             .outgoing
-            .send_or(&frame(self.calls.update(&update)), |issue| {
-                frame(unsent_update(&update, issue))
-            });
+            .encode(&frame(self.calls.update(&update)))
+            .or_else(|issue| self.outgoing.encode(&frame(unsent_update(&update, &issue))));
+        if let Ok(text) = text {
+            self.outgoing.queue(text);
+        }
     }
     fn completed(&mut self) {
         self.catalog.finish(&self.origin_call_id);
@@ -825,11 +858,53 @@ impl CodeModeObserver for DetachedObserver {
 
 type CallbackReply = Arc<Slot<oneshot::Sender<Result<Value, String>>>>;
 
+#[derive(Clone)]
+struct PendingCallback {
+    reply: CallbackReply,
+    frame: String,
+    held: bool,
+}
+
 struct CallbackBus {
     outgoing: Outgoing,
-    pending: Atom<HashMap<u64, CallbackReply>>,
+    pending: Atom<HashMap<u64, PendingCallback>>,
     next: AtomicU64,
     timeout: Option<Duration>,
+    holding: AtomicBool,
+}
+
+impl CallbackBus {
+    fn hold(&self) {
+        self.pending.update(|pending| {
+            for entry in pending.values_mut() {
+                entry.held = true;
+            }
+        });
+        self.holding.store(true, Ordering::SeqCst);
+    }
+    fn take_held(&self) -> Vec<String> {
+        self.holding.store(false, Ordering::SeqCst);
+        self.pending.update(|pending| {
+            let mut held = pending
+                .iter_mut()
+                .filter(|(_, entry)| entry.held)
+                .map(|(id, entry)| {
+                    entry.held = false;
+                    (*id, entry.frame.clone())
+                })
+                .collect::<Vec<_>>();
+            held.sort_unstable_by_key(|(id, _)| *id);
+            held.into_iter().map(|(_, frame)| frame).collect()
+        })
+    }
+    fn fail_pending(&self) {
+        self.holding.store(false, Ordering::SeqCst);
+        for (_, entry) in self.pending.update(std::mem::take) {
+            if let Some(reply) = entry.reply.take() {
+                let _ = reply.send(Err(CALLBACK_DROPPED.into()));
+            }
+        }
+    }
 }
 struct CallbackPending {
     bus: Arc<CallbackBus>,
@@ -859,16 +934,30 @@ async fn callback(bus: &Arc<CallbackBus>, frame: impl FnOnce(u64) -> Frame) -> T
         .map_err(|issue| -> ToolError { format!("{issue}; the call was not dispatched").into() })?;
     let (tx, rx) = oneshot::channel();
     let tx = Arc::new(Slot::new(Some(tx)));
+    let held = !bus.outgoing.connected();
     bus.pending.update(|pending| {
-        pending.insert(id, Arc::clone(&tx));
+        pending.insert(
+            id,
+            PendingCallback {
+                reply: Arc::clone(&tx),
+                frame: text.clone(),
+                held,
+            },
+        );
     });
     let _pending = CallbackPending {
         bus: Arc::clone(bus),
         id,
     };
-    bus.outgoing
-        .push(text)
-        .map_err(|e| -> ToolError { e.to_string().into() })?;
+    if held {
+        if !bus.holding.load(Ordering::SeqCst) {
+            return Err(BRAIN_DISCONNECTED.into());
+        }
+    } else {
+        bus.outgoing
+            .push(text)
+            .map_err(|e| -> ToolError { e.to_string().into() })?;
+    }
     let result = match bus.timeout {
         Some(deadline) => tokio::time::timeout(deadline, rx)
             .await
@@ -1006,11 +1095,13 @@ impl CallbackCatalog {
             state.origins.remove(index);
             Some(())
         });
-        if removed.is_some() {
-            let _ = self.bus.outgoing.send(&Frame::DetachedComplete {
+        if removed.is_some()
+            && let Ok(text) = self.bus.outgoing.encode(&Frame::DetachedComplete {
                 session_id: self.session_id.to_string(),
                 origin_call_id: origin.into(),
-            });
+            })
+        {
+            self.bus.outgoing.queue(text);
         }
     }
 
@@ -1118,6 +1209,7 @@ pub async fn serve_connect(
             name: None,
             runtime_id: None,
             callback_timeout: Some(policy.request_timeout),
+            callback_hold: None,
         },
     )
     .await
@@ -1139,6 +1231,7 @@ pub async fn serve_accept(
             name: None,
             runtime_id: None,
             callback_timeout: Some(policy.request_timeout),
+            callback_hold: None,
         },
     )
     .await
@@ -1234,6 +1327,7 @@ pub(super) struct Executor {
     retained: HashMap<u64, String>,
     connection: u64,
     resumable: bool,
+    hold: Option<tokio::task::AbortHandle>,
 }
 
 impl Executor {
@@ -1241,12 +1335,14 @@ impl Executor {
         let outgoing = Outgoing {
             wire: Arc::default(),
             limit: Arc::new(AtomicUsize::new(usize::MAX)),
+            backlog: Arc::default(),
         };
         let bus = Arc::new(CallbackBus {
             outgoing: outgoing.clone(),
             pending: Atom::default(),
             next: AtomicU64::new(0),
             timeout: options.callback_timeout,
+            holding: AtomicBool::new(false),
         });
         let callbacks = Arc::new(HandCallbacks {
             bus: Arc::clone(&bus),
@@ -1271,6 +1367,7 @@ impl Executor {
             retained: HashMap::new(),
             connection: 0,
             resumable: false,
+            hold: None,
         }
     }
 
@@ -1285,17 +1382,27 @@ impl Executor {
         definitions
     }
 
-    fn disconnected(&self) {
+    fn disconnected(&mut self) {
         self.outgoing.wire.set(None);
-        for (_, reply) in self.bus.pending.update(std::mem::take) {
-            if let Some(reply) = reply.take() {
-                let _ = reply.send(Err(CALLBACK_DROPPED.into()));
-            }
+        self.bus.hold();
+        let bus = Arc::clone(&self.bus);
+        let hold = self.options.callback_hold.unwrap_or(DEFAULT_CALLBACK_HOLD);
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(hold).await;
+            bus.fail_pending();
+        });
+        if let Some(previous) = self.hold.replace(timer.abort_handle()) {
+            previous.abort();
         }
     }
 
     pub(super) async fn reset(&mut self) {
-        self.disconnected();
+        self.outgoing.wire.set(None);
+        if let Some(timer) = self.hold.take() {
+            timer.abort();
+        }
+        self.bus.fail_pending();
+        self.outgoing.backlog().clear();
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
         for (_, (runtime, _)) in self.runtimes.0.drain() {
@@ -1369,6 +1476,13 @@ impl Executor {
     }
 
     fn resume(&mut self, pending: &[u64]) -> Result<(), CodeModeHostError> {
+        if let Some(timer) = self.hold.take() {
+            timer.abort();
+        }
+        for text in self.bus.take_held() {
+            self.outgoing.push(text)?;
+        }
+        self.outgoing.flush()?;
         let wanted = pending.iter().copied().collect::<HashSet<_>>();
         self.retained.retain(|id, _| wanted.contains(id));
         for id in pending {
@@ -1427,7 +1541,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 frame = read_live(&mut socket, &liveness, watchdog.as_mut()) => {
                     let Some(frame) = frame? else { return Ok(()); };
                     match frame {
-                        Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.update(|pending| pending.remove(&id)).and_then(|tx| tx.take()) { let _ = tx.send(result); } },
+                        Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.update(|pending| pending.remove(&id)).and_then(|entry| entry.reply.take()) { let _ = tx.send(result); } },
                         Frame::Ack { ids } => { for id in ids { executor.retained.remove(&id); } },
                         Frame::Resume { pending } => executor.resume(&pending)?,
                         Frame::Request { id, operation, max_frame_bytes, compact, resumable } => {
