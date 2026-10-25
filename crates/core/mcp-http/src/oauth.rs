@@ -711,7 +711,13 @@ async fn fetch_authorization_metadata(
         return Ok(None);
     }
     match serde_json::from_slice::<AuthorizationMetadata>(&response.body) {
-        Ok(metadata) => {
+        Ok(mut metadata) => {
+            // Metadata that states no issuer is the issuer's it was fetched
+            // for, as servers that leave the field out still mean it.
+            if metadata.issuer.is_none() {
+                metadata.issuer = nanocode_mcp::oauth::expected_issuer(url)
+                    .map(|issuer| issuer.trim_end_matches('/').to_owned());
+            }
             nanocode_mcp::oauth::validate_metadata_issuer(url, &metadata)?;
             Ok(Some(metadata))
         }
