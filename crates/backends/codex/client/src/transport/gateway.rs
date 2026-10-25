@@ -264,6 +264,14 @@ impl ResponsesGateway {
     }
 
     #[must_use]
+    pub const fn sends_custom_tools_as_functions(&self, model: Model) -> bool {
+        matches!(
+            model,
+            Model::Glm53 | Model::Kimi | Model::Mimo | Model::Custom(_)
+        )
+    }
+
+    #[must_use]
     pub const fn serves(&self, model: Model) -> bool {
         matches!(
             model,

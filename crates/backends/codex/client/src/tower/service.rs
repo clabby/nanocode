@@ -453,6 +453,7 @@ impl ResponsesService {
             ResponsesAttemptKind::Generation => {
                 let mut output = stream::receive(
                     socket,
+                    request.freeform_calls(self.config.responses_gateway.as_deref()),
                     ResponsesTransport::WebSocket.as_str(),
                     &request.observer,
                     &credentials,

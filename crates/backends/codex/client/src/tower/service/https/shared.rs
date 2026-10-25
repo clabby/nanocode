@@ -76,6 +76,7 @@ pub(crate) async fn run(
         ResponsesAttemptKind::Generation => {
             let mut output = stream::receive(
                 &mut response,
+                request.freeform_calls(service.config.responses_gateway.as_deref()),
                 transport,
                 &request.observer,
                 &connection.credentials,

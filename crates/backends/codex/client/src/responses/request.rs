@@ -509,6 +509,7 @@ impl Serialize for ResponsesInput<'_> {
             sequence.serialize_element(&RequestResponseItem {
                 item,
                 strip_image_detail: false,
+                custom_tools_as_functions: false,
             })?;
         }
         sequence.end()
@@ -520,6 +521,7 @@ struct RequestInput<'a> {
     input: ResponsesInput<'a>,
     strip_image_detail: bool,
     reasoning_effort_updates: bool,
+    custom_tools_as_functions: bool,
 }
 
 impl Serialize for RequestInput<'_> {
@@ -537,6 +539,7 @@ impl Serialize for RequestInput<'_> {
             sequence.serialize_element(&RequestResponseItem {
                 item,
                 strip_image_detail: self.strip_image_detail,
+                custom_tools_as_functions: self.custom_tools_as_functions,
             })?;
         }
         sequence.end()
@@ -546,6 +549,7 @@ impl Serialize for RequestInput<'_> {
 struct RequestResponseItem<'a> {
     item: &'a ResponseItem,
     strip_image_detail: bool,
+    custom_tools_as_functions: bool,
 }
 
 impl Serialize for RequestResponseItem<'_> {
@@ -553,10 +557,15 @@ impl Serialize for RequestResponseItem<'_> {
     where
         S: serde::Serializer,
     {
-        let unprefixed_id = self.item.id().is_some_and(|id| !id.is_prefixed());
-        let strip_image_detail = self.strip_image_detail && has_image_detail(self.item);
+        let function = self
+            .custom_tools_as_functions
+            .then(|| crate::client::transport::freeform::function_item(self.item))
+            .flatten();
+        let source = function.as_ref().unwrap_or(self.item);
+        let unprefixed_id = source.id().is_some_and(|id| !id.is_prefixed());
+        let strip_image_detail = self.strip_image_detail && has_image_detail(source);
         if unprefixed_id || strip_image_detail {
-            let mut item = self.item.clone();
+            let mut item = function.unwrap_or_else(|| self.item.clone());
             if unprefixed_id {
                 item.set_id(None);
             }
@@ -565,7 +574,7 @@ impl Serialize for RequestResponseItem<'_> {
             }
             item.serialize(serializer)
         } else {
-            self.item.serialize(serializer)
+            source.serialize(serializer)
         }
     }
 }
@@ -716,6 +725,10 @@ impl<'a> ResponseCreate<'a> {
                     && retained.map_or(config.model_id_prefix.is_none(), |retained| {
                         retained.model_id_prefix.is_none()
                     }),
+                custom_tools_as_functions: config
+                    .responses_gateway
+                    .as_deref()
+                    .is_some_and(|gateway| gateway.sends_custom_tools_as_functions(policy.model)),
                 strip_image_detail: matches!(
                     policy.model,
                     crate::client::Model::Sol

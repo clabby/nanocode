@@ -9,6 +9,7 @@ mod crypto;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod deflate;
 pub(crate) mod error;
+pub(crate) mod freeform;
 pub(crate) mod gateway;
 
 pub mod host;

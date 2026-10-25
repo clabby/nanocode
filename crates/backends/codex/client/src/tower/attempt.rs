@@ -366,6 +366,21 @@ impl ResponsesAttempt {
         }
     }
 
+    pub(crate) fn freeform_calls(
+        &self,
+        gateway: Option<&crate::client::transport::ResponsesGateway>,
+    ) -> Option<crate::client::transport::freeform::FreeformCalls> {
+        gateway.filter(|gateway| gateway.sends_custom_tools_as_functions(self.model))?;
+        Some(crate::client::transport::freeform::FreeformCalls::new(
+            ResponsesInput::history(
+                self.profile.prefix(),
+                &self.full_history,
+                self.tail.as_ref(),
+            )
+            .iter(),
+        ))
+    }
+
     #[must_use]
     pub const fn kind(&self) -> ResponsesAttemptKind {
         self.kind

@@ -14,7 +14,7 @@ use crate::client::{
     service_error::ResponsesServiceError,
     socket::{ReceivedText, ResponsesSocket},
     telemetry::{ApiEvent, ApiEventData, elapsed_ns},
-    transport::error::Credentials,
+    transport::{error::Credentials, freeform::FreeformCalls},
 };
 
 #[derive(Deserialize, Serialize)]
@@ -269,6 +269,43 @@ impl ResponseEventSource for ResponsesSocket {
 
     fn try_next_text(&mut self) -> Result<Option<ReceivedText>, ResponsesError> {
         Self::try_next_text(self)
+    }
+}
+
+struct FreeformEvents<'a, S> {
+    source: &'a mut S,
+    calls: Option<FreeformCalls>,
+}
+
+impl<S: ResponseEventSource> FreeformEvents<'_, S> {
+    fn rewrite(&mut self, mut received: ReceivedText) -> ReceivedText {
+        if let Some(text) = self
+            .calls
+            .as_mut()
+            .and_then(|calls| calls.rewrite(received.text.as_str()))
+        {
+            #[cfg(not(target_family = "wasm"))]
+            {
+                received.text = text.into();
+            }
+            #[cfg(target_family = "wasm")]
+            {
+                received.text = text;
+            }
+        }
+        received
+    }
+}
+
+impl<S: ResponseEventSource> ResponseEventSource for FreeformEvents<'_, S> {
+    async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError> {
+        let received = self.source.next_text().await?;
+        Ok(self.rewrite(received))
+    }
+
+    fn try_next_text(&mut self) -> Result<Option<ReceivedText>, ResponsesError> {
+        let received = self.source.try_next_text()?;
+        Ok(received.map(|received| self.rewrite(received)))
     }
 }
 
@@ -649,8 +686,13 @@ async fn publish_received<'a>(
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct input of the generation stream"
+)]
 pub(crate) async fn receive<S>(
     source: &mut S,
+    freeform: Option<FreeformCalls>,
     transport: &'static str,
     observer: &ResponsesObserver,
     credentials: &Credentials,
@@ -661,6 +703,10 @@ pub(crate) async fn receive<S>(
 where
     S: ResponseEventSource,
 {
+    let source = &mut FreeformEvents {
+        source,
+        calls: freeform,
+    };
     let mut done_items = Vec::with_capacity(2);
     let mut assistant_items = HashMap::new();
     let mut tool_items = HashMap::new();
