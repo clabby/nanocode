@@ -34,7 +34,7 @@ pub fn request_id(call_id: &str) -> u64 {
 
 pub struct QueuedCall<O> {
     pub name: String,
-    pub input: Value,
+    pub input: Arc<Value>,
     pub context: RemoteContext,
     pub request: Option<u64>,
     pub origin: O,
@@ -111,6 +111,9 @@ pub trait CommandQueue: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
     fn turns_ended(&self, turns: &[(String, String)]) -> impl Future<Output = Vec<bool>> + Send;
     fn unsettled(&self, commands: &[String], error: &str);
+    fn next_deadline(&self) -> Option<Instant> {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -244,7 +247,7 @@ pub async fn serve_queue<Q: CommandQueue>(
                                 request,
                                 RemoteOperation::Call {
                                     name: call.name,
-                                    input: call.input,
+                                    input: Arc::unwrap_or_clone(call.input),
                                     selected_tools: None,
                                     context: call.context,
                                 },
@@ -282,12 +285,15 @@ pub async fn serve_queue<Q: CommandQueue>(
                 checked = Instant::now();
             }
             let busy = calls > 0 || !flights.is_empty() || !watching.is_empty();
-            next = Instant::now()
-                + if busy {
-                    options.busy_poll
-                } else {
-                    options.poll
-                };
+            let now = Instant::now();
+            next = if busy {
+                let polled = now + options.busy_poll;
+                queue
+                    .next_deadline()
+                    .map_or(polled, |deadline| deadline.clamp(now, polled))
+            } else {
+                now + options.poll
+            };
         }
         if std::mem::take(&mut due) {
             match queue.poll().await {

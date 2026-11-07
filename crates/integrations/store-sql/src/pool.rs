@@ -27,7 +27,7 @@ pub struct Sides {
     pub other: String,
     pub default: String,
     pub shelved: usize,
-    pub ping_idle: Duration,
+    pub ping: fn(Duration) -> bool,
     pub within: Duration,
 }
 
@@ -123,7 +123,7 @@ impl Sided {
             let idle = since.elapsed();
             let mut lent = self.lent(conn, Side::Other, want);
             if idle_timeout.is_some_and(|limit| idle >= limit)
-                || (idle >= self.sides.ping_idle && lent.ping().await.is_err())
+                || ((self.sides.ping)(idle) && lent.ping().await.is_err())
             {
                 lent.discard();
                 continue;
@@ -265,6 +265,10 @@ impl Lent {
 
     pub const fn switched(&mut self) {
         self.current = Some(self.want);
+    }
+
+    pub const fn changed(&mut self) {
+        self.current = None;
     }
 
     pub const fn opened(&mut self) {
