@@ -14,7 +14,11 @@ use std::{
 use nanocode_sync::{Atom, Inbox, Slot};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{SessionEnvironment, process, selection::Shell};
+use super::{
+    SessionEnvironment, process,
+    selection::Shell,
+    server::{Fingerprint, fingerprint, quote},
+};
 
 const SCRIPT_BYTES: usize = 4096;
 
@@ -66,48 +70,6 @@ pub(super) async fn spawn(
         }));
     }
     taken?.start(&input).await.ok()
-}
-
-fn quote(out: &mut Vec<u8>, bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.extend_from_slice(b"$'");
-    for &byte in bytes {
-        match byte {
-            b'\\' | b'\'' => out.extend_from_slice(&[b'\\', byte]),
-            0x20..=0x7e => out.push(byte),
-            _ => out.extend_from_slice(&[
-                b'\\',
-                b'x',
-                HEX[usize::from(byte >> 4)],
-                HEX[usize::from(byte & 0x0f)],
-            ]),
-        }
-    }
-    out.push(b'\'');
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct Fingerprint(Vec<Option<[i64; 7]>>);
-
-fn fingerprint(files: &[PathBuf]) -> Fingerprint {
-    Fingerprint(
-        files
-            .iter()
-            .map(|file| {
-                std::fs::metadata(file).ok().map(|metadata| {
-                    [
-                        metadata.dev() as i64,
-                        metadata.ino() as i64,
-                        metadata.size() as i64,
-                        metadata.mtime(),
-                        metadata.mtime_nsec(),
-                        metadata.ctime(),
-                        metadata.ctime_nsec(),
-                    ]
-                })
-            })
-            .collect(),
-    )
 }
 
 fn identity(directory: &Path) -> Option<(u64, u64)> {
@@ -278,11 +240,11 @@ impl Lane {
         if !chosen.ready {
             let _ = self
                 .depth
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, grow);
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, grow);
         } else if alive.iter().any(|idle| idle.ready) {
             let _ = self
                 .depth
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
                     Some(depth.saturating_sub(1).max(1))
                 });
         }
@@ -419,7 +381,7 @@ impl Pool {
             let depth = lane.depth.load(Ordering::Relaxed);
             if lane
                 .count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                     (count < depth).then_some(count + 1)
                 })
                 .is_err()
@@ -428,7 +390,7 @@ impl Pool {
             }
             if self
                 .total
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
                     (total < self.limit).then_some(total + 1)
                 })
                 .is_err()

@@ -38,6 +38,7 @@ use nanocode_platform::Instant;
 #[cfg(target_family = "wasm")]
 use nanocode_platform::sleep;
 use nanocode_sync::{Atom, Owned, Sequencer, Slot};
+use nanocode_types::preview;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -607,6 +608,8 @@ fn model_max_tokens(model: &str) -> Option<u32> {
         _ => None,
     }
 }
+
+pub const DEFAULT_COMPACTION_RESERVED_TOKENS: u64 = 20_000 + 13_000;
 
 pub fn default_context_window_tokens(model: &str) -> u64 {
     match model {
@@ -1774,53 +1777,12 @@ impl ClaudeBuilder {
     }
 }
 
-const EVENT_RESULT_BYTES: usize = 32 * 1024;
-const EVENT_PREVIEW_BYTES: usize = 16 * 1024;
-
-struct CountingWriter(usize);
-impl std::io::Write for CountingWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0 += bytes.len();
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn encoded_len(value: Option<&Value>) -> usize {
-    match value {
-        None | Some(Value::Null) => 0,
-        Some(Value::String(text)) => text.len(),
-        Some(value) => {
-            let mut counter = CountingWriter(0);
-            serde_json::to_writer(&mut counter, value).map_or(0, |()| counter.0)
-        }
-    }
-}
-
-fn utf8_prefix(text: &str, bytes: usize) -> &str {
-    &text[..text.floor_char_boundary(bytes)]
+    value.map_or(0, preview::encoded_len)
 }
 
 fn event_image_reference(value: Option<&Value>) -> Value {
-    let Some(Value::Object(object)) = value else {
-        return Value::Null;
-    };
-    let reference: serde_json::Map<String, Value> = ["image_url", "file_id"]
-        .into_iter()
-        .filter_map(|key| {
-            object
-                .get(key)
-                .filter(|field| field.is_string())
-                .map(|field| (key.to_owned(), field.clone()))
-        })
-        .collect();
-    if reference.is_empty() {
-        Value::Null
-    } else {
-        Value::Object(reference)
-    }
+    value.map_or(Value::Null, preview::image_reference)
 }
 
 fn nested_call_summary(call: &Value) -> Option<Value> {
@@ -1885,47 +1847,10 @@ fn nested_event_arguments(input: Option<&Value>) -> (Value, Option<usize>) {
     let Some(input) = input else {
         return (Value::Null, None);
     };
-    let size = encoded_len(Some(input));
-    if size <= EVENT_RESULT_BYTES {
-        return (input.clone(), None);
+    match preview::shortened(input) {
+        Some((arguments, size)) => (arguments, Some(size)),
+        None => (input.clone(), None),
     }
-    fn lengths(value: &Value, found: &mut Vec<usize>) {
-        match value {
-            Value::String(text) => found.push(text.len()),
-            Value::Array(items) => items.iter().for_each(|item| lengths(item, found)),
-            Value::Object(fields) => fields.values().for_each(|item| lengths(item, found)),
-            _ => {}
-        }
-    }
-    fn cut(value: &Value, cap: usize) -> Value {
-        match value {
-            Value::String(text) => Value::String(utf8_prefix(text, cap).to_owned()),
-            Value::Array(items) => Value::Array(items.iter().map(|item| cut(item, cap)).collect()),
-            Value::Object(fields) => Value::Object(
-                fields
-                    .iter()
-                    .map(|(key, item)| (key.clone(), cut(item, cap)))
-                    .collect(),
-            ),
-            value => value.clone(),
-        }
-    }
-    let mut found = Vec::new();
-    lengths(input, &mut found);
-    let Some(mut left) = EVENT_PREVIEW_BYTES.checked_sub(size - found.iter().sum::<usize>()) else {
-        return (Value::Null, Some(size));
-    };
-    found.sort_unstable();
-    let mut cap = usize::MAX;
-    for (index, length) in found.iter().enumerate() {
-        let remaining = found.len() - index;
-        if length * remaining > left {
-            cap = left / remaining;
-            break;
-        }
-        left -= length;
-    }
-    (cut(input, cap), Some(size))
 }
 
 fn nested_event_result(call: &Value) -> serde_json::Map<String, Value> {
@@ -1948,7 +1873,7 @@ fn nested_event_result(call: &Value) -> serde_json::Map<String, Value> {
             encoded_len(structured)
         }
         + encoded_len(metadata);
-    if host_truncated || size <= EVENT_RESULT_BYTES {
+    if host_truncated || size <= preview::RESULT_BYTES {
         fields.insert("result".into(), json!({ "text": output }));
         fields.insert(
             "structured_result".into(),
@@ -1967,14 +1892,14 @@ fn nested_event_result(call: &Value) -> serde_json::Map<String, Value> {
         return fields;
     }
     let preview = match output {
-        Some(Value::String(text)) => utf8_prefix(text, EVENT_PREVIEW_BYTES).to_owned(),
+        Some(Value::String(text)) => preview::utf8_prefix(text, preview::PREVIEW_BYTES).to_owned(),
         Some(value) if !value.is_null() => {
             let text = value.to_string();
-            utf8_prefix(&text, EVENT_PREVIEW_BYTES).to_owned()
+            preview::utf8_prefix(&text, preview::PREVIEW_BYTES).to_owned()
         }
         _ => {
             let text = structured.map(Value::to_string).unwrap_or_default();
-            utf8_prefix(&text, EVENT_PREVIEW_BYTES).to_owned()
+            preview::utf8_prefix(&text, preview::PREVIEW_BYTES).to_owned()
         }
     };
     fields.insert("result".into(), json!({ "text": preview }));
@@ -1984,7 +1909,7 @@ fn nested_event_result(call: &Value) -> serde_json::Map<String, Value> {
     );
     fields.insert(
         "metadata".into(),
-        if encoded_len(metadata) <= 4096 {
+        if encoded_len(metadata) <= preview::METADATA_BYTES {
             metadata.cloned().unwrap_or(Value::Null)
         } else {
             Value::Null
@@ -2012,7 +1937,7 @@ fn top_level_event_fields(
     };
     fields.insert("result".into(), result);
     let structured_len = encoded_len(structured_result);
-    if structured_len > EVENT_RESULT_BYTES {
+    if structured_len > preview::RESULT_BYTES {
         fields.insert(
             "structured_result".into(),
             event_image_reference(structured_result),
@@ -2039,7 +1964,7 @@ fn top_level_event_fields(
             }
             Value::Object(object)
         }
-        Some(value) if encoded_len(Some(value)) > EVENT_RESULT_BYTES => Value::Null,
+        Some(value) if encoded_len(Some(value)) > preview::RESULT_BYTES => Value::Null,
         Some(value) => value.clone(),
         None => Value::Null,
     };
@@ -5572,7 +5497,7 @@ impl State {
         if let Some(limit) = *self.auto_compact_token_limit.get() {
             return limit.min(self.context_window_tokens);
         }
-        let reserve = 20_000u64 + 13_000;
+        let reserve = DEFAULT_COMPACTION_RESERVED_TOKENS;
         let window = self
             .auto_compact_window_tokens
             .unwrap_or(self.context_window_tokens)

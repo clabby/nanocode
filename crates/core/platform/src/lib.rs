@@ -55,6 +55,14 @@ pub async fn timeout<F: std::future::Future>(
     .await
 }
 
+pub fn unix_millis() -> u64 {
+    system_time()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub fn fill_random(bytes: &mut [u8]) -> std::io::Result<()> {
     getrandom::fill(bytes).map_err(std::io::Error::other)
@@ -92,7 +100,7 @@ pub fn uuid_v7() -> uuid::Uuid {
     let floor = (millis as u64) << 12;
     let next = |last: u64| floor.max(last + 1);
     let stamp = next(
-        LAST.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        LAST.try_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
             Some(next(last))
         })
         .unwrap_or_else(|last| last),
@@ -119,3 +127,21 @@ pub fn uuid_v7() -> uuid::Uuid {
     fill_random(&mut bytes).expect("the host could not provide UUID randomness");
     uuid::Builder::from_unix_timestamp_millis(millis as u64, &bytes).into_uuid()
 }
+
+#[cfg(not(target_family = "wasm"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Send> MaybeSend for T {}
+#[cfg(target_family = "wasm")]
+pub trait MaybeSend {}
+#[cfg(target_family = "wasm")]
+impl<T> MaybeSend for T {}
+
+#[cfg(not(target_family = "wasm"))]
+pub trait MaybeSync: Sync {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Sync> MaybeSync for T {}
+#[cfg(target_family = "wasm")]
+pub trait MaybeSync {}
+#[cfg(target_family = "wasm")]
+impl<T> MaybeSync for T {}

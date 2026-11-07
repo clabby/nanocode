@@ -24,6 +24,8 @@ pub struct CellJournal {
     pub origin_call_id: String,
     #[serde(default)]
     pub observer_call_id: Option<String>,
+    #[serde(default)]
+    pub observer_yield_ms: Option<u64>,
     pub script: String,
     pub tools: Vec<Value>,
     #[serde(default)]
@@ -90,6 +92,8 @@ pub struct CellJournalUpdate {
     pub calls: Vec<JournaledCall>,
     #[serde(default)]
     pub observer_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_yield_ms: Option<u64>,
     #[serde(default)]
     pub content_returned: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -100,6 +104,10 @@ pub trait CellJournalSink: Send + Sync + 'static {
     fn save(&self, update: CellJournalUpdate) -> HostFuture<'static, Result<(), String>>;
 
     fn forget(&self, session_id: &str, cell_id: u64) -> HostFuture<'static, ()>;
+
+    fn load(&self, _session_id: &str) -> HostFuture<'static, Result<Vec<CellJournal>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 impl CellJournal {
@@ -117,6 +125,7 @@ impl CellJournal {
             session_id: first.session_id.clone(),
             origin_call_id: header.origin_call_id,
             observer_call_id: None,
+            observer_yield_ms: None,
             script: header.script,
             tools: header.tools,
             stored: header.stored,
@@ -147,6 +156,7 @@ impl CellJournal {
             }
             if update.observer_call_id.is_some() {
                 journal.observer_call_id = update.observer_call_id;
+                journal.observer_yield_ms = update.observer_yield_ms;
             }
             journal.content_returned = journal.content_returned.max(update.content_returned);
             journal.finished |= update.finished;
@@ -223,6 +233,7 @@ struct Journals {
     restored: Atom<HashMap<String, Arc<Restored>>>,
     finished: Atom<Vec<Arc<CellRecord>>>,
     dormant: Atom<Vec<(Arc<CellJournal>, Arc<Restored>)>>,
+    loaded: Atom<HashSet<String>>,
     sink: Option<Arc<dyn CellJournalSink>>,
 }
 
@@ -238,6 +249,7 @@ enum Saving {
         next_seq: u64,
         calls: BTreeMap<u64, u8>,
         observer_call_id: Option<String>,
+        observer_yield_ms: Option<u64>,
         content_returned: u64,
     },
     Stopped,
@@ -311,6 +323,38 @@ impl CellJournals {
         });
         if let Some(sink) = &self.0.sink {
             for (journal, _) in dormant {
+                sink.forget(&journal.session_id, journal.cell_id).await;
+            }
+        }
+    }
+
+    pub(super) async fn load(&self, session_id: &str) {
+        let Some(sink) = &self.0.sink else {
+            return;
+        };
+        let first = self
+            .0
+            .loaded
+            .update(|loaded| loaded.insert(session_id.to_owned()));
+        if !first {
+            return;
+        }
+        match sink.load(session_id).await {
+            Ok(cells) => self.restore(session_id, cells, None, HashMap::new()),
+            Err(error) => tracing::warn!(
+                target: "nanocode_code_mode",
+                %error,
+                "stored Code Mode cell journals could not be loaded"
+            ),
+        }
+    }
+
+    pub(super) async fn discard_restored(&self, session_id: &str) {
+        let Some(restored) = self.take_restored(session_id) else {
+            return;
+        };
+        if let Some(sink) = &self.0.sink {
+            for journal in restored.cells {
                 sink.forget(&journal.session_id, journal.cell_id).await;
             }
         }
@@ -526,6 +570,7 @@ pub(super) struct CellRecord {
 #[derive(Clone)]
 pub(super) struct CellStatus {
     pub(super) observer_call_id: Option<String>,
+    pub(super) observer_yield_ms: Option<u64>,
     pub(super) life: CellLife,
     pub(super) unsupported: bool,
     pub(super) content_returned: u64,
@@ -536,6 +581,7 @@ impl CellStatus {
     pub(super) const fn new(life: CellLife) -> Self {
         Self {
             observer_call_id: None,
+            observer_yield_ms: None,
             life,
             unsupported: false,
             content_returned: 0,
@@ -712,17 +758,24 @@ impl CellRecord {
                 .await;
             return;
         };
-        let (observer_call_id, content_returned) =
-            self.status(|status| (status.observer_call_id.clone(), status.content_returned));
+        let (observer_call_id, observer_yield_ms, content_returned) = self.status(|status| {
+            (
+                status.observer_call_id.clone(),
+                status.observer_yield_ms,
+                status.content_returned,
+            )
+        });
         let mut marks = match &*saving {
             Saving::Saved {
                 calls: saved,
                 observer_call_id: saved_observer,
+                observer_yield_ms: saved_yield,
                 content_returned: saved_content,
                 ..
             } => {
                 if entries.is_empty()
                     && *saved_observer == observer_call_id
+                    && *saved_yield == observer_yield_ms
                     && *saved_content == content_returned
                     && calls
                         .iter()
@@ -755,6 +808,7 @@ impl CellRecord {
             entries,
             calls,
             observer_call_id: observer_call_id.clone(),
+            observer_yield_ms,
             content_returned,
             finished: false,
         };
@@ -765,6 +819,7 @@ impl CellRecord {
                     next_seq: seq + 1,
                     calls: marks,
                     observer_call_id,
+                    observer_yield_ms,
                     content_returned,
                 };
             }
@@ -804,6 +859,7 @@ impl CellRecord {
             persisted,
             next_seq,
             observer_call_id,
+            observer_yield_ms,
             content_returned,
             ..
         } = &*saving
@@ -822,6 +878,7 @@ impl CellRecord {
             entries,
             calls: Vec::new(),
             observer_call_id: observer_call_id.clone(),
+            observer_yield_ms: *observer_yield_ms,
             content_returned: *content_returned,
             finished: true,
         };
@@ -876,6 +933,7 @@ impl CellRecord {
             session_id: self.session_id.clone(),
             origin_call_id: self.origin_call_id.clone(),
             observer_call_id: status.observer_call_id.clone(),
+            observer_yield_ms: status.observer_yield_ms,
             script: self.script.clone(),
             tools: self.tools.to_vec(),
             stored: self
