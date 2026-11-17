@@ -100,16 +100,16 @@ const ASTRA62_LONG_CONTEXT_PRIORITY: TokenRates = TokenRates {
     output: 120_000,
 };
 const ASTRA62_ULTRAFAST: TokenRates = TokenRates {
+    input: 24_000,
+    cached_input: 1_200,
+    cache_write_input: 30_000,
+    output: 120_000,
+};
+const ASTRA62_LONG_CONTEXT_ULTRAFAST: TokenRates = TokenRates {
     input: 48_000,
     cached_input: 2_400,
     cache_write_input: 60_000,
-    output: 240_000,
-};
-const ASTRA62_LONG_CONTEXT_ULTRAFAST: TokenRates = TokenRates {
-    input: 96_000,
-    cached_input: 4_800,
-    cache_write_input: 120_000,
-    output: 360_000,
+    output: 180_000,
 };
 const ASTRA_STANDARD: TokenRates = TokenRates {
     input: 10_000,
@@ -136,6 +136,18 @@ const ASTRA_LONG_CONTEXT_PRIORITY: TokenRates = TokenRates {
     output: 150_000,
 };
 
+const SOL62_ULTRAFAST: TokenRates = TokenRates {
+    input: 6_000,
+    cached_input: 300,
+    cache_write_input: 7_500,
+    output: 30_000,
+};
+const SOL62_LONG_CONTEXT_ULTRAFAST: TokenRates = TokenRates {
+    input: 12_000,
+    cached_input: 600,
+    cache_write_input: 15_000,
+    output: 45_000,
+};
 const SOL_ULTRAFAST: TokenRates = TokenRates {
     input: 12_000,
     cached_input: 600,
@@ -208,10 +220,12 @@ impl TokenRates {
             (Model::Custom(_) | Model::DaybreakBlue, _, _) => UNPRICED,
             (Model::Sol62 | Model::Sol, Standard, false) => SOL_STANDARD,
             (Model::Sol62 | Model::Sol, Priority | Fast, false) => SOL_PRIORITY,
-            (Model::Sol62 | Model::Sol, Ultrafast, false) => SOL_ULTRAFAST,
+            (Model::Sol62, Ultrafast, false) => SOL62_ULTRAFAST,
+            (Model::Sol, Ultrafast, false) => SOL_ULTRAFAST,
             (Model::Sol62 | Model::Sol, Standard, true) => SOL_LONG_CONTEXT_STANDARD,
             (Model::Sol62 | Model::Sol, Priority | Fast, true) => SOL_LONG_CONTEXT_PRIORITY,
-            (Model::Sol62 | Model::Sol, Ultrafast, true) => SOL_LONG_CONTEXT_ULTRAFAST,
+            (Model::Sol62, Ultrafast, true) => SOL62_LONG_CONTEXT_ULTRAFAST,
+            (Model::Sol, Ultrafast, true) => SOL_LONG_CONTEXT_ULTRAFAST,
             (Model::Terra, Standard, false) => TERRA_STANDARD,
             (Model::Terra, Priority | Fast | Ultrafast, false) => TERRA_PRIORITY,
             (Model::Terra, Standard, true) => TERRA_LONG_CONTEXT_STANDARD,

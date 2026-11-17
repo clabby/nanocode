@@ -2187,3 +2187,9 @@ Checks: `cargo check --locked --lib` native and wasm32 for types-core, agent-typ
 ## Codex upstream pin moves to bc2c3284 (2026-11-17)
 
 Since d32063f9, openai/codex (330 commits, up to bc2c3284 at 18:24 UTC) has left `models.json` and every base prompt byte-identical. Among the pinned tool sources, only `shell_spec.rs` changed: `exec_command`'s `login` description is now "Request login-shell startup. Omit to inherit." (openai/codex#61744; PowerShell gets its own text, and nanocode doesn't expose it). `standard.rs` and the `upstream/request.json` snapshot copy that text. The local artifact hashes are refreshed for every reviewed file that drifted. Upstream behaviour left out as multi-environment or flag-gated: the v2 `send_message` acknowledgment (#61894), `multi_agent_tools_in_code_mode` metadata (#61854), catalog Apps instructions (#61213), per-environment permissions and MCP resource `environment_id`. Checks: `python3 scripts/verify-codex-upstream.py` passes, and `cargo check --locked --lib -p nanocode-backend-codex` passes native and wasm32.
+
+## GPT-6.2 Ultrafast launch pricing (2026-11-17)
+
+The [Astra 6.2](https://developers.openai.com/api/docs/models/gpt-6.2-astra) and [Sol 6.2](https://developers.openai.com/api/docs/models/gpt-6.2-sol) model pages specify Ultrafast at 3x Standard through February 28, 2027, then 6x starting March 1, 2027 (Pacific time). The initial model addition used 6x immediately. Astra62's short- and long-context Ultrafast rates are now halved, and Sol62 has its own 3x rates instead of sharing Sol 6.1's 6x rates. Older models and the other service tiers keep their rates. These are the current static list-price estimates, as elsewhere in this table; update the 6.2 Ultrafast rates when the launch discount ends.
+
+Validation: native and wasm32 checks of nanocode-types-core, plus arithmetic verification of all four rate components against 3x Standard for both context lengths and both 6.2 models.
