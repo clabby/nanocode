@@ -17,6 +17,7 @@ use nanocode::{
     backend::Prompt,
     durability::SessionStore,
 };
+use nanocode_agent_types::sim::Mutation as Types;
 use nanocode_backend_antigravity::{AntigravityFold, sim::Mutation as Production};
 use nanocode_durability_core::{Digest, Fact, FoldError, Folded, KeyValueStore};
 use nanocode_sync::{Atom, Signal};
@@ -43,6 +44,7 @@ const HOLD: &str = "hold";
 const QUICK: [&str; 2] = ["quick_first", "quick_second"];
 const CALLS: usize = 3;
 const DONE: &str = "done";
+const REFUSED: &str = "refused";
 const POLL: Duration = Duration::from_millis(5);
 const EPOCHS_MAX: u64 = 4;
 
@@ -58,10 +60,14 @@ pub enum AntigravityMutation {
     RevisionForgotten,
     OriginMissing,
     CompactionOriginMissing,
+    XhighAsHigh,
+    HarnessDefaultsHigh,
+    Gemini4OffersNone,
+    Gemini4DefaultsHigh,
 }
 
 impl AntigravityMutation {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 14] = [
         Self::None,
         Self::MovedForgetsResults,
         Self::ReplayReruns,
@@ -72,6 +78,10 @@ impl AntigravityMutation {
         Self::RevisionForgotten,
         Self::OriginMissing,
         Self::CompactionOriginMissing,
+        Self::XhighAsHigh,
+        Self::HarnessDefaultsHigh,
+        Self::Gemini4OffersNone,
+        Self::Gemini4DefaultsHigh,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -92,6 +102,10 @@ impl AntigravityMutation {
             Self::RevisionForgotten => "antigravity_revision_forgotten",
             Self::OriginMissing => "antigravity_origin_missing",
             Self::CompactionOriginMissing => "antigravity_compaction_origin_missing",
+            Self::XhighAsHigh => "antigravity_xhigh_as_high",
+            Self::HarnessDefaultsHigh => "antigravity_harness_defaults_high",
+            Self::Gemini4OffersNone => "antigravity_gemini4_offers_none",
+            Self::Gemini4DefaultsHigh => "antigravity_gemini4_defaults_high",
         }
     }
 
@@ -107,6 +121,28 @@ impl AntigravityMutation {
             Self::RevisionForgotten => Production::RevisionForgotten,
             Self::OriginMissing => Production::OriginMissing,
             Self::CompactionOriginMissing => Production::CompactionOriginMissing,
+            Self::XhighAsHigh => Production::XhighAsHigh,
+            Self::HarnessDefaultsHigh => Production::HarnessDefaultsHigh,
+            Self::Gemini4OffersNone | Self::Gemini4DefaultsHigh => Production::None,
+        }
+    }
+
+    const fn types(self) -> Types {
+        match self {
+            Self::Gemini4OffersNone => Types::Gemini4OffersNone,
+            Self::Gemini4DefaultsHigh => Types::Gemini4DefaultsHigh,
+            Self::None
+            | Self::MovedForgetsResults
+            | Self::ReplayReruns
+            | Self::FactSyncSkipped
+            | Self::RevisionMissing
+            | Self::HostContextMissing
+            | Self::SteerRevisionIgnored
+            | Self::RevisionForgotten
+            | Self::OriginMissing
+            | Self::CompactionOriginMissing
+            | Self::XhighAsHigh
+            | Self::HarnessDefaultsHigh => Types::None,
         }
     }
 
@@ -128,6 +164,7 @@ pub struct AntigravityStats {
     pub crashes: u64,
     pub model_calls: u64,
     pub fact_requests: u64,
+    pub thinking_levels: u64,
 }
 
 impl AntigravityStats {
@@ -138,6 +175,7 @@ impl AntigravityStats {
         self.crashes += other.crashes;
         self.model_calls += other.model_calls;
         self.fact_requests += other.fact_requests;
+        self.thinking_levels += other.thinking_levels;
     }
 }
 
@@ -433,12 +471,8 @@ fn tools(wire: &Arc<Wire>, gate: Option<Arc<dyn nanocode::turnlog::EffectGate>>)
     .expect("the antigravity sim tools build")
 }
 
-fn runtime(
-    sender: Arc<dyn nanocode_http::layer::Sender>,
-    store: SessionStore,
-    tools: Tools,
-) -> Result<Nanocode, String> {
-    let harness = AntigravityHarness::new()
+fn harness(sender: Arc<dyn nanocode_http::layer::Sender>) -> AntigravityHarness {
+    AntigravityHarness::new()
         .endpoint(Endpoint {
             base_url: "http://model.sim".to_owned(),
             auth: Auth::ApiKey("sim".to_owned()),
@@ -449,18 +483,101 @@ fn runtime(
         .sender(sender)
         .shell(Arc::new(NoShell))
         .files(Arc::new(NoFiles))
-        .app_data(std::env::temp_dir().join("nanocode-sim-antigravity"));
+        .app_data(std::env::temp_dir().join("nanocode-sim-antigravity"))
+}
+
+fn runtime(
+    sender: Arc<dyn nanocode_http::layer::Sender>,
+    store: SessionStore,
+    tools: Tools,
+) -> Result<Nanocode, String> {
     Nanocode::builder()
         .tools(tools)
         .runner_management(false)
         .thinking(Thinking::Low)
         .workspace(std::env::temp_dir())
         .durability(store)
-        .google(harness)
+        .google(harness(sender))
         .for_backend::<Gemini>()
         .model(MODEL)
         .build()
         .map_err(|error| format!("runtime build: {error}"))
+}
+
+async fn level_sent(
+    kv: SimKv,
+    model: &'static str,
+    thinking: Option<Thinking>,
+) -> Result<String, String> {
+    let wire = Arc::new(Wire::default());
+    let store = nanocode::session_store(KeyValueStore::new(kv))
+        .map_err(|error| format!("session store: {error}"))?;
+    let runtime = Nanocode::builder()
+        .tools(tools(&wire, None))
+        .runner_management(false)
+        .workspace(std::env::temp_dir())
+        .durability(store)
+        .google(harness(Arc::new(Sender(Arc::clone(&wire)))).model(model))
+        .for_backend::<Gemini>()
+        .model(model)
+        .build()
+        .map_err(|error| format!("runtime build: {error}"))?;
+    let spawn = runtime.spawn();
+    let spawn = match thinking {
+        Some(thinking) => spawn.thinking(thinking),
+        None => spawn,
+    };
+    let (agent, events) = match spawn.build().await {
+        Ok(built) => built,
+        Err(error) if error.to_string().contains("does not support") => {
+            return Ok(REFUSED.to_owned());
+        }
+        Err(error) => return Err(format!("spawn: {error}")),
+    };
+    drop(events);
+    agent
+        .prompt(PromptRequest::new(PROMPT))
+        .await
+        .map_err(|error| format!("admit: {error}"))?
+        .result()
+        .await
+        .map_err(|error| format!("turn: {error}"))?;
+    let bodies = wire.bodies.get();
+    let body = bodies.last().ok_or("no model request was made")?;
+    serde_json::from_str::<Value>(body)
+        .map_err(|error| format!("request unreadable: {error}"))?["generationConfig"]
+        ["thinkingConfig"]["thinkingLevel"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "the request carries no thinkingLevel".to_owned())
+}
+
+fn check_levels(seed: u64, stats: &mut AntigravityStats, digest: &mut u64) -> Vec<String> {
+    let clock = Clock::new();
+    crate::host::enter(seed, &clock);
+    let mut wrong = Vec::new();
+    for (model, thinking, expected) in [
+        ("gemini-4-neon", Some(Thinking::Xhigh), "XHIGH"),
+        ("gemini-4-carbon", None, "MEDIUM"),
+        ("gemini-4-carbon", Some(Thinking::None), REFUSED),
+    ] {
+        let asked = thinking.map_or("default", Thinking::as_str);
+        let label = format!("antigravity_durable level {model} {asked}");
+        let kv = media(seed, &clock).kv;
+        let sent = match epoch(seed, &clock, &label, level_sent(kv, model, thinking)) {
+            (Ended::Finished, Some(Ok(sent))) => sent,
+            (Ended::Finished, Some(Err(error))) => error,
+            (ended, _) => format!("ended {ended:?} without a result"),
+        };
+        stats.thinking_levels += 1;
+        *digest = fnv(*digest, format!("{label} {sent}").as_bytes());
+        if sent != expected {
+            wrong.push(format!(
+                "a {model} turn at {asked} thinking ended with {sent:?}, not {expected:?}"
+            ));
+        }
+    }
+    wrong
 }
 
 struct Media {
@@ -651,25 +768,23 @@ async fn refolds(log: &Arc<nanocode::turnlog::OneLog>, bodies: &[String]) -> Res
     Ok(checked)
 }
 
-fn simulate_case(seed: u64, case: &Case) -> (Run, u64) {
-    let clock = Clock::new();
-    crate::host::enter(seed, &clock);
+fn media(seed: u64, clock: &Arc<Clock>) -> Media {
     let mut profile = Profile::of(seed);
     profile.before_ppm = 0;
     profile.after_ppm = 0;
     profile.torn_ppm = 0;
     profile.read_ppm = 0;
     profile.durability = Durability::OnAck;
-    let media = Media {
-        kv: SimKv::new(
-            seed,
-            profile,
-            StoreMutation::None,
-            false,
-            Arc::clone(&clock),
-        ),
+    Media {
+        kv: SimKv::new(seed, profile, StoreMutation::None, false, Arc::clone(clock)),
         disk: Disk::new(),
-    };
+    }
+}
+
+fn simulate_case(seed: u64, case: &Case) -> (Run, u64) {
+    let clock = Clock::new();
+    crate::host::enter(seed, &clock);
+    let media = media(seed, &clock);
     let wire = Arc::new(Wire::default());
     wire.script.set([true, false].into_iter().collect());
     wire.hold.store(
@@ -789,6 +904,7 @@ struct Outcome {
 
 fn simulate(seed: u64, mutation: AntigravityMutation) -> Outcome {
     nanocode_backend_antigravity::sim::mutate(mutation.production());
+    nanocode_agent_types::sim::mutate(mutation.types());
     let mut rng = Rng::derive(seed, "antigravity_durable cases");
     let mut stats = AntigravityStats {
         seeds: 1,
@@ -826,7 +942,9 @@ fn simulate(seed: u64, mutation: AntigravityMutation) -> Outcome {
     stats.model_calls += calls;
     digest = fnv(digest, &calls.to_le_bytes());
     wrong.extend(errors);
+    wrong.extend(check_levels(seed, &mut stats, &mut digest));
     nanocode_backend_antigravity::sim::mutate(Production::None);
+    nanocode_agent_types::sim::mutate(Types::None);
     Outcome {
         digest,
         stats,

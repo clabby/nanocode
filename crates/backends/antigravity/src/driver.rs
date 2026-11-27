@@ -290,8 +290,10 @@ impl Inner {
 
     pub(crate) fn set_thinking(&self, thinking: Thinking) {
         self.thinking.set(thinking);
-        self.profile
-            .set(Profile::clone(&self.profile.get()).with_level(crate::harness::level(thinking)));
+        self.profile.set(
+            Profile::clone(&self.profile.get())
+                .with_level(crate::harness::level(&self.config.model, thinking)),
+        );
     }
 
     pub(crate) fn payload(&self, state: &State) -> Value {
