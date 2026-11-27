@@ -285,6 +285,7 @@ pub use nanocode_agent::{
 pub use nanocode_scope as scope;
 
 pub mod session_host {
+    pub use nanocode_agent::Guarded;
     pub use nanocode_agent::{
         Attach, Base, Delivery, Driven, EventLog, Halt, ImportedTurn, InboxError, InboxHost,
         LogEntry, LogPage, LoggedEvent, Missing, MovedQueued, Next, OneLog, PassEnd, Recording,

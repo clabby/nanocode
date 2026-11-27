@@ -23,7 +23,7 @@ use crate::{
     input::{Prompt, PromptInput, UserInput},
     stored_event::Stored,
     turn_inbox::{Envelope, accepted_bytes},
-    turn_log::{EventLog, Logged, Recording, TurnLog},
+    turn_log::{EventLog, Guarded, Logged, Recording, TurnLog},
 };
 
 type Dialects = [&'static str; 2];
@@ -2078,7 +2078,8 @@ impl<H: Sql + ?Sized> Log<H> {
         request_id: &str,
         edit_id: &str,
         text: &str,
-    ) -> Result<Replaced, StoreError> {
+        steering: bool,
+    ) -> Result<Guarded<Replaced>, StoreError> {
         if edit_id.is_empty() {
             return Err(StoreError::NotCommitted(
                 "an edit ID must not be empty".into(),
@@ -2093,7 +2094,7 @@ impl<H: Sql + ?Sized> Log<H> {
         })?;
         self.open(writer, true).await?;
         let Some(found) = self.read(writer, request_id).await? else {
-            return Ok(Replaced::NotQueued);
+            return Ok(Guarded::Ready(Replaced::NotQueued));
         };
         let mut edits: BTreeMap<String, String> = match &found.edits {
             Some(edits) => serde_json::from_str(edits)
@@ -2101,11 +2102,14 @@ impl<H: Sql + ?Sized> Log<H> {
             None => BTreeMap::new(),
         };
         if let Some(applied) = edits.get(edit_id) {
-            return Ok(if *applied == edit {
+            return Ok(Guarded::Ready(if *applied == edit {
                 Replaced::Applied(None)
             } else {
                 Replaced::Conflict
-            });
+            }));
+        }
+        if steering {
+            return Ok(Guarded::Steering);
         }
         let Some(prompt) = found
             .record
@@ -2113,7 +2117,7 @@ impl<H: Sql + ?Sized> Log<H> {
             .as_ref()
             .filter(|_| found.record.state == TurnState::Queued)
         else {
-            return Ok(Replaced::NotQueued);
+            return Ok(Guarded::Ready(Replaced::NotQueued));
         };
         let prompt = edited(prompt, text)?;
         let digest = submission_digest(&prompt, found.record.hand.as_deref())?;
@@ -2140,7 +2144,7 @@ impl<H: Sql + ?Sized> Log<H> {
             let receipt = event_bytes(&self.scope, Some(request_id), body.get().len());
             let bytes = row.max(accepted).max(receipt);
             if bytes > limit {
-                return Ok(Replaced::TooLarge { bytes, limit });
+                return Ok(Guarded::Ready(Replaced::TooLarge { bytes, limit }));
             }
         }
         self.put_blobs(&images).await?;
@@ -2160,7 +2164,7 @@ impl<H: Sql + ?Sized> Log<H> {
             Spill::default(),
         )
         .await?;
-        Ok(Replaced::Applied(Some(event)))
+        Ok(Guarded::Ready(Replaced::Applied(Some(event))))
     }
 
     async fn withdraw_steered(
@@ -3010,11 +3014,23 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> SessionLog<H> {
         edit_id: &str,
         text: &str,
     ) -> Result<Replaced, StoreError> {
+        self.edit_queued(request_id, edit_id, text, false)
+            .await?
+            .ready(request_id)
+    }
+
+    async fn edit_queued(
+        &self,
+        request_id: &str,
+        edit_id: &str,
+        text: &str,
+        steering: bool,
+    ) -> Result<Guarded<Replaced>, StoreError> {
         let (request_id, edit_id, text) =
             (request_id.to_owned(), edit_id.to_owned(), text.to_owned());
         self.write(move |log, writer| {
             Box::pin(async move {
-                log.replace_queued(writer, &request_id, &edit_id, &text)
+                log.replace_queued(writer, &request_id, &edit_id, &text, steering)
                     .await
             })
         })
@@ -3246,5 +3262,15 @@ impl<H: Sql + Send + Sync + ?Sized + 'static> TurnLog for SessionLog<H> {
         digest: &'a str,
     ) -> Logged<'a, Option<(TurnRecord, LoggedEvent)>> {
         Box::pin(Self::withdraw_steered(self, request_id, digest))
+    }
+
+    fn replace_queued<'a>(
+        &'a self,
+        request_id: &'a str,
+        edit_id: &'a str,
+        text: &'a str,
+        steering: bool,
+    ) -> Logged<'a, Guarded<Replaced>> {
+        Box::pin(self.edit_queued(request_id, edit_id, text, steering))
     }
 }

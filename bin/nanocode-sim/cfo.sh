@@ -265,6 +265,12 @@ default_table='
 1 canary_antigravity_moved_forgets_results canary:8 --scenario antigravity_durable --mutation antigravity_moved_forgets_results
 1 canary_antigravity_replay_reruns canary:8 --scenario antigravity_durable --mutation antigravity_replay_reruns
 1 canary_antigravity_fact_sync_skipped canary:8 --scenario antigravity_durable --mutation antigravity_fact_sync_skipped
+4 inbox_stress pass --scenario inbox_stress
+2 inbox_stress_twice pass --scenario inbox_stress --twice
+1 canary_inbox_stress_cancel_skips_steer_guard canary:8 --scenario inbox_stress --mutation cancel_skips_steer_guard
+1 canary_inbox_stress_edit_skips_steer_guard canary:8 --scenario inbox_stress --mutation edit_skips_steer_guard
+1 canary_inbox_stress_move_uses_unreserved_prompt canary:8 --scenario inbox_stress --mutation move_uses_unreserved_prompt
+1 canary_inbox_stress_edit_retry_skips_receipt canary:8 --scenario inbox_stress --mutation edit_retry_skips_receipt
 8 board_brief pass --scenario board_brief
 2 board_brief_twice pass --scenario board_brief --twice
 1 canary_board_brief_over_budget canary:40 --scenario board_brief --mutation brief_over_budget

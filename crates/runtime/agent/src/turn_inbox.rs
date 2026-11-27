@@ -11,7 +11,7 @@ use std::{
 
 use nanocode_subagents::{AgentId, AgentUpdate, COMPLETION_REQUEST_PREFIX, ScopedAgentUpdate};
 use nanocode_sync::future::{Either, select};
-use nanocode_sync::{Atom, Mailbox};
+use nanocode_sync::{Atom, Mailbox, Signal, oneshot};
 use nanocode_tool_host::embedded::HostFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -24,9 +24,9 @@ use crate::{
         AGENT_EVENT_PROTOCOL_VERSION, AcceptedInput, AgentEvent, AgentEventKind, AgentEventTiming,
     },
     input::{Prompt, PromptInput},
-    session_log::{LoggedEvent, Started, TurnRecord, TurnState, now},
+    session_log::{LoggedEvent, Replaced, Started, TurnRecord, TurnState, now},
     stored_event::Stored,
-    turn_log::{EventLog, Recording, TurnLog},
+    turn_log::{EventLog, Guarded, Recording, TurnLog},
 };
 
 pub trait InboxHost: Send + Sync + 'static {
@@ -308,6 +308,72 @@ impl Requests {
     }
 }
 
+#[derive(Default)]
+struct Admissions {
+    active: Atom<HashMap<String, Arc<Signal>>>,
+}
+
+impl Admissions {
+    async fn reserve(self: &Arc<Self>, id: &str) -> Admission {
+        let done = Arc::new(Signal::new());
+        loop {
+            let claimed = self.active.modify(|active| {
+                if let Some(ahead) = active.get(id) {
+                    return Err(Arc::clone(ahead));
+                }
+                active.insert(id.to_owned(), Arc::clone(&done));
+                Ok(())
+            });
+            match claimed {
+                Err(ahead) => ahead.wait().await,
+                Ok(()) => {
+                    return Admission {
+                        admissions: Arc::clone(self),
+                        id: id.to_owned(),
+                    };
+                }
+            }
+        }
+    }
+}
+
+struct Admission {
+    admissions: Arc<Admissions>,
+    id: String,
+}
+
+impl Admission {
+    async fn commit<T: Send + 'static>(
+        self,
+        work: HostFuture<'static, Result<T, InboxError>>,
+    ) -> Result<T, InboxError> {
+        let (reply, result) = oneshot::channel();
+        nanocode_platform::spawn(async move {
+            let outcome = work.await;
+            drop(self);
+            drop(reply.send(outcome));
+        });
+        result.await.map_err(|_| NanocodeError::AgentStopped)?
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.admissions
+            .active
+            .update(|active| active.remove(&self.id))
+            .expect("an admission owns its reservation")
+            .fire();
+    }
+}
+
+enum Admitted {
+    Started(Started),
+    Steered(TurnRecord, LoggedEvent),
+    Waiting,
+    Missing,
+}
+
 struct Shared<L: ?Sized> {
     log: Arc<L>,
     host: Arc<dyn InboxHost>,
@@ -316,6 +382,30 @@ struct Shared<L: ?Sized> {
     streams: Mailbox<Vec<Stream>>,
     delivery: Atom<Delivery>,
     recording: AtomicBool,
+}
+
+impl<L: ?Sized> Shared<L> {
+    async fn steer(
+        &self,
+        agent: &Agent,
+        target: Option<&str>,
+        id: &str,
+        prompt: Prompt,
+    ) -> Result<bool, InboxError> {
+        for (request_id, control) in agent.turn_controls() {
+            if target.is_some_and(|target| target != request_id)
+                || self.state.read(|state| state.cancelled(&request_id))
+            {
+                continue;
+            }
+            match control.steer_with_id(id.to_owned(), prompt.clone()).await {
+                Ok(()) => return Ok(true),
+                Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -935,6 +1025,7 @@ pub struct TurnInbox<L: ?Sized> {
     events: SessionEvents,
     model: String,
     busy: AtomicBool,
+    admissions: Arc<Admissions>,
 }
 
 impl<L: EventLog + ?Sized> TurnInbox<L> {
@@ -970,6 +1061,7 @@ impl<L: EventLog + ?Sized> TurnInbox<L> {
                 events,
                 model,
                 busy: AtomicBool::new(false),
+                admissions: Arc::default(),
             },
             pump,
         )
@@ -1009,19 +1101,7 @@ impl<L: EventLog + ?Sized> TurnInbox<L> {
         id: &str,
         prompt: Prompt,
     ) -> Result<bool, InboxError> {
-        for (request_id, control) in self.agent.turn_controls() {
-            if target.is_some_and(|target| target != request_id)
-                || self.shared.state.read(|state| state.cancelled(&request_id))
-            {
-                continue;
-            }
-            match control.steer_with_id(id.to_owned(), prompt.clone()).await {
-                Ok(()) => return Ok(true),
-                Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(false)
+        self.shared.steer(&self.agent, target, id, prompt).await
     }
 
     pub async fn settle(&self) -> Result<bool, InboxError> {
@@ -1157,7 +1237,9 @@ impl<L: EventLog + ?Sized> TurnInbox<L> {
     }
 
     fn idle(&self) -> bool {
-        self.shared.state.read(Requests::idle) && self.shared.host.idle()
+        self.shared.state.read(Requests::idle)
+            && self.admissions.active.read(HashMap::is_empty)
+            && self.shared.host.idle()
     }
 
     async fn publish(&self, event: LoggedEvent) -> Result<(), InboxError> {
@@ -1260,21 +1342,46 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
         request_id: &str,
         fields: &Map<String, Value>,
     ) -> Result<Option<(TurnRecord, bool)>, InboxError> {
-        let Some((record, event)) = self.shared.log.cancel(request_id, fields).await? else {
-            return Ok(None);
+        Ok(self
+            .cancel_guarded(request_id, fields)
+            .await?
+            .ready(request_id)?)
+    }
+
+    pub async fn cancel_guarded(
+        &self,
+        request_id: &str,
+        fields: &Map<String, Value>,
+    ) -> Result<Guarded<Option<(TurnRecord, bool)>>, InboxError> {
+        let admission = self.admissions.reserve(request_id).await;
+        if self.is_steering(request_id).await? {
+            return Ok(Guarded::Steering);
+        }
+        let shared = Arc::clone(&self.shared);
+        let id = request_id.to_owned();
+        let fields = fields.clone();
+        let cancelled = admission
+            .commit(Box::pin(async move {
+                let cancelled = shared.log.cancel(&id, &fields).await?;
+                if cancelled
+                    .as_ref()
+                    .is_some_and(|(record, _)| record.state == TurnState::Running)
+                {
+                    shared.state.update(|state| {
+                        state.requests.entry(id.clone()).or_default().cancelled = true;
+                    });
+                }
+                Ok(cancelled)
+            }))
+            .await?;
+        let Some((record, event)) = cancelled else {
+            return Ok(Guarded::Ready(None));
         };
         let dequeued = event.is_some();
         if let Some(event) = event {
             self.publish(event).await?;
         }
         if record.state == TurnState::Running {
-            self.shared.state.update(|state| {
-                state
-                    .requests
-                    .entry(request_id.to_owned())
-                    .or_default()
-                    .cancelled = true;
-            });
             let live = self
                 .agent
                 .turn_controls()
@@ -1284,7 +1391,55 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
                 ignore_inactive(control.cancel().await)?;
             }
         }
-        Ok(Some((record, dequeued)))
+        Ok(Guarded::Ready(Some((record, dequeued))))
+    }
+
+    pub async fn replace_queued(
+        &self,
+        request_id: &str,
+        edit_id: &str,
+        text: &str,
+    ) -> Result<Guarded<Replaced>, InboxError> {
+        let admission = self.admissions.reserve(request_id).await;
+        let steering = self.is_steering(request_id).await?;
+        let log = Arc::clone(&self.shared.log);
+        let (id, edit, text) = (request_id.to_owned(), edit_id.to_owned(), text.to_owned());
+        let replaced = admission
+            .commit(Box::pin(async move {
+                Ok(log.replace_queued(&id, &edit, &text, steering).await?)
+            }))
+            .await?;
+        if let Guarded::Ready(Replaced::Applied(Some(event))) = &replaced {
+            self.publish(event.clone()).await?;
+        }
+        Ok(replaced)
+    }
+
+    pub async fn steering(&self, request_id: &str) -> Result<bool, InboxError> {
+        let _admission = self.admissions.reserve(request_id).await;
+        self.is_steering(request_id).await
+    }
+
+    async fn is_steering(&self, request_id: &str) -> Result<bool, InboxError> {
+        let Some(queued) = self.shared.log.turn(request_id).await? else {
+            return Ok(false);
+        };
+        let Some(prompt) = queued.prompt.filter(|_| queued.state == TurnState::Queued) else {
+            return Ok(false);
+        };
+        if self
+            .agent
+            .steer_receipt(request_id.to_owned(), prompt)
+            .await?
+            != SteerReceiptStatus::Accepted
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .runtime
+            .steer_read(self.session_id(), request_id)
+            .await?
+            != Some(false))
     }
 
     pub async fn move_queued(
@@ -1292,12 +1447,13 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
         queued_id: &str,
         target: Option<&str>,
     ) -> Result<MovedQueued, InboxError> {
+        let admission = self.admissions.reserve(queued_id).await;
         let Some(queued) = self.shared.log.turn(queued_id).await? else {
             return Ok(MovedQueued::NotQueued);
         };
         let Some(prompt) = queued
             .prompt
-            .clone()
+            .as_ref()
             .filter(|_| queued.state == TurnState::Queued)
         else {
             let steered = queued.report()?.get("steered") == Some(&Value::Bool(true));
@@ -1307,74 +1463,100 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
                 MovedQueued::NotQueued
             });
         };
-        match self
+        let prompt = prompt.clone();
+        let receipt = self
             .agent
             .steer_receipt(queued_id.to_owned(), prompt.clone())
-            .await?
-        {
-            SteerReceiptStatus::Accepted => {}
-            SteerReceiptStatus::Absent => {
-                if !self.steer(target, queued_id, prompt).await? {
-                    return Ok(MovedQueued::NotRunning);
+            .await?;
+        let shared = Arc::clone(&self.shared);
+        let agent = self.agent.clone();
+        let runtime = self.runtime.clone();
+        let target = target.map(str::to_owned);
+        let id = queued.request_id;
+        let digest = queued.digest;
+        let (moved, event) = admission
+            .commit(Box::pin(async move {
+                match receipt {
+                    SteerReceiptStatus::Accepted => {}
+                    SteerReceiptStatus::Absent => {
+                        if !shared.steer(&agent, target.as_deref(), &id, prompt).await? {
+                            return Ok((MovedQueued::NotRunning, None));
+                        }
+                    }
+                    SteerReceiptStatus::Different | SteerReceiptStatus::Withdrawn => {
+                        return Ok((MovedQueued::Conflict, None));
+                    }
+                    SteerReceiptStatus::Unknown => return Ok((MovedQueued::Unknown, None)),
                 }
-            }
-            SteerReceiptStatus::Different | SteerReceiptStatus::Withdrawn => {
-                return Ok(MovedQueued::Conflict);
-            }
-            SteerReceiptStatus::Unknown => return Ok(MovedQueued::Unknown),
+                let event = if runtime.steer_read(agent.session_id(), &id).await? == Some(true) {
+                    shared
+                        .log
+                        .withdraw_steered(&id, &digest)
+                        .await?
+                        .map(|(_, event)| event)
+                } else {
+                    None
+                };
+                Ok((MovedQueued::Moved, event))
+            }))
+            .await?;
+        if let Some(event) = event {
+            self.publish(event).await?;
         }
-        if self
-            .runtime
-            .steer_read(self.session_id(), queued_id)
-            .await?
-            == Some(true)
-        {
-            self.withdraw_steered(&queued).await?;
-        }
-        Ok(MovedQueued::Moved)
+        Ok(moved)
     }
 
-    async fn withdraw_steered(
-        &self,
-        queued: &TurnRecord,
-    ) -> Result<Option<TurnRecord>, InboxError> {
-        let Some((record, event)) = self
-            .shared
-            .log
-            .withdraw_steered(&queued.request_id, &queued.digest)
-            .await?
-        else {
-            return Ok(None);
-        };
-        self.publish(event).await?;
-        Ok(Some(record))
-    }
-
-    async fn run(&self, id: &str, accepted: bool) -> Result<Driven, InboxError> {
+    async fn admit(&self, id: &str, accepted: bool) -> Result<Admitted, InboxError> {
+        let admission = self.admissions.reserve(id).await;
+        let log = Arc::clone(&self.shared.log);
         if !accepted
             && let Some(queued) = self.shared.log.turn(id).await?
             && queued.state == TurnState::Queued
-            && let Some(prompt) = queued.prompt.clone()
+            && let Some(prompt) = queued.prompt
             && self.agent.steer_receipt(id.to_owned(), prompt).await?
                 == SteerReceiptStatus::Accepted
         {
             match self.runtime.steer_read(self.session_id(), id).await? {
                 Some(true) => {
-                    if let Some(record) = self.withdraw_steered(&queued).await? {
-                        return Ok(Driven::Finished(record));
-                    }
+                    let withdrawn = admission
+                        .commit(Box::pin(async move {
+                            Ok(log
+                                .withdraw_steered(&queued.request_id, &queued.digest)
+                                .await?)
+                        }))
+                        .await?;
+                    return Ok(match withdrawn {
+                        Some((record, event)) => Admitted::Steered(record, event),
+                        None => Admitted::Missing,
+                    });
                 }
                 Some(false) => {}
-                None => return Ok(Driven::Waiting(id.to_owned())),
+                None => return Ok(Admitted::Waiting),
             }
         }
-        let Some(Started {
+        let id = id.to_owned();
+        let started = admission
+            .commit(Box::pin(async move { Ok(log.start(&id).await?) }))
+            .await?;
+        Ok(match started {
+            Some(started) => Admitted::Started(started),
+            None => Admitted::Missing,
+        })
+    }
+
+    async fn run(&self, id: &str, accepted: bool) -> Result<Driven, InboxError> {
+        let Started {
             previous,
             record,
             event,
-        }) = self.shared.log.start(id).await?
-        else {
-            return Ok(Driven::Idle);
+        } = match self.admit(id, accepted).await? {
+            Admitted::Started(started) => started,
+            Admitted::Steered(record, event) => {
+                self.publish(event).await?;
+                return Ok(Driven::Finished(record));
+            }
+            Admitted::Waiting => return Ok(Driven::Waiting(id.to_owned())),
+            Admitted::Missing => return Ok(Driven::Idle),
         };
         self.publish(event).await?;
         self.shared

@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 use crate::{
     SessionEvent,
     durability::StoreError,
-    session_log::{LoggedEvent, Started, TurnRecord, TurnState},
+    session_log::{LoggedEvent, Replaced, Started, TurnRecord, TurnState},
 };
 
 pub type Logged<'a, T> = HostFuture<'a, Result<T, StoreError>>;
@@ -52,6 +52,23 @@ pub trait EventLog: Send + Sync + 'static {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum Guarded<T> {
+    Ready(T),
+    Steering,
+}
+
+impl<T> Guarded<T> {
+    pub(crate) fn ready(self, request_id: &str) -> Result<T, StoreError> {
+        match self {
+            Self::Ready(value) => Ok(value),
+            Self::Steering => Err(StoreError::NotCommitted(format!(
+                "request {request_id} is held as a steer by the running turn"
+            ))),
+        }
+    }
+}
+
 pub trait TurnLog: EventLog {
     fn turn<'a>(&'a self, request_id: &'a str) -> Logged<'a, Option<TurnRecord>>;
 
@@ -77,4 +94,21 @@ pub trait TurnLog: EventLog {
         request_id: &'a str,
         digest: &'a str,
     ) -> Logged<'a, Option<(TurnRecord, LoggedEvent)>>;
+
+    fn replace_queued<'a>(
+        &'a self,
+        _request_id: &'a str,
+        _edit_id: &'a str,
+        _text: &'a str,
+        steering: bool,
+    ) -> Logged<'a, Guarded<Replaced>> {
+        Box::pin(async move {
+            if steering {
+                return Ok(Guarded::Steering);
+            }
+            Err(StoreError::NotCommitted(
+                "this log does not edit queued requests".into(),
+            ))
+        })
+    }
 }

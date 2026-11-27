@@ -136,7 +136,7 @@ use crate::{
     httpd::WireMutation,
     httpserver::{HttpServerMutation, HttpServerStats},
     imports::{ImportsMutation, ImportsStats},
-    inboxstress::InboxStressStats,
+    inboxstress::{InboxStressMutation, InboxStressStats},
     heldawait::{HeldAwaitMutation, HeldAwaitStats},
     interpdrop::{InterpDropMutation, InterpDropStats},
     lease::{LeaseMutation, LeaseStats},
@@ -285,6 +285,7 @@ struct Args {
     board_steer: BoardSteerMutation,
     steer_carry: CarryMutation,
     antigravity_durable: AntigravityMutation,
+    inbox_stress: InboxStressMutation,
     board_brief: BoardBriefMutation,
     workspace_fs: WorkspaceFsMutation,
     repo_cache: RepoCacheMutation,
@@ -502,6 +503,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut board_steer = BoardSteerMutation::None;
     let mut steer_carry = CarryMutation::None;
     let mut antigravity_durable = AntigravityMutation::None;
+    let mut inbox_stress = InboxStressMutation::None;
     let mut board_brief = BoardBriefMutation::None;
     let mut workspace_fs = WorkspaceFsMutation::None;
     let mut repo_cache = RepoCacheMutation::None;
@@ -691,7 +693,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::AntigravityDurable, Some(name)) => {
             antigravity_durable = AntigravityMutation::parse(name)?;
         }
-        (Scenario::InboxStress, Some(_)) => return None,
+        (Scenario::InboxStress, Some(name)) => inbox_stress = InboxStressMutation::parse(name)?,
         (Scenario::Board, Some(name)) => board = BoardMutation::parse(name)?,
         (Scenario::Controlplane, Some(name)) => {
             controlplane = ControlplaneMutation::parse(name)?;
@@ -813,6 +815,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         board_steer,
         steer_carry,
         antigravity_durable,
+        inbox_stress,
         board_brief,
         workspace_fs,
         repo_cache,
@@ -906,7 +909,7 @@ fn scenario_replay(seed: u64, args: &Args) -> String {
         return antigravitydurable::replay(seed, args.antigravity_durable);
     }
     if args.scenario == Scenario::InboxStress {
-        return inboxstress::replay(seed);
+        return inboxstress::replay(seed, args.inbox_stress);
     }
     if args.scenario == Scenario::Agents {
         let mut command = format!("nanocode-sim --scenario agents --seed {seed}");
@@ -1393,6 +1396,7 @@ fn mutations() -> ExitCode {
     add("board_steer", BoardSteerMutation::names());
     add("steer_carry", CarryMutation::names());
     add("antigravity_durable", AntigravityMutation::names());
+    add("inbox_stress", InboxStressMutation::names());
     add("board_brief", BoardBriefMutation::names());
     add("workspace_fs", WorkspaceFsMutation::names());
     add("repo_cache", RepoCacheMutation::names());
@@ -1679,6 +1683,7 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
         ),
         Scenario::InboxStress => inboxstress::judge(
             seed,
+            args.inbox_stress,
             args.twice,
             args.options.verbose,
             &mut totals.inbox_stress_totals,
@@ -2175,6 +2180,8 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::SteerCarry && args.steer_carry != CarryMutation::None)
         || (args.scenario == Scenario::AntigravityDurable
             && args.antigravity_durable != AntigravityMutation::None)
+        || (args.scenario == Scenario::InboxStress
+            && args.inbox_stress != InboxStressMutation::None)
         || (args.scenario == Scenario::BoardBrief && args.board_brief != BoardBriefMutation::None)
         || (args.scenario == Scenario::WorkspaceFs
             && args.workspace_fs != WorkspaceFsMutation::None)
@@ -2416,6 +2423,7 @@ fn main() -> ExitCode {
             passed,
             failed,
             args.twice,
+            args.inbox_stress,
             &inbox_stress_totals,
         );
     }

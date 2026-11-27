@@ -45,4 +45,4 @@ pub use turn_inbox::{
     Attach, Delivery, Driven, Halt, InboxError, InboxHost, MovedQueued, Next, PassEnd, TurnInbox,
     Wake,
 };
-pub use turn_log::{EventLog, Recording, TurnLog, Verdict};
+pub use turn_log::{EventLog, Guarded, Recording, TurnLog, Verdict};
