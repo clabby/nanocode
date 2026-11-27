@@ -180,7 +180,8 @@ enum Adoption {
 
 type Adoptions = HashMap<String, Adoption>;
 
-type Receipts = HashMap<(String, String), Vec<Weak<dyn ToolReceipt>>>;
+type HeldReceipts = Arc<Atom<Vec<Arc<dyn ToolReceipt>>>>;
+type Receipts = HashMap<(String, String), HeldReceipts>;
 
 type Sending<'a> = (
     HostFuture<'a, Result<(), CodeModeHostError>>,
@@ -1154,11 +1155,7 @@ impl Client {
                 origin_call_id,
             } => {
                 let key = (session_id, origin_call_id);
-                self.callbacks.update(|callbacks| {
-                    callbacks.remove(&key);
-                });
-                self.answers
-                    .forget(&answer_key(&key.0, &format!("{}/", key.1)));
+                self.settle(key.0, key.1, None);
             }
             Frame::Callback {
                 id,
@@ -1248,12 +1245,20 @@ impl Client {
         });
         let outgoing = self.outgoing.clone();
         let client = Arc::downgrade(self);
-        let holder = Weak::clone(&client);
+        let held = self
+            .receipts
+            .update(|receipts| Arc::downgrade(receipts.entry(key.clone()).or_default()));
         let max_frame_bytes = self.max_frame_bytes;
         Box::pin(async move {
             let hold = |output: &mut ToolOutput| {
-                if let Some(client) = holder.upgrade() {
-                    client.hold_receipts(&key, output);
+                let receipts = output.take_receipts();
+                if !receipts.is_empty()
+                    && let Some(held) = held.upgrade()
+                {
+                    for receipt in &receipts {
+                        receipt.carried_by(None);
+                    }
+                    held.update(|held| held.extend(receipts.iter().cloned()));
                 }
                 if let Some(recorded) = &recorded {
                     answers.record(recorded.clone(), output);
@@ -1284,10 +1289,22 @@ impl Client {
                         let owned = authoritative.owned();
                         let mut output = if durable {
                             hands
-                                .call_once(&hand, &name, input, owned.as_context())
+                                .call_once(
+                                    &hand,
+                                    &name,
+                                    input,
+                                    owned.as_context().with_deferred_output(),
+                                )
                                 .await
                         } else {
-                            hands.call(&hand, &name, input, owned.as_context()).await
+                            hands
+                                .call(
+                                    &hand,
+                                    &name,
+                                    input,
+                                    owned.as_context().with_deferred_output(),
+                                )
+                                .await
                         };
                         hold(&mut output);
                         return encode_output(output, compact, output_prefix);
@@ -1309,7 +1326,7 @@ impl Client {
                     };
                     let mut output = match input {
                         Ok(input) => tool
-                            .execute(input, owned.as_context())
+                            .execute(input, owned.as_context().with_deferred_output())
                             .await
                             .map_err(error)?,
                         Err(refused) => refused,
@@ -1442,40 +1459,19 @@ impl Client {
         }
     }
 
-    fn settle(&self, session_id: String, origin: String, carrier: Option<&str>) {
+    fn settle(&self, session_id: String, origin: String, carrier: Option<(&str, Option<&str>)>) {
         self.answers
             .forget(&answer_key(&session_id, &format!("{origin}/")));
         let key = (session_id, origin);
         self.callbacks.update(|callbacks| {
             callbacks.remove(&key);
         });
-        let held = self
-            .receipts
-            .update(|receipts| receipts.remove(&key))
-            .unwrap_or_default();
-        if let Some(carrier) = carrier {
-            for receipt in held.iter().filter_map(Weak::upgrade) {
-                receipt.carried_by(Some(carrier));
+        let held = self.receipts.update(|receipts| receipts.remove(&key));
+        if let (Some(held), Some((call_id, turn_id))) = (held, carrier) {
+            for receipt in held.update(std::mem::take) {
+                receipt.carried_by_in_turn(call_id, turn_id);
             }
         }
-    }
-
-    fn hold_receipts(&self, origin: &(String, String), output: &mut ToolOutput) {
-        let held = output.take_receipts();
-        if held.is_empty() {
-            return;
-        }
-        for receipt in &held {
-            receipt.carried_by(None);
-        }
-        self.receipts.update(|receipts| {
-            receipts
-                .retain(|_, receipts| receipts.iter().any(|receipt| receipt.strong_count() > 0));
-            receipts
-                .entry(origin.clone())
-                .or_default()
-                .extend(held.iter().map(Arc::downgrade));
-        });
     }
 
     fn local_tools_key(&self, definitions: &[ToolDefinition]) -> Option<String> {
@@ -1826,9 +1822,7 @@ impl Drop for Pending {
         let _ = self.client.outgoing.send(Outgoing::Forget(self.id));
         if !self.complete {
             if let Some(origin) = self.origin.take() {
-                self.client.callbacks.update(|callbacks| {
-                    callbacks.remove(&origin);
-                });
+                self.client.settle(origin.0, origin.1, None);
             }
             if let Some(session_id) = self.session_id.take() {
                 let id = self.client.next.fetch_add(1, Ordering::Relaxed);
@@ -1867,7 +1861,7 @@ impl RemoteClient {
         let origin_call_id = executed.as_ref().map(|context| context.call_id.clone());
         let carrier = match &operation {
             RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } => {
-                Some(context.call_id.clone())
+                Some((context.call_id.clone(), context.turn_id.clone()))
             }
             _ => None,
         };
@@ -2025,7 +2019,7 @@ impl RemoteClient {
             };
             if let Some(origin) = completed {
                 let carrier = match (&result, &carrier) {
-                    (Ok(Some(_)), Some(carrier)) => Some(carrier.as_str()),
+                    (Ok(Some(_)), Some((call, turn))) => Some((call.as_str(), turn.as_deref())),
                     _ => None,
                 };
                 client.settle(session_id, origin, carrier);
@@ -2080,8 +2074,11 @@ impl RemoteTransport for RemoteClient {
             Some(cell) => cell.origin_call_id.clone(),
             None => context.call_id.clone(),
         };
-        self.client
-            .settle(context.session_id.clone(), origin, Some(&context.call_id));
+        self.client.settle(
+            context.session_id.clone(),
+            origin,
+            Some((&context.call_id, context.turn_id.as_deref())),
+        );
     }
     fn request<'a>(
         &'a self,

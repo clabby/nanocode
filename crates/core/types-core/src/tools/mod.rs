@@ -108,6 +108,10 @@ pub struct ToolOutput {
 
 pub trait ToolReceipt: Send + Sync {
     fn carried_by(&self, call_id: Option<&str>);
+
+    fn carried_by_in_turn(&self, call_id: &str, _turn_id: Option<&str>) {
+        self.carried_by(Some(call_id));
+    }
 }
 
 #[doc(hidden)]

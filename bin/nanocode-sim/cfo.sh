@@ -345,6 +345,10 @@ default_table='
 1 canary_agents_pool_retire_keeps_agent canary:40 --scenario agents --mutation pool_retire_keeps_agent
 1 canary_agents_pool_forgets_intent canary:40 --scenario agents --mutation pool_forgets_intent
 1 canary_agents_wait_repeats_ids canary:40 --scenario agents --mutation wait_repeats_ids
+1 canary_agents_wait_repeats_unread canary:40 --scenario agents --mutation wait_repeats_unread
+1 canary_agents_wait_ignores_carrier_release canary:40 --scenario agents --mutation wait_ignores_carrier_release
+1 canary_agents_wait_keeps_origin_turn canary:40 --scenario agents --mutation wait_keeps_origin_turn
+1 canary_agents_wait_forgets_discard canary:40 --scenario agents --mutation wait_forgets_discard
 1 canary_agents_restore_remembers_waits canary:40 --scenario agents --mutation restore_remembers_waits
 1 canary_agents_route_skips_claim canary:40 --scenario agents --mutation route_skips_claim
 1 canary_agents_scope_jobs_overlap canary:40 --scenario agents --mutation scope_jobs_overlap
