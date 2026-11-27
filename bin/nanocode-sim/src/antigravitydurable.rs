@@ -291,6 +291,26 @@ impl nanocode_http::layer::Sender for Sender {
     }
 }
 
+/// Answers every request at once, for turns that only check the request's thinking level.
+struct LevelSender(Arc<Wire>);
+
+impl nanocode_http::layer::Sender for LevelSender {
+    fn send(
+        &self,
+        request: nanocode_http::layer::Request,
+    ) -> nanocode_http::layer::BoxFuture<
+        '_,
+        Result<nanocode_http::layer::Response, nanocode_http::layer::Error>,
+    > {
+        Box::pin(async move {
+            self.0
+                .bodies
+                .update(|bodies| bodies.push(String::from_utf8_lossy(&request.body).into_owned()));
+            Ok(model_response(vec![json!({"text": DONE})], true))
+        })
+    }
+}
+
 fn model_response(parts: Vec<Value>, streaming: bool) -> nanocode_http::layer::Response {
     let chunk = json!({
         "candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": "STOP"}],
@@ -517,7 +537,7 @@ async fn level_sent(
         .runner_management(false)
         .workspace(std::env::temp_dir())
         .durability(store)
-        .google(harness(Arc::new(Sender(Arc::clone(&wire)))).model(model))
+        .google(harness(Arc::new(LevelSender(Arc::clone(&wire)))).model(model))
         .for_backend::<Gemini>()
         .model(model)
         .build()
