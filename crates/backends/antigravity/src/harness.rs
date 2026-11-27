@@ -433,6 +433,7 @@ impl AntigravityHarness {
             model,
             thinking,
             session,
+            host_context: spec.host_context,
             cache,
             logs,
             notice,

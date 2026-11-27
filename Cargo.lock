@@ -304,6 +304,7 @@ dependencies = [
  "nanocode-backend-antigravity-tools",
  "nanocode-durability",
  "nanocode-home",
+ "nanocode-http",
  "nanocode-platform",
  "nanocode-process-contracts",
  "nanocode-sync",

@@ -35,6 +35,7 @@ pub struct Config {
     pub model: ModelSelection,
     pub thinking: Thinking,
     pub session: String,
+    pub host_context: Option<Arc<str>>,
     pub cache: Option<Arc<ExplicitCache>>,
     pub logs: Option<PathBuf>,
     pub notice: Option<String>,
@@ -59,6 +60,8 @@ pub(crate) struct Usage {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Progress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) instruction_revision: Option<u64>,
     #[serde(default)]
     pub(crate) usage: Usage,
     #[serde(default)]
@@ -103,6 +106,7 @@ pub(crate) struct Steer {
 pub(crate) struct Turn {
     pub(crate) key: u64,
     pub(crate) id: String,
+    pub(crate) host_context: Arc<str>,
     pub(crate) pending: bool,
     pub(crate) automatic: bool,
     pub(crate) cancel_on_admission: bool,

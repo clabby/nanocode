@@ -263,6 +263,12 @@ default_table='
 4 antigravity_durable pass --scenario antigravity_durable
 2 antigravity_durable_twice pass --scenario antigravity_durable --twice
 1 canary_antigravity_moved_forgets_results canary:8 --scenario antigravity_durable --mutation antigravity_moved_forgets_results
+1 canary_antigravity_revision_missing canary:8 --scenario antigravity_durable --mutation antigravity_revision_missing
+1 canary_antigravity_host_context_missing canary:8 --scenario antigravity_durable --mutation antigravity_host_context_missing
+1 canary_antigravity_steer_revision_ignored canary:8 --scenario antigravity_durable --mutation antigravity_steer_revision_ignored
+1 canary_antigravity_revision_forgotten canary:8 --scenario antigravity_durable --mutation antigravity_revision_forgotten
+1 canary_antigravity_origin_missing canary:8 --scenario antigravity_durable --mutation antigravity_origin_missing
+1 canary_antigravity_compaction_origin_missing canary:8 --scenario antigravity_durable --mutation antigravity_compaction_origin_missing
 1 canary_antigravity_replay_reruns canary:8 --scenario antigravity_durable --mutation antigravity_replay_reruns
 1 canary_antigravity_fact_sync_skipped canary:8 --scenario antigravity_durable --mutation antigravity_fact_sync_skipped
 8 board_brief pass --scenario board_brief

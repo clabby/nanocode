@@ -7,6 +7,12 @@ pub enum Mutation {
     MovedForgetsResults,
     ReplayReruns,
     FactSyncSkipped,
+    RevisionMissing,
+    HostContextMissing,
+    SteerRevisionIgnored,
+    RevisionForgotten,
+    OriginMissing,
+    CompactionOriginMissing,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);

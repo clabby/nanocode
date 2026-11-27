@@ -16,6 +16,7 @@ nanocode-agent-config.workspace = true
 nanocode-agent-core.workspace = true
 nanocode-durability.workspace = true
 nanocode-home.workspace = true
+nanocode-http.workspace = true
 nanocode-platform.workspace = true
 nanocode-process-contracts.workspace = true
 nanocode-sync.workspace = true

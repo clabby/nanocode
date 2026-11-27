@@ -13,8 +13,10 @@ use nanocode_backend_antigravity_tools::{
     NAMES, Outcome, REMINDER, local_timestamp, system_message, with_header,
 };
 use nanocode_durability::{BeginStep, EncodedPayload, OwnerWrite, StepRecovery, agent_error};
+use nanocode_http::layer::origin::Origin;
 use nanocode_tool_host::ToolContext;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 const MODEL_STEP: &str = "model_call";
@@ -174,6 +176,23 @@ impl State {
 }
 
 impl Inner {
+    pub(crate) fn origin(&self, context: Option<Arc<str>>) -> Origin {
+        if crate::sim::mutated(crate::sim::Mutation::OriginMissing) {
+            return Origin::default();
+        }
+        Origin {
+            context: self.config.host_context.clone().or(context),
+            session: Some(Arc::from(self.config.session.as_str())),
+        }
+    }
+
+    pub(crate) fn compaction_origin(&self, context: Option<Arc<str>>) -> Origin {
+        if crate::sim::mutated(crate::sim::Mutation::CompactionOriginMissing) {
+            return Origin::default();
+        }
+        self.origin(context)
+    }
+
     pub(crate) async fn request(
         &self,
         state: &State,
@@ -418,7 +437,16 @@ impl Inner {
         Ok(())
     }
 
-    fn context<'a>(&'a self, call_id: &'a str, turn: &'a str) -> ToolContext<'a> {
+    fn context<'a>(
+        &'a self,
+        call_id: &'a str,
+        turn: &'a Turn,
+        instruction_revision: Option<u64>,
+    ) -> ToolContext<'a> {
+        let revision = instruction_revision
+            .filter(|_| !crate::sim::mutated(crate::sim::Mutation::RevisionMissing));
+        let host_context = (!crate::sim::mutated(crate::sim::Mutation::HostContextMissing))
+            .then_some(&*turn.host_context);
         ToolContext::new(
             self.config.model.as_str(),
             &self.config.session,
@@ -426,7 +454,9 @@ impl Inner {
             &[],
             usize::MAX,
         )
-        .with_turn_id(Some(turn))
+        .with_turn_id(Some(&turn.id))
+        .with_instruction_revision(revision)
+        .with_host_context(host_context)
     }
 
     async fn execute(
@@ -434,8 +464,7 @@ impl Inner {
         name: &str,
         args: &Value,
         step: u64,
-        call_id: &str,
-        turn: &str,
+        context: ToolContext<'_>,
     ) -> (&'static str, String) {
         let created = Self::now();
         let engine = &self.config.engine;
@@ -458,12 +487,7 @@ impl Inner {
                 format!("Encountered error in tool validation: tool {name:?} not found"),
             );
         }
-        match self
-            .config
-            .nano
-            .call(name, args, self.context(call_id, turn))
-            .await
-        {
+        match self.config.nano.call(name, args, context).await {
             Ok(body) => {
                 let full = with_header(created, Self::now(), &body);
                 ("output", engine.finish_output(name, step, &full).await)
@@ -475,13 +499,9 @@ impl Inner {
         }
     }
 
-    async fn recover(&self, name: &str, call_id: &str, turn: &str) -> (&'static str, String) {
+    async fn recover(&self, name: &str, context: ToolContext<'_>) -> (&'static str, String) {
         if self.config.nano.handles(name)
-            && let Some(recovered) = self
-                .config
-                .nano
-                .recover(name, self.context(call_id, turn))
-                .await
+            && let Some(recovered) = self.config.nano.recover(name, context).await
         {
             return match recovered {
                 Ok(body) => ("output", body),
@@ -551,7 +571,10 @@ impl Inner {
             &local_timestamp(Self::now()),
             settings.as_deref(),
         ))]));
-        state.progress = Progress::default();
+        state.progress = Progress {
+            instruction_revision: prompt.instruction_revision(),
+            ..Progress::default()
+        };
         state.operation = self.config.durable.as_ref().map(|_| id.to_owned());
     }
 
@@ -568,10 +591,12 @@ impl Inner {
         if !recovering {
             self.open(&mut state, prompt, id);
             self.persist(&state).await?;
+        } else if crate::sim::mutated(crate::sim::Mutation::RevisionForgotten) {
+            state.progress.instruction_revision = None;
         }
         self.retain_steers(&mut state, turn).await?;
         loop {
-            self.rounds(&mut state, turn, id, recovering).await?;
+            self.rounds(&mut state, turn, recovering).await?;
             recovering = false;
             turn.accepting.store(false, Ordering::SeqCst);
             std::sync::atomic::fence(Ordering::SeqCst);
@@ -592,18 +617,12 @@ impl Inner {
         })
     }
 
-    async fn rounds(
-        &self,
-        state: &mut State,
-        turn: &Turn,
-        id: &str,
-        mut recovering: bool,
-    ) -> Result<()> {
+    async fn rounds(&self, state: &mut State, turn: &Turn, mut recovering: bool) -> Result<()> {
         let events = &turn.events;
         let mut resumed = recovering;
         loop {
             match state.phase() {
-                Phase::Calls => self.calls(state, events, id, recovering).await?,
+                Phase::Calls => self.calls(state, turn, recovering).await?,
                 Phase::Answered if recovering && turn.steers.get().is_empty() => return Ok(()),
                 Phase::Answered | Phase::Request => {}
             }
@@ -774,13 +793,9 @@ impl Inner {
         Ok(called)
     }
 
-    async fn calls(
-        &self,
-        state: &mut State,
-        events: &AgentEventPublisher,
-        id: &str,
-        recovering: bool,
-    ) -> Result<()> {
+    async fn calls(&self, state: &mut State, turn: &Turn, recovering: bool) -> Result<()> {
+        let events = &turn.events;
+        let id = &turn.id;
         let calls = state
             .contents
             .last()
@@ -803,9 +818,10 @@ impl Inner {
             };
             let unstarted =
                 recover && settled.is_none() && self.intended(&call_id).await? == Some(false);
+            let context = self.context(&call_id, turn, state.progress.instruction_revision);
             let (key, body) = match settled {
                 Some(settled) => settled,
-                None if recover && !unstarted => self.recover(&call.name, &call_id, id).await,
+                None if recover && !unstarted => self.recover(&call.name, context).await,
                 None => {
                     emit(
                         events,
@@ -813,7 +829,7 @@ impl Inner {
                         json!({"call_id": call_id, "tool": call.name, "arguments": call.args, "model_call_index": call_index}),
                     );
                     self.fact_intent(id, &call_id, &call.name).await?;
-                    self.execute(&call.name, &call.args, state.step, &call_id, id)
+                    self.execute(&call.name, &call.args, state.step, context)
                         .await
                 }
             };
@@ -879,13 +895,14 @@ impl Inner {
             nanocode_agent_core::backend::BackendRuntime::new(self.config.session.clone());
         let max_output_tokens = self.profile.get().max_output_tokens;
         let reply = self
-            .request(
+            .origin(None)
+            .scope(self.request(
                 &state,
                 Some(&extra),
                 max_output_tokens,
                 state.calls,
                 &runtime.events(),
-            )
+            ))
             .await?;
         let text = visible(&reply.parts);
         if text.trim().is_empty() {

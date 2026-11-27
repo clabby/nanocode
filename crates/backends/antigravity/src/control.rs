@@ -260,6 +260,11 @@ impl Inner {
         let turn = Arc::new(Turn {
             key: request.key.0,
             id: id.clone(),
+            host_context: self
+                .config
+                .host_context
+                .clone()
+                .unwrap_or_else(|| Arc::from(id.as_str())),
             pending,
             automatic,
             cancel_on_admission: request.cancel_on_admission,
@@ -320,7 +325,10 @@ impl Inner {
 
     async fn run_turn(&self, turn: &Turn, prompt: &Prompt) -> Result<TurnResult> {
         let started = nanocode_platform::now();
-        let result = self.attempt(turn, prompt).await;
+        let result = self
+            .origin(Some(Arc::clone(&turn.host_context)))
+            .scope(self.attempt(turn, prompt))
+            .await;
         let nanos =
             u64::try_from(nanocode_platform::elapsed(started).as_nanos()).unwrap_or(u64::MAX);
         self.emit_finished(&turn.events, &result, false, nanos);
@@ -786,6 +794,11 @@ impl Inner {
         let mut parts = notices.into_iter().map(Part::text).collect::<Vec<_>>();
         let mut binds = Vec::with_capacity(steers.len());
         for steer in &steers {
+            if let Some(revision) = steer.prompt.instruction_revision()
+                && !crate::sim::mutated(crate::sim::Mutation::SteerRevisionIgnored)
+            {
+                state.progress.instruction_revision = Some(revision);
+            }
             let text = prompt_text(&steer.prompt.instruction);
             state.requests.push(text.clone());
             parts.push(Part::text(crate::prompts::user_request(
@@ -928,7 +941,9 @@ impl Inner {
         }
         let events = self.config.events.clone();
         let Some(owner) = &self.config.durable else {
-            self.compact(&mut state, &events).await?;
+            self.compaction_origin(None)
+                .scope(self.compact(&mut state, &events))
+                .await?;
             self.save(&state);
             self.settled.set(state);
             return Ok(());
@@ -953,7 +968,10 @@ impl Inner {
             self.retire(owner, &id).await;
             return Err(agent_error(error));
         }
-        let result = self.compact(&mut state, &events).await;
+        let result = self
+            .compaction_origin(Some(Arc::from(id.as_str())))
+            .scope(self.compact(&mut state, &events))
+            .await;
         let written = match &result {
             Err(error) if error.execution_policy_disposition().is_some() => {
                 self.stop();
