@@ -65,6 +65,7 @@ pub struct ToolContext<'a> {
     session_id: &'a str,
     call_id: &'a str,
     turn_id: Option<&'a str>,
+    deferred_output: bool,
     history: History<'a>,
     output_token_budget: usize,
     host_context: Option<&'a str>,
@@ -108,6 +109,7 @@ impl<'a> ToolContext<'a> {
             session_id,
             call_id,
             turn_id: None,
+            deferred_output: false,
             history: History::Borrowed(history),
             output_token_budget,
             host_context: None,
@@ -214,6 +216,17 @@ impl<'a> ToolContext<'a> {
     pub const fn with_turn_id(mut self, turn_id: Option<&'a str>) -> Self {
         self.turn_id = turn_id;
         self
+    }
+
+    #[must_use]
+    pub const fn with_deferred_output(mut self) -> Self {
+        self.deferred_output = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn deferred_output(self) -> bool {
+        self.deferred_output
     }
 
     #[must_use]

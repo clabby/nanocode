@@ -188,7 +188,17 @@ impl Ledger {
         session_id: &str,
         model: ModelSelection,
     ) -> (Agent, AgentEvents) {
+        let (agent, events, _) = self.agent_with_publisher(session_id, model);
+        (agent, events)
+    }
+
+    pub fn agent_with_publisher(
+        self: &Arc<Self>,
+        session_id: &str,
+        model: ModelSelection,
+    ) -> (Agent, AgentEvents, AgentEventPublisher) {
         let (runtime, events) = BackendRuntime::new(session_id.to_owned());
+        let publisher = runtime.events();
         let backend = ScriptedBackend {
             inner: Arc::new(Inner {
                 session_id: Arc::from(session_id),
@@ -207,7 +217,7 @@ impl Ledger {
         };
         self.open_agents.fetch_add(1, Ordering::SeqCst);
         self.trace(&format!("agent {session_id}"));
-        (runtime.bind(backend), events)
+        (runtime.bind(backend), events, publisher)
     }
 }
 

@@ -897,15 +897,7 @@ impl CodeModeRuntime {
                 let journal = journals.whole(journal).await?;
                 let epoch = self.cells.read(|registry| registry.admission_epoch);
                 let turn = self.current_turn.load(Ordering::Acquire);
-                match self.revive(
-                    &tools,
-                    &context,
-                    journals,
-                    journal,
-                    &restored,
-                    turn,
-                    epoch,
-                )? {
+                match self.revive(&tools, &context, journals, journal, &restored, turn, epoch)? {
                     Ok(cell) => cell,
                     Err(cell) => {
                         cell.join().await;
@@ -956,7 +948,7 @@ impl CodeModeRuntime {
                 started_at,
                 ObservationMode::YieldAfter(yield_after, yield_after, preempt, YieldChoice::Named),
                 record.max_output_tokens,
-                Some(call_id),
+                Some((call_id, context.turn_id.as_deref())),
                 observer,
             )
             .await;
@@ -1065,6 +1057,7 @@ impl CodeModeRuntime {
             .unwrap_or(crate::contract::DEFAULT_TOOL_OUTPUT_TOKENS);
         nanocode_trace::Span::current().record("output.max_tokens", output_token_budget);
         let context = context.with_output_token_budget(output_token_budget);
+        let turn_id = context.turn_id.clone();
 
         let held = crate::sim::hold_admission();
         if let Some(journals) = &self.journals {
@@ -1168,7 +1161,7 @@ impl CodeModeRuntime {
                 started_at,
                 ObservationMode::Started(yield_after, preempt, choice),
                 Some(output_token_budget),
-                Some(&cell.origin_call_id),
+                Some((&cell.origin_call_id, turn_id.as_deref())),
                 observer,
             )
             .await;
@@ -1218,7 +1211,7 @@ impl CodeModeRuntime {
             duration_ns = nanocode_trace::field::Empty,
         );
         let execution = self
-            .wait_inner(input, context.call_id(), observer, started_at)
+            .wait_inner(input, context, observer, started_at)
             .instrument(span.clone())
             .await;
         if let Some(cell) = &execution.cell {
@@ -1231,10 +1224,11 @@ impl CodeModeRuntime {
     async fn wait_inner(
         &self,
         input: &str,
-        call_id: &str,
+        context: ToolContext<'_>,
         observer: &mut dyn CodeModeObserver,
         started_at: Instant,
     ) -> CodeModeExecution {
+        let call_id = context.call_id();
         let preempt = Preemption {
             signal: self.preempt.subscribe(),
             turn: self.current_turn.load(Ordering::Acquire),
@@ -1296,7 +1290,7 @@ impl CodeModeRuntime {
                     started_at,
                     ObservationMode::Terminate,
                     output_token_budget,
-                    Some(call_id),
+                    Some((call_id, context.turn_id())),
                     observer,
                 )
                 .await;
@@ -1318,7 +1312,7 @@ impl CodeModeRuntime {
                 started_at,
                 ObservationMode::YieldAfter(yield_time, quiet_until, Some(preempt), choice),
                 output_token_budget,
-                Some(call_id),
+                Some((call_id, context.turn_id())),
                 observer,
             )
             .await;
@@ -1797,7 +1791,7 @@ impl LiveCell {
         started_at: Instant,
         mode: ObservationMode,
         max_output_tokens: Option<usize>,
-        carrier: Option<&str>,
+        carrier: Option<(&str, Option<&str>)>,
         observer: &mut dyn CodeModeObserver,
     ) -> (CodeModeExecution, bool) {
         let (events, mut forwarded) = mpsc::unbounded_channel();
@@ -1808,7 +1802,7 @@ impl LiveCell {
             started_at,
             mode,
             max_output_tokens,
-            carrier: carrier.map(str::to_owned),
+            carrier: carrier.map(|(call, turn)| (call.to_owned(), turn.map(str::to_owned))),
             events,
             reply,
         });
@@ -1970,7 +1964,7 @@ enum Watch {
         started_at: Instant,
         mode: ObservationMode,
         max_output_tokens: Option<usize>,
-        carrier: Option<String>,
+        carrier: Option<(String, Option<String>)>,
         events: mpsc::UnboundedSender<Observed>,
         reply: oneshot::Sender<(CodeModeExecution, bool)>,
     },
@@ -2007,7 +2001,9 @@ async fn watch_cell(
                         started_at,
                         mode,
                         max_output_tokens,
-                        carrier.as_deref(),
+                        carrier
+                            .as_ref()
+                            .map(|(call, turn)| (call.as_str(), turn.as_deref())),
                         &mut Forward(events),
                     )
                     .await
@@ -2185,7 +2181,7 @@ async fn observe_cell(
     started_at: Instant,
     mode: ObservationMode,
     max_output_tokens: Option<usize>,
-    carrier: Option<&str>,
+    carrier: Option<(&str, Option<&str>)>,
     observer: &mut dyn CodeModeObserver,
 ) -> (CodeModeExecution, bool) {
     let (mut execution, running) = observe_updates(
@@ -2205,9 +2201,9 @@ async fn observe_cell(
     if let Some(record) = &cell.record {
         record.update(|status| status.content_returned = observation.content_seen);
     }
-    if !running && let Some(carrier) = carrier {
+    if !running && let Some((call_id, turn_id)) = carrier {
         for receipt in observation.receipts.drain(..) {
-            receipt.carried_by(Some(carrier));
+            receipt.carried_by_in_turn(call_id, turn_id);
         }
     }
     (execution, running)
@@ -3889,6 +3885,7 @@ async fn execute_nested_call(
     .with_instruction_revision(context.instruction_revision())
     .with_host_context(context.host_context())
     .with_turn_id(context.turn_id())
+    .with_deferred_output()
     .with_tool_settings(context.tool_settings());
     let mut execution = async {
         match how {

@@ -61,6 +61,7 @@ pub(super) fn observe_completions<'a>(
     root_session_id: &'a str,
     ids: &'a [AgentId],
     call_id: &'a str,
+    receipt: Option<Arc<ResultReceipt>>,
 ) -> RegistryFuture<'a, Option<Arc<dyn ToolReceipt>>> {
     Box::pin(async move {
         let resolver = Option::clone(&reg.parent_resolver.get());
@@ -102,18 +103,18 @@ pub(super) fn observe_completions<'a>(
             }
             (claimed, routed)
         });
-        let receipt = Arc::new(ResultReceipt {
-            carrier: Atom::new(Some(Arc::from(call_id))),
-        });
+        let observing_wait = receipt.is_some();
+        let receipt = receipt
+            .unwrap_or_else(|| Arc::new(ResultReceipt::new(WaitCall::direct(call_id), None)));
         let joined = reg.result_readers.read(|readers| {
             routed
                 .iter()
                 .filter_map(|key| readers.get(key))
-                .map(|readers| readers.update(|readers| readers.push(Arc::clone(&receipt))))
+                .map(|readers| readers.update(|readers| readers.push(Arc::clone(&receipt.reader))))
                 .count()
         });
         if claimed.is_empty() {
-            return (joined > 0).then_some(receipt as Arc<dyn ToolReceipt>);
+            return (joined > 0 || observing_wait).then_some(receipt as Arc<dyn ToolReceipt>);
         }
         let watched = claimed
             .into_iter()
@@ -124,7 +125,7 @@ pub(super) fn observe_completions<'a>(
             .read(|running| running.contains(root_session_id));
         for ((id, revision), events) in watched {
             let key = (root_session_id.to_owned(), id);
-            let readers: Readers = Arc::new(Atom::new(vec![Arc::clone(&receipt)]));
+            let readers: Readers = Arc::new(Atom::new(vec![Arc::clone(&receipt.reader)]));
             reg.result_readers.update(|all| {
                 all.insert(key.clone(), Arc::clone(&readers));
             });
@@ -132,7 +133,7 @@ pub(super) fn observe_completions<'a>(
             let parent = parent.downgrade();
             drop(platform::spawn(async move {
                 let outcome = if running {
-                    NoticeOutcome::of_tool_output(events, &readers).await
+                    NoticeOutcome::of_tool_output(events, &readers, false).await
                 } else {
                     NoticeOutcome::Undelivered
                 };
@@ -248,12 +249,7 @@ pub(super) fn dispatch_parent<'a>(
             .await
         {
             Ok(route) => {
-                reg.wait_reported.update(|reported| {
-                    reported.insert(
-                        (root_session_id.to_owned(), id),
-                        wait_mark(&status, revision),
-                    );
-                });
+                reg.report_notice(key.clone(), wait_mark(&status, revision));
                 reg.completion_routes.update(|routes| {
                     routes.insert(key.clone(), revision);
                 });
@@ -470,9 +466,7 @@ pub(super) fn route_completions<'a>(
             Ok(route) => {
                 for (id, revision, status, _, _) in &group {
                     let key = (root_session_id.to_owned(), *id);
-                    reg.wait_reported.update(|reported| {
-                        reported.insert(key.clone(), wait_mark(status, *revision));
-                    });
+                    reg.report_notice(key.clone(), wait_mark(status, *revision));
                     reg.completion_routes.update(|routes| {
                         routes.insert(key.clone(), *revision);
                     });

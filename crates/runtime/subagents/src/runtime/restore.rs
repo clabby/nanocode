@@ -718,13 +718,18 @@ pub(super) fn await_restored<'a>(
     })
 }
 
-fn remembered(id: AgentId, session: &ChildSession) -> Vec<((String, AgentId), u64)> {
+fn remembered(id: AgentId, session: &ChildSession) -> Vec<((String, AgentId), WaitReport)> {
     if !crate::sim::mutated(crate::sim::Mutation::RestoreRemembersWaits) {
         return Vec::new();
     }
     session
         .waited
         .iter()
-        .map(|waited| ((waited.session.clone(), id), waited.mark))
+        .map(|waited| {
+            (
+                (waited.session.clone(), id),
+                WaitReport::Wait(waited.mark, None),
+            )
+        })
         .collect()
 }
