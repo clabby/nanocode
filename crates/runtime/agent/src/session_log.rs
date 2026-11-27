@@ -1,14 +1,18 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 pub(crate) use nanocode_platform::unix_millis as now;
 use nanocode_sync::{
-    OnceCell, Stopped,
+    Atom,
     future::{Either, select},
-    mpsc, oneshot,
+    mpsc::{self, error::SendError},
+    oneshot,
 };
 use nanocode_tool_host::embedded::HostFuture;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
@@ -25,6 +29,32 @@ use crate::{
     turn_inbox::{Envelope, accepted_bytes},
     turn_log::{EventLog, Logged, Recording, TurnLog},
 };
+
+pub mod sim {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    pub enum Mutation {
+        None,
+        WriterNeverRespawned,
+        StagedDropped,
+        HeldAfterJob,
+        HeldUnwritten,
+        StartWriterKeepsStopped,
+    }
+
+    static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);
+
+    pub fn mutate(mutation: Mutation) {
+        MUTATION.store(mutation as u8, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn mutated(mutation: Mutation) -> bool {
+        MUTATION.load(Ordering::Relaxed) == mutation as u8
+    }
+}
 
 type Dialects = [&'static str; 2];
 
@@ -490,6 +520,7 @@ struct Writer {
     rows: HashMap<String, Row>,
     stale: bool,
     epoch: Option<u64>,
+    held: Arc<AtomicUsize>,
 }
 
 impl Writer {
@@ -1123,6 +1154,7 @@ impl<H: Sql + ?Sized> Log<H> {
                 durable: high,
                 holder,
                 epoch,
+                held: Arc::clone(&writer.held),
                 ..Writer::default()
             };
         }
@@ -1374,6 +1406,9 @@ impl<H: Sql + ?Sized> Log<H> {
         let epoch = writer
             .epoch
             .expect("a session log writes only at an epoch it claimed");
+        if !sim::mutated(sim::Mutation::HeldAfterJob) {
+            writer.held.store(all.len(), Ordering::Relaxed);
+        }
         let mut results = match self
             .execute(operation, &statements, &spill, Some(epoch))
             .await
@@ -2744,28 +2779,22 @@ type WriterJob = Box<dyn for<'a> FnOnce(&'a mut Writer) -> HostFuture<'a, ()> + 
 
 struct WriterTask {
     jobs: mpsc::UnboundedSender<WriterJob>,
+    held: Arc<AtomicUsize>,
 }
 
 impl WriterTask {
-    fn spawn() -> std::io::Result<Self> {
-        let (jobs, received) = mpsc::unbounded_channel();
-        #[cfg(not(target_family = "wasm"))]
-        nanocode_platform::Handle::try_current()
-            .map_err(std::io::Error::other)?
-            .spawn(Self::serve(received));
-        #[cfg(target_family = "wasm")]
-        nanocode_platform::spawn_local(Self::serve(received));
-        Ok(Self { jobs })
-    }
-
-    async fn serve(mut jobs: mpsc::UnboundedReceiver<WriterJob>) {
-        let mut writer = Writer::default();
+    async fn serve(mut jobs: mpsc::UnboundedReceiver<WriterJob>, held: Arc<AtomicUsize>) {
+        let mut writer = Writer {
+            held,
+            ..Writer::default()
+        };
         while let Some(job) = jobs.recv().await {
             job(&mut writer).await;
+            writer.held.store(writer.buffer.len(), Ordering::Relaxed);
         }
     }
 
-    async fn run<R, F>(&self, job: F) -> Result<R, Stopped>
+    fn job<R, F>(job: F) -> (WriterJob, oneshot::Receiver<R>)
     where
         R: Send + 'static,
         F: for<'a> FnOnce(&'a mut Writer) -> HostFuture<'a, R> + Send + 'static,
@@ -2789,14 +2818,13 @@ impl WriterTask {
                 }
             })
         });
-        self.jobs.send(job).map_err(|_| Stopped)?;
-        receiver.await.map_err(|_| Stopped)
+        (job, receiver)
     }
 }
 
 pub struct SessionLog<H: ?Sized> {
     log: Arc<Log<H>>,
-    writer: OnceCell<WriterTask>,
+    writer: Atom<Option<Arc<WriterTask>>>,
 }
 
 impl<H: Sql + ?Sized> SessionLog<H> {
@@ -2806,7 +2834,7 @@ impl<H: Sql + ?Sized> SessionLog<H> {
         migrated.assert_opens(COMPONENT, &MIGRATIONS);
         Self {
             log: Arc::new(Log::new(host, scope.into())),
-            writer: OnceCell::new(),
+            writer: Atom::new(None),
         }
     }
 
@@ -2871,23 +2899,100 @@ impl<H: Sql + ?Sized> SessionLog<H> {
 }
 
 impl<H: Sql + Send + Sync + ?Sized + 'static> SessionLog<H> {
+    fn writer(&self) -> Result<Arc<WriterTask>, StoreError> {
+        if let Some(writer) = &*self.writer.get() {
+            return Ok(Arc::clone(writer));
+        }
+        #[cfg(not(target_family = "wasm"))]
+        let runtime = nanocode_platform::Handle::try_current().map_err(|error| {
+            StoreError::Backend(format!("start the session log writer: {error}"))
+        })?;
+        let (jobs, received) = mpsc::unbounded_channel();
+        let started = Arc::new(WriterTask {
+            jobs,
+            held: Arc::default(),
+        });
+        let writer = self
+            .writer
+            .update(|writer| Arc::clone(writer.get_or_insert_with(|| Arc::clone(&started))));
+        if Arc::ptr_eq(&writer, &started) {
+            let serve = WriterTask::serve(received, Arc::clone(&started.held));
+            #[cfg(not(target_family = "wasm"))]
+            runtime.spawn(serve);
+            #[cfg(target_family = "wasm")]
+            nanocode_platform::spawn_local(serve);
+        }
+        Ok(writer)
+    }
+
+    fn retire(&self, writer: &Arc<WriterTask>) -> usize {
+        if !sim::mutated(sim::Mutation::WriterNeverRespawned) {
+            self.writer.update(|current| {
+                if current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, writer))
+                {
+                    *current = None;
+                }
+            });
+        }
+        let held = writer.held.swap(0, Ordering::Relaxed);
+        if sim::mutated(sim::Mutation::StagedDropped) {
+            return 0;
+        }
+        held
+    }
+
+    fn retire_unsent(&self, writer: &Arc<WriterTask>) -> Result<(), StoreError> {
+        match self.retire(writer) {
+            0 => Ok(()),
+            held if sim::mutated(sim::Mutation::HeldUnwritten) => {
+                Err(StoreError::NotCommitted(format!(
+                    "session log writer stopped with {held} staged events unwritten; they are dropped and this call did not run"
+                )))
+            }
+            held => Err(StoreError::NotCommitted(format!(
+                "this call did not run: the session log writer stopped holding {held} events whose outcome is unknown"
+            ))),
+        }
+    }
+
+    pub fn start_writer(&self) -> Result<(), StoreError> {
+        let writer = self.writer()?;
+        if writer.jobs.is_closed() && !sim::mutated(sim::Mutation::StartWriterKeepsStopped) {
+            self.retire_unsent(&writer)?;
+            self.writer()?;
+        }
+        Ok(())
+    }
+
     async fn write<R, F>(&self, job: F) -> Result<R, StoreError>
     where
         R: Send + 'static,
         F: for<'a> FnOnce(&'a Log<H>, &'a mut Writer) -> Logged<'a, R> + Send + 'static,
     {
-        let writer = self
-            .writer
-            .get_or_try_init(|| async { WriterTask::spawn() })
-            .await
-            .map_err(|error| {
-                StoreError::Backend(format!("start the session log writer: {error}"))
-            })?;
         let log = Arc::clone(&self.log);
-        writer
-            .run(move |writer| Box::pin(async move { job(&log, writer).await }))
-            .await
-            .map_err(|stopped| StoreError::Backend(format!("session log writer: {stopped}")))?
+        let (job, reply) =
+            WriterTask::job(move |writer| Box::pin(async move { job(&log, writer).await }));
+        let mut writer = self.writer()?;
+        if let Err(SendError(job)) = writer.jobs.send(job) {
+            self.retire_unsent(&writer)?;
+            writer = self.writer()?;
+            if writer.jobs.send(job).is_err() {
+                self.retire_unsent(&writer)?;
+                return Err(StoreError::NotCommitted(
+                    "session log writer stopped as it started; this call did not run".into(),
+                ));
+            }
+        }
+        reply.await.unwrap_or_else(|_| {
+            Err(StoreError::Backend(match self.retire(&writer) {
+                0 => "session log writer stopped during this call; its outcome is unknown".into(),
+                held => format!(
+                    "session log writer stopped during this call, holding {held} events whose outcome is unknown; this call's outcome is unknown too"
+                ),
+            }))
+        })
     }
 
     pub async fn stage(&self, entries: &[LogEntry]) -> Result<Vec<LoggedEvent>, StoreError> {

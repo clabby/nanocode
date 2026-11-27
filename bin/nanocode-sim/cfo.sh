@@ -395,6 +395,11 @@ default_table='
 8 slog pass --scenario slog
 2 slog_twice pass --scenario slog --twice
 1 canary_slog_append_skips_epoch canary:8 --scenario slog --mutation append_skips_epoch
+1 canary_slog_writer_never_respawned canary:8 --scenario slog --mutation writer_never_respawned
+1 canary_slog_staged_dropped canary:8 --scenario slog --mutation staged_dropped
+1 canary_slog_held_after_job canary:8 --scenario slog --mutation held_after_job
+1 canary_slog_held_unwritten canary:8 --scenario slog --mutation held_unwritten
+1 canary_slog_start_writer_keeps_stopped canary:8 --scenario slog --mutation start_writer_keeps_stopped
 8 append pass --scenario append
 2 append_twice pass --scenario append --twice
 1 canary_append_retry_skips_read_back canary:32 --scenario append --mutation retry_skips_read_back
