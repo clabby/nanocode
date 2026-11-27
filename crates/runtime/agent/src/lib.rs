@@ -32,7 +32,7 @@ pub use runtime::{
 pub use session_events::{EventSink, SessionEvent, SessionEvents};
 pub use session_log::{
     ImportedTurn, LogEntry, LogPage, LoggedEvent, Replaced, SessionLog, Started, Submission,
-    Submitted, TurnRecord, TurnRetry, TurnState, submission_digest,
+    Submitted, TurnRecord, TurnRetry, TurnState, sim as session_log_sim, submission_digest,
 };
 pub use thread_scope::{
     Done, FinishedFilter, Found, Job, KeptEvent, KeptFact, Lease, Legacy, Moved, Probe, Probes,
@@ -43,6 +43,6 @@ pub use thread_scope::{
 };
 pub use turn_inbox::{
     Attach, Delivery, Driven, Halt, InboxError, InboxHost, MovedQueued, Next, PassEnd, TurnInbox,
-    Wake,
+    Wake, sim as inbox_sim,
 };
-pub use turn_log::{EventLog, Recording, TurnLog, Verdict};
+pub use turn_log::{EventLog, Guarded, Recording, TurnLog, Verdict};

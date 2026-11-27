@@ -1,7 +1,13 @@
 use std::{cell::RefCell, sync::Arc, time::Duration};
 
-use nanocode_agent_core::AgentHandle;
+use nanocode::tool_contract::{Tool, ToolCollection, ToolContext, ToolInput};
+use nanocode_agent_core::{AgentHandle, events::AgentEventKind};
 use nanocode_board::{Board, NewTask, Op, Phase, TaskId};
+use nanocode_code_mode::{
+    CodeModeToolset, ToolOutput,
+    code_mode::{CodeModeObserver, CodeModeRuntime},
+    embedded::{HostFuture, OwnedToolContext},
+};
 use nanocode_dispatch::{Budgets, IntentState, Policy, Role};
 use nanocode_dispatcher::{BRIEF, Dispatcher, Pool};
 use nanocode_subagents::{
@@ -57,6 +63,10 @@ pub enum AgentsMutation {
     PoolRetireKeepsAgent,
     PoolForgetsIntent,
     WaitRepeatsIds,
+    WaitRepeatsUnread,
+    WaitIgnoresCarrierRelease,
+    WaitKeepsOriginTurn,
+    WaitForgetsDiscard,
     RestoreRemembersWaits,
     RouteSkipsClaim,
     ScopeJobsOverlap,
@@ -66,7 +76,7 @@ pub enum AgentsMutation {
 }
 
 impl AgentsMutation {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 19] = [
         Self::None,
         Self::CancelIgnored,
         Self::ShutdownHangs,
@@ -76,6 +86,10 @@ impl AgentsMutation {
         Self::PoolRetireKeepsAgent,
         Self::PoolForgetsIntent,
         Self::WaitRepeatsIds,
+        Self::WaitRepeatsUnread,
+        Self::WaitIgnoresCarrierRelease,
+        Self::WaitKeepsOriginTurn,
+        Self::WaitForgetsDiscard,
         Self::RestoreRemembersWaits,
         Self::RouteSkipsClaim,
         Self::ScopeJobsOverlap,
@@ -100,6 +114,10 @@ impl AgentsMutation {
             Self::BoardFailuresUnread => "board_failures_unread",
             Self::PoolRetireKeepsAgent => "pool_retire_keeps_agent",
             Self::PoolForgetsIntent => "pool_forgets_intent",
+            Self::WaitIgnoresCarrierRelease => "wait_ignores_carrier_release",
+            Self::WaitForgetsDiscard => "wait_forgets_discard",
+            Self::WaitKeepsOriginTurn => "wait_keeps_origin_turn",
+            Self::WaitRepeatsUnread => "wait_repeats_unread",
             Self::WaitRepeatsIds => "wait_repeats_ids",
             Self::RestoreRemembersWaits => "restore_remembers_waits",
             Self::RouteSkipsClaim => "route_skips_claim",
@@ -817,6 +835,271 @@ async fn steer_running(run: &Run) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WaitCarrier {
+    Direct,
+    Transferred,
+    Discarded,
+}
+
+async fn waits_once(ledger: &Arc<Ledger>, scenario: WaitCarrier) -> Result<(), String> {
+    let session = match scenario {
+        WaitCarrier::Direct => "wait-direct",
+        WaitCarrier::Transferred => "wait-transfer",
+        WaitCarrier::Discarded => "wait-discard",
+    };
+    let (registry, control, updates) = nanocode_subagents::channel(DEFAULT_MAX_SUBAGENTS);
+    let root = AgentHandle::new(
+        session,
+        simulated_model(),
+        Arc::new(ScriptedFactory::new(Arc::clone(ledger))),
+    );
+    let start = || nanocode_subagents::start_agent(&root, &registry, session, tasks(1).remove(0));
+    let first = start().await.map_err(shown)?.agent_id;
+    let poll = Duration::from_millis(STEP_LATENCY_MS_MIN);
+    loop {
+        let listed = registry
+            .directory(session, true, false)
+            .await
+            .map_err(shown)?;
+        if listed
+            .iter()
+            .any(|child| child.agent_id == first && !child.status.is_active())
+        {
+            break;
+        }
+        nanocode_platform::sleep(poll).await;
+    }
+    let second = start().await.map_err(shown)?.agent_id;
+    let (parent, events, publisher) = ledger.agent_with_publisher(session, simulated_model());
+    registry.await_restored_root(&parent, session).await;
+    publisher
+        .publish_next(AgentEventKind::RunStarted, raw_run("cell", None)?)
+        .map_err(shown)?;
+    registry.set_parent_resolver(Arc::new(move |root| {
+        (root == session).then(|| parent.clone())
+    }));
+    let ids = [first, second];
+    let bound = poll / 4;
+    nanocode_platform::sleep(bound).await;
+    let mut discard = None;
+    let carrier = if !matches!(scenario, WaitCarrier::Direct) {
+        let tools =
+            nanocode_subagents::install_tools(WaitTools::default(), root, Arc::clone(&registry))
+                .map_err(shown)?;
+        let tools = Arc::new(tools);
+        let turn = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let runtime = CodeModeRuntime::new_with_turn(Arc::clone(&turn));
+        let mut source = format!(
+            "// @exec: {{\"yield_time_ms\": {}}}\nconsole.log(await tools.wait_agent({}));",
+            bound.as_millis() / 4,
+            serde_json::json!({"agent_ids": ids, "timeout_ms": bound.as_millis()})
+        );
+        if matches!(scenario, WaitCarrier::Discarded) {
+            source.push_str("await tools.hold({});");
+        }
+        let context = OwnedToolContext::new("sim", session, "first", Arc::default(), 1000)
+            .with_turn_id(Some(Arc::from("cell")));
+        let yielded = runtime.execute(&source, tools.clone(), context).await;
+        if !yielded.cell.is_some_and(|cell| cell.running) {
+            return Err(format!(
+                "exec did not yield before wait_agent returned: {:?}",
+                yielded.output
+            ));
+        }
+        if matches!(scenario, WaitCarrier::Discarded) {
+            tools.gate.fire();
+            tools.holding.wait().await;
+        }
+        publisher
+            .publish_next(AgentEventKind::RunFailed, raw_run("cell", Some("failed"))?)
+            .map_err(shown)?;
+        runtime
+            .control()
+            .detach_turn(1, &mut |_| Box::new(QuietCellObserver))
+            .await;
+        turn.store(2, std::sync::atomic::Ordering::Release);
+        runtime.control().begin_turn();
+        publisher
+            .publish_next(AgentEventKind::RunStarted, raw_run("observer", None)?)
+            .map_err(shown)?;
+        tools.gate.fire();
+        if matches!(scenario, WaitCarrier::Discarded) {
+            discard = Some(runtime);
+        } else {
+            let context = ToolContext::new("sim", session, "observe", &[], 1000)
+                .with_turn_id(Some("observer"));
+            let observed = runtime
+                .wait(r#"{"cell_id":1,"yield_time_ms":50}"#, context)
+                .await;
+            if !observed.success || !observed.cell.is_some_and(|cell| !cell.running) {
+                return Err(format!(
+                    "the next turn did not collect the yielded cell: {:?}",
+                    observed.output
+                ));
+            }
+            if !observed.nested_calls.iter().any(|call| {
+                call.success
+                    && call.name == "wait_agent"
+                    && call.structured_result["timed_out"] == false
+                    && matches!(
+                        call.structured_result["agents"][0]["status"]["state"].as_str(),
+                        Some("completed" | "failed")
+                    )
+            }) {
+                return Err(format!(
+                    "the yielded cell did not report a terminal child: {:?}",
+                    observed.output
+                ));
+            }
+        }
+        "observer"
+    } else {
+        let (agents, delivered, timed_out, receipt) = registry
+            .wait(session, "first", &ids, bound)
+            .await
+            .map_err(shown)?;
+        if timed_out || delivered.contains(&first) || !agents[1].status.is_active() {
+            return Err(
+                "the first cell wait did not deliver the completed child while the other ran"
+                    .to_owned(),
+            );
+        }
+        let _receipt = receipt.ok_or("the first cell wait has no receipt")?;
+        "cell"
+    };
+    let started = nanocode_platform::now();
+    let (agents, delivered, timed_out, receipt) = registry
+        .wait(session, "repeat", &ids, bound)
+        .await
+        .map_err(shown)?;
+    if !timed_out
+        || nanocode_platform::elapsed(started) < bound
+        || !delivered.contains(&first)
+        || !agents[1].status.is_active()
+        || receipt.is_some()
+    {
+        return Err(format!(
+            "{scenario:?}: a repeated wait returned an unread child instead of timing out"
+        ));
+    }
+    if matches!(scenario, WaitCarrier::Transferred) {
+        for (kind, event) in [
+            (
+                AgentEventKind::ToolResult,
+                serde_json::json!({"call_id": "observe", "turn_id": carrier}),
+            ),
+            (
+                AgentEventKind::ModelCallStarted,
+                serde_json::json!({"call_index": 1, "turn_id": carrier}),
+            ),
+        ] {
+            publisher
+                .publish_next(
+                    kind,
+                    Arc::from(serde_json::value::to_raw_value(&event).map_err(shown)?),
+                )
+                .map_err(shown)?;
+        }
+    }
+    let started = nanocode_platform::now();
+    let wait = Box::pin(registry.wait(session, "after-cell", &ids, bound));
+    let timer = Box::pin(nanocode_platform::sleep(bound / 4));
+    let wait = match nanocode_sync::future::select(wait, timer).await {
+        nanocode_sync::future::Either::Left(_) => {
+            return Err("wait returned before the carrier ended".into());
+        }
+        nanocode_sync::future::Either::Right((_, wait)) => wait,
+    };
+    if let Some(runtime) = discard {
+        runtime.control().terminate_all(None).await;
+    } else {
+        let status = match scenario {
+            WaitCarrier::Direct => "failed",
+            _ => "cancelled",
+        };
+        publisher
+            .publish_next(AgentEventKind::RunFailed, raw_run(carrier, Some(status))?)
+            .map_err(shown)?;
+    }
+    let (agents, delivered, timed_out, _) = wait.await.map_err(shown)?;
+    if timed_out
+        || delivered.contains(&first)
+        || !agents[1].status.is_active()
+        || nanocode_platform::elapsed(started) >= bound
+    {
+        return Err(format!(
+            "{scenario:?}: a blocked wait did not return the unread result when its carrier ended"
+        ));
+    }
+    control.close_all(session).await.map_err(shown)?;
+    drop((registry, updates, events));
+    Ok(())
+}
+
+struct QuietCellObserver;
+
+impl CodeModeObserver for QuietCellObserver {
+    fn update(&mut self, _: nanocode_code_mode::code_mode::CodeModeUpdate<'_>) {}
+}
+
+#[derive(Default)]
+struct WaitTools {
+    inner: Vec<Arc<dyn Tool>>,
+    gate: nanocode_sync::Signal,
+    holding: nanocode_sync::Signal,
+}
+
+impl ToolCollection for WaitTools {
+    type Error = std::convert::Infallible;
+
+    fn add_shared_tool(mut self, tool: Arc<dyn Tool>) -> Result<Self, Self::Error> {
+        self.inner.push(tool);
+        Ok(self)
+    }
+}
+
+impl CodeModeToolset for WaitTools {
+    fn nested_tool_metadata(&self) -> Vec<Value> {
+        vec![
+            serde_json::json!({"kind": "function", "name": "wait_agent", "tool_name": "wait_agent"}),
+            serde_json::json!({"kind": "function", "name": "hold", "tool_name": "hold"}),
+        ]
+    }
+
+    fn execute_nested<'a>(
+        &'a self,
+        name: &'a str,
+        input: Value,
+        context: ToolContext<'a>,
+    ) -> HostFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            if name == "hold" {
+                self.holding.fire();
+                return std::future::pending().await;
+            }
+            self.gate.wait().await;
+            let tool = self
+                .inner
+                .iter()
+                .find(|tool| tool.definition().name() == name)
+                .unwrap();
+            tool.execute(
+                ToolInput::Function(serde_json::value::to_raw_value(&input).unwrap()),
+                context,
+            )
+            .await
+            .unwrap()
+        })
+    }
+}
+
+fn raw_run(turn: &str, status: Option<&str>) -> Result<Arc<serde_json::value::RawValue>, String> {
+    serde_json::value::to_raw_value(&serde_json::json!({"turn_id": turn, "status": status}))
+        .map(Arc::from)
+        .map_err(shown)
+}
+
 const REDELIVER_SESSION: &str = "redeliver";
 
 async fn handed_out(
@@ -1191,6 +1474,9 @@ async fn drive(shape: &Shape, ledger: &Arc<Ledger>, clock: &Arc<Clock>) -> Resul
     nanocode_platform::sleep(RUNTIME_STOP_TIMEOUT).await;
     judge(&run, shape, ledger, &retired, hosted).await?;
     drop(run.updates);
+    waits_once(ledger, WaitCarrier::Direct).await?;
+    waits_once(ledger, WaitCarrier::Transferred).await?;
+    waits_once(ledger, WaitCarrier::Discarded).await?;
     redelivered(shape, ledger).await?;
     ledger.trace("redelivered");
     routed_once(shape, ledger).await?;
@@ -1216,6 +1502,20 @@ pub fn simulate(seed: u64, mutation: AgentsMutation) -> AgentOutcome {
     }
     if mutation == AgentsMutation::WaitRepeatsIds {
         nanocode_subagents::sim::mutate(nanocode_subagents::sim::Mutation::WaitRepeatsIds);
+    }
+    if mutation == AgentsMutation::WaitRepeatsUnread {
+        nanocode_subagents::sim::mutate(nanocode_subagents::sim::Mutation::WaitRepeatsUnread);
+    }
+    if mutation == AgentsMutation::WaitIgnoresCarrierRelease {
+        nanocode_subagents::sim::mutate(
+            nanocode_subagents::sim::Mutation::WaitIgnoresCarrierRelease,
+        );
+    }
+    if mutation == AgentsMutation::WaitKeepsOriginTurn {
+        nanocode_subagents::sim::mutate(nanocode_subagents::sim::Mutation::WaitKeepsOriginTurn);
+    }
+    if mutation == AgentsMutation::WaitForgetsDiscard {
+        nanocode_subagents::sim::mutate(nanocode_subagents::sim::Mutation::WaitForgetsDiscard);
     }
     if mutation == AgentsMutation::RestoreRemembersWaits {
         nanocode_subagents::sim::mutate(nanocode_subagents::sim::Mutation::RestoreRemembersWaits);

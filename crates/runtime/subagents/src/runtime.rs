@@ -548,6 +548,11 @@ impl Sessions {
         ids
     }
 
+    fn active_direct_ids(&mut self) -> Vec<AgentId> {
+        self.refresh();
+        self.active_direct.iter().copied().collect()
+    }
+
     fn spawned_in(&mut self, contexts: &[&str]) -> Vec<AgentId> {
         self.refresh();
         let mut ids = self.spawning.iter().copied().collect::<HashSet<_>>();
@@ -779,7 +784,7 @@ pub struct Registry {
 
     deferred_work: Atom<nanocode_sync::Map<String, RestoredWork>>,
 
-    wait_reported: Atom<AgentMap<u64>>,
+    wait_reported: Atom<AgentMap<WaitReport>>,
 
     idle_waits: Atom<HashMap<String, (Vec<AgentId>, u32)>>,
 
@@ -1109,8 +1114,12 @@ impl NoticeOutcome {
         }
     }
 
-    async fn of_tool_output(mut events: AgentEvents, readers: &Readers) -> Self {
-        let mut carried = false;
+    async fn of_tool_output(
+        mut events: AgentEvents,
+        readers: &Readers,
+        watch_carrier: bool,
+    ) -> Self {
+        let mut carried = None;
         let mut carrying_call = None;
         while let Some(event) = events.recv().await {
             match event.kind {
@@ -1119,32 +1128,57 @@ impl NoticeOutcome {
                         continue;
                     };
                     if readers.read(|readers| {
-                        readers
-                            .iter()
-                            .any(|receipt| receipt.carries(&result.call_id))
+                        readers.iter().any(|reader| {
+                            reader.read(|carrier| {
+                                carrier.as_ref().is_some_and(|carrier| {
+                                    carrier.call_id.as_ref() == result.call_id
+                                        && carrier
+                                            .turn_id
+                                            .as_deref()
+                                            .is_none_or(|id| Some(id) == result.turn_id.as_deref())
+                                })
+                            })
+                        })
                     }) {
-                        carried = true;
+                        carried = Some(result.turn_id);
                         carrying_call = None;
                     }
                 }
-                AgentEventKind::ModelCallStarted if carried => {
-                    carrying_call = event
-                        .decode_payload::<ModelCall>()
-                        .ok()
-                        .map(|call| call.call_index);
+                AgentEventKind::ModelCallStarted => {
+                    if let Ok(call) = event.decode_payload::<ModelCall>()
+                        && carried.as_ref() == Some(&call.turn_id)
+                    {
+                        carrying_call = Some((call.call_index, call.turn_id));
+                    }
                 }
                 AgentEventKind::ModelCallCompleted if carrying_call.is_some() => {
                     if event
                         .decode_payload::<ModelCall>()
-                        .is_ok_and(|call| Some(call.call_index) == carrying_call)
+                        .is_ok_and(|call| Some((call.call_index, call.turn_id)) == carrying_call)
                     {
                         return Self::Read;
                     }
                 }
                 AgentEventKind::RunCompleted | AgentEventKind::RunFailed => {
-                    let cancelled = event
-                        .decode_payload::<RootRunEvent>()
-                        .is_ok_and(|run| run.status == Some(RunStatus::Cancelled));
+                    let run = event.decode_payload::<RootRunEvent>().ok();
+                    let turn_id = run.as_ref().and_then(|run| run.turn_id.as_deref());
+                    if watch_carrier
+                        && !readers.read(|readers| {
+                            readers.iter().any(|reader| {
+                                reader.read(|carrier| {
+                                    carrier.as_ref().is_some_and(|carrier| {
+                                        carrier
+                                            .turn_id
+                                            .as_deref()
+                                            .is_none_or(|id| Some(id) == turn_id)
+                                    })
+                                })
+                            })
+                        })
+                    {
+                        continue;
+                    }
+                    let cancelled = run.is_some_and(|run| run.status == Some(RunStatus::Cancelled));
                     return if cancelled {
                         Self::Cancelled
                     } else {
@@ -1159,10 +1193,41 @@ impl NoticeOutcome {
 }
 
 struct ResultReceipt {
-    carrier: Atom<Option<Arc<str>>>,
+    reader: ResultReader,
+    origin_turn: Option<Arc<str>>,
+    unread: Option<Arc<Signal>>,
 }
 
-type Readers = Arc<Atom<Vec<Arc<ResultReceipt>>>>;
+struct BoundResult {
+    call_id: Arc<str>,
+    turn_id: Option<Arc<str>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct WaitCall<'a> {
+    pub(super) call_id: &'a str,
+    pub(super) turn_id: Option<&'a str>,
+    pub(super) deferred: bool,
+}
+
+impl<'a> WaitCall<'a> {
+    fn direct(call_id: &'a str) -> Self {
+        Self {
+            call_id,
+            turn_id: None,
+            deferred: false,
+        }
+    }
+}
+
+struct WaitCarrier {
+    unread: Arc<Signal>,
+    receipt: Arc<ResultReceipt>,
+}
+
+type ResultReader = Arc<Atom<Option<BoundResult>>>;
+
+type Readers = Arc<Atom<Vec<ResultReader>>>;
 
 type Held = Vec<(AgentId, Option<u64>, Arc<AgentMarks>)>;
 
@@ -1175,26 +1240,60 @@ struct Told {
 }
 
 impl ResultReceipt {
-    fn carries(&self, call_id: &str) -> bool {
-        self.carrier
-            .read(|carrier| carrier.as_deref() == Some(call_id))
+    fn new(call: WaitCall<'_>, unread: Option<Arc<Signal>>) -> Self {
+        let origin_turn = call.turn_id.map(Arc::from);
+        Self {
+            reader: Arc::new(Atom::new((!call.deferred).then(|| BoundResult {
+                call_id: Arc::from(call.call_id),
+                turn_id: origin_turn.clone(),
+            }))),
+            origin_turn,
+            unread,
+        }
     }
 }
 
 impl ToolReceipt for ResultReceipt {
     fn carried_by(&self, call_id: Option<&str>) {
-        self.carrier.set(call_id.map(Arc::from));
+        self.reader.set(call_id.map(|call_id| BoundResult {
+            call_id: Arc::from(call_id),
+            turn_id: self.origin_turn.clone(),
+        }));
+    }
+
+    fn carried_by_in_turn(&self, call_id: &str, turn_id: Option<&str>) {
+        if crate::sim::mutated(crate::sim::Mutation::WaitKeepsOriginTurn) {
+            self.carried_by(Some(call_id));
+            return;
+        }
+        self.reader.set(Some(BoundResult {
+            call_id: Arc::from(call_id),
+            turn_id: turn_id.map(Arc::from),
+        }));
+    }
+}
+
+impl Drop for ResultReceipt {
+    fn drop(&mut self) {
+        if let Some(unread) = &self.unread
+            && self.reader.read(Option::is_none)
+            && !crate::sim::mutated(crate::sim::Mutation::WaitForgetsDiscard)
+        {
+            unread.fire();
+        }
     }
 }
 
 #[derive(serde::Deserialize)]
 struct ToolResultCall {
     call_id: String,
+    turn_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct ModelCall {
     call_index: u32,
+    turn_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -3293,6 +3392,43 @@ fn distinct(ids: &[AgentId]) -> Vec<AgentId> {
     }
     let mut seen = HashSet::with_capacity(ids.len());
     ids.iter().copied().filter(|id| seen.insert(*id)).collect()
+}
+
+#[derive(Clone)]
+enum WaitReport {
+    Notice(u64),
+    Wait(u64, Option<Arc<Signal>>),
+}
+
+impl WaitReport {
+    fn mark(&self) -> u64 {
+        match self {
+            Self::Notice(mark) | Self::Wait(mark, _) => *mark,
+        }
+    }
+
+    fn reported(&self, mark: u64, unread: bool, releases: &mut Vec<Arc<Signal>>) -> bool {
+        if self.mark() != mark {
+            return false;
+        }
+        if !unread {
+            return true;
+        }
+        if crate::sim::mutated(crate::sim::Mutation::WaitRepeatsUnread) {
+            return false;
+        }
+        match self {
+            Self::Notice(_) => false,
+            Self::Wait(_, None) => true,
+            Self::Wait(_, Some(signal)) => {
+                if signal.is_fired() {
+                    return false;
+                }
+                releases.push(Arc::clone(signal));
+                true
+            }
+        }
+    }
 }
 
 fn wait_mark(status: &AgentStatus, revision: u64) -> u64 {
@@ -7042,21 +7178,42 @@ impl Registry {
 
     async fn unpark_completions(&self, root_session_id: &str) {
         let root = root_session_id.to_owned();
-        let unparked = self
+        let (unparked, released) = self
             .state
             .call(move |state| {
                 let Some(scope) = state.scopes.get_mut(&root) else {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 };
+                let mut released = false;
+                if !crate::sim::mutated(crate::sim::Mutation::CancelHoldKept) {
+                    for id in scope.sessions.active_direct_ids() {
+                        let marked = scope
+                            .sessions
+                            .get(&id)
+                            .is_some_and(|session| session.cancelled_revision.is_some());
+                        if marked && let Some(session) = scope.sessions.get_mut(&id) {
+                            session.cancelled_revision = None;
+                            released = true;
+                        }
+                    }
+                }
                 let ids = scope.sessions.parked_ids();
-                ids.into_iter()
+                let unparked = ids
+                    .into_iter()
                     .filter_map(|id| {
                         let revision = scope.sessions.get_mut(&id)?.completion.unpark()?;
                         Some((id, revision))
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (unparked, released)
             })
             .await;
+        if released
+            && self.store_for(root_session_id).is_some()
+            && let Err(error) = self.persist_durably(root_session_id).await
+        {
+            nanocode_trace::warn!(%error, root_session_id, "released subagent lineage was not journaled");
+        }
         if unparked.is_empty() {
             return;
         }
@@ -7093,8 +7250,9 @@ impl Registry {
         root_session_id: &str,
         ids: &[AgentId],
         call_id: &str,
+        receipt: Option<Arc<ResultReceipt>>,
     ) -> Option<Arc<dyn ToolReceipt>> {
-        delivery::observe_completions(self, root_session_id, ids, call_id).await
+        delivery::observe_completions(self, root_session_id, ids, call_id, receipt).await
     }
 
     pub(crate) async fn observe_listed(
@@ -7115,7 +7273,7 @@ impl Registry {
             .iter()
             .map(|entry| entry.agent_id)
             .collect::<Vec<_>>();
-        self.observe_completions(&root, &ids, call_id).await
+        self.observe_completions(&root, &ids, call_id, None).await
     }
 
     async fn acknowledge_observed(&self, root_session_id: &str, ids: &[AgentId]) {
@@ -7770,7 +7928,18 @@ impl Registry {
         ids: &[AgentId],
         duration: Duration,
     ) -> std::io::Result<AgentWait> {
-        self.wait_inner(session_id, call_id, &distinct(ids), duration)
+        self.wait_in_turn(session_id, WaitCall::direct(call_id), ids, duration)
+            .await
+    }
+
+    pub(super) async fn wait_in_turn(
+        self: &Arc<Self>,
+        session_id: &str,
+        call: WaitCall<'_>,
+        ids: &[AgentId],
+        duration: Duration,
+    ) -> std::io::Result<AgentWait> {
+        self.wait_inner(session_id, call, &distinct(ids), duration)
             .instrument(nanocode_trace::info_span!(
                 "subagent.wait",
                 session.id = session_id,
@@ -7779,10 +7948,45 @@ impl Registry {
             .await
     }
 
+    fn report_notice(&self, key: (String, AgentId), mark: u64) {
+        self.wait_reported.update(|reported| {
+            if reported.get(&key).is_none_or(|entry| entry.mark() != mark) {
+                reported.insert(key.clone(), WaitReport::Notice(mark));
+            }
+        });
+    }
+
+    fn watch_wait_carrier(&self, root: &str, call: WaitCall<'_>) -> Option<WaitCarrier> {
+        if call.turn_id.is_none()
+            && !call.deferred
+            && !self.running_roots.read(|running| running.contains(root))
+        {
+            return None;
+        }
+        let resolver = Option::clone(&self.parent_resolver.get())?;
+        let parent = resolver(root)?;
+        let events = parent.subscribe();
+        let unread = Arc::new(Signal::new());
+        let observation = Arc::clone(&unread);
+        let receipt = Arc::new(ResultReceipt::new(call, Some(Arc::clone(&unread))));
+        let readers: Readers = Arc::new(Atom::new(vec![Arc::clone(&receipt.reader)]));
+        drop(platform::spawn(async move {
+            nanocode_sync::select! {
+                outcome = NoticeOutcome::of_tool_output(events, &readers, true) => {
+                    if !matches!(outcome, NoticeOutcome::Read) {
+                        observation.fire();
+                    }
+                },
+                () = observation.wait() => {}
+            }
+        }));
+        Some(WaitCarrier { unread, receipt })
+    }
+
     async fn wait_inner(
         self: &Arc<Self>,
         session_id: &str,
-        call_id: &str,
+        call: WaitCall<'_>,
         ids: &[AgentId],
         duration: Duration,
     ) -> std::io::Result<AgentWait> {
@@ -7814,6 +8018,7 @@ impl Registry {
         }
 
         let deadline = nanocode_platform::now().checked_add(duration);
+        let mut expired = false;
         loop {
             let session = session_id.to_owned();
             let wanted = ids.to_vec();
@@ -7865,37 +8070,63 @@ impl Registry {
             let all_terminal = terminal.len() == snapshot.len();
             let summaries = snapshot.into_iter().map(|(summary, _)| summary).collect();
 
-            let reported = |reported: &AgentMap<u64>| {
-                terminal.iter().all(|&(id, mark)| {
-                    !unread.contains(&id)
-                        && reported.get(&(session_id.to_owned(), id)) == Some(&mark)
-                })
-            };
-            let (fresh, delivered) = if self.wait_reported.read(reported) {
-                (false, terminal.iter().map(|&(id, _)| id).collect())
+            let already_reported =
+                |reported: &AgentMap<WaitReport>, id, mark, releases: &mut Vec<_>| {
+                    reported
+                        .get(&(session_id.to_owned(), id))
+                        .is_some_and(|entry| entry.reported(mark, unread.contains(&id), releases))
+                };
+            let mut releases = Vec::new();
+            let all_reported = self.wait_reported.read(|reported| {
+                terminal
+                    .iter()
+                    .all(|&(id, mark)| already_reported(reported, id, mark, &mut releases))
+            });
+            let (fresh, delivered, carrier) = if all_reported {
+                (false, terminal.iter().map(|&(id, _)| id).collect(), None)
             } else {
-                self.wait_reported.update(|reported| {
+                let carrier = (!unread.is_empty())
+                    .then(|| self.watch_wait_carrier(&root, call))
+                    .flatten();
+                let (fresh, delivered, observed) = self.wait_reported.update(|reported| {
+                    let mut observed = Vec::new();
                     let mut fresh = false;
                     let mut delivered = HashSet::new();
                     for &(id, mark) in &terminal {
-                        if reported.insert((session_id.to_owned(), id), mark) == Some(mark)
-                            && !unread.contains(&id)
-                        {
+                        if already_reported(reported, id, mark, &mut observed) {
                             delivered.insert(id);
                         } else {
+                            reported.insert(
+                                (session_id.to_owned(), id),
+                                WaitReport::Wait(
+                                    mark,
+                                    carrier.as_ref().map(|carrier| Arc::clone(&carrier.unread)),
+                                ),
+                            );
                             fresh = true;
                         }
                     }
-                    (fresh, delivered)
-                })
+                    (fresh, delivered, observed)
+                });
+                releases = observed;
+                (fresh, delivered, carrier)
             };
             if fresh {
                 self.forget_idle_wait(session_id);
-                self.record_waited(session_id, call_id, &terminal, &delivered)
+                self.record_waited(session_id, call.call_id, &terminal, &delivered)
                     .await;
                 let receipt = if root == session_id {
-                    let ids = terminal.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-                    self.observe_completions(&root, &ids, call_id).await
+                    let ids = terminal
+                        .iter()
+                        .filter_map(|(id, _)| (!delivered.contains(id)).then_some(*id))
+                        .collect::<Vec<_>>();
+                    self.observe_completions(
+                        &root,
+                        &ids,
+                        call.call_id,
+                        carrier.map(|carrier| carrier.receipt),
+                    )
+                    .await
                 } else {
                     None
                 };
@@ -7928,40 +8159,37 @@ impl Registry {
                 return Ok((summaries, delivered, false, None));
             }
             self.forget_idle_wait(session_id);
+            if expired {
+                return Ok((summaries, delivered, true, None));
+            }
+            if crate::sim::mutated(crate::sim::Mutation::WaitIgnoresCarrierRelease) {
+                releases.clear();
+            }
             let changed = async {
-                if changes.is_empty() {
+                let mut wakes: Vec<RegistryFuture<'_, ()>> = changes
+                    .iter_mut()
+                    .map(|changes| {
+                        Box::pin(async {
+                            let _ = changes.changed().await;
+                        }) as _
+                    })
+                    .collect();
+                wakes.extend(releases.iter().map(|release| Box::pin(release.wait()) as _));
+                if wakes.is_empty() {
                     return std::future::pending().await;
                 }
-                drop(
-                    nanocode_sync::future::select_all(
-                        changes
-                            .iter_mut()
-                            .map(|changes| Box::pin(changes.changed())),
-                    )
-                    .await,
-                );
+                drop(nanocode_sync::future::select_all(wakes).await);
             };
-            let timed_out = match deadline {
-                Some(deadline) => timeout_at(deadline, changed).await.is_err(),
+            expired = match deadline {
+                Some(deadline) => {
+                    timeout_at(deadline, changed).await.is_err()
+                        || nanocode_platform::now() >= deadline
+                }
                 None => {
                     changed.await;
                     false
                 }
             };
-            if timed_out {
-                let session = session_id.to_owned();
-                let wanted = ids.to_vec();
-                let mut summaries = self
-                    .state
-                    .call(move |state| state.summaries(&session, &wanted))
-                    .await?;
-                if let Some(board) = self.board_agents(&root).await? {
-                    for summary in &mut summaries {
-                        board_status(&board, summary.agent_id, &mut summary.status);
-                    }
-                }
-                return Ok((summaries, delivered, true, None));
-            }
         }
     }
 
@@ -8014,11 +8242,21 @@ impl Registry {
         call_id: &str,
         ids: &[AgentId],
     ) -> std::io::Result<Option<AgentWait>> {
+        self.rewait_in_turn(session_id, WaitCall::direct(call_id), ids)
+            .await
+    }
+
+    pub(super) async fn rewait_in_turn(
+        self: &Arc<Self>,
+        session_id: &str,
+        call: WaitCall<'_>,
+        ids: &[AgentId],
+    ) -> std::io::Result<Option<AgentWait>> {
         let ids = &distinct(ids);
         self.await_restored(session_id).await?;
         let _warm = self.warm(&self.root_of(session_id), ids.to_vec()).await?;
         let session = session_id.to_owned();
-        let call = call_id.to_owned();
+        let call_id = call.call_id.to_owned();
         let wanted = ids.to_vec();
         let (snapshot, root, answered) = self
             .state
@@ -8034,7 +8272,7 @@ impl Registry {
                                 && scope.sessions.get(&summary.agent_id).is_some_and(|child| {
                                     child.waited.iter().any(|waited| {
                                         waited.session == session
-                                            && waited.call == call
+                                            && waited.call == call_id
                                             && waited.mark == mark
                                     })
                                 })
@@ -8048,21 +8286,39 @@ impl Registry {
         if answered.is_empty() {
             return Ok(None);
         }
-        let delivered = self.wait_reported.read(|reported| {
-            snapshot
-                .iter()
-                .filter(|(summary, revision)| {
-                    !answered.contains(&summary.agent_id)
-                        && summary.status.is_wait_terminal()
-                        && reported.get(&(session_id.to_owned(), summary.agent_id))
-                            == Some(&wait_mark(&summary.status, *revision))
-                })
-                .map(|(summary, _)| summary.agent_id)
-                .collect::<HashSet<_>>()
+        let carrier = (root == session_id)
+            .then(|| self.watch_wait_carrier(&root, call))
+            .flatten();
+        let delivered = self.wait_reported.update(|reported| {
+            let mut delivered = HashSet::new();
+            for (summary, revision) in &snapshot {
+                if summary.status.is_wait_terminal() {
+                    let mark = wait_mark(&summary.status, *revision);
+                    let key = (session_id.to_owned(), summary.agent_id);
+                    if answered.contains(&summary.agent_id) {
+                        reported.insert(
+                            key,
+                            WaitReport::Wait(
+                                mark,
+                                carrier.as_ref().map(|carrier| Arc::clone(&carrier.unread)),
+                            ),
+                        );
+                    } else if reported.get(&key).is_some_and(|entry| entry.mark() == mark) {
+                        delivered.insert(summary.agent_id);
+                    }
+                }
+            }
+            delivered
         });
         let summaries = snapshot.into_iter().map(|(summary, _)| summary).collect();
         let receipt = if root == session_id {
-            self.observe_completions(&root, &answered, call_id).await
+            self.observe_completions(
+                &root,
+                &answered,
+                call.call_id,
+                carrier.map(|carrier| carrier.receipt),
+            )
+            .await
         } else {
             None
         };

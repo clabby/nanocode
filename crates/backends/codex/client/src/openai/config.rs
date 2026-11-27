@@ -128,7 +128,7 @@ pub struct ModelConfig {
 
 const SKILLS_SECTION_HEADING: &str = "# Using skills";
 const SKILL_CATALOG_HEADING: &str = "### Available skills";
-const UNSERVED_SECTION_HEADINGS: [&str; 2] = ["# Apps (Connectors)", "# Plugins"];
+const UNSERVED_SECTION_HEADINGS: [&str; 1] = ["# Plugins and Apps"];
 const HEADLESS_SECTION_HEADINGS: [&str; 4] = [
     "# When to ask the user for permission",
     "# Personality",
@@ -301,7 +301,12 @@ impl ModelConfig {
         if self.system_prompt.is_some() || !self.codesign {
             return base;
         }
-        let mut dropped: Vec<&str> = UNSERVED_SECTION_HEADINGS.to_vec();
+        let mut dropped: Vec<&str> =
+            if crate::sim::mutated(crate::sim::Mutation::UnservedSectionsKept) {
+                Vec::new()
+            } else {
+                UNSERVED_SECTION_HEADINGS.to_vec()
+            };
         if !self
             .additional_instructions
             .as_deref()

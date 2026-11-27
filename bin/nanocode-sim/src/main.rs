@@ -136,7 +136,7 @@ use crate::{
     httpd::WireMutation,
     httpserver::{HttpServerMutation, HttpServerStats},
     imports::{ImportsMutation, ImportsStats},
-    inboxstress::InboxStressStats,
+    inboxstress::{InboxStressMutation, InboxStressStats},
     heldawait::{HeldAwaitMutation, HeldAwaitStats},
     interpdrop::{InterpDropMutation, InterpDropStats},
     lease::{LeaseMutation, LeaseStats},
@@ -151,7 +151,7 @@ use crate::{
     pgpool::{PgPoolMutation, PgPoolStats},
     plog::{PlogMutation, PlogStats},
     repocache::{RepoCacheMutation, RepoCacheStats},
-    requestclose::RequestCloseStats,
+    requestclose::{RequestCloseMutation, RequestCloseStats},
     scale::{ScaleConfig, ScaleLoad, ScaleMutation, ScaleStats},
     secrets::{SecretsMutation, SecretsStats},
     simulate::{Options, run_seed},
@@ -267,6 +267,7 @@ struct Args {
     cell_calls: CellCallsMutation,
     live: LiveMutation,
     long_thread: LongThreadMutation,
+    request_close: RequestCloseMutation,
     tasks: TasksMutation,
     board: BoardMutation,
     controlplane: ControlplaneMutation,
@@ -285,6 +286,7 @@ struct Args {
     board_steer: BoardSteerMutation,
     steer_carry: CarryMutation,
     antigravity_durable: AntigravityMutation,
+    inbox_stress: InboxStressMutation,
     board_brief: BoardBriefMutation,
     workspace_fs: WorkspaceFsMutation,
     repo_cache: RepoCacheMutation,
@@ -336,6 +338,7 @@ fn usage() -> ExitCode {
        cell_calls: [--mutation {}]
        live: [--mutation {}] [--trace-dir DIR]
        long_thread: [--mutation {}]
+       request_close: [--mutation {}]
        capture: [--mutation skip_trim|drop_chunk|skip_redact|redact_then_trim]
        executor: [--mutation {}]
        dns: [--mutation cut_answer|drop_search]
@@ -390,6 +393,7 @@ fn usage() -> ExitCode {
         CellCallsMutation::names(),
         LiveMutation::names(),
         LongThreadMutation::names(),
+        requestclose::names(),
         TasksMutation::names(),
         BoardMutation::names(),
         CostMutation::names(),
@@ -484,6 +488,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut cell_calls = CellCallsMutation::None;
     let mut live = LiveMutation::None;
     let mut long_thread = LongThreadMutation::None;
+    let mut request_close = RequestCloseMutation::None;
     let mut tasks = TasksMutation::None;
     let mut board = BoardMutation::None;
     let mut controlplane = ControlplaneMutation::None;
@@ -502,6 +507,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut board_steer = BoardSteerMutation::None;
     let mut steer_carry = CarryMutation::None;
     let mut antigravity_durable = AntigravityMutation::None;
+    let mut inbox_stress = InboxStressMutation::None;
     let mut board_brief = BoardBriefMutation::None;
     let mut workspace_fs = WorkspaceFsMutation::None;
     let mut repo_cache = RepoCacheMutation::None;
@@ -686,12 +692,14 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::Live, Some(name)) => live = LiveMutation::parse(name)?,
         (Scenario::LongThread, Some(name)) => long_thread = LongThreadMutation::parse(name)?,
         (Scenario::Executor, Some(name)) => tasks = TasksMutation::parse(name)?,
-        (Scenario::RequestClose, Some(_)) => return None,
+        (Scenario::RequestClose, Some(name)) => {
+            request_close = RequestCloseMutation::parse(name)?;
+        }
         (Scenario::SteerCarry, Some(name)) => steer_carry = CarryMutation::parse(name)?,
         (Scenario::AntigravityDurable, Some(name)) => {
             antigravity_durable = AntigravityMutation::parse(name)?;
         }
-        (Scenario::InboxStress, Some(_)) => return None,
+        (Scenario::InboxStress, Some(name)) => inbox_stress = InboxStressMutation::parse(name)?,
         (Scenario::Board, Some(name)) => board = BoardMutation::parse(name)?,
         (Scenario::Controlplane, Some(name)) => {
             controlplane = ControlplaneMutation::parse(name)?;
@@ -795,6 +803,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         cell_calls,
         live,
         long_thread,
+        request_close,
         tasks,
         board,
         controlplane,
@@ -813,6 +822,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         board_steer,
         steer_carry,
         antigravity_durable,
+        inbox_stress,
         board_brief,
         workspace_fs,
         repo_cache,
@@ -897,7 +907,7 @@ fn scenario_replay(seed: u64, args: &Args) -> String {
         return longthread::replay(seed, args.long_thread);
     }
     if args.scenario == Scenario::RequestClose {
-        return requestclose::replay(seed);
+        return requestclose::replay(seed, args.request_close);
     }
     if args.scenario == Scenario::SteerCarry {
         return steercarry::replay(seed, args.steer_carry);
@@ -906,7 +916,7 @@ fn scenario_replay(seed: u64, args: &Args) -> String {
         return antigravitydurable::replay(seed, args.antigravity_durable);
     }
     if args.scenario == Scenario::InboxStress {
-        return inboxstress::replay(seed);
+        return inboxstress::replay(seed, args.inbox_stress);
     }
     if args.scenario == Scenario::Agents {
         let mut command = format!("nanocode-sim --scenario agents --seed {seed}");
@@ -1375,6 +1385,7 @@ fn mutations() -> ExitCode {
     add("cell_calls", CellCallsMutation::names());
     add("live", LiveMutation::names());
     add("long_thread", LongThreadMutation::names());
+    add("request_close", requestclose::names());
     add("executor", TasksMutation::names());
     add("board", BoardMutation::names());
     add("controlplane", ControlplaneMutation::names());
@@ -1393,6 +1404,7 @@ fn mutations() -> ExitCode {
     add("board_steer", BoardSteerMutation::names());
     add("steer_carry", CarryMutation::names());
     add("antigravity_durable", AntigravityMutation::names());
+    add("inbox_stress", InboxStressMutation::names());
     add("board_brief", BoardBriefMutation::names());
     add("workspace_fs", WorkspaceFsMutation::names());
     add("repo_cache", RepoCacheMutation::names());
@@ -1659,6 +1671,7 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
         ),
         Scenario::RequestClose => requestclose::judge(
             seed,
+            args.request_close,
             args.twice,
             args.options.verbose,
             &mut totals.request_close_totals,
@@ -1679,6 +1692,7 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
         ),
         Scenario::InboxStress => inboxstress::judge(
             seed,
+            args.inbox_stress,
             args.twice,
             args.options.verbose,
             &mut totals.inbox_stress_totals,
@@ -2149,6 +2163,8 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::CellCalls && args.cell_calls != CellCallsMutation::None)
         || (args.scenario == Scenario::Live && args.live != LiveMutation::None)
         || (args.scenario == Scenario::LongThread && args.long_thread != LongThreadMutation::None)
+        || (args.scenario == Scenario::RequestClose
+            && args.request_close != RequestCloseMutation::None)
         || (args.scenario == Scenario::Executor && args.tasks != TasksMutation::None)
         || (args.scenario == Scenario::Board && args.board != BoardMutation::None)
         || (args.scenario == Scenario::Controlplane
@@ -2175,6 +2191,8 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::SteerCarry && args.steer_carry != CarryMutation::None)
         || (args.scenario == Scenario::AntigravityDurable
             && args.antigravity_durable != AntigravityMutation::None)
+        || (args.scenario == Scenario::InboxStress
+            && args.inbox_stress != InboxStressMutation::None)
         || (args.scenario == Scenario::BoardBrief && args.board_brief != BoardBriefMutation::None)
         || (args.scenario == Scenario::WorkspaceFs
             && args.workspace_fs != WorkspaceFsMutation::None)
@@ -2387,6 +2405,7 @@ fn main() -> ExitCode {
             passed,
             failed,
             args.twice,
+            args.request_close,
             &request_close_totals,
         );
     }
@@ -2416,6 +2435,7 @@ fn main() -> ExitCode {
             passed,
             failed,
             args.twice,
+            args.inbox_stress,
             &inbox_stress_totals,
         );
     }
