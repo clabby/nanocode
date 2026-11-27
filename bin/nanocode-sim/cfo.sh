@@ -362,6 +362,8 @@ default_table='
 1 canary_cell_calls_admission_held canary:8 --scenario cell_calls --mutation admission_held
 1 canary_cell_calls_admits_stale canary:8 --scenario cell_calls --mutation admits_stale
 1 canary_cell_calls_observer_save_held canary:8 --scenario cell_calls --mutation observer_save_held
+1 canary_cell_calls_nested_ends_first canary:8 --scenario cell_calls --mutation nested_ends_first
+1 canary_cell_calls_nested_starts_first canary:8 --scenario cell_calls --mutation nested_starts_first
 4 nested_meta pass --scenario nested_meta
 1 nested_meta_twice pass --scenario nested_meta --twice
 1 canary_nested_meta_forgets_written canary:8 --scenario nested_meta --mutation forgets_written

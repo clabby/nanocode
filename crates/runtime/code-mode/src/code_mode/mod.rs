@@ -1393,24 +1393,41 @@ fn finish_cell_span(
     span.record("nested.max_concurrent", max_concurrent);
 }
 
-fn nested_overlap(calls: &[NestedToolCall]) -> (u64, u64) {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NestedEdge {
+    End,
+    Start,
+    InstantEnd,
+}
+
+impl NestedEdge {
+    fn end(started_at: u64, ended_at: u64) -> Self {
+        if crate::sim::mutated(crate::sim::Mutation::NestedEndsFirst) {
+            return Self::End;
+        }
+        if ended_at == started_at || crate::sim::mutated(crate::sim::Mutation::NestedStartsFirst) {
+            return Self::InstantEnd;
+        }
+        Self::End
+    }
+}
+
+pub(crate) fn nested_overlap(calls: &[NestedToolCall]) -> (u64, u64) {
     let mut edges = calls
         .iter()
         .flat_map(|call| {
+            let ended_at = call.started_after_ns.saturating_add(call.duration_ns);
             [
-                (call.started_after_ns, true),
-                (
-                    call.started_after_ns.saturating_add(call.duration_ns),
-                    false,
-                ),
+                (call.started_after_ns, NestedEdge::Start),
+                (ended_at, NestedEdge::end(call.started_after_ns, ended_at)),
             ]
         })
         .collect::<Vec<_>>();
     edges.sort_unstable();
     let (mut running, mut max_concurrent, mut busy_ns, mut busy_since) =
         (0_u64, 0_u64, 0_u64, 0_u64);
-    for (at, starts) in edges {
-        if starts {
+    for (at, edge) in edges {
+        if edge == NestedEdge::Start {
             if running == 0 {
                 busy_since = at;
             }

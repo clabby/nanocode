@@ -10,6 +10,8 @@ pub enum Mutation {
     AdmissionHeld,
     AdmitsStale,
     ObserverSaveHeld,
+    NestedEndsFirst,
+    NestedStartsFirst,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);
@@ -22,6 +24,11 @@ pub fn mutate(mutation: Mutation) {
 
 pub fn mutated(mutation: Mutation) -> bool {
     MUTATION.load(Ordering::Relaxed) == mutation as u8
+}
+
+#[cfg(any(not(target_family = "wasm"), feature = "local-cells"))]
+pub fn nested_overlap(calls: &[crate::embedded::NestedToolCall]) -> (u64, u64) {
+    crate::code_mode::nested_overlap(calls)
 }
 
 pub fn hold_admission() -> bool {

@@ -10,10 +10,10 @@ use std::{
 };
 
 use nanocode_code_mode::{
-    CodeModeToolset, ToolContext, ToolOutput,
+    CodeModeToolset, ToolContext, ToolOutput, ToolOutputBody,
     code_mode::{CellJournalSink, CellJournalUpdate, CellJournals, CodeModeRuntime},
-    embedded::{HostFuture, OwnedToolContext},
-    sim::{Mutation as CodeModeMutation, mutate as mutate_code_mode},
+    embedded::{HostFuture, NestedToolCall, OwnedToolContext},
+    sim::{Mutation as CodeModeMutation, mutate as mutate_code_mode, nested_overlap},
 };
 use nanocode_code_mode_engine::{CellTools, EmbeddedHost, Interrupt, RuntimeEvent};
 use nanocode_sync::watch;
@@ -31,6 +31,9 @@ const BATCH_MAX: u64 = 500;
 const PAD_MAX: u64 = 64;
 const OBSERVER_YIELD_MS: u64 = 10;
 const OBSERVER_SPINS_MAX: u64 = 100_000;
+const OVERLAP_CALLS_MAX: u64 = 8;
+const OVERLAP_TICKS: u64 = 8;
+const OVERLAP_TICK_NS: u64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellCallsMutation {
@@ -40,16 +43,20 @@ pub enum CellCallsMutation {
     AdmissionHeld,
     AdmitsStale,
     ObserverSaveHeld,
+    NestedEndsFirst,
+    NestedStartsFirst,
 }
 
 impl CellCallsMutation {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::None,
         Self::CrossResults,
         Self::RootRecoveryUnbound,
         Self::AdmissionHeld,
         Self::AdmitsStale,
         Self::ObserverSaveHeld,
+        Self::NestedEndsFirst,
+        Self::NestedStartsFirst,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -66,6 +73,8 @@ impl CellCallsMutation {
             Self::AdmissionHeld => "admission_held",
             Self::AdmitsStale => "admits_stale",
             Self::ObserverSaveHeld => "observer_save_held",
+            Self::NestedEndsFirst => "nested_ends_first",
+            Self::NestedStartsFirst => "nested_starts_first",
         }
     }
 
@@ -262,6 +271,8 @@ const fn code_mode_mutation(mutation: CellCallsMutation) -> CodeModeMutation {
         CellCallsMutation::AdmissionHeld => CodeModeMutation::AdmissionHeld,
         CellCallsMutation::AdmitsStale => CodeModeMutation::AdmitsStale,
         CellCallsMutation::ObserverSaveHeld => CodeModeMutation::ObserverSaveHeld,
+        CellCallsMutation::NestedEndsFirst => CodeModeMutation::NestedEndsFirst,
+        CellCallsMutation::NestedStartsFirst => CodeModeMutation::NestedStartsFirst,
         _ => CodeModeMutation::None,
     }
 }
@@ -385,6 +396,62 @@ fn observer_save(seed: u64, mutation: CellCallsMutation, clock: &Clock) -> Resul
     Ok(())
 }
 
+fn nested_call(start: u64, ticks: u64) -> NestedToolCall {
+    NestedToolCall {
+        call_id: String::new(),
+        name: "t".to_owned(),
+        input: Value::Null,
+        output: ToolOutputBody::Text(String::new()),
+        structured_result: Value::Null,
+        success: true,
+        started_after_ns: start * OVERLAP_TICK_NS,
+        duration_ns: ticks * OVERLAP_TICK_NS,
+        metadata: None,
+    }
+}
+
+fn nested_concurrency(seed: u64, mutation: CellCallsMutation) -> Result<(), String> {
+    mutate_code_mode(code_mode_mutation(mutation));
+    let mut rng = Rng::derive(seed, "cell_calls nested overlap");
+    let count = rng.range(1, OVERLAP_CALLS_MAX);
+    let spans: Vec<(u64, u64)> = (0..count)
+        .map(|_| (rng.below(OVERLAP_TICKS), rng.below(OVERLAP_TICKS / 2)))
+        .collect();
+    let calls: Vec<NestedToolCall> = spans
+        .iter()
+        .map(|&(start, ticks)| nested_call(start, ticks))
+        .collect();
+    let running_at = |tick: u64| {
+        spans
+            .iter()
+            .filter(|&&(start, ticks)| start <= tick && tick < start + ticks.max(1))
+            .count()
+    };
+    let max_concurrent = spans
+        .iter()
+        .map(|&(start, _)| running_at(start))
+        .max()
+        .expect("a nested overlap check has at least one call");
+    let busy_ticks = (0..OVERLAP_TICKS * 2)
+        .filter(|&tick| {
+            spans
+                .iter()
+                .any(|&(start, ticks)| start <= tick && tick < start + ticks)
+        })
+        .count();
+    let expected = (
+        u64::try_from(busy_ticks).expect("a tick count fits in u64") * OVERLAP_TICK_NS,
+        u64::try_from(max_concurrent).expect("a call count fits in u64"),
+    );
+    let measured = nested_overlap(&calls);
+    if measured != expected {
+        return Err(format!(
+            "nested_overlap: calls (start, ticks) {spans:?} measured (busy_ns, max_concurrent) {measured:?}, expected {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn admission(seed: u64, mutation: CellCallsMutation) -> Result<(), String> {
     mutate_code_mode(code_mode_mutation(mutation));
     let session = format!("cell-admission-{seed}");
@@ -463,12 +530,14 @@ fn simulate(seed: u64, mutation: CellCallsMutation) -> CellCallsOutcome {
         let clock = Clock::new();
         crate::host::entered(seed, &clock, || observer_save(seed, mutation, &clock))
     };
+    let overlapped = nested_concurrency(seed, mutation);
     crate::host::enter(seed, &Clock::new());
     let mut host = EmbeddedHost::spawn().expect("the embedded host starts");
     let mut digest = fnv(FNV_OFFSET, shape.as_bytes());
 
     let wrong = admitted
         .and_then(|()| observed)
+        .and_then(|()| overlapped)
         .and_then(|()| root_recovery(seed, mutation))
         .and_then(|()| {
             host.start_cell(
