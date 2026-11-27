@@ -104,11 +104,17 @@ impl AntigravityHarness {
     }
 }
 
-pub const fn level(thinking: Thinking) -> Option<&'static str> {
+pub fn level(model: &ModelSelection, thinking: Thinking) -> Option<&'static str> {
     match thinking {
         Thinking::None => Some("MINIMAL"),
         Thinking::Low => Some("LOW"),
         Thinking::Medium => Some("MEDIUM"),
+        Thinking::Xhigh
+            if model.supports_thinking(Thinking::Xhigh)
+                && !crate::sim::mutated(crate::sim::Mutation::XhighAsHigh) =>
+        {
+            Some("XHIGH")
+        }
         _ => Some("HIGH"),
     }
 }
@@ -137,7 +143,7 @@ impl RuntimeBackend for AntigravityHarness {
     }
 
     fn default_thinking(&self) -> Option<Thinking> {
-        Some(Thinking::High)
+        crate::sim::mutated(crate::sim::Mutation::HarnessDefaultsHigh).then_some(Thinking::High)
     }
 
     fn validate_model(&self, model: &str) -> Result<()> {
@@ -303,7 +309,7 @@ impl AntigravityHarness {
                 })
             })
             .unwrap_or_else(|| Lineage::root(session.clone()));
-        let profile = Profile::for_model(model.as_str()).with_level(level(thinking));
+        let profile = Profile::for_model(model.as_str()).with_level(level(&model, thinking));
         let root = spec.parent.as_ref().map_or_else(
             || session.clone(),
             |parent| parent.root_session_id().to_owned(),

@@ -22,6 +22,7 @@ nanocode-bytes.workspace = true
 nanocode-io.workspace = true
 nanocode = { path = "../../crates/nanocode", default-features = false, features = ["local-cells"] }
 nanocode-agent-core.workspace = true
+nanocode-agent-types.workspace = true
 nanocode-backend-antigravity.workspace = true
 nanocode-backend-codex.workspace = true
 nanocode-code-mode.workspace = true

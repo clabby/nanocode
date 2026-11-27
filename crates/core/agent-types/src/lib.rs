@@ -1,6 +1,7 @@
 pub mod error;
 pub mod harness;
 pub mod pricing;
+pub mod sim;
 pub mod usage;
 
 pub use error::{

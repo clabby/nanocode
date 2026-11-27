@@ -77,6 +77,7 @@ impl Profile {
                 let label = match level {
                     "LOW" | "MINIMAL" => "Low",
                     "MEDIUM" => "Medium",
+                    "XHIGH" => "Extra High",
                     _ => "High",
                 };
                 self.display = format!("Gemini 4 Neon ({label})");
