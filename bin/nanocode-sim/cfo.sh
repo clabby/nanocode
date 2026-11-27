@@ -260,11 +260,32 @@ default_table='
 1 canary_steer_carry_codex_fact_dropped canary:20 --scenario steer_carry --mutation codex_fact_dropped
 1 canary_steer_carry_gate_dropped canary:8 --scenario steer_carry --mutation carry_gate_dropped
 1 canary_steer_waits_round canary:8 --scenario steer_carry --mutation steer_waits_round
+4 request_close pass --scenario request_close
+2 request_close_twice pass --scenario request_close --twice
+1 canary_request_close_owned_request_held canary:8 --scenario request_close --mutation owned_request_held
+1 canary_request_close_owned_cancel_closes canary:8 --scenario request_close --mutation owned_cancel_closes
+1 canary_request_close_cancel_hold_kept canary:8 --scenario request_close --mutation subagents_cancel_hold_kept
 4 antigravity_durable pass --scenario antigravity_durable
 2 antigravity_durable_twice pass --scenario antigravity_durable --twice
 1 canary_antigravity_moved_forgets_results canary:8 --scenario antigravity_durable --mutation antigravity_moved_forgets_results
+1 canary_antigravity_revision_missing canary:8 --scenario antigravity_durable --mutation antigravity_revision_missing
+1 canary_antigravity_host_context_missing canary:8 --scenario antigravity_durable --mutation antigravity_host_context_missing
+1 canary_antigravity_steer_revision_ignored canary:8 --scenario antigravity_durable --mutation antigravity_steer_revision_ignored
+1 canary_antigravity_revision_forgotten canary:8 --scenario antigravity_durable --mutation antigravity_revision_forgotten
+1 canary_antigravity_origin_missing canary:8 --scenario antigravity_durable --mutation antigravity_origin_missing
+1 canary_antigravity_compaction_origin_missing canary:8 --scenario antigravity_durable --mutation antigravity_compaction_origin_missing
 1 canary_antigravity_replay_reruns canary:8 --scenario antigravity_durable --mutation antigravity_replay_reruns
+1 canary_antigravity_xhigh_as_high canary:8 --scenario antigravity_durable --mutation antigravity_xhigh_as_high
+1 canary_antigravity_harness_defaults_high canary:8 --scenario antigravity_durable --mutation antigravity_harness_defaults_high
+1 canary_antigravity_gemini4_offers_none canary:8 --scenario antigravity_durable --mutation antigravity_gemini4_offers_none
+1 canary_antigravity_gemini4_defaults_high canary:8 --scenario antigravity_durable --mutation antigravity_gemini4_defaults_high
 1 canary_antigravity_fact_sync_skipped canary:8 --scenario antigravity_durable --mutation antigravity_fact_sync_skipped
+4 inbox_stress pass --scenario inbox_stress
+2 inbox_stress_twice pass --scenario inbox_stress --twice
+1 canary_inbox_stress_cancel_skips_steer_guard canary:8 --scenario inbox_stress --mutation cancel_skips_steer_guard
+1 canary_inbox_stress_edit_skips_steer_guard canary:8 --scenario inbox_stress --mutation edit_skips_steer_guard
+1 canary_inbox_stress_move_uses_unreserved_prompt canary:8 --scenario inbox_stress --mutation move_uses_unreserved_prompt
+1 canary_inbox_stress_edit_retry_skips_receipt canary:8 --scenario inbox_stress --mutation edit_retry_skips_receipt
 8 board_brief pass --scenario board_brief
 2 board_brief_twice pass --scenario board_brief --twice
 1 canary_board_brief_over_budget canary:40 --scenario board_brief --mutation brief_over_budget
@@ -328,6 +349,10 @@ default_table='
 1 canary_agents_pool_retire_keeps_agent canary:40 --scenario agents --mutation pool_retire_keeps_agent
 1 canary_agents_pool_forgets_intent canary:40 --scenario agents --mutation pool_forgets_intent
 1 canary_agents_wait_repeats_ids canary:40 --scenario agents --mutation wait_repeats_ids
+1 canary_agents_wait_repeats_unread canary:40 --scenario agents --mutation wait_repeats_unread
+1 canary_agents_wait_ignores_carrier_release canary:40 --scenario agents --mutation wait_ignores_carrier_release
+1 canary_agents_wait_keeps_origin_turn canary:40 --scenario agents --mutation wait_keeps_origin_turn
+1 canary_agents_wait_forgets_discard canary:40 --scenario agents --mutation wait_forgets_discard
 1 canary_agents_restore_remembers_waits canary:40 --scenario agents --mutation restore_remembers_waits
 1 canary_agents_route_skips_claim canary:40 --scenario agents --mutation route_skips_claim
 1 canary_agents_scope_jobs_overlap canary:40 --scenario agents --mutation scope_jobs_overlap
@@ -370,6 +395,7 @@ default_table='
 1 canary_nested_meta_written_on_failure canary:8 --scenario nested_meta --mutation written_on_failure
 1 canary_nested_meta_catalog_keeps_escalation canary:8 --scenario nested_meta --mutation catalog_keeps_escalation
 1 canary_nested_meta_call_keeps_escalation canary:8 --scenario nested_meta --mutation call_keeps_escalation
+1 canary_nested_meta_unserved_sections_kept canary:8 --scenario nested_meta --mutation unserved_sections_kept
 4 gc_unwind pass --scenario gc_unwind
 1 gc_unwind_twice pass --scenario gc_unwind --twice
 1 canary_gc_unwind_keeps_leftover_bits canary:8 --scenario gc_unwind --mutation keeps_leftover_bits
@@ -397,6 +423,11 @@ default_table='
 8 slog pass --scenario slog
 2 slog_twice pass --scenario slog --twice
 1 canary_slog_append_skips_epoch canary:8 --scenario slog --mutation append_skips_epoch
+1 canary_slog_writer_never_respawned canary:8 --scenario slog --mutation writer_never_respawned
+1 canary_slog_staged_dropped canary:8 --scenario slog --mutation staged_dropped
+1 canary_slog_held_after_job canary:8 --scenario slog --mutation held_after_job
+1 canary_slog_held_unwritten canary:8 --scenario slog --mutation held_unwritten
+1 canary_slog_start_writer_keeps_stopped canary:8 --scenario slog --mutation start_writer_keeps_stopped
 8 append pass --scenario append
 2 append_twice pass --scenario append --twice
 1 canary_append_retry_skips_read_back canary:32 --scenario append --mutation retry_skips_read_back

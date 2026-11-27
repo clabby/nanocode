@@ -155,7 +155,7 @@ pub mod turnlog {
         OneLogJournals, OneLogOver, OneLogStore, Policy, Probe, Probes, Probing, Staged,
         ThreadCommand, ThreadFacts, ThreadFold, ThreadHolds, ThreadJournals, ThreadLog, ThreadLogs,
         ThreadPolicy, ThreadReply, ThreadState, ThreadStore, ThreadTurns, ThreadWakes, WakeError,
-        Window, facts_sim, import_sim, thread_history, thread_scope_sim,
+        Window, facts_sim, import_sim, session_log_sim, thread_history, thread_scope_sim,
     };
     pub use nanocode_tool_runtime::effects::{EffectCall, EffectGate};
     pub use nanocode_turnlog::*;
@@ -285,12 +285,13 @@ pub use nanocode_agent::{
 pub use nanocode_scope as scope;
 
 pub mod session_host {
+    pub use nanocode_agent::Guarded;
     pub use nanocode_agent::{
         Attach, Base, Delivery, Driven, EventLog, Halt, ImportedTurn, InboxError, InboxHost,
         LogEntry, LogPage, LoggedEvent, Missing, MovedQueued, Next, OneLog, PassEnd, Recording,
         Replaced, ResumeError, SessionLog, Settled, Started, Submission, Submitted, TurnInbox,
         TurnLog, TurnRecord, TurnRetry, TurnState, Unresumable, Verdict, Wake, base_checkpoint,
-        settle_pending, submission_digest,
+        inbox_sim, settle_pending, submission_digest,
     };
 }
 

@@ -11,7 +11,7 @@ use super::{
         forward_events,
     },
 };
-use crate::runtime::RegistryFuture;
+use crate::runtime::{RegistryFuture, WaitCall};
 use nanocode_agent_core::usage::{UsdAmount, usd_number};
 use nanocode_agent_core::{
     AgentHandle, ClaudeModel, ForkRequest, HarnessFamily, Model, ModelSelection, ReasoningMode,
@@ -2006,9 +2006,14 @@ impl WaitAgent {
         let duration = timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_WAIT_TIMEOUT);
+        let call = WaitCall {
+            call_id: context.call_id(),
+            turn_id: context.turn_id(),
+            deferred: context.deferred_output(),
+        };
         let answered = if resumed {
             registry
-                .rewait(context.session_id(), context.call_id(), &agent_ids)
+                .rewait_in_turn(context.session_id(), call, &agent_ids)
                 .await?
         } else {
             None
@@ -2017,12 +2022,7 @@ impl WaitAgent {
             Some(answered) => answered,
             None => {
                 registry
-                    .wait(
-                        context.session_id(),
-                        context.call_id(),
-                        &agent_ids,
-                        duration,
-                    )
+                    .wait_in_turn(context.session_id(), call, &agent_ids, duration)
                     .await?
             }
         };

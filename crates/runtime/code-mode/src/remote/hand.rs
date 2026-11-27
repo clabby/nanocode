@@ -882,10 +882,6 @@ impl CodeModeObserver for DetachedObserver {
             self.outgoing.queue(text);
         }
     }
-
-    fn completed(&mut self) {
-        self.catalog.finish(&self.origin_call_id);
-    }
 }
 
 type CallbackReply = Arc<Slot<oneshot::Sender<Result<Value, String>>>>;

@@ -314,7 +314,34 @@ impl ModelSelection {
                     (set(&[Low, Medium, High]), Medium, false, false, false)
                 }
                 _ if self.backend.as_str() == "antigravity" => {
-                    (set(&[None, Low, Medium, High]), High, false, false, false)
+                    let lower = self.model.to_ascii_lowercase();
+                    let gemini_4 = lower.strip_prefix("gemini-4-");
+                    let (thinking, default_thinking) = match gemini_4 {
+                        Some(name) if name.ends_with("-cyber-permissive") => {
+                            (set(&[Low, Medium, High]), High)
+                        }
+                        Some(name) if name.starts_with("neon") || name.starts_with("hydrogen") => {
+                            (set(&[Low, Medium, High, Xhigh]), High)
+                        }
+                        Some(name) if name.starts_with("carbon") || name.starts_with("argon") => {
+                            (set(&[Low, Medium, High]), Medium)
+                        }
+                        Some(_) => (set(&[Low, Medium, High]), High),
+                        _ => (set(&[None, Low, Medium, High]), High),
+                    };
+                    let thinking = match gemini_4.is_some()
+                        && crate::sim::mutated(crate::sim::Mutation::Gemini4OffersNone)
+                    {
+                        true => thinking | thinking_bit(None),
+                        false => thinking,
+                    };
+                    let default_thinking = match gemini_4.is_some()
+                        && crate::sim::mutated(crate::sim::Mutation::Gemini4DefaultsHigh)
+                    {
+                        true => High,
+                        false => default_thinking,
+                    };
+                    (thinking, default_thinking, false, false, false)
                 }
                 _ => (set(&Thinking::ALL), Medium, false, false, false),
             };

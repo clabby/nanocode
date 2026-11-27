@@ -18,10 +18,11 @@ use nanocode::{
     durability::SessionRecord,
     session_host::{
         Delivery, Driven, InboxHost, LoggedEvent, Next, PassEnd, Submission, TurnInbox, TurnRecord,
-        TurnState,
+        TurnState, inbox_sim,
     },
     turnlog::OneLog,
 };
+use nanocode_subagents::sim::Mutation as SubagentMutation;
 use nanocode_sync::Atom;
 use serde_json::{Value, json};
 
@@ -37,6 +38,8 @@ const SESSION: &str = "request-close";
 const MODEL: &str = "claude-haiku-5-5";
 const REQUEST: &str = "req";
 const PROMPT: &str = "ROOTREQ delegate two lookups and answer";
+const NEXT_REQUEST: &str = "next";
+const NEXT_PROMPT: &str = "NEXTREQ continue";
 const CHILD_A: &str = "CHILDA";
 const CHILD_B: &str = "CHILDB";
 const RESULT_A: &str = "found-alpha";
@@ -47,6 +50,58 @@ const COMPLETION_PREFIX: &str = "subagent-completion:";
 const EPOCHS_MAX: u64 = 6;
 const CRASH_AFTER: Duration = Duration::from_secs(600);
 const DRIVES_MAX: u64 = 400;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestCloseMutation {
+    None,
+    OwnedRequestHeld,
+    OwnedCancelCloses,
+    CancelHoldKept,
+}
+
+impl RequestCloseMutation {
+    const ALL: [Self; 3] = [
+        Self::OwnedRequestHeld,
+        Self::OwnedCancelCloses,
+        Self::CancelHoldKept,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::OwnedRequestHeld => "owned_request_held",
+            Self::OwnedCancelCloses => "owned_cancel_closes",
+            Self::CancelHoldKept => SubagentMutation::CancelHoldKept.name(),
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        std::iter::once(Self::None)
+            .chain(Self::ALL)
+            .find(|mutation| mutation.name() == name)
+    }
+
+    fn apply(self) {
+        inbox_sim::mutate(match self {
+            Self::OwnedRequestHeld => inbox_sim::Mutation::OwnedRequestHeld,
+            Self::OwnedCancelCloses => inbox_sim::Mutation::OwnedCancelCloses,
+            Self::None | Self::CancelHoldKept => inbox_sim::Mutation::None,
+        });
+        nanocode_subagents::sim::mutate(if self == Self::CancelHoldKept {
+            SubagentMutation::CancelHoldKept
+        } else {
+            SubagentMutation::None
+        });
+    }
+}
+
+pub fn names() -> String {
+    RequestCloseMutation::ALL
+        .iter()
+        .map(|mutation| mutation.name())
+        .collect::<Vec<_>>()
+        .join("|")
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RequestCloseStats {
@@ -74,14 +129,20 @@ enum Case {
     CrashInContinuation,
     CrashWhileClosing,
     CancelWhileAwaitingChild,
+    HostOwned,
+    HostOwnedCancel,
+    HostOwnedCancelLate,
 }
 
-const CASES: [Case; 5] = [
+const CASES: [Case; 8] = [
     Case::NoCrash,
     Case::CrashWhileAwaitingChild,
     Case::CrashInContinuation,
     Case::CrashWhileClosing,
     Case::CancelWhileAwaitingChild,
+    Case::HostOwned,
+    Case::HostOwnedCancel,
+    Case::HostOwnedCancelLate,
 ];
 
 #[derive(Default)]
@@ -90,6 +151,7 @@ struct Wire {
     calls: Atom<u64>,
     released: AtomicBool,
     held: AtomicBool,
+    late: AtomicBool,
     hang: Atom<Option<(String, String)>>,
 }
 
@@ -139,6 +201,10 @@ impl Wire {
         let messages = messages(body);
         let first = messages.first().map(content).unwrap_or_default();
         let last = messages.last().map(content).unwrap_or_default();
+        if self.late.load(Ordering::Acquire) && last.contains(NEXT_PROMPT) {
+            self.released.store(true, Ordering::Release);
+            nanocode_platform::sleep(Duration::from_secs(5)).await;
+        }
         if let Some(cell) = running_cell(&last) {
             return tool("wait", &json!({"cell_id": cell, "yield_time_ms": 30_000}));
         }
@@ -227,9 +293,14 @@ impl HttpTransport for WireTransport {
 #[derive(Default)]
 struct Inbox {
     hang_result: AtomicBool,
+    owns: AtomicBool,
 }
 
 impl InboxHost for Inbox {
+    fn owns_completion_turns(&self) -> bool {
+        self.owns.load(Ordering::Acquire)
+    }
+
     fn publish(&self, events: Vec<LoggedEvent>) -> HostFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let closing = events.iter().any(|event| {
@@ -336,48 +407,82 @@ async fn pumped<T>(pump: &mut HostFuture<'static, ()>, work: impl Future<Output 
     .await
 }
 
-async fn serve(process: &Process, wire: &Wire, first: bool, cancel: bool) -> Result<(), String> {
+async fn submit(process: &Process, request_id: &str, prompt: &str) -> Result<(), String> {
+    process
+        .inbox
+        .log()
+        .submit(&Submission {
+            request_id: request_id.to_owned(),
+            prompt: Prompt::new(prompt),
+            hand: None,
+            metadata: serde_json::value::to_raw_value(&json!({})).expect("an empty object encodes"),
+        })
+        .await
+        .map(drop)
+        .map_err(|error| format!("submit {request_id}: {error}"))
+}
+
+async fn serve(process: &Process, wire: &Wire, first: bool, case: Case) -> Result<(), String> {
     if first {
-        process
-            .inbox
+        submit(process, REQUEST, PROMPT).await?;
+    }
+    let settling = pin!(settle(process));
+    let watching = pin!(watch(process, wire, case));
+    match nanocode_sync::future::select(settling, watching).await {
+        nanocode_sync::future::Either::Left((settled, _)) => settled?,
+        nanocode_sync::future::Either::Right((watched, settling)) => {
+            watched?;
+            settling.await?;
+        }
+    }
+    if first && case == Case::HostOwnedCancel {
+        submit(process, NEXT_REQUEST, NEXT_PROMPT).await?;
+        settle(process).await?;
+    }
+    Ok(())
+}
+
+async fn watch(process: &Process, wire: &Wire, case: Case) -> Result<(), String> {
+    let inbox = &process.inbox;
+    let cancels = matches!(
+        case,
+        Case::CancelWhileAwaitingChild | Case::HostOwnedCancel | Case::HostOwnedCancelLate
+    );
+    if !cancels && case != Case::HostOwned {
+        return Ok(());
+    }
+    loop {
+        nanocode_platform::sleep(Duration::from_millis(50)).await;
+        let state = inbox
             .log()
-            .submit(&Submission {
-                request_id: REQUEST.to_owned(),
-                prompt: Prompt::new(PROMPT),
-                hand: None,
-                metadata: serde_json::value::to_raw_value(&json!({}))
-                    .expect("an empty object encodes"),
-            })
+            .turn(REQUEST)
             .await
-            .map_err(|error| format!("submit: {error}"))?;
-    }
-    if cancel {
-        let inbox = &process.inbox;
-        let drive = pin!(inbox.drive(None));
-        let cancelling = pin!(async {
-            loop {
-                nanocode_platform::sleep(Duration::from_millis(50)).await;
-                let open = inbox
-                    .log()
-                    .turn(REQUEST)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|record| record.state == TurnState::Running);
-                let answered = inbox.agent().turn_controls().is_empty();
-                if open && answered {
-                    drop(inbox.cancel(REQUEST, &serde_json::Map::new()).await);
-                    wire.released.store(true, Ordering::Release);
-                    return;
-                }
+            .ok()
+            .flatten()
+            .map(|record| record.state);
+        let open = state == Some(TurnState::Running);
+        let ready = match case {
+            Case::CancelWhileAwaitingChild => open && inbox.agent().turn_controls().is_empty(),
+            Case::HostOwnedCancel | Case::HostOwnedCancelLate => {
+                open && wire.hang.read(Option::is_none)
             }
-        });
-        let driven = match nanocode_sync::future::select(drive, cancelling).await {
-            nanocode_sync::future::Either::Left((driven, _)) => driven,
-            nanocode_sync::future::Either::Right(((), drive)) => drive.await,
+            _ => state.is_some_and(|state| state.is_terminal()),
         };
-        driven.map_err(|error| format!("drive: {error}"))?;
+        if !ready {
+            continue;
+        }
+        if cancels {
+            drop(inbox.cancel(REQUEST, &serde_json::Map::new()).await);
+        }
+        if case == Case::HostOwnedCancelLate {
+            return submit(process, NEXT_REQUEST, NEXT_PROMPT).await;
+        }
+        wire.released.store(true, Ordering::Release);
+        return Ok(());
     }
+}
+
+async fn settle(process: &Process) -> Result<(), String> {
     for _ in 0..DRIVES_MAX {
         let driven = process
             .inbox
@@ -480,6 +585,18 @@ fn simulate_case(seed: u64, case: Case) -> (Run, u64) {
         }
         Case::CrashWhileClosing => inbox.hang_result.store(true, Ordering::Release),
         Case::CancelWhileAwaitingChild => wire.held.store(true, Ordering::Release),
+        Case::HostOwned => {
+            inbox.owns.store(true, Ordering::Release);
+            wire.held.store(true, Ordering::Release);
+        }
+        Case::HostOwnedCancel | Case::HostOwnedCancelLate => {
+            inbox.owns.store(true, Ordering::Release);
+            wire.held.store(true, Ordering::Release);
+            wire.late
+                .store(case == Case::HostOwnedCancelLate, Ordering::Release);
+            wire.hang
+                .set(Some((PROMPT.to_owned(), "spawned".to_owned())));
+        }
     }
     let mut run = Run::default();
     let mut done = false;
@@ -492,16 +609,7 @@ fn simulate_case(seed: u64, case: Case) -> (Run, u64) {
             async {
                 let mut process = open(&disk, &wire, &inbox).await?;
                 let mut pump = std::mem::replace(&mut process.pump, Box::pin(async {}));
-                pumped(
-                    &mut pump,
-                    serve(
-                        &process,
-                        &wire,
-                        number == 0,
-                        case == Case::CancelWhileAwaitingChild,
-                    ),
-                )
-                .await
+                pumped(&mut pump, serve(&process, &wire, number == 0, case)).await
             },
         );
         match (ended, result) {
@@ -525,7 +633,10 @@ fn simulate_case(seed: u64, case: Case) -> (Run, u64) {
         run.wrong
             .push(format!("still open after {EPOCHS_MAX} epochs"));
     }
-    if !matches!(case, Case::NoCrash | Case::CancelWhileAwaitingChild) {
+    if matches!(
+        case,
+        Case::CrashWhileAwaitingChild | Case::CrashInContinuation | Case::CrashWhileClosing
+    ) {
         run.wrong
             .extend((run.crashes == 0).then(|| "the crash never happened".to_owned()));
     }
@@ -555,64 +666,6 @@ fn simulate_case(seed: u64, case: Case) -> (Run, u64) {
         }
     };
     let state = seen.record.as_ref().map(|record| record.state);
-    if case == Case::CancelWhileAwaitingChild {
-        if state != Some(TurnState::Cancelled) {
-            run.wrong.push(format!(
-                "a request cancelled while waiting for a child ended {state:?}"
-            ));
-        }
-        let results = seen
-            .events
-            .iter()
-            .filter(|event| event.request_id.as_deref() == Some(REQUEST))
-            .filter(|event| event.event.get().contains("\"type\":\"result\""))
-            .count();
-        if results != 1 {
-            run.wrong.push(format!(
-                "the request recorded {results} results instead of one"
-            ));
-        }
-        let stray = seen
-            .events
-            .iter()
-            .filter(|event| {
-                event
-                    .request_id
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with(COMPLETION_PREFIX))
-            })
-            .count();
-        if stray > 0 {
-            run.wrong.push(format!(
-                "{stray} events of child-completion passes belong to no request after the cancel"
-            ));
-        }
-        let woke = wire
-            .root_calls
-            .get()
-            .iter()
-            .filter(|last| last.contains(RESULT_B))
-            .count();
-        if woke > 0 {
-            run.wrong.push(format!(
-                "after the request was cancelled, child B still woke the root agent in {woke} model calls"
-            ));
-        }
-        return (run, calls);
-    }
-    if state != Some(TurnState::Completed) {
-        run.wrong.push(format!("the request ended {state:?}"));
-    }
-    let message = seen
-        .record
-        .as_ref()
-        .and_then(final_message)
-        .unwrap_or_default();
-    if !message.contains(RESULT_B) {
-        run.wrong.push(format!(
-            "the request closed with {message:?}, before the root read child B's result"
-        ));
-    }
     let results = seen
         .events
         .iter()
@@ -634,26 +687,93 @@ fn simulate_case(seed: u64, case: Case) -> (Run, u64) {
                 .is_some_and(|id| id.starts_with(COMPLETION_PREFIX))
         })
         .count();
-    if stray > 0 {
-        run.wrong.push(format!(
-            "{stray} events of child-completion passes belong to no request"
-        ));
-    }
     let root_calls = wire.root_calls.get();
     let root_calls: &Vec<String> = &root_calls;
-    for result in [RESULT_A, RESULT_B] {
-        let delivered = root_calls
+    let delivered = |result: &str| {
+        root_calls
             .iter()
             .filter(|last| last.contains(result))
-            .count();
-        let ok = if case == Case::NoCrash {
-            delivered == 1
-        } else {
-            delivered >= 1
-        };
-        if !ok {
-            run.wrong
-                .push(format!("the root read {result} in {delivered} new inputs"));
+            .count()
+    };
+    let message = seen
+        .record
+        .as_ref()
+        .and_then(final_message)
+        .unwrap_or_default();
+    match case {
+        Case::CancelWhileAwaitingChild => {
+            if state != Some(TurnState::Cancelled) {
+                run.wrong.push(format!(
+                    "a request cancelled while waiting for a child ended {state:?}"
+                ));
+            }
+            if stray > 0 {
+                run.wrong.push(format!(
+                    "{stray} events of child-completion passes belong to no request after the cancel"
+                ));
+            }
+            let woke = delivered(RESULT_B);
+            if woke > 0 {
+                run.wrong.push(format!(
+                    "after the request was cancelled, child B still woke the root agent in {woke} model calls"
+                ));
+            }
+        }
+        Case::HostOwned | Case::HostOwnedCancel | Case::HostOwnedCancelLate => {
+            let expected = if case == Case::HostOwned {
+                TurnState::Completed
+            } else {
+                TurnState::Cancelled
+            };
+            if state != Some(expected) {
+                run.wrong.push(format!(
+                    "a request whose host owns completion turns ended {state:?}"
+                ));
+            }
+            if case == Case::HostOwned && (message.is_empty() || message.contains(RESULT_B)) {
+                run.wrong.push(format!(
+                    "the request closed with {message:?} instead of its first pass's answer while child B ran"
+                ));
+            }
+            if case == Case::HostOwned && stray == 0 {
+                run.wrong.push(
+                    "no child-completion pass kept its own request id though the host owns them"
+                        .to_owned(),
+                );
+            }
+            let woke = delivered(RESULT_B);
+            if woke != 1 {
+                run.wrong.push(format!(
+                    "child B's result reached the root {woke} times after the request closed instead of once"
+                ));
+            }
+        }
+        _ => {
+            if state != Some(TurnState::Completed) {
+                run.wrong.push(format!("the request ended {state:?}"));
+            }
+            if !message.contains(RESULT_B) {
+                run.wrong.push(format!(
+                    "the request closed with {message:?}, before the root read child B's result"
+                ));
+            }
+            if stray > 0 {
+                run.wrong.push(format!(
+                    "{stray} events of child-completion passes belong to no request"
+                ));
+            }
+            for result in [RESULT_A, RESULT_B] {
+                let count = delivered(result);
+                let ok = if case == Case::NoCrash {
+                    count == 1
+                } else {
+                    count >= 1
+                };
+                if !ok {
+                    run.wrong
+                        .push(format!("the root read {result} in {count} new inputs"));
+                }
+            }
         }
     }
     (run, calls)
@@ -695,10 +815,12 @@ fn simulate(seed: u64) -> Outcome {
 
 pub fn judge(
     seed: u64,
+    mutation: RequestCloseMutation,
     twice: bool,
     verbose: bool,
     totals: &mut RequestCloseStats,
 ) -> Option<String> {
+    mutation.apply();
     let first = simulate(seed);
     totals.add(&first.stats);
     if verbose {
@@ -716,8 +838,13 @@ pub fn judge(
     })
 }
 
-pub fn replay(seed: u64) -> String {
-    format!("nanocode-sim --scenario request_close --seed {seed}")
+pub fn replay(seed: u64, mutation: RequestCloseMutation) -> String {
+    let mut command = format!("nanocode-sim --scenario request_close --seed {seed}");
+    if mutation != RequestCloseMutation::None {
+        command.push_str(" --mutation ");
+        command.push_str(mutation.name());
+    }
+    command
 }
 
 pub fn report(
@@ -725,15 +852,25 @@ pub fn report(
     passed: u64,
     failed: u64,
     twice: bool,
+    mutation: RequestCloseMutation,
     totals: &RequestCloseStats,
 ) -> ExitCode {
     println!(
-        "RESULT seeds={}..{} scenario=request_close passed={passed} failed={failed} twice={twice} stats={totals:?}",
-        seeds.start, seeds.end
+        "RESULT seeds={}..{} scenario=request_close mutation={} passed={passed} failed={failed} twice={twice} stats={totals:?}",
+        seeds.start,
+        seeds.end,
+        mutation.name()
     );
-    if failed == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    match mutation {
+        RequestCloseMutation::None if failed == 0 => ExitCode::SUCCESS,
+        RequestCloseMutation::None => ExitCode::FAILURE,
+        _ if failed > 0 => {
+            println!("MUTATION {} caught by {failed} seeds", mutation.name());
+            ExitCode::SUCCESS
+        }
+        _ => {
+            println!("MUTATION {} NOT caught", mutation.name());
+            ExitCode::FAILURE
+        }
     }
 }

@@ -1,3 +1,5 @@
+mod delegation;
+
 use std::{
     collections::VecDeque,
     ops::Range,
@@ -12,11 +14,13 @@ use std::{
 use nanocode::{
     Nanocode, PromptRequest, Thinking, Tools,
     antigravity::{AntigravityHarness, Auth, Endpoint, GoogleBuilder, Route},
+    backend::Prompt,
     durability::SessionStore,
 };
+use nanocode_agent_types::sim::Mutation as Types;
 use nanocode_backend_antigravity::{AntigravityFold, sim::Mutation as Production};
 use nanocode_durability_core::{Digest, Fact, FoldError, Folded, KeyValueStore};
-use nanocode_sync::Atom;
+use nanocode_sync::{Atom, Signal};
 use serde_json::{Value, json};
 
 use crate::{
@@ -34,10 +38,13 @@ const MODEL: &str = "gemini-4-neon";
 const TURN: &str = "antigravity-turn";
 const PROMPT: &str = "PROMPTMARK run the three tools";
 const PROMPT_MARK: &str = "PROMPTMARK";
+const PROMPT_REVISION: u64 = 1;
+const STEER_REVISION: u64 = PROMPT_REVISION + 1;
 const HOLD: &str = "hold";
 const QUICK: [&str; 2] = ["quick_first", "quick_second"];
 const CALLS: usize = 3;
 const DONE: &str = "done";
+const REFUSED: &str = "refused";
 const POLL: Duration = Duration::from_millis(5);
 const EPOCHS_MAX: u64 = 4;
 
@@ -47,14 +54,34 @@ pub enum AntigravityMutation {
     MovedForgetsResults,
     ReplayReruns,
     FactSyncSkipped,
+    RevisionMissing,
+    HostContextMissing,
+    SteerRevisionIgnored,
+    RevisionForgotten,
+    OriginMissing,
+    CompactionOriginMissing,
+    XhighAsHigh,
+    HarnessDefaultsHigh,
+    Gemini4OffersNone,
+    Gemini4DefaultsHigh,
 }
 
 impl AntigravityMutation {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 14] = [
         Self::None,
         Self::MovedForgetsResults,
         Self::ReplayReruns,
         Self::FactSyncSkipped,
+        Self::RevisionMissing,
+        Self::HostContextMissing,
+        Self::SteerRevisionIgnored,
+        Self::RevisionForgotten,
+        Self::OriginMissing,
+        Self::CompactionOriginMissing,
+        Self::XhighAsHigh,
+        Self::HarnessDefaultsHigh,
+        Self::Gemini4OffersNone,
+        Self::Gemini4DefaultsHigh,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -69,6 +96,16 @@ impl AntigravityMutation {
             Self::MovedForgetsResults => "antigravity_moved_forgets_results",
             Self::ReplayReruns => "antigravity_replay_reruns",
             Self::FactSyncSkipped => "antigravity_fact_sync_skipped",
+            Self::RevisionMissing => "antigravity_revision_missing",
+            Self::HostContextMissing => "antigravity_host_context_missing",
+            Self::SteerRevisionIgnored => "antigravity_steer_revision_ignored",
+            Self::RevisionForgotten => "antigravity_revision_forgotten",
+            Self::OriginMissing => "antigravity_origin_missing",
+            Self::CompactionOriginMissing => "antigravity_compaction_origin_missing",
+            Self::XhighAsHigh => "antigravity_xhigh_as_high",
+            Self::HarnessDefaultsHigh => "antigravity_harness_defaults_high",
+            Self::Gemini4OffersNone => "antigravity_gemini4_offers_none",
+            Self::Gemini4DefaultsHigh => "antigravity_gemini4_defaults_high",
         }
     }
 
@@ -78,6 +115,34 @@ impl AntigravityMutation {
             Self::MovedForgetsResults => Production::MovedForgetsResults,
             Self::ReplayReruns => Production::ReplayReruns,
             Self::FactSyncSkipped => Production::FactSyncSkipped,
+            Self::RevisionMissing => Production::RevisionMissing,
+            Self::HostContextMissing => Production::HostContextMissing,
+            Self::SteerRevisionIgnored => Production::SteerRevisionIgnored,
+            Self::RevisionForgotten => Production::RevisionForgotten,
+            Self::OriginMissing => Production::OriginMissing,
+            Self::CompactionOriginMissing => Production::CompactionOriginMissing,
+            Self::XhighAsHigh => Production::XhighAsHigh,
+            Self::HarnessDefaultsHigh => Production::HarnessDefaultsHigh,
+            Self::Gemini4OffersNone | Self::Gemini4DefaultsHigh => Production::None,
+        }
+    }
+
+    const fn types(self) -> Types {
+        match self {
+            Self::Gemini4OffersNone => Types::Gemini4OffersNone,
+            Self::Gemini4DefaultsHigh => Types::Gemini4DefaultsHigh,
+            Self::None
+            | Self::MovedForgetsResults
+            | Self::ReplayReruns
+            | Self::FactSyncSkipped
+            | Self::RevisionMissing
+            | Self::HostContextMissing
+            | Self::SteerRevisionIgnored
+            | Self::RevisionForgotten
+            | Self::OriginMissing
+            | Self::CompactionOriginMissing
+            | Self::XhighAsHigh
+            | Self::HarnessDefaultsHigh => Types::None,
         }
     }
 
@@ -99,6 +164,7 @@ pub struct AntigravityStats {
     pub crashes: u64,
     pub model_calls: u64,
     pub fact_requests: u64,
+    pub thinking_levels: u64,
 }
 
 impl AntigravityStats {
@@ -109,6 +175,7 @@ impl AntigravityStats {
         self.crashes += other.crashes;
         self.model_calls += other.model_calls;
         self.fact_requests += other.fact_requests;
+        self.thinking_levels += other.thinking_levels;
     }
 }
 
@@ -128,14 +195,37 @@ struct Case {
 #[derive(Default)]
 struct Wire {
     bodies: Atom<Vec<String>>,
+    wrong: Atom<Vec<String>>,
+    waiting_for_steer: Signal,
+    steered: Signal,
     script: Atom<VecDeque<bool>>,
     calls: AtomicU64,
     hold: AtomicU64,
     hang: AtomicBool,
+    recovered: AtomicU64,
     runs: Atom<Vec<String>>,
 }
 
 impl Wire {
+    fn check_tool_context(&self, name: &str, context: &nanocode::tools::ToolContext<'_>) {
+        if context.instruction_revision() != Some(STEER_REVISION) {
+            self.wrong.update(|wrong| {
+                wrong.push(format!(
+                    "tool {name} saw instruction revision {:?}, expected {STEER_REVISION}",
+                    context.instruction_revision()
+                ));
+            });
+        }
+        if context.host_context() != Some(TURN) {
+            self.wrong.update(|wrong| {
+                wrong.push(format!(
+                    "tool {name} saw host context {:?}, expected {TURN:?}",
+                    context.host_context()
+                ));
+            });
+        }
+    }
+
     fn names(&self) -> Vec<&'static str> {
         let hold = usize::try_from(self.hold.load(Ordering::Acquire)).expect("hold fits usize");
         let mut quick = QUICK.iter();
@@ -165,9 +255,28 @@ impl nanocode_http::layer::Sender for Sender {
     > {
         Box::pin(async move {
             let wire = &self.0;
-            wire.calls.fetch_add(1, Ordering::AcqRel);
+            let call = wire.calls.fetch_add(1, Ordering::AcqRel);
+            if let Err(error) = check_origin(SESSION, Some(TURN)) {
+                wire.wrong.update(|wrong| wrong.push(error.clone()));
+            }
             wire.bodies
                 .update(|bodies| bodies.push(String::from_utf8_lossy(&request.body).into_owned()));
+            if call == 0 {
+                return Ok(model_response(
+                    vec![
+                        json!({"functionCall": {"name": "manage_task", "args": {"Action": "list"}}}),
+                    ],
+                    true,
+                ));
+            }
+            if !wire.steered.is_fired() {
+                wire.waiting_for_steer.fire();
+                wire.steered.wait().await;
+                return Ok(model_response(
+                    vec![json!({"text": "Awaiting instructions"})],
+                    true,
+                ));
+            }
             let tools = wire.script.update(VecDeque::pop_front).unwrap_or(false);
             let parts = match tools {
                 true => wire
@@ -177,21 +286,40 @@ impl nanocode_http::layer::Sender for Sender {
                     .collect::<Vec<_>>(),
                 false => vec![json!({"text": DONE})],
             };
-            let chunk = json!({
-                "candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": "STOP"}],
-                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
-                "modelVersion": MODEL,
-            });
-            let sse = format!("data: {chunk}\n\n");
-            Ok(nanocode_http::layer::Response::new(
-                nanocode_http::types::StatusCode::OK,
-                event_stream(),
-                Box::pin(nanocode_sync::stream::once(
-                    async move { Ok(sse.into_bytes()) },
-                )),
-            ))
+            Ok(model_response(parts, true))
         })
     }
+}
+
+fn model_response(parts: Vec<Value>, streaming: bool) -> nanocode_http::layer::Response {
+    let chunk = json!({
+        "candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+        "modelVersion": MODEL,
+    });
+    let (body, headers) = match streaming {
+        true => (format!("data: {chunk}\n\n"), event_stream()),
+        false => (chunk.to_string(), nanocode_http::types::HeaderMap::new()),
+    };
+    nanocode_http::layer::Response::new(
+        nanocode_http::types::StatusCode::OK,
+        headers,
+        Box::pin(nanocode_sync::stream::once(
+            async move { Ok(body.into_bytes()) },
+        )),
+    )
+}
+
+fn check_origin(expected_session: &str, expected_context: Option<&str>) -> Result<(), String> {
+    use nanocode_http::layer::origin;
+    let session = origin::session();
+    let context = origin::current();
+    if session.as_deref() != Some(expected_session) || context.as_deref() != expected_context {
+        return Err(format!(
+            "HTTP origin named session {session:?}, context {context:?}; expected {expected_session:?}, {expected_context:?}"
+        ));
+    }
+    Ok(())
 }
 
 struct Tool(Arc<Wire>);
@@ -201,9 +329,10 @@ impl nanocode::FunctionHandler for Tool {
         &'a self,
         name: &'a str,
         _input: Value,
-        _context: nanocode::tools::ToolContext<'a>,
+        context: nanocode::tools::ToolContext<'a>,
     ) -> nanocode::HostFuture<'a, Result<Value, String>> {
         Box::pin(async move {
+            self.0.check_tool_context(name, &context);
             self.0.runs.update(|runs| runs.push(name.to_owned()));
             if name == HOLD && self.0.hang.swap(false, Ordering::AcqRel) {
                 loop {
@@ -211,6 +340,22 @@ impl nanocode::FunctionHandler for Tool {
                 }
             }
             Ok(Value::String(format!("{name} output")))
+        })
+    }
+}
+
+struct Recovery(Arc<Wire>);
+
+impl nanocode::ToolRecovery for Recovery {
+    fn recover<'a>(
+        &'a self,
+        name: &'a str,
+        context: nanocode::tools::ToolContext<'a>,
+    ) -> nanocode::HostFuture<'a, Option<nanocode_tool_runtime::ToolOutput>> {
+        Box::pin(async move {
+            self.0.recovered.fetch_add(1, Ordering::AcqRel);
+            self.0.check_tool_context(name, &context);
+            None
         })
     }
 }
@@ -315,7 +460,9 @@ fn tools(wire: &Arc<Wire>, gate: Option<Arc<dyn nanocode::turnlog::EffectGate>>)
             Arc::new(Tool(Arc::clone(wire))),
         ));
     }
-    let builder = builder.exposure(nanocode_tool_provider::ToolExposure::DirectOnly);
+    let builder = builder
+        .exposure(nanocode_tool_provider::ToolExposure::DirectOnly)
+        .tool_recovery(Arc::new(Recovery(Arc::clone(wire))));
     match gate {
         Some(gate) => builder.effect_gate(gate),
         None => builder,
@@ -324,12 +471,8 @@ fn tools(wire: &Arc<Wire>, gate: Option<Arc<dyn nanocode::turnlog::EffectGate>>)
     .expect("the antigravity sim tools build")
 }
 
-fn runtime(
-    wire: &Arc<Wire>,
-    store: SessionStore,
-    gate: Option<Arc<dyn nanocode::turnlog::EffectGate>>,
-) -> Result<Nanocode, String> {
-    let harness = AntigravityHarness::new()
+fn harness(sender: Arc<dyn nanocode_http::layer::Sender>) -> AntigravityHarness {
+    AntigravityHarness::new()
         .endpoint(Endpoint {
             base_url: "http://model.sim".to_owned(),
             auth: Auth::ApiKey("sim".to_owned()),
@@ -337,21 +480,123 @@ fn runtime(
             route: Route::GeminiApi,
             notice: None,
         })
-        .sender(Arc::new(Sender(Arc::clone(wire))))
+        .sender(sender)
         .shell(Arc::new(NoShell))
         .files(Arc::new(NoFiles))
-        .app_data(std::env::temp_dir().join("nanocode-sim-antigravity"));
+        .app_data(std::env::temp_dir().join("nanocode-sim-antigravity"))
+}
+
+fn runtime(
+    sender: Arc<dyn nanocode_http::layer::Sender>,
+    store: SessionStore,
+    tools: Tools,
+) -> Result<Nanocode, String> {
     Nanocode::builder()
-        .tools(tools(wire, gate))
+        .tools(tools)
         .runner_management(false)
         .thinking(Thinking::Low)
         .workspace(std::env::temp_dir())
         .durability(store)
-        .google(harness)
+        .google(harness(sender))
         .for_backend::<Gemini>()
         .model(MODEL)
         .build()
         .map_err(|error| format!("runtime build: {error}"))
+}
+
+struct Levels(Arc<Wire>);
+
+impl nanocode_http::layer::Sender for Levels {
+    fn send(
+        &self,
+        request: nanocode_http::layer::Request,
+    ) -> nanocode_http::layer::BoxFuture<
+        '_,
+        Result<nanocode_http::layer::Response, nanocode_http::layer::Error>,
+    > {
+        Box::pin(async move {
+            self.0
+                .bodies
+                .update(|bodies| bodies.push(String::from_utf8_lossy(&request.body).into_owned()));
+            Ok(model_response(vec![json!({"text": DONE})], true))
+        })
+    }
+}
+
+async fn level_sent(
+    kv: SimKv,
+    model: &'static str,
+    thinking: Option<Thinking>,
+) -> Result<String, String> {
+    let wire = Arc::new(Wire::default());
+    let store = nanocode::session_store(KeyValueStore::new(kv))
+        .map_err(|error| format!("session store: {error}"))?;
+    let runtime = Nanocode::builder()
+        .tools(tools(&wire, None))
+        .runner_management(false)
+        .workspace(std::env::temp_dir())
+        .durability(store)
+        .google(harness(Arc::new(Levels(Arc::clone(&wire)))).model(model))
+        .for_backend::<Gemini>()
+        .model(model)
+        .build()
+        .map_err(|error| format!("runtime build: {error}"))?;
+    let spawn = runtime.spawn();
+    let spawn = match thinking {
+        Some(thinking) => spawn.thinking(thinking),
+        None => spawn,
+    };
+    let (agent, events) = match spawn.build().await {
+        Ok(built) => built,
+        Err(error) if error.to_string().contains("does not support") => {
+            return Ok(REFUSED.to_owned());
+        }
+        Err(error) => return Err(format!("spawn: {error}")),
+    };
+    drop(events);
+    agent
+        .prompt(PromptRequest::new(PROMPT))
+        .await
+        .map_err(|error| format!("admit: {error}"))?
+        .result()
+        .await
+        .map_err(|error| format!("turn: {error}"))?;
+    let bodies = wire.bodies.get();
+    let body = bodies.last().ok_or("no model request was made")?;
+    serde_json::from_str::<Value>(body)
+        .map_err(|error| format!("request unreadable: {error}"))?["generationConfig"]
+        ["thinkingConfig"]["thinkingLevel"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "the request carries no thinkingLevel".to_owned())
+}
+
+fn check_levels(seed: u64, stats: &mut AntigravityStats, digest: &mut u64) -> Vec<String> {
+    let clock = Clock::new();
+    crate::host::enter(seed, &clock);
+    let mut wrong = Vec::new();
+    for (model, thinking, expected) in [
+        ("gemini-4-neon", Some(Thinking::Xhigh), "XHIGH"),
+        ("gemini-4-carbon", None, "MEDIUM"),
+        ("gemini-4-carbon", Some(Thinking::None), REFUSED),
+    ] {
+        let asked = thinking.map_or("default", Thinking::as_str);
+        let label = format!("antigravity_durable level {model} {asked}");
+        let kv = media(seed, &clock).kv;
+        let sent = match epoch(seed, &clock, &label, level_sent(kv, model, thinking)) {
+            (Ended::Finished, Some(Ok(sent))) => sent,
+            (Ended::Finished, Some(Err(error))) => error,
+            (ended, _) => format!("ended {ended:?} without a result"),
+        };
+        stats.thinking_levels += 1;
+        *digest = fnv(*digest, format!("{label} {sent}").as_bytes());
+        if sent != expected {
+            wrong.push(format!(
+                "a {model} turn at {asked} thinking ended with {sent:?}, not {expected:?}"
+            ));
+        }
+    }
+    wrong
 }
 
 struct Media {
@@ -420,7 +665,7 @@ async fn epoch_work(
 ) -> Result<(), String> {
     let (store, parts) = media.open(case.store).await?;
     let gate = parts.as_ref().map(|parts| Arc::clone(&parts.gate));
-    let runtime = runtime(wire, store, gate)?;
+    let runtime = runtime(Arc::new(Sender(Arc::clone(wire))), store, tools(wire, gate))?;
     let fresh = *stage.get() == Stage::Fresh;
     let (agent, events) = match fresh {
         true => runtime.spawn().session_id(SESSION).build().await,
@@ -428,9 +673,10 @@ async fn epoch_work(
     }
     .map_err(|error| format!("open: {error}"))?;
     drop(events);
+    let prompt = || Prompt::new(PROMPT).with_instruction_revision(PROMPT_REVISION);
     if *stage.get() != Stage::Replay {
         let request = match fresh {
-            true => PromptRequest::new(PROMPT),
+            true => PromptRequest::new(prompt()),
             false => PromptRequest::new(
                 runtime
                     .durable_prompt(&agent, TURN)
@@ -440,10 +686,23 @@ async fn epoch_work(
             ),
         };
         stage.set(Stage::Running);
-        let done = agent
+        let turn = agent
             .prompt(request.request_id(TURN))
             .await
-            .map_err(|error| format!("admit: {error}"))?
+            .map_err(|error| format!("admit: {error}"))?;
+        if fresh {
+            wire.waiting_for_steer.wait().await;
+            turn.control()
+                .steer_with_id(
+                    "revision-steer".to_owned(),
+                    Prompt::new("Use the revised instruction")
+                        .with_instruction_revision(STEER_REVISION),
+                )
+                .await
+                .map_err(|error| format!("steer: {error}"))?;
+            wire.steered.fire();
+        }
+        let done = turn
             .result()
             .await
             .map_err(|error| format!("turn: {error}"))?;
@@ -454,7 +713,7 @@ async fn epoch_work(
     }
     let before = wire.calls.load(Ordering::Acquire);
     let replayed = agent
-        .prompt(PromptRequest::new(PROMPT).request_id(TURN))
+        .prompt(PromptRequest::new(prompt()).request_id(TURN))
         .await
         .map_err(|error| format!("replay admit: {error}"))?
         .result()
@@ -528,25 +787,23 @@ async fn refolds(log: &Arc<nanocode::turnlog::OneLog>, bodies: &[String]) -> Res
     Ok(checked)
 }
 
-fn simulate_case(seed: u64, case: &Case) -> (Run, u64) {
-    let clock = Clock::new();
-    crate::host::enter(seed, &clock);
+fn media(seed: u64, clock: &Arc<Clock>) -> Media {
     let mut profile = Profile::of(seed);
     profile.before_ppm = 0;
     profile.after_ppm = 0;
     profile.torn_ppm = 0;
     profile.read_ppm = 0;
     profile.durability = Durability::OnAck;
-    let media = Media {
-        kv: SimKv::new(
-            seed,
-            profile,
-            StoreMutation::None,
-            false,
-            Arc::clone(&clock),
-        ),
+    Media {
+        kv: SimKv::new(seed, profile, StoreMutation::None, false, Arc::clone(clock)),
         disk: Disk::new(),
-    };
+    }
+}
+
+fn simulate_case(seed: u64, case: &Case) -> (Run, u64) {
+    let clock = Clock::new();
+    crate::host::enter(seed, &clock);
+    let media = media(seed, &clock);
     let wire = Arc::new(Wire::default());
     wire.script.set([true, false].into_iter().collect());
     wire.hold.store(
@@ -610,11 +867,16 @@ fn simulate_case(seed: u64, case: &Case) -> (Run, u64) {
 }
 
 fn check_runs(case: &Case, wire: &Wire, run: &mut Run) {
+    run.wrong.extend(wire.wrong.get().iter().cloned());
     for name in [HOLD, QUICK[0], QUICK[1]] {
         let ran = wire.ran(name);
         if ran != 1 {
             run.wrong.push(format!("{name} ran {ran} times, not once"));
         }
+    }
+    if case.crash && wire.recovered.load(Ordering::Acquire) == 0 {
+        run.wrong
+            .push("no interrupted tool call was offered for recovery".to_owned());
     }
     let bodies = wire.bodies.get();
     if let Some(body) = bodies
@@ -661,6 +923,7 @@ struct Outcome {
 
 fn simulate(seed: u64, mutation: AntigravityMutation) -> Outcome {
     nanocode_backend_antigravity::sim::mutate(mutation.production());
+    nanocode_agent_types::sim::mutate(mutation.types());
     let mut rng = Rng::derive(seed, "antigravity_durable cases");
     let mut stats = AntigravityStats {
         seeds: 1,
@@ -692,7 +955,15 @@ fn simulate(seed: u64, mutation: AntigravityMutation) -> Outcome {
             }
         }
     }
+    let (calls, errors) = delegation::simulate(seed);
+    stats.cases += 1;
+    stats.epochs += 1;
+    stats.model_calls += calls;
+    digest = fnv(digest, &calls.to_le_bytes());
+    wrong.extend(errors);
+    wrong.extend(check_levels(seed, &mut stats, &mut digest));
     nanocode_backend_antigravity::sim::mutate(Production::None);
+    nanocode_agent_types::sim::mutate(Types::None);
     Outcome {
         digest,
         stats,

@@ -40,7 +40,7 @@ use crate::{
     stored_event::Stored,
     thread_scope::sim as thread_scope_sim,
     turn_inbox::Envelope,
-    turn_log::{EventLog, Logged, Recording, TurnLog},
+    turn_log::{EventLog, Guarded, Logged, Recording, TurnLog},
 };
 
 mod export;
@@ -1591,6 +1591,18 @@ let events = events.as_slice();
         edit_id: &str,
         text: &str,
     ) -> Result<Replaced, StoreError> {
+        self.edit_queued(request_id, edit_id, text, false)
+            .await?
+            .ready(request_id)
+    }
+
+    async fn edit_queued(
+        &self,
+        request_id: &str,
+        edit_id: &str,
+        text: &str,
+        steering: bool,
+    ) -> Result<Guarded<Replaced>, StoreError> {
         if edit_id.is_empty() {
             return Err(StoreError::NotCommitted(
                 "an edit ID must not be empty".into(),
@@ -1609,17 +1621,20 @@ let events = events.as_slice();
                     let edit_id = edit_id.as_str();
                     let text = text.as_str();
                     let Some(turn) = writing.fold().turn(request_id) else {
-                        return Ok(Replaced::NotQueued);
+                        return Ok(Guarded::Ready(Replaced::NotQueued));
                     };
                     if let Some(applied) = turn.edits.get(edit_id) {
-                        return Ok(if *applied == edit || *applied == derived {
+                        return Ok(Guarded::Ready(if *applied == edit || *applied == derived {
                             Replaced::Applied(None)
                         } else {
                             Replaced::Conflict
-                        });
+                        }));
+                    }
+                    if steering {
+                        return Ok(Guarded::Steering);
                     }
                     if !matches!(turn.phase, Phase::Queued { .. }) {
-                        return Ok(Replaced::NotQueued);
+                        return Ok(Guarded::Ready(Replaced::NotQueued));
                     }
                     let prompt =
                         serde_json::from_str::<Prompt>(turn.prompt.get()).map_err(|error| {
@@ -1654,12 +1669,12 @@ let events = events.as_slice();
                         }),
                     )?;
                     writing.commit(Point::Admission).await?;
-                    Ok(Replaced::Applied(Some(logged(
+                    Ok(Guarded::Ready(Replaced::Applied(Some(logged(
                         seq,
                         Some(request_id),
                         at,
                         body,
-                    ))))
+                    )))))
                 })
             })
             .await
@@ -1839,6 +1854,16 @@ impl TurnLog for OneLog {
         digest: &'a str,
     ) -> Logged<'a, Option<(TurnRecord, LoggedEvent)>> {
         Box::pin(Self::withdraw_steered(self, request_id, digest))
+    }
+
+    fn replace_queued<'a>(
+        &'a self,
+        request_id: &'a str,
+        edit_id: &'a str,
+        text: &'a str,
+        steering: bool,
+    ) -> Logged<'a, Guarded<Replaced>> {
+        Box::pin(self.edit_queued(request_id, edit_id, text, steering))
     }
 }
 

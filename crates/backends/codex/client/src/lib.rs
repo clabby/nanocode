@@ -19,6 +19,9 @@ pub mod responses;
 
 mod route;
 
+#[doc(hidden)]
+pub mod sim;
+
 #[cfg(not(target_family = "wasm"))]
 pub mod tls;
 
