@@ -11,10 +11,11 @@ pub enum Mutation {
     RestoreSharesClaim,
     ScopeJobsStopInline,
     ScopeLocksKept,
+    CancelHoldKept,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::None,
         Self::WaitRepeatsIds,
         Self::RestoreRemembersWaits,
@@ -23,6 +24,7 @@ impl Mutation {
         Self::RestoreSharesClaim,
         Self::ScopeJobsStopInline,
         Self::ScopeLocksKept,
+        Self::CancelHoldKept,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -35,6 +37,7 @@ impl Mutation {
             Self::RestoreSharesClaim => "subagents_restore_shares_claim",
             Self::ScopeJobsStopInline => "subagents_scope_jobs_stop_inline",
             Self::ScopeLocksKept => "subagents_scope_locks_kept",
+            Self::CancelHoldKept => "subagents_cancel_hold_kept",
         }
     }
 }

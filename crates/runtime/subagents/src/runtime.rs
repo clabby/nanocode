@@ -548,6 +548,11 @@ impl Sessions {
         ids
     }
 
+    fn active_direct_ids(&mut self) -> Vec<AgentId> {
+        self.refresh();
+        self.active_direct.iter().copied().collect()
+    }
+
     fn spawned_in(&mut self, contexts: &[&str]) -> Vec<AgentId> {
         self.refresh();
         let mut ids = self.spawning.iter().copied().collect::<HashSet<_>>();
@@ -7042,21 +7047,42 @@ impl Registry {
 
     async fn unpark_completions(&self, root_session_id: &str) {
         let root = root_session_id.to_owned();
-        let unparked = self
+        let (unparked, released) = self
             .state
             .call(move |state| {
                 let Some(scope) = state.scopes.get_mut(&root) else {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 };
+                let mut released = false;
+                if !crate::sim::mutated(crate::sim::Mutation::CancelHoldKept) {
+                    for id in scope.sessions.active_direct_ids() {
+                        let marked = scope
+                            .sessions
+                            .get(&id)
+                            .is_some_and(|session| session.cancelled_revision.is_some());
+                        if marked && let Some(session) = scope.sessions.get_mut(&id) {
+                            session.cancelled_revision = None;
+                            released = true;
+                        }
+                    }
+                }
                 let ids = scope.sessions.parked_ids();
-                ids.into_iter()
+                let unparked = ids
+                    .into_iter()
                     .filter_map(|id| {
                         let revision = scope.sessions.get_mut(&id)?.completion.unpark()?;
                         Some((id, revision))
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (unparked, released)
             })
             .await;
+        if released
+            && self.store_for(root_session_id).is_some()
+            && let Err(error) = self.persist_durably(root_session_id).await
+        {
+            nanocode_trace::warn!(%error, root_session_id, "released subagent lineage was not journaled");
+        }
         if unparked.is_empty() {
             return;
         }

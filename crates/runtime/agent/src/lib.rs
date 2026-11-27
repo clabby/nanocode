@@ -43,6 +43,6 @@ pub use thread_scope::{
 };
 pub use turn_inbox::{
     Attach, Delivery, Driven, Halt, InboxError, InboxHost, MovedQueued, Next, PassEnd, TurnInbox,
-    Wake,
+    Wake, sim as inbox_sim,
 };
 pub use turn_log::{EventLog, Recording, TurnLog, Verdict};

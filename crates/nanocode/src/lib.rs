@@ -290,7 +290,7 @@ pub mod session_host {
         LogEntry, LogPage, LoggedEvent, Missing, MovedQueued, Next, OneLog, PassEnd, Recording,
         Replaced, ResumeError, SessionLog, Settled, Started, Submission, Submitted, TurnInbox,
         TurnLog, TurnRecord, TurnRetry, TurnState, Unresumable, Verdict, Wake, base_checkpoint,
-        settle_pending, submission_digest,
+        inbox_sim, settle_pending, submission_digest,
     };
 }
 

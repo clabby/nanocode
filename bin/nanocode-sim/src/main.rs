@@ -151,7 +151,7 @@ use crate::{
     pgpool::{PgPoolMutation, PgPoolStats},
     plog::{PlogMutation, PlogStats},
     repocache::{RepoCacheMutation, RepoCacheStats},
-    requestclose::RequestCloseStats,
+    requestclose::{RequestCloseMutation, RequestCloseStats},
     scale::{ScaleConfig, ScaleLoad, ScaleMutation, ScaleStats},
     secrets::{SecretsMutation, SecretsStats},
     simulate::{Options, run_seed},
@@ -267,6 +267,7 @@ struct Args {
     cell_calls: CellCallsMutation,
     live: LiveMutation,
     long_thread: LongThreadMutation,
+    request_close: RequestCloseMutation,
     tasks: TasksMutation,
     board: BoardMutation,
     controlplane: ControlplaneMutation,
@@ -336,6 +337,7 @@ fn usage() -> ExitCode {
        cell_calls: [--mutation {}]
        live: [--mutation {}] [--trace-dir DIR]
        long_thread: [--mutation {}]
+       request_close: [--mutation {}]
        capture: [--mutation skip_trim|drop_chunk|skip_redact|redact_then_trim]
        executor: [--mutation {}]
        dns: [--mutation cut_answer|drop_search]
@@ -390,6 +392,7 @@ fn usage() -> ExitCode {
         CellCallsMutation::names(),
         LiveMutation::names(),
         LongThreadMutation::names(),
+        requestclose::names(),
         TasksMutation::names(),
         BoardMutation::names(),
         CostMutation::names(),
@@ -484,6 +487,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut cell_calls = CellCallsMutation::None;
     let mut live = LiveMutation::None;
     let mut long_thread = LongThreadMutation::None;
+    let mut request_close = RequestCloseMutation::None;
     let mut tasks = TasksMutation::None;
     let mut board = BoardMutation::None;
     let mut controlplane = ControlplaneMutation::None;
@@ -686,7 +690,9 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::Live, Some(name)) => live = LiveMutation::parse(name)?,
         (Scenario::LongThread, Some(name)) => long_thread = LongThreadMutation::parse(name)?,
         (Scenario::Executor, Some(name)) => tasks = TasksMutation::parse(name)?,
-        (Scenario::RequestClose, Some(_)) => return None,
+        (Scenario::RequestClose, Some(name)) => {
+            request_close = RequestCloseMutation::parse(name)?;
+        }
         (Scenario::SteerCarry, Some(name)) => steer_carry = CarryMutation::parse(name)?,
         (Scenario::AntigravityDurable, Some(name)) => {
             antigravity_durable = AntigravityMutation::parse(name)?;
@@ -795,6 +801,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         cell_calls,
         live,
         long_thread,
+        request_close,
         tasks,
         board,
         controlplane,
@@ -897,7 +904,7 @@ fn scenario_replay(seed: u64, args: &Args) -> String {
         return longthread::replay(seed, args.long_thread);
     }
     if args.scenario == Scenario::RequestClose {
-        return requestclose::replay(seed);
+        return requestclose::replay(seed, args.request_close);
     }
     if args.scenario == Scenario::SteerCarry {
         return steercarry::replay(seed, args.steer_carry);
@@ -1375,6 +1382,7 @@ fn mutations() -> ExitCode {
     add("cell_calls", CellCallsMutation::names());
     add("live", LiveMutation::names());
     add("long_thread", LongThreadMutation::names());
+    add("request_close", requestclose::names());
     add("executor", TasksMutation::names());
     add("board", BoardMutation::names());
     add("controlplane", ControlplaneMutation::names());
@@ -1659,6 +1667,7 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
         ),
         Scenario::RequestClose => requestclose::judge(
             seed,
+            args.request_close,
             args.twice,
             args.options.verbose,
             &mut totals.request_close_totals,
@@ -2149,6 +2158,8 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::CellCalls && args.cell_calls != CellCallsMutation::None)
         || (args.scenario == Scenario::Live && args.live != LiveMutation::None)
         || (args.scenario == Scenario::LongThread && args.long_thread != LongThreadMutation::None)
+        || (args.scenario == Scenario::RequestClose
+            && args.request_close != RequestCloseMutation::None)
         || (args.scenario == Scenario::Executor && args.tasks != TasksMutation::None)
         || (args.scenario == Scenario::Board && args.board != BoardMutation::None)
         || (args.scenario == Scenario::Controlplane
@@ -2387,6 +2398,7 @@ fn main() -> ExitCode {
             passed,
             failed,
             args.twice,
+            args.request_close,
             &request_close_totals,
         );
     }

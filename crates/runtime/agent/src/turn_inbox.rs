@@ -29,6 +29,29 @@ use crate::{
     turn_log::{EventLog, Recording, TurnLog},
 };
 
+pub mod sim {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    pub enum Mutation {
+        None,
+        OwnedRequestHeld,
+        OwnedCancelCloses,
+    }
+
+    static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);
+
+    pub fn mutate(mutation: Mutation) {
+        MUTATION.store(mutation as u8, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn mutated(mutation: Mutation) -> bool {
+        MUTATION.load(Ordering::Relaxed) == mutation as u8
+    }
+}
+
 pub trait InboxHost: Send + Sync + 'static {
     fn publish(&self, events: Vec<LoggedEvent>) -> HostFuture<'_, Result<(), String>>;
 
@@ -60,6 +83,10 @@ pub trait InboxHost: Send + Sync + 'static {
 
     fn coalesce_deltas(&self) -> bool {
         true
+    }
+
+    fn owns_completion_turns(&self) -> bool {
+        false
     }
 
     fn inputs<'a>(&'a self, _request_id: &'a str) -> HostFuture<'a, Result<Vec<String>, String>> {
@@ -1208,13 +1235,16 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
         }
         let _busy = Busy(&self.busy);
         let root = self.session_id();
-        let open = self
-            .shared
-            .log
-            .pending()
-            .await?
-            .into_iter()
-            .find(|record| record.state == TurnState::Running);
+        let open = if self.shared.host.owns_completion_turns() {
+            None
+        } else {
+            self.shared
+                .log
+                .pending()
+                .await?
+                .into_iter()
+                .find(|record| record.state == TurnState::Running)
+        };
         let _hold = open
             .as_ref()
             .map(|open| Hold::new(&self.shared, &open.request_id));
@@ -1386,7 +1416,9 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             None
         };
         let cancel = record.cancel_requested;
-        let _hold = Hold::new(&self.shared, id);
+        let owned = self.shared.host.owns_completion_turns();
+        let held = !owned || sim::mutated(sim::Mutation::OwnedRequestHeld);
+        let _hold = held.then(|| Hold::new(&self.shared, id));
         let Some(prompt) = stored.or(record.prompt) else {
             return if cancel {
                 self.finish(
@@ -1405,10 +1437,11 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
             };
         };
         let outcome = match self.execute(id, prompt, cancel, Run::Inbox).await {
-            DurableOutcome::Completed(message) => self.children(id, message).await,
+            DurableOutcome::Completed(message) if held => self.children(id, message).await,
             outcome => outcome,
         };
-        if matches!(outcome, DurableOutcome::Cancelled) {
+        let closes = !owned || sim::mutated(sim::Mutation::OwnedCancelCloses);
+        if closes && matches!(outcome, DurableOutcome::Cancelled) {
             self.abandon_children().await?;
         }
         match outcome {
