@@ -1,5 +1,9 @@
 use std::{collections::BTreeSet, ops::Range, process::ExitCode, sync::Arc};
 
+use nanocode_backend_codex::{
+    Model,
+    client::{ModelConfig, sim as prompt_sim},
+};
 use nanocode_code_mode::{ToolContext, ToolOutput};
 use nanocode_sync::{Slot, block_on};
 use nanocode_tool_runtime::{
@@ -20,6 +24,19 @@ const PLAIN: &str = "plain";
 const ESCALATE: &str = "escalate";
 const PATHS: [&str; 6] = ["a.txt", "src/b.rs", "c/d/e.md", "f", "g.json", "h i.txt"];
 const CALLS: Range<u64> = 20..400;
+const PINNED_MODELS: [Model; 5] = [
+    Model::Luna,
+    Model::Sol,
+    Model::Sol62,
+    Model::Astra,
+    Model::Astra62,
+];
+const UNSERVED_TEXT: [&str; 4] = [
+    "# Plugins and Apps",
+    "plugin://",
+    "app://",
+    "list_mcp_resources",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NestedMetaMutation {
@@ -28,15 +45,17 @@ pub enum NestedMetaMutation {
     WrittenOnFailure,
     CatalogKeepsEscalation,
     CallKeepsEscalation,
+    UnservedSectionsKept,
 }
 
 impl NestedMetaMutation {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::None,
         Self::ForgetsWritten,
         Self::WrittenOnFailure,
         Self::CatalogKeepsEscalation,
         Self::CallKeepsEscalation,
+        Self::UnservedSectionsKept,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -52,6 +71,7 @@ impl NestedMetaMutation {
             Self::WrittenOnFailure => "written_on_failure",
             Self::CatalogKeepsEscalation => "catalog_keeps_escalation",
             Self::CallKeepsEscalation => "call_keeps_escalation",
+            Self::UnservedSectionsKept => "unserved_sections_kept",
         }
     }
 
@@ -70,6 +90,14 @@ impl NestedMetaMutation {
             Self::WrittenOnFailure => Rule::WrittenOnFailure,
             Self::CatalogKeepsEscalation => Rule::CatalogKeepsEscalation,
             Self::CallKeepsEscalation => Rule::CallKeepsEscalation,
+            Self::UnservedSectionsKept => Rule::None,
+        }
+    }
+
+    const fn prompt_rule(self) -> prompt_sim::Mutation {
+        match self {
+            Self::UnservedSectionsKept => prompt_sim::Mutation::UnservedSectionsKept,
+            _ => prompt_sim::Mutation::None,
         }
     }
 }
@@ -238,8 +266,40 @@ fn written(output: &ToolOutput) -> Option<Value> {
         .cloned()
 }
 
+fn unserved_sections() -> Option<String> {
+    let mut named = [false; UNSERVED_TEXT.len()];
+    for model in PINNED_MODELS {
+        let upstream = ModelConfig {
+            model: model.clone(),
+            codesign: false,
+            ..ModelConfig::default()
+        };
+        let served = ModelConfig {
+            model: model.clone(),
+            ..ModelConfig::default()
+        };
+        let (upstream, served) = (upstream.base_system_prompt(), served.base_system_prompt());
+        for (text, named) in UNSERVED_TEXT.into_iter().zip(&mut named) {
+            *named |= upstream.contains(text);
+            if served.contains(text) {
+                return Some(format!(
+                    "unserved_section: the {model:?} prompt still carries {text:?} though the SDK serves no plugins or apps"
+                ));
+            }
+        }
+    }
+    UNSERVED_TEXT.into_iter().zip(named).find_map(|(text, named)| {
+        (!named).then(|| {
+            format!(
+                "unserved_stale: no pinned prompt contains {text:?} any more, so stripping the unserved sections matches nothing"
+            )
+        })
+    })
+}
+
 fn run_seed(seed: u64, mutation: NestedMetaMutation) -> Outcome {
     host_sim::mutate(mutation.rule());
+    prompt_sim::mutate(mutation.prompt_rule());
     crate::host::enter(seed, &Clock::new());
     let mut rng = Rng::derive(seed, "nested_meta");
     let calls = rng.range(CALLS.start, CALLS.end);
@@ -294,6 +354,7 @@ fn run_seed(seed: u64, mutation: NestedMetaMutation) -> Outcome {
             format!("{surface}:{properties:?}:{required:?}").as_bytes(),
         );
     }
+    wrong = wrong.or_else(unserved_sections);
     for index in 0..calls {
         if wrong.is_some() {
             break;
@@ -390,6 +451,7 @@ fn run_seed(seed: u64, mutation: NestedMetaMutation) -> Outcome {
         }
     }
     host_sim::mutate(Rule::None);
+    prompt_sim::mutate(prompt_sim::Mutation::None);
     Outcome {
         digest,
         wrong,

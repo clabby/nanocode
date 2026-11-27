@@ -368,6 +368,7 @@ default_table='
 1 canary_nested_meta_written_on_failure canary:8 --scenario nested_meta --mutation written_on_failure
 1 canary_nested_meta_catalog_keeps_escalation canary:8 --scenario nested_meta --mutation catalog_keeps_escalation
 1 canary_nested_meta_call_keeps_escalation canary:8 --scenario nested_meta --mutation call_keeps_escalation
+1 canary_nested_meta_unserved_sections_kept canary:8 --scenario nested_meta --mutation unserved_sections_kept
 4 gc_unwind pass --scenario gc_unwind
 1 gc_unwind_twice pass --scenario gc_unwind --twice
 1 canary_gc_unwind_keeps_leftover_bits canary:8 --scenario gc_unwind --mutation keeps_leftover_bits
